@@ -1,0 +1,55 @@
+version: "2"
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+linters:
+  enable:
+    # Defaults
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+
+    # Style
+    - misspell
+
+    # Bugs
+    - bodyclose
+    - durationcheck
+    - nilerr
+
+    # Complexity
+    - cyclop
+    - gocognit
+    - nestif
+
+    # Security
+    - gosec
+
+    # Performance
+    - prealloc
+
+  settings:
+    cyclop:
+      max-complexity: 25
+    gocognit:
+      min-complexity: 40
+    nestif:
+      min-complexity: 10
+    gosec:
+      excludes:
+        - G115  # integer overflow uint->int (false positive for line numbers)
+        - G304  # file inclusion via variable (expected: we read source files)
+
+exclusions:
+  rules:
+    - path: _test\.go
+      linters:
+        - cyclop
+        - gocognit
+        - gosec
+        - prealloc

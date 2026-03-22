@@ -1,0 +1,6 @@
+# Binary
+/defn
+*.db
+
+# OS
+.DS_Store
