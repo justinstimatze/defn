@@ -6,8 +6,12 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
+	"os"
+	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
+	"github.com/justinstimatze/defn/internal/goload"
 	"github.com/justinstimatze/defn/internal/store"
 	"golang.org/x/tools/go/packages"
 )
@@ -22,8 +26,10 @@ func Ingest(db *store.DB, modulePath string) error {
 			packages.NeedTypes |
 			packages.NeedTypesInfo |
 			packages.NeedImports |
-			packages.NeedDeps,
-		Dir: modulePath,
+			packages.NeedDeps |
+			packages.NeedEmbedPatterns,
+		Dir:   modulePath,
+		Tests: true, // include test packages
 	}
 
 	pkgs, err := packages.Load(cfg, "./...")
@@ -42,40 +48,171 @@ func Ingest(db *store.DB, modulePath string) error {
 		return fmt.Errorf("package errors:\n%s", strings.Join(errs, "\n"))
 	}
 
-	for _, pkg := range pkgs {
-		if err := ingestPackage(db, pkg); err != nil {
+	state := &ingestState{
+		initCounter: make(map[int64]int),
+		liveDefIDs:  make(map[int64]bool),
+	}
+
+	// Store project-level files (go.mod, go.sum).
+	for _, name := range []string{"go.mod", "go.sum"} {
+		data, err := os.ReadFile(filepath.Join(modulePath, name))
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("read %s: %w", name, err)
+		}
+		if err := db.SetProjectFile(name, string(data)); err != nil {
+			return fmt.Errorf("store %s: %w", name, err)
+		}
+	}
+
+	for _, pkg := range goload.FilterPackages(pkgs) {
+		if err := ingestPackage(db, pkg, modulePath, state); err != nil {
 			return fmt.Errorf("ingest %s: %w", pkg.PkgPath, err)
 		}
+	}
+
+	// Remove definitions that no longer exist in the source code.
+	if pruned, err := db.PruneStaleDefinitions(state.liveDefIDs); err != nil {
+		return fmt.Errorf("prune stale: %w", err)
+	} else if pruned > 0 {
+		fmt.Fprintf(os.Stderr, "pruned %d stale definitions\n", pruned)
 	}
 
 	return nil
 }
 
-func ingestPackage(db *store.DB, pkg *packages.Package) error {
-	mod, err := db.EnsureModule(pkg.PkgPath, pkg.Name)
+func ingestPackage(db *store.DB, pkg *packages.Package, modulePath string, state *ingestState) error {
+	// Strip _test suffix from external test package paths so test definitions
+	// are stored in the same module as the code they test.
+	pkgPath := pkg.PkgPath
+	pkgName := pkg.Name
+	if strings.HasSuffix(pkgName, "_test") {
+		pkgName = strings.TrimSuffix(pkgName, "_test")
+		if strings.HasSuffix(pkgPath, "_test") {
+			pkgPath = strings.TrimSuffix(pkgPath, "_test")
+		}
+	}
+	// Extract package doc comment from the first file that has one.
+	pkgDoc := ""
+	for _, file := range pkg.Syntax {
+		if file.Doc != nil {
+			pkgDoc = strings.TrimSpace(file.Doc.Text())
+			break
+		}
+	}
+	mod, err := db.EnsureModule(pkgPath, pkgName, pkgDoc)
 	if err != nil {
 		return err
 	}
 
+	// Collect imports from all files in this package.
+	seen := make(map[string]string) // path → alias
 	for _, file := range pkg.Syntax {
-		if err := ingestFile(db, pkg, mod, file); err != nil {
+		for _, imp := range file.Imports {
+			path := strings.Trim(imp.Path.Value, `"`)
+			alias := ""
+			if imp.Name != nil && imp.Name.Name != "." {
+				alias = imp.Name.Name
+			}
+			// Keep the first alias seen (they should be consistent within a package).
+			if _, ok := seen[path]; !ok {
+				seen[path] = alias
+			}
+		}
+	}
+	var imports []store.Import
+	for path, alias := range seen {
+		imports = append(imports, store.Import{
+			ModuleID:     mod.ID,
+			ImportedPath: path,
+			Alias:        alias,
+		})
+	}
+	if err := db.SetImports(mod.ID, imports); err != nil {
+		return fmt.Errorf("set imports: %w", err)
+	}
+
+	// Find and store //go:embed referenced files.
+	if err := ingestEmbedFiles(db, pkg, modulePath); err != nil {
+		return err
+	}
+
+	for _, file := range pkg.Syntax {
+		// Determine if this is a test file using the actual filename
+		// from the token.FileSet (not index-based, which isn't guaranteed).
+		isTest := false
+		if file.Pos().IsValid() {
+			filename := pkg.Fset.Position(file.Pos()).Filename
+			isTest = strings.HasSuffix(filename, "_test.go")
+		}
+		if err := ingestFile(db, pkg, mod, file, isTest, state); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func ingestFile(db *store.DB, pkg *packages.Package, mod *store.Module, file *ast.File) error {
+// ingestEmbedFiles finds //go:embed referenced files in a package
+// and stores them as project files with their relative paths.
+func ingestEmbedFiles(db *store.DB, pkg *packages.Package, modulePath string) error {
+	// Use EmbedPatterns if available (requires NeedEmbedPatterns).
+	if len(pkg.EmbedPatterns) == 0 {
+		return nil
+	}
+
+	// pkg.GoFiles contains absolute paths to the package's source directory.
+	var pkgDir string
+	if len(pkg.GoFiles) > 0 {
+		pkgDir = filepath.Dir(pkg.GoFiles[0])
+	} else {
+		return nil
+	}
+
+	absModulePath, _ := filepath.Abs(modulePath)
+
+	for _, pattern := range pkg.EmbedPatterns {
+		// EmbedPatterns may be absolute paths or glob patterns.
+		if !filepath.IsAbs(pattern) {
+			pattern = filepath.Join(pkgDir, pattern)
+		}
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+		for _, absPath := range matches {
+			content, err := os.ReadFile(absPath)
+			if err != nil {
+				continue
+			}
+			// Skip binary files (not valid UTF-8) — can't store in TEXT columns.
+			if !utf8.Valid(content) {
+				continue
+			}
+			relPath, err := filepath.Rel(absModulePath, absPath)
+			if err != nil {
+				continue
+			}
+			if err := db.SetProjectFile(relPath, string(content)); err != nil {
+				continue // best effort for embeds
+			}
+		}
+	}
+	return nil
+}
+
+func ingestFile(db *store.DB, pkg *packages.Package, mod *store.Module, file *ast.File, isTest bool, state *ingestState) error {
 	fset := pkg.Fset
 
 	for _, decl := range file.Decls {
 		switch d := decl.(type) {
 		case *ast.FuncDecl:
-			if err := ingestFunc(db, fset, mod, file, d); err != nil {
+			if err := ingestFunc(db, fset, mod, file, d, isTest, state); err != nil {
 				return err
 			}
 		case *ast.GenDecl:
-			if err := ingestGenDecl(db, fset, mod, file, d); err != nil {
+			if err := ingestGenDecl(db, fset, mod, file, d, isTest, state); err != nil {
 				return err
 			}
 		}
@@ -83,7 +220,14 @@ func ingestFile(db *store.DB, pkg *packages.Package, mod *store.Module, file *as
 	return nil
 }
 
-func ingestFunc(db *store.DB, fset *token.FileSet, mod *store.Module, file *ast.File, fn *ast.FuncDecl) error {
+// ingestState holds mutable state for a single ingest run.
+// Passed by pointer to avoid package-level mutable state.
+type ingestState struct {
+	initCounter map[int64]int  // tracks init functions per module
+	liveDefIDs  map[int64]bool // tracks all definition IDs seen
+}
+
+func ingestFunc(db *store.DB, fset *token.FileSet, mod *store.Module, file *ast.File, fn *ast.FuncDecl, isTest bool, state *ingestState) error {
 	start := fset.Position(fn.Pos())
 	end := fset.Position(fn.End())
 
@@ -101,11 +245,23 @@ func ingestFunc(db *store.DB, fset *token.FileSet, mod *store.Module, file *ast.
 	sig := renderSignature(fset, fn)
 	doc := fn.Doc.Text()
 
+	// Multiple init() functions are valid in Go. Give each a unique name
+	// so they don't overwrite each other in the database.
+	name := fn.Name.Name
+	if name == "init" {
+		n := state.initCounter[mod.ID]
+		if n > 0 {
+			name = fmt.Sprintf("init_%d", n)
+		}
+		state.initCounter[mod.ID]++
+	}
+
 	def := &store.Definition{
 		ModuleID:  mod.ID,
-		Name:      fn.Name.Name,
+		Name:      name,
 		Kind:      kind,
 		Exported:  fn.Name.IsExported(),
+		Test:      isTest,
 		Receiver:  receiver,
 		Signature: sig,
 		Body:      body,
@@ -114,23 +270,84 @@ func ingestFunc(db *store.DB, fset *token.FileSet, mod *store.Module, file *ast.
 		EndLine:   end.Line,
 	}
 
-	_, err := db.UpsertDefinition(def)
-	return err
+	id, err := db.UpsertDefinition(def)
+	if err != nil {
+		return err
+	}
+	state.liveDefIDs[id] = true
+	return nil
 }
 
-func ingestGenDecl(db *store.DB, fset *token.FileSet, mod *store.Module, file *ast.File, gd *ast.GenDecl) error {
+// containsIota checks if a GenDecl contains iota in any of its value specs.
+func containsIota(gd *ast.GenDecl) bool {
+	if gd.Tok != token.CONST {
+		return false
+	}
+	found := false
+	ast.Inspect(gd, func(n ast.Node) bool {
+		if ident, ok := n.(*ast.Ident); ok && ident.Name == "iota" {
+			found = true
+			return false
+		}
+		return !found
+	})
+	return found
+}
+
+func ingestGenDecl(db *store.DB, fset *token.FileSet, mod *store.Module, file *ast.File, gd *ast.GenDecl, isTest bool, state *ingestState) error {
+	grouped := gd.Lparen.IsValid() // parenthesized group: const (...), var (...), type (...)
+
+	// Iota const blocks must be stored as a single definition because
+	// individual specs depend on their position in the block.
+	if grouped && containsIota(gd) {
+		body := renderNode(fset, gd)
+		doc := gd.Doc.Text()
+		// Use the first name as the definition name.
+		firstName := "const_group"
+		if vs, ok := gd.Specs[0].(*ast.ValueSpec); ok && len(vs.Names) > 0 {
+			firstName = vs.Names[0].Name
+		}
+		start := fset.Position(gd.Pos())
+		end := fset.Position(gd.End())
+		def := &store.Definition{
+			ModuleID:  mod.ID,
+			Name:      firstName,
+			Kind:      "const",
+			Exported:  ast.IsExported(firstName),
+			Test:      isTest,
+			Signature: fmt.Sprintf("const %s (iota group)", firstName),
+			Body:      body,
+			Doc:       doc,
+			StartLine: start.Line,
+			EndLine:   end.Line,
+		}
+		id, err := db.UpsertDefinition(def)
+		if err != nil {
+			return err
+		}
+		state.liveDefIDs[id] = true
+		return nil
+	}
+
 	for _, spec := range gd.Specs {
 		switch s := spec.(type) {
 		case *ast.TypeSpec:
-			start := fset.Position(gd.Pos())
-			end := fset.Position(gd.End())
-
 			kind := "type"
 			if _, ok := s.Type.(*ast.InterfaceType); ok {
 				kind = "interface"
 			}
 
-			body := renderNode(fset, gd)
+			// For grouped type declarations, render just this spec.
+			// For standalone, render the whole GenDecl (includes "type" keyword).
+			var body string
+			if grouped {
+				body = renderNode(fset, s)
+			} else {
+				body = renderNode(fset, gd)
+			}
+
+			start := fset.Position(s.Pos())
+			end := fset.Position(s.End())
 			doc := gd.Doc.Text()
 			if doc == "" {
 				doc = s.Doc.Text()
@@ -141,43 +358,69 @@ func ingestGenDecl(db *store.DB, fset *token.FileSet, mod *store.Module, file *a
 				Name:      s.Name.Name,
 				Kind:      kind,
 				Exported:  s.Name.IsExported(),
+				Test:      isTest,
 				Signature: fmt.Sprintf("type %s", s.Name.Name),
 				Body:      body,
 				Doc:       doc,
 				StartLine: start.Line,
 				EndLine:   end.Line,
 			}
-			if _, err := db.UpsertDefinition(def); err != nil {
+			id, err := db.UpsertDefinition(def)
+			if err != nil {
 				return err
 			}
+			state.liveDefIDs[id] = true
 
 		case *ast.ValueSpec:
 			kind := "var"
 			if gd.Tok == token.CONST {
 				kind = "const"
 			}
+			// Find the first non-blank name to be the definition's name.
+			// For multi-name specs (var x, y int), store once under the
+			// first name — the body already contains all names.
+			firstName := ""
+			exported := false
 			for _, name := range s.Names {
-				if name.Name == "_" {
-					continue
-				}
-				body := renderNode(fset, gd)
-				doc := gd.Doc.Text()
-				if doc == "" {
-					doc = s.Doc.Text()
-				}
-				def := &store.Definition{
-					ModuleID:  mod.ID,
-					Name:      name.Name,
-					Kind:      kind,
-					Exported:  name.IsExported(),
-					Signature: fmt.Sprintf("%s %s", kind, name.Name),
-					Body:      body,
-					Doc:       doc,
-				}
-				if _, err := db.UpsertDefinition(def); err != nil {
-					return err
+				if name.Name != "_" {
+					if firstName == "" {
+						firstName = name.Name
+						exported = name.IsExported()
+					}
 				}
 			}
+			if firstName == "" {
+				continue
+			}
+
+			// For grouped declarations, render just this spec.
+			// For standalone, render the whole GenDecl.
+			var body string
+			if grouped {
+				body = renderNode(fset, s)
+			} else {
+				body = renderNode(fset, gd)
+			}
+
+			doc := gd.Doc.Text()
+			if doc == "" {
+				doc = s.Doc.Text()
+			}
+			def := &store.Definition{
+				ModuleID:  mod.ID,
+				Name:      firstName,
+				Kind:      kind,
+				Exported:  exported,
+				Test:      isTest,
+				Signature: fmt.Sprintf("%s %s", kind, firstName),
+				Body:      body,
+				Doc:       doc,
+			}
+			id, err := db.UpsertDefinition(def)
+			if err != nil {
+				return err
+			}
+			state.liveDefIDs[id] = true
 		}
 	}
 	return nil

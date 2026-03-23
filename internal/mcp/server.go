@@ -1,340 +1,165 @@
 // Package mcp implements the MCP server that exposes the defn database
-// to Claude Code. This is the primary interface through which AI agents
-// interact with code.
+// to Claude Code.
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"go/types"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync/atomic"
+	"time"
 
+	"github.com/justinstimatze/defn/internal/emit"
+	"github.com/justinstimatze/defn/internal/ingest"
+	"github.com/justinstimatze/defn/internal/resolve"
 	"github.com/justinstimatze/defn/internal/store"
+	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// Server holds the MCP server state.
-type Server struct {
-	db *store.DB
-}
+const maxSearchResults = 20 // keep responses compact to avoid context bloat
 
-// New creates a new MCP server backed by the given database.
-func New(db *store.DB) *Server {
-	return &Server{db: db}
-}
+var (
+	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
+	testTimeout  = envDuration("DEFN_TEST_TIMEOUT", 60*time.Second)
+)
 
-// ToolDefinitions returns the MCP tool definitions for registration.
-func (s *Server) ToolDefinitions() []ToolDef {
-	return []ToolDef{
-		{
-			Name:        "get_definition",
-			Description: "Get a code definition by name. Returns the full source, signature, doc comment, and metadata. Use this instead of reading files.",
-			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"name":   map[string]any{"type": "string", "description": "Definition name (e.g. 'Open', 'DB', 'HashBody')"},
-					"module": map[string]any{"type": "string", "description": "Module path filter (optional, e.g. 'github.com/.../store')"},
-				},
-				"required": []string{"name"},
-			},
-		},
-		{
-			Name:        "search_definitions",
-			Description: "Search for definitions by name pattern (SQL LIKE). Use % as wildcard. Returns matching names, kinds, signatures, and modules.",
-			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"pattern": map[string]any{"type": "string", "description": "SQL LIKE pattern (e.g. '%Handler%', 'Get%', '%')"},
-				},
-				"required": []string{"pattern"},
-			},
-		},
-		{
-			Name:        "get_callers",
-			Description: "Get all definitions that call/reference a given definition. Use this to understand blast radius before making changes.",
-			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"name":   map[string]any{"type": "string", "description": "Definition name"},
-					"module": map[string]any{"type": "string", "description": "Module path filter (optional)"},
-				},
-				"required": []string{"name"},
-			},
-		},
-		{
-			Name:        "get_callees",
-			Description: "Get all definitions that a given definition calls/references. Use this to understand dependencies.",
-			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"name":   map[string]any{"type": "string", "description": "Definition name"},
-					"module": map[string]any{"type": "string", "description": "Module path filter (optional)"},
-				},
-				"required": []string{"name"},
-			},
-		},
-		{
-			Name:        "update_definition",
-			Description: "Update the body of an existing definition. The new body must be valid Go. This replaces the entire definition.",
-			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"name":     map[string]any{"type": "string", "description": "Definition name"},
-					"module":   map[string]any{"type": "string", "description": "Module path filter (optional)"},
-					"new_body": map[string]any{"type": "string", "description": "Complete new source text for this definition"},
-				},
-				"required": []string{"name", "new_body"},
-			},
-		},
-		{
-			Name:        "create_definition",
-			Description: "Create a new definition (function, type, method, etc.) in a module.",
-			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"module": map[string]any{"type": "string", "description": "Module path"},
-					"name":   map[string]any{"type": "string", "description": "Definition name"},
-					"kind":   map[string]any{"type": "string", "enum": []string{"function", "method", "type", "interface", "const", "var"}},
-					"body":   map[string]any{"type": "string", "description": "Full source text of the definition"},
-				},
-				"required": []string{"module", "name", "kind", "body"},
-			},
-		},
-		{
-			Name:        "list_modules",
-			Description: "List all modules (packages) in the database.",
-			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{},
-			},
-		},
-		{
-			Name:        "get_module_definitions",
-			Description: "List all definitions in a module. Returns names, kinds, signatures, and export status.",
-			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"module": map[string]any{"type": "string", "description": "Module path"},
-				},
-				"required": []string{"module"},
-			},
-		},
-		{
-			Name:        "query",
-			Description: "Run a raw SQL query against the defn database. Use for complex queries not covered by other tools. Tables: modules, definitions, references, imports, commits.",
-			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"sql": map[string]any{"type": "string", "description": "SQL query to execute"},
-				},
-				"required": []string{"sql"},
-			},
-		},
-		{
-			Name:        "build",
-			Description: "Emit files from the database and run `go build`. Returns any compilation errors.",
-			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{},
-			},
-		},
-	}
-}
-
-// ToolDef represents an MCP tool definition.
-type ToolDef struct {
-	Name        string
-	Description string
-	InputSchema map[string]any
-}
-
-// HandleTool dispatches a tool call to the appropriate handler.
-func (s *Server) HandleTool(name string, args map[string]any) (string, error) {
-	switch name {
-	case "get_definition":
-		return s.handleGetDefinition(args)
-	case "search_definitions":
-		return s.handleSearchDefinitions(args)
-	case "get_callers":
-		return s.handleGetCallers(args)
-	case "get_callees":
-		return s.handleGetCallees(args)
-	case "update_definition":
-		return s.handleUpdateDefinition(args)
-	case "create_definition":
-		return s.handleCreateDefinition(args)
-	case "list_modules":
-		return s.handleListModules(args)
-	case "get_module_definitions":
-		return s.handleGetModuleDefinitions(args)
-	case "query":
-		return s.handleQuery(args)
-	case "build":
-		return s.handleBuild(args)
-	default:
-		return "", fmt.Errorf("unknown tool: %s", name)
-	}
-}
-
-func (s *Server) handleGetDefinition(args map[string]any) (string, error) {
-	name, _ := args["name"].(string)
-	module, _ := args["module"].(string)
-
-	d, err := s.db.GetDefinitionByName(name, module)
-	if err != nil {
-		return "", fmt.Errorf("definition %q not found: %w", name, err)
-	}
-	return toJSON(d)
-}
-
-func (s *Server) handleSearchDefinitions(args map[string]any) (string, error) {
-	pattern, _ := args["pattern"].(string)
-	defs, err := s.db.FindDefinitions(pattern)
-	if err != nil {
-		return "", err
-	}
-	// Return summary, not full bodies.
-	type summary struct {
-		ID        int64  `json:"id"`
-		Name      string `json:"name"`
-		Kind      string `json:"kind"`
-		Exported  bool   `json:"exported"`
-		Receiver  string `json:"receiver,omitempty"`
-		Signature string `json:"signature"`
-		Module    int64  `json:"module_id"`
-	}
-	var results []summary
-	for _, d := range defs {
-		results = append(results, summary{
-			ID: d.ID, Name: d.Name, Kind: d.Kind,
-			Exported: d.Exported, Receiver: d.Receiver,
-			Signature: d.Signature, Module: d.ModuleID,
-		})
-	}
-	return toJSON(results)
-}
-
-func (s *Server) handleGetCallers(args map[string]any) (string, error) {
-	name, _ := args["name"].(string)
-	module, _ := args["module"].(string)
-
-	d, err := s.db.GetDefinitionByName(name, module)
-	if err != nil {
-		return "", fmt.Errorf("definition %q not found: %w", name, err)
-	}
-	callers, err := s.db.GetCallers(d.ID)
-	if err != nil {
-		return "", err
-	}
-	return toJSON(callers)
-}
-
-func (s *Server) handleGetCallees(args map[string]any) (string, error) {
-	name, _ := args["name"].(string)
-	module, _ := args["module"].(string)
-
-	d, err := s.db.GetDefinitionByName(name, module)
-	if err != nil {
-		return "", fmt.Errorf("definition %q not found: %w", name, err)
-	}
-	callees, err := s.db.GetCallees(d.ID)
-	if err != nil {
-		return "", err
-	}
-	return toJSON(callees)
-}
-
-func (s *Server) handleUpdateDefinition(args map[string]any) (string, error) {
-	name, _ := args["name"].(string)
-	module, _ := args["module"].(string)
-	newBody, _ := args["new_body"].(string)
-
-	d, err := s.db.GetDefinitionByName(name, module)
-	if err != nil {
-		return "", fmt.Errorf("definition %q not found: %w", name, err)
-	}
-
-	d.Body = newBody
-	id, err := s.db.UpsertDefinition(d)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf(`{"updated": true, "id": %d, "hash": "%s"}`, id, store.HashBody(newBody)), nil
-}
-
-func (s *Server) handleCreateDefinition(args map[string]any) (string, error) {
-	modulePath, _ := args["module"].(string)
-	name, _ := args["name"].(string)
-	kind, _ := args["kind"].(string)
-	body, _ := args["body"].(string)
-
-	// Look up module — it must exist.
-	modules, err := s.db.ListModules()
-	if err != nil {
-		return "", err
-	}
-	var mod *store.Module
-	for _, m := range modules {
-		if m.Path == modulePath {
-			mod = &m
-			break
+func envDuration(key string, fallback time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
 		}
 	}
-	if mod == nil {
-		return "", fmt.Errorf("module %q not found", modulePath)
-	}
-
-	exported := len(name) > 0 && name[0] >= 'A' && name[0] <= 'Z'
-	d := &store.Definition{
-		ModuleID: mod.ID,
-		Name:     name,
-		Kind:     kind,
-		Exported: exported,
-		Body:     body,
-	}
-	id, err := s.db.UpsertDefinition(d)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf(`{"created": true, "id": %d}`, id), nil
+	return fallback
 }
 
-func (s *Server) handleListModules(_ map[string]any) (string, error) {
-	modules, err := s.db.ListModules()
-	if err != nil {
-		return "", err
-	}
-	return toJSON(modules)
+type server struct {
+	db           *store.DB
+	projectDir   string
+	lastResolved atomic.Int64 // UnixNano timestamp of last resolve (to debounce watcher)
 }
 
-func (s *Server) handleGetModuleDefinitions(args map[string]any) (string, error) {
-	modulePath, _ := args["module"].(string)
+// Run starts the MCP server. projDir is the project root where files
+// should be emitted (for in-place sync with file-based tools).
+func Run(ctx context.Context, database *store.DB, projDir string) error {
+	s := &server{db: database, projectDir: projDir}
 
-	modules, err := s.db.ListModules()
-	if err != nil {
-		return "", err
+	// Watch for .go file changes and auto-reingest.
+	if projDir != "" {
+		go s.watchFiles(ctx)
 	}
-	for _, m := range modules {
-		if m.Path == modulePath {
-			defs, err := s.db.GetModuleDefinitions(m.ID)
-			if err != nil {
-				return "", err
-			}
-			return toJSON(defs)
-		}
-	}
-	return "", fmt.Errorf("module %q not found", modulePath)
+
+	server := sdkmcp.NewServer(&sdkmcp.Implementation{
+		Name:    "defn",
+		Version: "0.1.0",
+	}, nil)
+
+	sdkmcp.AddTool(server, &sdkmcp.Tool{
+		Name: "code",
+		Description: `Go code database. One tool, many ops. Start with impact for blast radius — it returns callers, transitives, and test coverage in one call. Don't follow up with search/explain unless you need more.
+
+Ops: impact (blast radius — START HERE), read, search, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, find, sync, query`,
+	}, s.handleCode)
+
+	return server.Run(ctx, &sdkmcp.StdioTransport{})
 }
 
-func (s *Server) handleQuery(args map[string]any) (string, error) {
-	sql, _ := args["sql"].(string)
-	results, err := s.db.Query(sql)
-	if err != nil {
-		return "", err
-	}
-	return toJSON(results)
+// --- Params ---
+
+// codeParam is the unified parameter for the single "code" tool.
+// Required fields per op:
+//
+//	read, impact, explain, delete, test, history: name
+//	search: pattern (or name as fallback)
+//	edit: name + new_body
+//	create: body (+ optional module)
+//	rename: old_name + new_name
+//	move: name + module
+//	find: file (+ optional line)
+//	query: sql
+//	apply: operations
+//	untested, diff, sync: (no params)
+type codeParam struct {
+	Op         string    `json:"op"`
+	Name       string    `json:"name,omitempty"`
+	Pattern    string    `json:"pattern,omitempty"`
+	Body       string    `json:"body,omitempty"`
+	NewBody    string    `json:"new_body,omitempty"`
+	Module     string    `json:"module,omitempty"`
+	OldName    string    `json:"old_name,omitempty"`
+	NewName    string    `json:"new_name,omitempty"`
+	SQL        string    `json:"sql,omitempty"`
+	File       string    `json:"file,omitempty"`
+	Line       int       `json:"line,omitempty"`
+	Operations []applyOp `json:"operations,omitempty"`
+	DryRun     bool      `json:"dry_run,omitempty"`
 }
 
-func (s *Server) handleBuild(_ map[string]any) (string, error) {
-	// TODO: emit files, run go build, return output
-	return `{"status": "not yet implemented"}`, nil
+type applyOp struct {
+	Op      string `json:"op"`
+	Name    string `json:"name"`
+	NewName string `json:"new_name"`
+	Body    string `json:"body"`
+	Module  string `json:"module"`
+}
+
+// Legacy param types used by internal handlers.
+type nameParam struct {
+	Name string `json:"name"`
+}
+type patternParam struct {
+	Pattern string `json:"pattern"`
+}
+type editParam struct {
+	Name    string `json:"name"`
+	NewBody string `json:"new_body"`
+}
+type createParam struct {
+	Body   string `json:"body"`
+	Module string `json:"module,omitempty"`
+}
+type applyParam struct {
+	Operations []applyOp `json:"operations"`
+	DryRun     bool      `json:"dry_run,omitempty"`
+}
+type renameParam struct {
+	OldName string `json:"old_name"`
+	NewName string `json:"new_name"`
+}
+type sqlParam struct {
+	SQL string `json:"sql"`
+}
+type emptyParam struct{}
+type findParam struct {
+	File string `json:"file"`
+	Line int    `json:"line"`
+}
+type moveParam struct {
+	Name     string `json:"name"`
+	ToModule string `json:"to_module"`
+}
+
+// --- Helpers ---
+
+func textResult(text string) *sdkmcp.CallToolResult {
+	return &sdkmcp.CallToolResult{
+		Content: []sdkmcp.Content{&sdkmcp.TextContent{Text: text}},
+	}
+}
+
+func errResult(err error) (*sdkmcp.CallToolResult, any, error) {
+	return &sdkmcp.CallToolResult{
+		Content: []sdkmcp.Content{&sdkmcp.TextContent{Text: err.Error()}},
+		IsError: true,
+	}, nil, nil
 }
 
 func toJSON(v any) (string, error) {
@@ -343,4 +168,947 @@ func toJSON(v any) (string, error) {
 		return "", err
 	}
 	return string(b), nil
+}
+
+func formatReceiver(recv string) string {
+	if recv == "" {
+		return ""
+	}
+	return "(" + recv + ")."
+}
+
+func (s *server) findModule(query string) *store.Module {
+	mods, _ := s.db.ListModules() // best effort — nil is safe
+	for _, m := range mods {
+		if strings.EqualFold(m.Name, query) ||
+			strings.Contains(strings.ToLower(m.Path), strings.ToLower(query)) {
+			return &m
+		}
+	}
+	return nil
+}
+
+func (s *server) modulePath(moduleID int64) string {
+	mods, _ := s.db.ListModules() // best effort — nil is safe
+	for _, m := range mods {
+		if m.ID == moduleID {
+			return m.Path
+		}
+	}
+	return ""
+}
+
+// --- Dispatch ---
+
+// handleCode is the single entry point for all operations.
+// It dispatches based on the "op" field to the appropriate handler.
+func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	// Validate required params per op (fail fast with clear error).
+	need := func(field, label string) (*sdkmcp.CallToolResult, any, error) {
+		if strings.TrimSpace(field) == "" {
+			return errResult(fmt.Errorf("%s: %s is required", args.Op, label))
+		}
+		return nil, nil, nil
+	}
+
+	switch args.Op {
+	case "read", "impact", "explain", "delete", "test", "history", "similar":
+		if r, o, e := need(args.Name, "name"); r != nil {
+			return r, o, e
+		}
+	case "edit":
+		if r, o, e := need(args.Name, "name"); r != nil {
+			return r, o, e
+		}
+		body := args.NewBody
+		if body == "" {
+			body = args.Body
+		}
+		if r, o, e := need(body, "new_body"); r != nil {
+			return r, o, e
+		}
+	case "create":
+		if r, o, e := need(args.Body, "body"); r != nil {
+			return r, o, e
+		}
+	case "rename":
+		if r, o, e := need(args.OldName, "old_name"); r != nil {
+			return r, o, e
+		}
+		if r, o, e := need(args.NewName, "new_name"); r != nil {
+			return r, o, e
+		}
+	case "move":
+		if r, o, e := need(args.Name, "name"); r != nil {
+			return r, o, e
+		}
+		if r, o, e := need(args.Module, "module"); r != nil {
+			return r, o, e
+		}
+	case "query":
+		if r, o, e := need(args.SQL, "sql"); r != nil {
+			return r, o, e
+		}
+	case "find":
+		if r, o, e := need(args.File, "file"); r != nil {
+			return r, o, e
+		}
+	}
+
+	switch args.Op {
+	case "read":
+		return s.handleGetDefinition(ctx, req, nameParam{Name: args.Name})
+	case "search":
+		p := args.Pattern
+		if p == "" {
+			p = args.Name
+		}
+		return s.handleSearch(ctx, req, patternParam{Pattern: p})
+	case "impact":
+		return s.handleImpact(ctx, req, nameParam{Name: args.Name})
+	case "explain":
+		return s.handleExplain(ctx, req, nameParam{Name: args.Name})
+	case "untested":
+		return s.handleUntested(ctx, req, emptyParam{})
+	case "edit":
+		body := args.NewBody
+		if body == "" {
+			body = args.Body
+		}
+		return s.handleEdit(ctx, req, editParam{Name: args.Name, NewBody: body})
+	case "create":
+		return s.handleCreate(ctx, req, createParam{Body: args.Body, Module: args.Module})
+	case "delete":
+		return s.handleDelete(ctx, req, nameParam{Name: args.Name})
+	case "rename":
+		return s.handleRename(ctx, req, renameParam{OldName: args.OldName, NewName: args.NewName})
+	case "move":
+		return s.handleMove(ctx, req, moveParam{Name: args.Name, ToModule: args.Module})
+	case "test":
+		return s.handleTest(ctx, req, nameParam{Name: args.Name})
+	case "similar":
+		return s.handleSimilar(ctx, req, nameParam{Name: args.Name})
+	case "apply":
+		return s.handleApply(ctx, req, applyParam{Operations: args.Operations, DryRun: args.DryRun})
+	case "diff":
+		return s.handleCodeDiff(ctx, req, emptyParam{})
+	case "history":
+		return s.handleHistory(ctx, req, nameParam{Name: args.Name})
+	case "query":
+		return s.handleQuery(ctx, req, sqlParam{SQL: args.SQL})
+	case "find":
+		return s.handleFind(ctx, req, findParam{File: args.File, Line: args.Line})
+	case "sync":
+		return s.handleSync(ctx, req, emptyParam{})
+	default:
+		return errResult(fmt.Errorf("unknown op %q — valid: read, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync", args.Op))
+	}
+}
+
+// --- Handlers ---
+
+func (s *server) handleImpact(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
+	d, err := s.db.GetDefinitionByName(args.Name, "")
+	if err != nil {
+		return errResult(fmt.Errorf("definition %q not found", args.Name))
+	}
+	impact, err := s.db.GetImpact(d.ID)
+	if err != nil {
+		return errResult(err)
+	}
+
+	// Formatted markdown response.
+	var sb strings.Builder
+	recv := formatReceiver(impact.Definition.Receiver)
+	sb.WriteString(fmt.Sprintf("## %s%s (%s)\n", recv, impact.Definition.Name, impact.Definition.Kind))
+	sb.WriteString(fmt.Sprintf("Module: %s\n\n", impact.Module))
+
+	// Compact format: counts + caller names only (no test names — agent can get those via code(op:"test")).
+	var prodCallers, testCallers []string
+	for _, c := range impact.DirectCallers {
+		name := formatReceiver(c.Receiver) + c.Name
+		if c.Test {
+			testCallers = append(testCallers, name)
+		} else {
+			prodCallers = append(prodCallers, name)
+		}
+	}
+	sb.WriteString(fmt.Sprintf("Direct callers: %d (%d production, %d test)\n", len(impact.DirectCallers), len(prodCallers), len(testCallers)))
+	for _, name := range prodCallers {
+		sb.WriteString(fmt.Sprintf("  %s\n", name))
+	}
+	sb.WriteString(fmt.Sprintf("Transitive callers: %d\n", impact.TransitiveCount))
+	sb.WriteString(fmt.Sprintf("Tests covering this: %d\n", len(impact.Tests)))
+	if impact.UncoveredBy > 0 {
+		sb.WriteString(fmt.Sprintf("Uncovered direct callers: %d\n", impact.UncoveredBy))
+	}
+
+	return textResult(sb.String()), nil, nil
+}
+
+func (s *server) handleGetDefinition(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
+	d, err := s.db.GetDefinitionByName(args.Name, "")
+	if err != nil {
+		return errResult(fmt.Errorf("definition %q not found", args.Name))
+	}
+
+	// Look up module path for this definition.
+	var modulePath string
+	mods, _ := s.db.ListModules() // best effort — nil is safe
+	for _, m := range mods {
+		if m.ID == d.ModuleID {
+			modulePath = m.Path
+			break
+		}
+	}
+
+	var sb strings.Builder
+	recv := formatReceiver(d.Receiver)
+	sb.WriteString(fmt.Sprintf("## %s%s (%s)\n", recv, d.Name, d.Kind))
+	sb.WriteString(fmt.Sprintf("Module: %s\n\n", modulePath))
+	if d.Doc != "" {
+		sb.WriteString(d.Doc + "\n\n")
+	}
+	sb.WriteString("```go\n")
+	sb.WriteString(d.Body)
+	sb.WriteString("\n```\n")
+
+	return textResult(sb.String()), nil, nil
+}
+
+func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args patternParam) (*sdkmcp.CallToolResult, any, error) {
+	var defs []store.Definition
+	var err error
+
+	if strings.Contains(args.Pattern, "%") {
+		// SQL LIKE pattern (e.g., "%Auth%").
+		defs, err = s.db.FindDefinitions(args.Pattern)
+	} else {
+		// Search names/signatures first (indexed, fast).
+		defs, err = s.db.FindDefinitions("%" + args.Pattern + "%")
+		if err != nil || len(defs) == 0 {
+			// Fall back to body/doc search (LIKE scan, slower).
+			defs, err = s.db.SearchDefinitions(args.Pattern)
+		}
+	}
+	if err != nil {
+		return errResult(err)
+	}
+	type summary struct {
+		Name     string `json:"name"`
+		Kind     string `json:"kind"`
+		Receiver string `json:"receiver,omitempty"`
+	}
+	var results []summary
+	for _, d := range defs {
+		if len(results) >= maxSearchResults {
+			break
+		}
+		results = append(results, summary{
+			Name: d.Name, Kind: d.Kind, Receiver: d.Receiver,
+		})
+	}
+	truncated := ""
+	if len(defs) > maxSearchResults {
+		truncated = fmt.Sprintf("\n(showing %d of %d results)", maxSearchResults, len(defs))
+	}
+	text, err := toJSON(results)
+	if err != nil {
+		return errResult(err)
+	}
+	if truncated != "" {
+		text += truncated
+	}
+	return textResult(text), nil, nil
+}
+
+func (s *server) handleUntested(_ context.Context, _ *sdkmcp.CallToolRequest, _ emptyParam) (*sdkmcp.CallToolResult, any, error) {
+	defs, err := s.db.GetUntested()
+	if err != nil {
+		return errResult(err)
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("%d exported definitions without test coverage:\n\n", len(defs)))
+	for _, d := range defs {
+		recv := formatReceiver(d.Receiver)
+		sb.WriteString(fmt.Sprintf("- %s%s (%s)\n", recv, d.Name, d.Kind))
+	}
+	return textResult(sb.String()), nil, nil
+}
+
+func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args editParam) (*sdkmcp.CallToolResult, any, error) {
+	d, err := s.db.GetDefinitionByName(args.Name, "")
+	if err != nil {
+		return errResult(fmt.Errorf("definition %q not found", args.Name))
+	}
+
+	d.Body = args.NewBody
+	d.Signature = extractSignature(args.NewBody)
+
+	id, err := s.db.UpsertDefinition(d)
+	if err != nil {
+		return errResult(err)
+	}
+
+	recv := formatReceiver(d.Receiver)
+
+	buildResult := s.autoEmitAndBuild()
+
+	s.autoResolve(s.modulePath(d.ModuleID))
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Updated %s%s (id=%d, hash=%s)\n", recv, d.Name, id, store.HashBody(args.NewBody)[:12]))
+	if buildResult != "" {
+		sb.WriteString("\n" + buildResult)
+	}
+	return textResult(sb.String()), nil, nil
+}
+
+// autoResolve re-runs ingest+resolve in-process to keep the reference graph
+// current after edits. If modulePath is non-empty, only resolves references
+// for that module (incremental — much faster). Falls back to full resolve
+// if modulePath is empty.
+// autoResolve updates the reference graph after a definition change.
+// When modulePath is set, only resolves that module (incremental).
+// Skips re-ingest — the DB was already updated by UpsertDefinition and
+// files were emitted by autoEmitAndBuild. Re-ingesting would just re-read
+// from disk what we just wrote.
+func (s *server) autoResolve(modulePath string) {
+	if s.projectDir == "" {
+		return
+	}
+	// Best effort — don't fail the edit if resolve fails.
+	if modulePath != "" {
+		resolve.ResolveModule(s.db, s.projectDir, modulePath)
+	} else {
+		resolve.Resolve(s.db, s.projectDir)
+	}
+	s.lastResolved.Store(time.Now().UnixNano())
+}
+
+// watchFiles polls for .go file changes and auto-reingests when detected.
+// This keeps the defn database in sync when files are edited outside defn
+// (e.g. via Edit/Write tools, vim, or other processes).
+func (s *server) watchFiles(ctx context.Context) {
+	var lastMod int64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(3 * time.Second):
+		}
+
+		// Check directory modtimes instead of stat-ing every .go file.
+		// When a file changes, its parent directory's modtime updates.
+		var newest int64
+		filepath.Walk(s.projectDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || !info.IsDir() {
+				return nil
+			}
+			base := filepath.Base(path)
+			if base == ".defn" || base == ".defn-server" || base == ".git" || base == "vendor" || base == "node_modules" {
+				return filepath.SkipDir
+			}
+			if mod := info.ModTime().UnixNano(); mod > newest {
+				newest = mod
+			}
+			return nil
+		})
+
+		if newest > lastMod && lastMod > 0 {
+			// Skip if autoResolve ran recently (avoids double-resolve after code_edit).
+			if time.Now().UnixNano()-s.lastResolved.Load() < int64(5*time.Second) {
+				lastMod = newest
+				continue
+			}
+			// Files changed externally — re-ingest and resolve.
+			ingest.Ingest(s.db, s.projectDir)
+			resolve.Resolve(s.db, s.projectDir)
+			s.lastResolved.Store(time.Now().UnixNano())
+		}
+		lastMod = newest
+	}
+}
+
+// autoEmitAndBuild emits to the project directory (so file-based tools
+// see the changes) and runs go build to verify.
+// Set DEFN_LEGACY=1 to disable auto-emit (for projects where you want
+// to edit files directly and use defn as a read-only acceleration layer).
+func (s *server) autoEmitAndBuild() string {
+	if s.projectDir == "" || os.Getenv("DEFN_LEGACY") == "1" {
+		return "Saved to database."
+	}
+
+	// Emit to the actual project directory — keeps files in sync.
+	if err := emit.Emit(s.db, s.projectDir); err != nil {
+		return fmt.Sprintf("emit error: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), buildTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "build", "./...")
+	cmd.Dir = s.projectDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Sprintf("BUILD FAILED:\n%s", string(out))
+	}
+	return "Build: OK"
+}
+
+// extractSignature pulls the signature from a Go definition body.
+// Handles multi-line signatures like func Foo(\n  param string,\n) {
+// and skips braces inside type expressions like map[string]interface{}.
+func extractSignature(body string) string {
+	// Parse the body to extract the signature from the AST.
+	src := "package x\n" + strings.TrimSpace(body)
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	if err != nil || len(f.Decls) == 0 {
+		// Unparseable — return first non-comment line.
+		for _, line := range strings.Split(body, "\n") {
+			t := strings.TrimSpace(line)
+			if t != "" && !strings.HasPrefix(t, "//") {
+				return t
+			}
+		}
+		return body
+	}
+
+	switch d := f.Decls[0].(type) {
+	case *ast.FuncDecl:
+		var sig strings.Builder
+		sig.WriteString("func ")
+		if d.Recv != nil && len(d.Recv.List) > 0 {
+			sig.WriteString("(")
+			sig.WriteString(types.ExprString(d.Recv.List[0].Type))
+			sig.WriteString(") ")
+		}
+		sig.WriteString(d.Name.Name)
+		// types.ExprString on FuncType produces "func(...) ...", strip the "func" prefix.
+		funcSig := types.ExprString(d.Type)
+		sig.WriteString(strings.TrimPrefix(funcSig, "func"))
+		return sig.String()
+	case *ast.GenDecl:
+		if len(d.Specs) > 0 {
+			switch s := d.Specs[0].(type) {
+			case *ast.TypeSpec:
+				return fmt.Sprintf("type %s", s.Name.Name)
+			case *ast.ValueSpec:
+				return fmt.Sprintf("%s %s", d.Tok, s.Names[0].Name)
+			}
+		}
+	}
+	return body
+}
+
+func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args createParam) (*sdkmcp.CallToolResult, any, error) {
+	// Infer name, kind, and test flag from the body.
+	name, kind, receiver, isTest := s.inferFromBody(args.Body)
+	if name == "" {
+		return errResult(fmt.Errorf("couldn't infer definition name from body — make sure it starts with func/type/const/var"))
+	}
+
+	// Find module: use provided, or default to first.
+	var mod *store.Module
+	if args.Module != "" {
+		mod = s.findModule(args.Module)
+	}
+	if mod == nil {
+		mods, _ := s.db.ListModules() // best effort — nil is safe
+		if len(mods) > 0 {
+			mod = &mods[0]
+		}
+	}
+	if mod == nil {
+		return errResult(fmt.Errorf("no modules found — run defn init first"))
+	}
+
+	// Check if a definition with this name already exists in the target module.
+	if existing, err := s.db.GetDefinitionByName(name, mod.Path); err == nil {
+		recv := formatReceiver(existing.Receiver)
+		return errResult(fmt.Errorf("definition %s%s already exists in %s (id=%d) — use code(op:\"edit\") to modify it", recv, name, mod.Path, existing.ID))
+	}
+
+	exported := len(name) > 0 && name[0] >= 'A' && name[0] <= 'Z'
+	d := &store.Definition{
+		ModuleID:  mod.ID,
+		Name:      name,
+		Kind:      kind,
+		Exported:  exported,
+		Test:      isTest,
+		Receiver:  receiver,
+		Signature: extractSignature(args.Body),
+		Body:      args.Body,
+	}
+	id, err := s.db.UpsertDefinition(d)
+	if err != nil {
+		return errResult(err)
+	}
+
+	buildResult := s.autoEmitAndBuild()
+	s.autoResolve(mod.Path)
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Created %s (id=%d, kind=%s) in %s\n", name, id, kind, mod.Path))
+	if buildResult != "" {
+		sb.WriteString("\n" + buildResult)
+	}
+	return textResult(sb.String()), nil, nil
+}
+
+// inferFromBody extracts definition name, kind, receiver, and test flag from Go source.
+func (s *server) inferFromBody(body string) (name, kind, receiver string, isTest bool) {
+	// Parse the body as a Go source file to extract definition metadata.
+	src := "package x\n" + strings.TrimSpace(body)
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	if err != nil || len(f.Decls) == 0 {
+		return // unparseable — caller will report error
+	}
+
+	switch d := f.Decls[0].(type) {
+	case *ast.FuncDecl:
+		name = d.Name.Name
+		if d.Recv != nil && len(d.Recv.List) > 0 {
+			kind = "method"
+			receiver = types.ExprString(d.Recv.List[0].Type)
+		} else {
+			kind = "function"
+		}
+	case *ast.GenDecl:
+		switch d.Tok {
+		case token.TYPE:
+			if len(d.Specs) > 0 {
+				ts := d.Specs[0].(*ast.TypeSpec)
+				name = ts.Name.Name
+				if _, ok := ts.Type.(*ast.InterfaceType); ok {
+					kind = "interface"
+				} else {
+					kind = "type"
+				}
+			}
+		case token.CONST:
+			if len(d.Specs) > 0 {
+				vs := d.Specs[0].(*ast.ValueSpec)
+				name = vs.Names[0].Name
+				kind = "const"
+			}
+		case token.VAR:
+			if len(d.Specs) > 0 {
+				vs := d.Specs[0].(*ast.ValueSpec)
+				name = vs.Names[0].Name
+				kind = "var"
+			}
+		}
+	}
+
+	if name != "" {
+		isTest = strings.HasPrefix(name, "Test") || strings.HasPrefix(name, "Benchmark")
+	}
+	return
+}
+
+func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args applyParam) (*sdkmcp.CallToolResult, any, error) {
+	var sb strings.Builder
+	var errors []string
+
+	// Dry-run: validate all operations without executing.
+	if args.DryRun {
+		for _, op := range args.Operations {
+			switch op.Op {
+			case "create":
+				name, kind, _, _ := s.inferFromBody(op.Body)
+				if name == "" {
+					errors = append(errors, "create: couldn't infer name from body")
+				} else {
+					sb.WriteString(fmt.Sprintf("+ would create %s (%s)\n", name, kind))
+				}
+			case "edit":
+				if _, err := s.db.GetDefinitionByName(op.Name, ""); err != nil {
+					errors = append(errors, fmt.Sprintf("edit %s: not found", op.Name))
+				} else {
+					sb.WriteString(fmt.Sprintf("~ would edit %s\n", op.Name))
+				}
+			case "delete":
+				if _, err := s.db.GetDefinitionByName(op.Name, ""); err != nil {
+					errors = append(errors, fmt.Sprintf("delete %s: not found", op.Name))
+				} else {
+					sb.WriteString(fmt.Sprintf("- would delete %s\n", op.Name))
+				}
+			case "rename":
+				if op.Name == "" || op.NewName == "" {
+					errors = append(errors, "rename: both name and new_name are required")
+				} else if _, err := s.db.GetDefinitionByName(op.Name, ""); err != nil {
+					errors = append(errors, fmt.Sprintf("rename %s: not found", op.Name))
+				} else {
+					sb.WriteString(fmt.Sprintf("→ would rename %s → %s\n", op.Name, op.NewName))
+				}
+			default:
+				errors = append(errors, fmt.Sprintf("unknown op: %s", op.Op))
+			}
+		}
+		if len(errors) > 0 {
+			sb.WriteString("\nErrors:\n")
+			for _, e := range errors {
+				sb.WriteString("- " + e + "\n")
+			}
+		}
+		sb.WriteString("\n(dry run — no changes made)")
+		return textResult(sb.String()), nil, nil
+	}
+
+	for _, op := range args.Operations {
+		switch op.Op {
+		case "create":
+			name, kind, receiver, isTest := s.inferFromBody(op.Body)
+			if name == "" {
+				errors = append(errors, "create: couldn't infer name from body")
+				continue
+			}
+			var mod *store.Module
+			if op.Module != "" {
+				mod = s.findModule(op.Module)
+			}
+			if mod == nil {
+				mods, _ := s.db.ListModules() // best effort — nil is safe
+				if len(mods) > 0 {
+					mod = &mods[0]
+				}
+			}
+			if mod == nil {
+				errors = append(errors, "create: no modules found")
+				continue
+			}
+			exported := len(name) > 0 && name[0] >= 'A' && name[0] <= 'Z'
+			d := &store.Definition{
+				ModuleID: mod.ID, Name: name, Kind: kind, Exported: exported,
+				Test: isTest, Receiver: receiver, Signature: extractSignature(op.Body), Body: op.Body,
+			}
+			id, err := s.db.UpsertDefinition(d)
+			if err != nil {
+				errors = append(errors, fmt.Sprintf("create %s: %v", name, err))
+			} else {
+				sb.WriteString(fmt.Sprintf("+ created %s (id=%d)\n", name, id))
+			}
+
+		case "edit":
+			d, err := s.db.GetDefinitionByName(op.Name, "")
+			if err != nil {
+				errors = append(errors, fmt.Sprintf("edit %s: not found", op.Name))
+				continue
+			}
+			d.Body = op.Body
+			d.Signature = extractSignature(op.Body)
+			if _, err := s.db.UpsertDefinition(d); err != nil {
+				errors = append(errors, fmt.Sprintf("edit %s: %v", op.Name, err))
+			} else {
+				sb.WriteString(fmt.Sprintf("~ edited %s\n", op.Name))
+			}
+
+		case "delete":
+			d, err := s.db.GetDefinitionByName(op.Name, "")
+			if err != nil {
+				errors = append(errors, fmt.Sprintf("delete %s: not found", op.Name))
+				continue
+			}
+			if err := s.db.DeleteDefinition(d.ID); err != nil {
+				errors = append(errors, fmt.Sprintf("delete %s: %v", op.Name, err))
+			} else {
+				sb.WriteString(fmt.Sprintf("- deleted %s\n", op.Name))
+			}
+
+		case "rename":
+			if op.Name == "" || op.NewName == "" {
+				errors = append(errors, "rename: both name and new_name are required")
+				continue
+			}
+			d, err := s.db.GetDefinitionByName(op.Name, "")
+			if err != nil {
+				errors = append(errors, fmt.Sprintf("rename %s: not found", op.Name))
+				continue
+			}
+			newBody := strings.ReplaceAll(d.Body, op.Name, op.NewName)
+			d.Body = newBody
+			d.Name = op.NewName
+			d.Signature = extractSignature(newBody)
+			d.Exported = len(op.NewName) > 0 && op.NewName[0] >= 'A' && op.NewName[0] <= 'Z'
+			if _, err := s.db.UpsertDefinition(d); err != nil {
+				errors = append(errors, fmt.Sprintf("rename %s: %v", op.Name, err))
+				continue
+			}
+			// Update callers (same as handleRename).
+			callers, _ := s.db.GetCallers(d.ID) // best effort
+			callerCount := 0
+			for _, caller := range callers {
+				if strings.Contains(caller.Body, op.Name) {
+					caller.Body = strings.ReplaceAll(caller.Body, op.Name, op.NewName)
+					caller.Signature = extractSignature(caller.Body)
+					if _, err := s.db.UpsertDefinition(&caller); err != nil {
+						errors = append(errors, fmt.Sprintf("rename caller %s: %v", caller.Name, err))
+					} else {
+						callerCount++
+					}
+				}
+			}
+			sb.WriteString(fmt.Sprintf("→ renamed %s → %s (%d callers updated)\n", op.Name, op.NewName, callerCount))
+
+		default:
+			errors = append(errors, fmt.Sprintf("unknown op: %s", op.Op))
+		}
+	}
+
+	if len(errors) > 0 {
+		sb.WriteString(fmt.Sprintf("\n%d errors:\n", len(errors)))
+		for _, e := range errors {
+			sb.WriteString("  " + e + "\n")
+		}
+	}
+
+	// One emit + build for all changes.
+	buildResult := s.autoEmitAndBuild()
+	s.autoResolve("") // full resolve — batch may touch multiple modules
+	if buildResult != "" {
+		sb.WriteString("\n" + buildResult)
+	}
+
+	return textResult(sb.String()), nil, nil
+}
+
+func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
+	d, err := s.db.GetDefinitionByName(args.Name, "")
+	if err != nil {
+		return errResult(fmt.Errorf("definition %q not found", args.Name))
+	}
+
+	// Show what we're about to delete.
+	recv := formatReceiver(d.Receiver)
+
+	if err := s.db.DeleteDefinition(d.ID); err != nil {
+		return errResult(err)
+	}
+
+	buildResult := s.autoEmitAndBuild()
+	s.autoResolve("") // full resolve — deletion may affect other modules' references
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Deleted %s%s (id=%d)\n", recv, d.Name, d.ID))
+	if buildResult != "" {
+		sb.WriteString("\n" + buildResult)
+	}
+	return textResult(sb.String()), nil, nil
+}
+
+func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args renameParam) (*sdkmcp.CallToolResult, any, error) {
+	d, err := s.db.GetDefinitionByName(args.OldName, "")
+	if err != nil {
+		return errResult(fmt.Errorf("definition %q not found", args.OldName))
+	}
+
+	// Update the definition name in its own body.
+	newBody := strings.Replace(d.Body, args.OldName, args.NewName, -1)
+	d.Body = newBody
+	d.Name = args.NewName
+	d.Signature = extractSignature(newBody)
+	d.Exported = len(args.NewName) > 0 && args.NewName[0] >= 'A' && args.NewName[0] <= 'Z'
+
+	if _, err := s.db.UpsertDefinition(d); err != nil {
+		return errResult(err)
+	}
+
+	// Update all callers' bodies that reference the old name.
+	callers, err := s.db.GetCallers(d.ID)
+	if err != nil {
+		return errResult(fmt.Errorf("get callers for rename: %w", err))
+	}
+	updated := 0
+	for _, caller := range callers {
+		if strings.Contains(caller.Body, args.OldName) {
+			caller.Body = strings.ReplaceAll(caller.Body, args.OldName, args.NewName)
+			caller.Signature = extractSignature(caller.Body)
+			if _, err := s.db.UpsertDefinition(&caller); err != nil {
+				return errResult(fmt.Errorf("update caller %s: %w", caller.Name, err))
+			}
+			updated++
+		}
+	}
+
+	buildResult := s.autoEmitAndBuild()
+	s.autoResolve("") // full resolve — rename touches callers across modules
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Renamed %s → %s\n", args.OldName, args.NewName))
+	sb.WriteString(fmt.Sprintf("Updated %d callers\n", updated))
+	sb.WriteString("\n**Warning:** This used string replacement, not AST transformation. Comments or strings containing the old name may have been affected. Run code(op:\"test\") to verify.\n")
+	if buildResult != "" {
+		sb.WriteString("\n" + buildResult)
+	}
+	return textResult(sb.String()), nil, nil
+}
+
+func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
+	d, err := s.db.GetDefinitionByName(args.Name, "")
+	if err != nil {
+		return errResult(fmt.Errorf("definition %q not found", args.Name))
+	}
+
+	impact, err := s.db.GetImpact(d.ID)
+	if err != nil {
+		return errResult(err)
+	}
+
+	if len(impact.Tests) == 0 {
+		return textResult(fmt.Sprintf("No tests cover %s. Nothing to run.", args.Name)), nil, nil
+	}
+
+	if s.projectDir == "" {
+		return errResult(fmt.Errorf("no project directory configured"))
+	}
+
+	// Ensure files are current.
+	if err := emit.Emit(s.db, s.projectDir); err != nil {
+		return errResult(fmt.Errorf("emit: %w", err))
+	}
+
+	// Build the -run regex from test names (escape metacharacters).
+	var testNames []string
+	for _, t := range impact.Tests {
+		testNames = append(testNames, regexp.QuoteMeta(t.Name))
+	}
+	runPattern := "^(" + strings.Join(testNames, "|") + ")$"
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "test", "-run", runPattern, "-count=1", "-v", "./...")
+	cmd.Dir = s.projectDir
+	out, err := cmd.CombinedOutput()
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Running %d of %d tests (affected by %s):\n\n",
+		len(testNames), len(testNames), args.Name))
+	sb.WriteString(string(out))
+
+	if err != nil {
+		sb.WriteString("\nSOME TESTS FAILED")
+	} else {
+		sb.WriteString("\nALL TESTS PASSED")
+	}
+
+	return textResult(sb.String()), nil, nil
+}
+
+func (s *server) handleQuery(_ context.Context, _ *sdkmcp.CallToolRequest, args sqlParam) (*sdkmcp.CallToolResult, any, error) {
+	results, err := s.db.Query(args.SQL)
+	if err != nil {
+		return errResult(err)
+	}
+	text, err := toJSON(results)
+	if err != nil {
+		return errResult(err)
+	}
+	return textResult(text), nil, nil
+}
+
+func (s *server) handleSync(_ context.Context, _ *sdkmcp.CallToolRequest, _ emptyParam) (*sdkmcp.CallToolResult, any, error) {
+	if s.projectDir == "" {
+		return errResult(fmt.Errorf("no project directory configured"))
+	}
+	if err := ingest.Ingest(s.db, s.projectDir); err != nil {
+		return errResult(fmt.Errorf("ingest: %w", err))
+	}
+	if err := resolve.Resolve(s.db, s.projectDir); err != nil {
+		return errResult(fmt.Errorf("resolve: %w", err))
+	}
+	return textResult("Synced: re-ingested source and rebuilt reference graph."), nil, nil
+}
+
+func (s *server) handleSimilar(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
+	d, err := s.db.GetDefinitionByName(args.Name, "")
+	if err != nil {
+		return errResult(fmt.Errorf("definition %q not found", args.Name))
+	}
+	if d.Signature == "" {
+		return errResult(fmt.Errorf("definition %q has no signature", args.Name))
+	}
+
+	// Find definitions with similar signatures by searching for shared type tokens.
+	// Extract type names from the signature (e.g., "func Foo(ctx context.Context, id int) error"
+	// → search for "context.Context" and "error").
+	sig := d.Signature
+	// Strip func keyword, receiver, and name to get just the params/returns.
+	if idx := strings.Index(sig, "("); idx >= 0 {
+		sig = sig[idx:]
+	}
+
+	// Find definitions with similar param/return signatures.
+	sigDefs, _ := s.db.FindDefinitions("%" + sig + "%")
+
+	// Deduplicate, exclude self.
+	seen := map[string]bool{d.Name: true}
+	type match struct {
+		Name      string `json:"name"`
+		Kind      string `json:"kind"`
+		Receiver  string `json:"receiver,omitempty"`
+		Signature string `json:"signature"`
+	}
+	var matches []match
+	for _, c := range sigDefs {
+		key := c.Name + c.Receiver
+		if seen[key] || c.Signature == "" {
+			continue
+		}
+		seen[key] = true
+		matches = append(matches, match{
+			Name: c.Name, Kind: c.Kind, Receiver: c.Receiver, Signature: c.Signature,
+		})
+		if len(matches) >= 20 {
+			break
+		}
+	}
+
+	if len(matches) == 0 {
+		return textResult(fmt.Sprintf("No definitions with similar signatures to %s", args.Name)), nil, nil
+	}
+
+	text, err := toJSON(matches)
+	if err != nil {
+		return errResult(err)
+	}
+	return textResult(fmt.Sprintf("Definitions with similar signatures to %s:\n\n%s", args.Name, text)), nil, nil
+}
+
+func (s *server) handleFind(_ context.Context, _ *sdkmcp.CallToolRequest, args findParam) (*sdkmcp.CallToolResult, any, error) {
+	if args.File == "" {
+		return errResult(fmt.Errorf("file is required"))
+	}
+
+	// Strip filename to get the package directory path for module matching.
+	// If there's no directory separator, the input is just a filename — strip
+	// the .go extension and use the base name for fuzzy module matching.
+	dir := args.File
+	if idx := strings.LastIndex(dir, "/"); idx >= 0 {
+		dir = dir[:idx]
+	} else {
+		dir = strings.TrimSuffix(dir, "_test.go")
+		dir = strings.TrimSuffix(dir, ".go")
+	}
+
+	defs, err := s.db.FindDefinitionsByFile(dir, args.Line)
+	if err != nil {
+		return errResult(err)
+	}
+	if len(defs) == 0 {
+		return errResult(fmt.Errorf("no definitions found at %s:%d", args.File, args.Line))
+	}
+
+	var sb strings.Builder
+	if args.Line > 0 {
+		sb.WriteString(fmt.Sprintf("Definition at %s:%d:\n\n", args.File, args.Line))
+	} else {
+		sb.WriteString(fmt.Sprintf("Definitions in %s:\n\n", args.File))
+	}
+	for _, d := range defs {
+		recv := formatReceiver(d.Receiver)
+		sb.WriteString(fmt.Sprintf("- %s%s (%s) lines %d-%d\n", recv, d.Name, d.Kind, d.StartLine, d.EndLine))
+	}
+	return textResult(sb.String()), nil, nil
 }

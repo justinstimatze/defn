@@ -1,6 +1,17 @@
-# Binary
+# Binaries
 /defn
+/defn-test
+/defn-bench
+
+# Database
+.defn/
 *.db
+
+# Generated configs (contain absolute paths)
+.mcp.json
 
 # OS
 .DS_Store
+
+# GoReleaser
+.goreleaser-dist/

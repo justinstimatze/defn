@@ -19,13 +19,13 @@ import (
 
 // Diagnostic is a single lint finding mapped back to a defn definition.
 type Diagnostic struct {
-	Module    string // e.g. "github.com/justinstimatze/defn/internal/store"
-	DefName   string // e.g. "Open"
-	DefKind   string // e.g. "function"
-	DefID     int64
-	Linter    string // e.g. "errcheck"
-	Message   string
-	BodyLine  int // 1-based line within the definition body
+	Module   string // e.g. "github.com/justinstimatze/defn/internal/store"
+	DefName  string // e.g. "Open"
+	DefKind  string // e.g. "function"
+	DefID    int64
+	Linter   string // e.g. "errcheck"
+	Message  string
+	BodyLine int // 1-based line within the definition body
 }
 
 // String formats a diagnostic in defn terms.
@@ -40,9 +40,9 @@ func (d Diagnostic) String() string {
 	return fmt.Sprintf("%s: %s", loc, d.Message)
 }
 
-// Run emits files to a temp directory, runs golangci-lint, and remaps
+// Check emits files to a temp directory, runs golangci-lint, and remaps
 // the output back to defn definitions.
-func Run(db *store.DB) ([]Diagnostic, error) {
+func Check(db *store.DB) ([]Diagnostic, error) {
 	tmpDir, err := os.MkdirTemp("", "defn-lint-*")
 	if err != nil {
 		return nil, fmt.Errorf("create temp dir: %w", err)

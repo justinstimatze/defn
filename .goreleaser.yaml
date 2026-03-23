@@ -1,0 +1,41 @@
+version: 2
+
+dist: .goreleaser-dist
+
+builds:
+  - id: defn
+    main: ./cmd/defn
+    binary: defn
+    env:
+      - CGO_ENABLED=1
+    goos:
+      - linux
+    goarch:
+      - amd64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+
+archives:
+  - id: default
+    formats: ['tar.gz']
+    name_template: "defn_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: 'checksums.txt'
+
+changelog:
+  use: github
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^ci:'
+
+release:
+  github:
+    owner: justinstimatze
+    name: defn
+  draft: false
+  prerelease: auto
