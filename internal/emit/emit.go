@@ -193,33 +193,33 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string) ([]D
 		return nil, err
 	}
 
-	// Split definitions into non-test and test.
-	var nonTestDefs, testDefs []store.Definition
+	// Group definitions by source file.
+	// If source_file is empty (old data), fall back to one file per package.
+	byFile := map[string][]store.Definition{}
 	for _, d := range defs {
-		if d.Test {
-			testDefs = append(testDefs, d)
-		} else {
-			nonTestDefs = append(nonTestDefs, d)
+		file := d.SourceFile
+		if file == "" {
+			if d.Test {
+				file = strings.ToLower(mod.Name) + "_test.go"
+			} else {
+				file = strings.ToLower(mod.Name) + ".go"
+			}
 		}
+		byFile[file] = append(byFile[file], d)
 	}
 
 	var allLocs []DefLocation
+	docWritten := false
 
-	// Emit non-test definitions. Use lowercase filename to avoid
-	// case-insensitive filesystem collisions (e.g. ginS.go vs gins.go on macOS).
-	if len(nonTestDefs) > 0 {
-		path := filepath.Join(pkgDir, strings.ToLower(mod.Name)+".go")
-		locs, err := writeFile(path, mod.Name, mod.Path, mod.Doc, imports, nonTestDefs)
-		if err != nil {
-			return nil, err
+	for file, fileDefs := range byFile {
+		path := filepath.Join(pkgDir, file)
+		// Only include package doc on the first non-test file.
+		pkgDoc := ""
+		if !docWritten && !strings.HasSuffix(file, "_test.go") {
+			pkgDoc = mod.Doc
+			docWritten = true
 		}
-		allLocs = append(allLocs, locs...)
-	}
-
-	// Emit test definitions into a _test.go file.
-	if len(testDefs) > 0 {
-		path := filepath.Join(pkgDir, strings.ToLower(mod.Name)+"_test.go")
-		locs, err := writeFile(path, mod.Name, mod.Path, "", imports, testDefs)
+		locs, err := writeFile(path, mod.Name, mod.Path, pkgDoc, imports, fileDefs)
 		if err != nil {
 			return nil, err
 		}
@@ -237,7 +237,7 @@ func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import,
 
 	// Package doc comment.
 	if pkgDoc != "" {
-		for _, line := range strings.Split(pkgDoc, "\n") {
+		for line := range strings.SplitSeq(pkgDoc, "\n") {
 			src.WriteString("// " + line + "\n")
 		}
 	}
@@ -268,7 +268,7 @@ func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import,
 			}
 			src.WriteString(fmt.Sprintf("%s (\n", keyword))
 			for k := i; k < j; k++ {
-				for _, specLine := range strings.Split(defs[k].Body, "\n") {
+				for specLine := range strings.SplitSeq(defs[k].Body, "\n") {
 					src.WriteString("\t" + specLine + "\n")
 				}
 			}
@@ -339,7 +339,7 @@ func isGroupedSpec(d store.Definition) bool {
 	// Standalone declarations have the keyword at the start of a line:
 	//   "type Foo struct { ... }" or "// Doc\ntype Foo struct { ... }"
 	// Grouped specs are just the spec body: "Foo struct { ... }" or "X = 1"
-	for _, line := range strings.Split(d.Body, "\n") {
+	for line := range strings.SplitSeq(d.Body, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "const ") ||
 			strings.HasPrefix(trimmed, "var ") ||

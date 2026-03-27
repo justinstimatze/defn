@@ -15,3 +15,5 @@
 
 # GoReleaser
 .goreleaser-dist/
+.claude/settings.local.json
+.codex/

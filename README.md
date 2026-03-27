@@ -65,7 +65,7 @@ defn init .             # or: embedded mode, no server needed
 
 To remove everything: `defn clean`
 
-Requires Go 1.25+, CGO, and `goimports`. Binary is ~140MB due to embedded Dolt engine.
+Requires Go 1.26+, CGO, and `goimports`. Binary is ~140MB due to embedded Dolt engine.
 
 **macOS:** install ICU first: `brew install icu4c` then build with:
 ```bash
@@ -76,7 +76,7 @@ go install github.com/justinstimatze/defn/cmd/defn@latest
 
 `defn init` parses your Go source, stores definitions and references in [Dolt](https://www.dolthub.com/), and configures MCP for Claude Code and OpenAI Codex.
 
-The database and files are **kept in sync**. Edits via defn update the database and emit files. File edits are auto-detected and re-ingested. Either can recover the other: `defn init` rebuilds the database from files; `defn emit` recreates files from the database. The `.defn/` directory is gitignored — rebuild on clone with `defn init`.
+The database is a **lossless representation** of your source — all comments, file structure, and definitions are preserved on round-trip. Edits via defn update the database and emit files. File edits are auto-detected and re-ingested. Either can recover the other: `defn init` rebuilds the database from files; `defn emit` recreates files from the database. The `.defn/` directory is gitignored — rebuild on clone with `defn init`.
 
 ### Embedded mode
 
@@ -221,11 +221,8 @@ Dolt handles row-level merge. Semantic conflicts (e.g. one agent renames a funct
 
 ## Limitations
 
-- **Inline comments between statements are lost** on round-trip. Doc comments on functions/types and package doc comments are preserved. Comments within expressions are preserved. But standalone comments like `// Step 2: do X` are dropped by `go/ast` re-printing. Use doc comments instead.
 - **Go only.** The type-checked reference graph requires `go/types`. Other languages would need their own type checkers.
 - **`rename` op is string replacement**, not AST transformation. May affect comments/strings containing the name.
-- **Emit produces one file per package.** Multi-file package layouts (foo.go, bar.go) are collapsed to a single file. Original file structure is not preserved.
-- **`apply` op is not atomic.** Partial failures leave the database in a mixed state. Check the response for per-operation errors.
 
 ## Self-hosting
 
@@ -246,7 +243,7 @@ Verified on go-chi/chi, gorilla/mux, gin-gonic/gin, BurntSushi/toml.
 | gin | 24K | 1,580 | 3,829 | 48s | 81M |
 | hugo | 218K | 10,221 | 22,209 | 7min | 714M |
 
-Tested up to ~200K lines. Projects with cgo imports (moby) or Go 1.26+ (kubernetes) are not yet supported. Init is a one-time cost — incremental resolve after edits is much faster.
+Tested up to ~200K lines. Projects with cgo imports (moby) are not yet supported. Init is a one-time cost — incremental resolve after edits is much faster.
 
 ## Why not gopls?
 

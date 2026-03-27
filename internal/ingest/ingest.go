@@ -88,10 +88,10 @@ func ingestPackage(db *store.DB, pkg *packages.Package, modulePath string, state
 	// are stored in the same module as the code they test.
 	pkgPath := pkg.PkgPath
 	pkgName := pkg.Name
-	if strings.HasSuffix(pkgName, "_test") {
-		pkgName = strings.TrimSuffix(pkgName, "_test")
-		if strings.HasSuffix(pkgPath, "_test") {
-			pkgPath = strings.TrimSuffix(pkgPath, "_test")
+	if before, ok := strings.CutSuffix(pkgName, "_test"); ok {
+		pkgName = before
+		if before, ok := strings.CutSuffix(pkgPath, "_test"); ok {
+			pkgPath = before
 		}
 	}
 	// Extract package doc comment from the first file that has one.
@@ -140,14 +140,20 @@ func ingestPackage(db *store.DB, pkg *packages.Package, modulePath string, state
 	}
 
 	for _, file := range pkg.Syntax {
-		// Determine if this is a test file using the actual filename
-		// from the token.FileSet (not index-based, which isn't guaranteed).
+		// Get source filename from the token.FileSet.
 		isTest := false
+		sourceFile := ""
 		if file.Pos().IsValid() {
-			filename := pkg.Fset.Position(file.Pos()).Filename
-			isTest = strings.HasSuffix(filename, "_test.go")
+			absFile := pkg.Fset.Position(file.Pos()).Filename
+			isTest = strings.HasSuffix(absFile, "_test.go")
+			// Make relative to module root.
+			if rel, err := filepath.Rel(modulePath, absFile); err == nil {
+				sourceFile = rel
+			} else {
+				sourceFile = filepath.Base(absFile)
+			}
 		}
-		if err := ingestFile(db, pkg, mod, file, isTest, state); err != nil {
+		if err := ingestFile(db, pkg, mod, file, isTest, sourceFile, state); err != nil {
 			return err
 		}
 	}
@@ -202,17 +208,17 @@ func ingestEmbedFiles(db *store.DB, pkg *packages.Package, modulePath string) er
 	return nil
 }
 
-func ingestFile(db *store.DB, pkg *packages.Package, mod *store.Module, file *ast.File, isTest bool, state *ingestState) error {
+func ingestFile(db *store.DB, pkg *packages.Package, mod *store.Module, file *ast.File, isTest bool, sourceFile string, state *ingestState) error {
 	fset := pkg.Fset
 
 	for _, decl := range file.Decls {
 		switch d := decl.(type) {
 		case *ast.FuncDecl:
-			if err := ingestFunc(db, fset, mod, file, d, isTest, state); err != nil {
+			if err := ingestFunc(db, fset, mod, file, d, isTest, sourceFile, state); err != nil {
 				return err
 			}
 		case *ast.GenDecl:
-			if err := ingestGenDecl(db, fset, mod, file, d, isTest, state); err != nil {
+			if err := ingestGenDecl(db, fset, mod, file, d, isTest, sourceFile, state); err != nil {
 				return err
 			}
 		}
@@ -227,7 +233,7 @@ type ingestState struct {
 	liveDefIDs  map[int64]bool // tracks all definition IDs seen
 }
 
-func ingestFunc(db *store.DB, fset *token.FileSet, mod *store.Module, file *ast.File, fn *ast.FuncDecl, isTest bool, state *ingestState) error {
+func ingestFunc(db *store.DB, fset *token.FileSet, mod *store.Module, file *ast.File, fn *ast.FuncDecl, isTest bool, sourceFile string, state *ingestState) error {
 	start := fset.Position(fn.Pos())
 	end := fset.Position(fn.End())
 
@@ -257,17 +263,18 @@ func ingestFunc(db *store.DB, fset *token.FileSet, mod *store.Module, file *ast.
 	}
 
 	def := &store.Definition{
-		ModuleID:  mod.ID,
-		Name:      name,
-		Kind:      kind,
-		Exported:  fn.Name.IsExported(),
-		Test:      isTest,
-		Receiver:  receiver,
-		Signature: sig,
-		Body:      body,
-		Doc:       doc,
-		StartLine: start.Line,
-		EndLine:   end.Line,
+		ModuleID:   mod.ID,
+		Name:       name,
+		Kind:       kind,
+		Exported:   fn.Name.IsExported(),
+		Test:       isTest,
+		Receiver:   receiver,
+		Signature:  sig,
+		Body:       body,
+		Doc:        doc,
+		StartLine:  start.Line,
+		EndLine:    end.Line,
+		SourceFile: sourceFile,
 	}
 
 	id, err := db.UpsertDefinition(def)
@@ -294,7 +301,7 @@ func containsIota(gd *ast.GenDecl) bool {
 	return found
 }
 
-func ingestGenDecl(db *store.DB, fset *token.FileSet, mod *store.Module, file *ast.File, gd *ast.GenDecl, isTest bool, state *ingestState) error {
+func ingestGenDecl(db *store.DB, fset *token.FileSet, mod *store.Module, file *ast.File, gd *ast.GenDecl, isTest bool, sourceFile string, state *ingestState) error {
 	grouped := gd.Lparen.IsValid() // parenthesized group: const (...), var (...), type (...)
 
 	// Iota const blocks must be stored as a single definition because
@@ -310,16 +317,17 @@ func ingestGenDecl(db *store.DB, fset *token.FileSet, mod *store.Module, file *a
 		start := fset.Position(gd.Pos())
 		end := fset.Position(gd.End())
 		def := &store.Definition{
-			ModuleID:  mod.ID,
-			Name:      firstName,
-			Kind:      "const",
-			Exported:  ast.IsExported(firstName),
-			Test:      isTest,
-			Signature: fmt.Sprintf("const %s (iota group)", firstName),
-			Body:      body,
-			Doc:       doc,
-			StartLine: start.Line,
-			EndLine:   end.Line,
+			ModuleID:   mod.ID,
+			Name:       firstName,
+			Kind:       "const",
+			Exported:   ast.IsExported(firstName),
+			Test:       isTest,
+			Signature:  fmt.Sprintf("const %s (iota group)", firstName),
+			Body:       body,
+			Doc:        doc,
+			StartLine:  start.Line,
+			EndLine:    end.Line,
+			SourceFile: sourceFile,
 		}
 		id, err := db.UpsertDefinition(def)
 		if err != nil {
@@ -354,16 +362,17 @@ func ingestGenDecl(db *store.DB, fset *token.FileSet, mod *store.Module, file *a
 			}
 
 			def := &store.Definition{
-				ModuleID:  mod.ID,
-				Name:      s.Name.Name,
-				Kind:      kind,
-				Exported:  s.Name.IsExported(),
-				Test:      isTest,
-				Signature: fmt.Sprintf("type %s", s.Name.Name),
-				Body:      body,
-				Doc:       doc,
-				StartLine: start.Line,
-				EndLine:   end.Line,
+				ModuleID:   mod.ID,
+				Name:       s.Name.Name,
+				Kind:       kind,
+				Exported:   s.Name.IsExported(),
+				Test:       isTest,
+				Signature:  fmt.Sprintf("type %s", s.Name.Name),
+				Body:       body,
+				Doc:        doc,
+				StartLine:  start.Line,
+				EndLine:    end.Line,
+				SourceFile: sourceFile,
 			}
 			id, err := db.UpsertDefinition(def)
 			if err != nil {
@@ -407,14 +416,15 @@ func ingestGenDecl(db *store.DB, fset *token.FileSet, mod *store.Module, file *a
 				doc = s.Doc.Text()
 			}
 			def := &store.Definition{
-				ModuleID:  mod.ID,
-				Name:      firstName,
-				Kind:      kind,
-				Exported:  exported,
-				Test:      isTest,
-				Signature: fmt.Sprintf("%s %s", kind, firstName),
-				Body:      body,
-				Doc:       doc,
+				ModuleID:   mod.ID,
+				Name:       firstName,
+				Kind:       kind,
+				Exported:   exported,
+				Test:       isTest,
+				Signature:  fmt.Sprintf("%s %s", kind, firstName),
+				Body:       body,
+				Doc:        doc,
+				SourceFile: sourceFile,
 			}
 			id, err := db.UpsertDefinition(def)
 			if err != nil {

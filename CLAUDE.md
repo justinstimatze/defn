@@ -86,7 +86,7 @@ Dolt system tables (queryable via `code(op:"query")`):
 
 ## Conventions
 
-- **Use doc comments, not inline comments.** Standalone comments between statements (like `// Step 2`) are lost on ingest→emit round-trip. Doc comments on functions/types are preserved. Comments within expressions are preserved.
+- **All comments are preserved** on round-trip — doc comments, inline comments, and comments between statements. The database is a lossless representation of the source.
 - All Go dependencies MIT or BSD-2 licensed (Dolt is Apache 2.0).
 - `internal/store/schema.sql` is the schema source of truth (embedded via `//go:embed`).
 - `internal/store/` must not import other internal packages.

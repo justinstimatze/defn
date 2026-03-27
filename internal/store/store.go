@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	_ "github.com/dolthub/driver"
 	_ "github.com/go-sql-driver/mysql"
@@ -123,7 +124,7 @@ func openEmbedded(path string) (*DB, error) {
 func splitSQL(s string) []string {
 	// First strip comment lines.
 	var lines []string
-	for _, line := range strings.Split(s, "\n") {
+	for line := range strings.SplitSeq(s, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if !strings.HasPrefix(trimmed, "--") {
 			lines = append(lines, line)
@@ -132,7 +133,7 @@ func splitSQL(s string) []string {
 	cleaned := strings.Join(lines, "\n")
 
 	var stmts []string
-	for _, part := range strings.Split(cleaned, ";") {
+	for part := range strings.SplitSeq(cleaned, ";") {
 		trimmed := strings.TrimSpace(part)
 		if trimmed != "" {
 			stmts = append(stmts, trimmed)
@@ -149,6 +150,22 @@ func (s *DB) Close() error {
 // Path returns the filesystem path of this database.
 func (s *DB) Path() string {
 	return s.path
+}
+
+// Begin starts a transaction. Returns a function to commit or rollback.
+func (s *DB) Begin() (commit func() error, rollback func(), err error) {
+	_, err = s.db.ExecContext(s.Ctx(), "START TRANSACTION")
+	if err != nil {
+		return nil, nil, fmt.Errorf("begin transaction: %w", err)
+	}
+	commit = func() error {
+		_, err := s.db.ExecContext(s.Ctx(), "COMMIT")
+		return err
+	}
+	rollback = func() {
+		s.db.ExecContext(s.Ctx(), "ROLLBACK")
+	}
+	return commit, rollback, nil
 }
 
 // Ctx returns a background context for database operations.
@@ -326,19 +343,20 @@ type Module struct {
 
 // Definition represents a single Go definition (function, type, method, etc.).
 type Definition struct {
-	ID        int64
-	ModuleID  int64
-	Name      string
-	Kind      string
-	Exported  bool
-	Test      bool
-	Receiver  string
-	Signature string
-	Body      string
-	Doc       string
-	StartLine int
-	EndLine   int
-	Hash      string
+	ID         int64
+	ModuleID   int64
+	Name       string
+	Kind       string
+	Exported   bool
+	Test       bool
+	Receiver   string
+	Signature  string
+	Body       string
+	Doc        string
+	StartLine  int
+	EndLine    int
+	SourceFile string
+	Hash       string
 }
 
 // Reference represents a reference from one definition to another.
@@ -441,10 +459,10 @@ func (s *DB) UpsertDefinition(d *Definition) (int64, error) {
 	if err == sql.ErrNoRows {
 		res, err := s.db.ExecContext(ctx,
 			`INSERT INTO definitions
-			 (module_id, name, kind, exported, test, receiver, signature, doc, start_line, end_line, hash)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 (module_id, name, kind, exported, test, receiver, signature, doc, start_line, end_line, source_file, hash)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			d.ModuleID, d.Name, d.Kind, d.Exported, d.Test, d.Receiver,
-			d.Signature, d.Doc, d.StartLine, d.EndLine, d.Hash,
+			d.Signature, d.Doc, d.StartLine, d.EndLine, d.SourceFile, d.Hash,
 		)
 		if err != nil {
 			return 0, fmt.Errorf("insert definition: %w", err)
@@ -467,10 +485,10 @@ func (s *DB) UpsertDefinition(d *Definition) (int64, error) {
 
 	if _, err := s.db.ExecContext(ctx,
 		`UPDATE definitions
-		 SET exported=?, signature=?, doc=?, start_line=?, end_line=?, hash=?
+		 SET exported=?, signature=?, doc=?, start_line=?, end_line=?, source_file=?, hash=?
 		 WHERE id=?`,
 		d.Exported, d.Signature, d.Doc,
-		d.StartLine, d.EndLine, d.Hash, existingID,
+		d.StartLine, d.EndLine, d.SourceFile, d.Hash, existingID,
 	); err != nil {
 		return 0, fmt.Errorf("update definition: %w", err)
 	}
@@ -569,12 +587,12 @@ func (s *DB) GetDefinition(id int64) (*Definition, error) {
 	d := &Definition{}
 	err := s.db.QueryRowContext(s.Ctx(),
 		`SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
-		        d.signature, COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), d.hash
+		        d.signature, COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
 		 FROM definitions d
 		 LEFT JOIN bodies b ON b.def_id = d.id
 		 WHERE d.id = ?`, id,
 	).Scan(&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &d.Receiver,
-		&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.Hash)
+		&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.SourceFile, &d.Hash)
 	if err != nil {
 		return nil, err
 	}
@@ -590,7 +608,7 @@ func (s *DB) SearchDefinitions(query string) ([]Definition, error) {
 	likePattern := "%" + query + "%"
 	rows, err := s.db.QueryContext(s.Ctx(),
 		`SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
-		        COALESCE(d.signature,''), '', COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), d.hash
+		        COALESCE(d.signature,''), '', COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
 		 FROM definitions d
 		 WHERE d.doc LIKE ?
 		    OR d.id IN (SELECT def_id FROM bodies WHERE body LIKE ?)
@@ -607,7 +625,7 @@ func (s *DB) SearchDefinitions(query string) ([]Definition, error) {
 func (s *DB) FindDefinitions(namePattern string) ([]Definition, error) {
 	rows, err := s.db.QueryContext(s.Ctx(),
 		`SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
-		        COALESCE(d.signature,''), '', COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), d.hash
+		        COALESCE(d.signature,''), '', COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
 		 FROM definitions d
 		 WHERE d.name LIKE ? OR COALESCE(d.signature,'') LIKE ?
 		 ORDER BY d.name`, namePattern, namePattern)
@@ -636,10 +654,11 @@ func (s *DB) GetDefinitionByName(name, modulePath string) (*Definition, error) {
 		recv = strings.TrimPrefix(recv, "(")
 		recv = strings.TrimSuffix(recv, ")")
 		if methName != "" && recv != "" {
+			// Exact receiver match.
 			if d, err := s.GetDefinitionByNameAndReceiver(methName, modulePath, recv); err == nil {
 				return d, nil
 			}
-			// Also try with/without * prefix.
+			// Try with/without * prefix.
 			if strings.HasPrefix(recv, "*") {
 				if d, err := s.GetDefinitionByNameAndReceiver(methName, modulePath, recv[1:]); err == nil {
 					return d, nil
@@ -649,6 +668,17 @@ func (s *DB) GetDefinitionByName(name, modulePath string) (*Definition, error) {
 					return d, nil
 				}
 			}
+			// Suffix match: *Router matches *DefaultRouter, *Echo matches *echo.Echo
+			bareRecv := strings.TrimPrefix(recv, "*")
+			prefix := ""
+			if strings.HasPrefix(recv, "*") {
+				prefix = "*"
+			}
+			if d, err := s.fuzzyReceiverLookup(methName, modulePath, bareRecv, prefix); err == nil {
+				return d, nil
+			}
+			// Last resort: name-only lookup (ignores receiver, picks highest blast radius).
+			// This handles cases where diff says method but defn stores as standalone func.
 		}
 	}
 
@@ -677,7 +707,7 @@ func (s *DB) GetDefinitionByName(name, modulePath string) (*Definition, error) {
 	}
 
 	baseQuery := `SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
-	                 COALESCE(d.signature,''), COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), d.hash
+	                 COALESCE(d.signature,''), COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
 	          FROM definitions d
 	          LEFT JOIN bodies b ON b.def_id = d.id`
 	var args []any
@@ -688,7 +718,7 @@ func (s *DB) GetDefinitionByName(name, modulePath string) (*Definition, error) {
 		d := &Definition{}
 		err := s.db.QueryRowContext(s.Ctx(), query, name, modulePath).Scan(
 			&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &d.Receiver,
-			&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.Hash,
+			&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.SourceFile, &d.Hash,
 		)
 		if err == nil {
 			return d, nil
@@ -699,7 +729,7 @@ func (s *DB) GetDefinitionByName(name, modulePath string) (*Definition, error) {
 		d = &Definition{}
 		err = s.db.QueryRowContext(s.Ctx(), query, name, "%"+modulePath+"%").Scan(
 			&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &d.Receiver,
-			&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.Hash,
+			&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.SourceFile, &d.Hash,
 		)
 		if err == nil {
 			return d, nil
@@ -719,7 +749,7 @@ func (s *DB) GetDefinitionByName(name, modulePath string) (*Definition, error) {
 	d := &Definition{}
 	err := s.db.QueryRowContext(s.Ctx(), query, args...).Scan(
 		&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &d.Receiver,
-		&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.Hash,
+		&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.SourceFile, &d.Hash,
 	)
 	if err != nil {
 		return nil, err
@@ -734,7 +764,7 @@ func (s *DB) GetDefinitionByNameAndReceiver(name, modulePath, receiver string) (
 	var args []any
 	if modulePath != "" {
 		query = `SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
-		        COALESCE(d.signature,''), COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), d.hash
+		        COALESCE(d.signature,''), COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
 		 FROM definitions d
 		 LEFT JOIN bodies b ON b.def_id = d.id
 		 JOIN modules m ON d.module_id = m.id
@@ -742,7 +772,7 @@ func (s *DB) GetDefinitionByNameAndReceiver(name, modulePath, receiver string) (
 		args = []any{name, "%" + modulePath + "%", receiver}
 	} else {
 		query = `SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
-		        COALESCE(d.signature,''), COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), d.hash
+		        COALESCE(d.signature,''), COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
 		 FROM definitions d
 		 LEFT JOIN bodies b ON b.def_id = d.id
 		 WHERE d.name = ? AND COALESCE(d.receiver,'') = ?
@@ -753,18 +783,188 @@ func (s *DB) GetDefinitionByNameAndReceiver(name, modulePath, receiver string) (
 	}
 	err := s.db.QueryRowContext(s.Ctx(), query, args...).Scan(
 		&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &d.Receiver,
-		&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.Hash)
+		&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.SourceFile, &d.Hash)
 	if err != nil {
 		return nil, err
 	}
 	return d, nil
 }
 
+// fuzzyReceiverLookup finds a method where the stored receiver ends with the given suffix.
+// e.g. bareRecv="Router" matches stored "*DefaultRouter", prefix="*" adds the pointer.
+func (s *DB) fuzzyReceiverLookup(name, modulePath, bareRecv, prefix string) (*Definition, error) {
+	query := `SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
+	        COALESCE(d.signature,''), COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
+	 FROM definitions d
+	 LEFT JOIN bodies b ON b.def_id = d.id
+	 WHERE d.name = ? AND COALESCE(d.receiver,'') LIKE ?
+	 ORDER BY (SELECT COUNT(*) FROM ` + "`references`" + ` r
+	   JOIN definitions caller ON caller.id = r.from_def AND caller.test = FALSE
+	   WHERE r.to_def = d.id) DESC LIMIT 1`
+	pattern := "%" + bareRecv
+	if prefix != "" {
+		pattern = prefix + "%" + bareRecv
+	}
+	d := &Definition{}
+	err := s.db.QueryRowContext(s.Ctx(), query, name, pattern).Scan(
+		&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &d.Receiver,
+		&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.SourceFile, &d.Hash)
+	if err != nil {
+		return nil, err
+	}
+	return d, nil
+}
+
+// Simulate creates a throwaway branch, applies mutations, queries impact, and discards.
+// All operations happen on a single connection to maintain branch context.
+func (s *DB) Simulate(mutations []Mutation) (*SimulationResult, error) {
+	ctx := s.Ctx()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get connection: %w", err)
+	}
+	defer conn.Close()
+
+	branchName := fmt.Sprintf("sim_%x", time.Now().UnixNano())
+
+	// Create and checkout simulation branch.
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_BRANCH(?)", branchName); err != nil {
+		return nil, fmt.Errorf("create sim branch: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", branchName); err != nil {
+		return nil, fmt.Errorf("checkout sim branch: %w", err)
+	}
+
+	// Ensure we clean up: checkout main and delete branch.
+	defer func() {
+		conn.ExecContext(ctx, "CALL DOLT_CHECKOUT('main')")
+		conn.ExecContext(ctx, "CALL DOLT_BRANCH('-D', ?)", branchName)
+	}()
+
+	result := &SimulationResult{
+		Steps: make([]SimulationStep, 0, len(mutations)),
+	}
+	allCallers := map[string]bool{}
+	allTests := map[string]bool{}
+
+	for _, m := range mutations {
+		step := SimulationStep{Mutation: m}
+
+		// Find the definition.
+		d, err := s.GetDefinitionByName(m.Name, "")
+		if err != nil {
+			step.Error = fmt.Sprintf("definition %q not found", m.Name)
+			result.Steps = append(result.Steps, step)
+			continue
+		}
+
+		// Apply mutation on the sim branch.
+		switch m.Type {
+		case "signature-change":
+			// Change hash + signature → callers break.
+			_, err = conn.ExecContext(ctx,
+				"UPDATE definitions SET hash = ?, signature = CONCAT(signature, ' (changed)') WHERE id = ?",
+				fmt.Sprintf("sim_%x", time.Now().UnixNano()), d.ID)
+		case "behavior-change":
+			// Change hash only → tests may break.
+			_, err = conn.ExecContext(ctx,
+				"UPDATE definitions SET hash = ? WHERE id = ?",
+				fmt.Sprintf("sim_%x", time.Now().UnixNano()), d.ID)
+		case "removal":
+			// Delete → all references break.
+			err = s.DeleteDefinition(d.ID)
+		case "addition", "one-shot-stub":
+			// No mutation needed — just report what references exist.
+		default:
+			step.Error = fmt.Sprintf("unknown mutation type %q", m.Type)
+			result.Steps = append(result.Steps, step)
+			continue
+		}
+		if err != nil {
+			step.Error = fmt.Sprintf("apply mutation: %v", err)
+			result.Steps = append(result.Steps, step)
+			continue
+		}
+
+		// Query impact for this definition.
+		impact, err := s.GetImpact(d.ID)
+		if err != nil && m.Type != "removal" {
+			step.Error = fmt.Sprintf("get impact: %v", err)
+			result.Steps = append(result.Steps, step)
+			continue
+		}
+
+		if impact != nil {
+			var prodCallers, testCallers int
+			for _, c := range impact.DirectCallers {
+				key := c.Receiver + "." + c.Name
+				allCallers[key] = true
+				if c.Test {
+					testCallers++
+				} else {
+					prodCallers++
+				}
+			}
+			for _, t := range impact.Tests {
+				allTests[t.Name] = true
+			}
+			step.ProductionCallers = prodCallers
+			step.TestCallers = testCallers
+			step.TransitiveCallers = impact.TransitiveCount
+			step.TestCoverage = len(impact.Tests)
+			step.UncoveredCallers = impact.UncoveredBy
+		} else if m.Type == "removal" {
+			// For removal, we already collected callers before deleting.
+			// Re-query from the original (callers still exist, just orphaned).
+		}
+
+		result.Steps = append(result.Steps, step)
+	}
+
+	// Compute totals.
+	totalProd := 0
+	for _, step := range result.Steps {
+		totalProd += step.ProductionCallers
+	}
+	result.TotalMutations = len(mutations)
+	result.CombinedCallers = len(allCallers)
+	result.CombinedTests = len(allTests)
+	if result.CombinedCallers > 0 {
+		result.TestDensity = float64(result.CombinedTests) / float64(result.CombinedCallers)
+	}
+
+	return result, nil
+}
+
+type Mutation struct {
+	Type     string `json:"type"` // signature-change, behavior-change, removal, addition, one-shot-stub
+	Name     string `json:"name"`
+	Receiver string `json:"receiver,omitempty"`
+}
+
+type SimulationStep struct {
+	Mutation          Mutation `json:"mutation"`
+	ProductionCallers int      `json:"production_callers"`
+	TestCallers       int      `json:"test_callers"`
+	TransitiveCallers int      `json:"transitive_callers"`
+	TestCoverage      int      `json:"test_coverage"`
+	UncoveredCallers  int      `json:"uncovered_callers"`
+	Error             string   `json:"error,omitempty"`
+}
+
+type SimulationResult struct {
+	Steps           []SimulationStep `json:"steps"`
+	TotalMutations  int              `json:"total_mutations"`
+	CombinedCallers int              `json:"combined_callers"`
+	CombinedTests   int              `json:"combined_tests"`
+	TestDensity     float64          `json:"test_density"`
+}
+
 // GetCallers returns all definitions that reference the given definition.
 func (s *DB) GetCallers(defID int64) ([]Definition, error) {
 	rows, err := s.db.QueryContext(s.Ctx(),
 		`SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
-		        COALESCE(d.signature,''), COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), d.hash
+		        COALESCE(d.signature,''), COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
 		 FROM definitions d
 		 LEFT JOIN bodies b ON b.def_id = d.id
 		 JOIN `+"`references`"+` r ON r.from_def = d.id
@@ -781,7 +981,7 @@ func (s *DB) GetCallers(defID int64) ([]Definition, error) {
 func (s *DB) GetCallees(defID int64) ([]Definition, error) {
 	rows, err := s.db.QueryContext(s.Ctx(),
 		`SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
-		        COALESCE(d.signature,''), COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), d.hash
+		        COALESCE(d.signature,''), COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
 		 FROM definitions d
 		 LEFT JOIN bodies b ON b.def_id = d.id
 		 JOIN `+"`references`"+` r ON r.to_def = d.id
@@ -798,11 +998,11 @@ func (s *DB) GetCallees(defID int64) ([]Definition, error) {
 func (s *DB) GetModuleDefinitions(moduleID int64) ([]Definition, error) {
 	rows, err := s.db.QueryContext(s.Ctx(),
 		`SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
-		        COALESCE(d.signature,''), COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), d.hash
+		        COALESCE(d.signature,''), COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
 		 FROM definitions d
 		 LEFT JOIN bodies b ON b.def_id = d.id
 		 WHERE d.module_id = ?
-		 ORDER BY d.kind, d.name`, moduleID)
+		 ORDER BY d.source_file, d.kind, d.name`, moduleID)
 	if err != nil {
 		return nil, err
 	}
@@ -1002,6 +1202,24 @@ func (s *DB) GetImpact(defID int64) (*Impact, error) {
 		return nil, err
 	}
 
+	// If this is a method on a concrete type, also include callers of
+	// any interface method it satisfies (interface dispatch).
+	if d.Receiver != "" {
+		ifaceMethodCallers := s.getInterfaceDispatchCallers(d)
+		for _, c := range ifaceMethodCallers {
+			found := false
+			for _, existing := range directCallers {
+				if existing.ID == c.ID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				directCallers = append(directCallers, c)
+			}
+		}
+	}
+
 	// Transitive callers via BFS.
 	visited := map[int64]bool{defID: true}
 	queue := []int64{defID}
@@ -1063,10 +1281,55 @@ func (s *DB) GetImpact(defID int64) (*Impact, error) {
 }
 
 // GetUntested returns definitions that have no test in their direct callers.
+// getInterfaceDispatchCallers finds callers of interface methods that this
+// concrete method satisfies. E.g., if *responseWriter satisfies ResponseWriter,
+// callers of ResponseWriter.WriteHeader are also callers of responseWriter.WriteHeader.
+func (s *DB) getInterfaceDispatchCallers(d *Definition) []Definition {
+	// Find the concrete type (strip * from receiver).
+	concreteType := strings.TrimPrefix(d.Receiver, "*")
+
+	// Find interfaces this type implements (via "implements" edges).
+	rows, err := s.db.QueryContext(s.Ctx(),
+		`SELECT d2.name FROM definitions d1
+		 JOIN `+"`references`"+` r ON r.from_def = d1.id
+		 JOIN definitions d2 ON d2.id = r.to_def
+		 WHERE d1.name = ? AND r.kind = 'implements'`,
+		concreteType)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var ifaces []string
+	for rows.Next() {
+		var name string
+		rows.Scan(&name)
+		ifaces = append(ifaces, name)
+	}
+
+	// For each interface, find the same-named method and get its callers.
+	var allCallers []Definition
+	for _, iface := range ifaces {
+		// Interface methods don't exist as separate definitions in defn.
+		// But callers reference the interface type. Find callers that
+		// use this method name via the interface.
+		ifaceDef, err := s.GetDefinitionByName(iface, "")
+		if err != nil {
+			continue
+		}
+		callers, err := s.GetCallers(ifaceDef.ID)
+		if err != nil {
+			continue
+		}
+		allCallers = append(allCallers, callers...)
+	}
+	return allCallers
+}
+
 func (s *DB) GetUntested() ([]Definition, error) {
 	rows, err := s.db.QueryContext(s.Ctx(), `
 		SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
-		       COALESCE(d.signature,''), '', COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), d.hash
+		       COALESCE(d.signature,''), '', COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
 		FROM definitions d
 		WHERE d.test = FALSE AND d.exported = TRUE AND d.kind IN ('function', 'method')
 		AND NOT EXISTS (
@@ -1090,7 +1353,7 @@ func scanDefinitions(rows *sql.Rows) ([]Definition, error) {
 		var d Definition
 		if err := rows.Scan(
 			&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &d.Receiver,
-			&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.Hash,
+			&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.SourceFile, &d.Hash,
 		); err != nil {
 			return nil, err
 		}

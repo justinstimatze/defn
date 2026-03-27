@@ -31,7 +31,7 @@ func init() {
 		if err != nil {
 			continue
 		}
-		for _, line := range strings.Split(string(data), "\n") {
+		for line := range strings.SplitSeq(string(data), "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "[") {
 				continue
@@ -103,7 +103,7 @@ func cmdInitServer(modulePath string) {
 	// Wait for server to be ready (poll, don't sleep).
 	dsn := fmt.Sprintf("root@tcp(127.0.0.1:%s)/%s", port, dbName)
 	ready := false
-	for i := 0; i < 30; i++ {
+	for range 30 {
 		conn, err := net.DialTimeout("tcp", "127.0.0.1:"+port, time.Second)
 		if err == nil {
 			conn.Close()
@@ -118,7 +118,7 @@ func cmdInitServer(modulePath string) {
 	}
 
 	// Write pidfile only after server is confirmed ready.
-	os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", pid)), 0644)
+	os.WriteFile(pidFile, fmt.Appendf(nil, "%d", pid), 0644)
 	fmt.Fprintf(os.Stderr, "dolt server ready\n")
 
 	// Create a defn user with a random password (don't use root/no-password).
@@ -182,7 +182,7 @@ func cmdServer(action string) {
 		if err := cmd.Start(); err != nil {
 			fatal(fmt.Errorf("start: %w", err))
 		}
-		os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", cmd.Process.Pid)), 0644)
+		os.WriteFile(pidFile, fmt.Appendf(nil, "%d", cmd.Process.Pid), 0644)
 		fmt.Fprintf(os.Stderr, "started dolt server (pid %d) on 127.0.0.1:%s\n", cmd.Process.Pid, port)
 
 	case "stop":
@@ -405,15 +405,24 @@ Edit files normally with Edit/Write tools. defn is a read-only acceleration laye
 		claudeMDContent = fmt.Sprintf(`# defn
 
 This project has a defn database (%d modules, %d definitions).
-Use the **code** MCP tool. One call usually suffices — don't chain multiple calls.
+Use the **code** MCP tool via the "op" field.
 
-code(op:"impact", name:"X") — callers, transitive callers, test coverage. **Use this first.**
-code(op:"read", name:"X") — full source code.
-code(op:"edit", name:"X", new_body:"...") — edit a definition.
-code(op:"test", name:"X") — run affected tests only.
+## When to use defn vs file tools
 
-Both editing paths work. code(op:"edit") updates DB + emits files.
-File tools (Edit/Write) work too — call code(op:"sync") after file edits.
+**Use defn when:** you need to understand relationships between definitions.
+- "Who calls X?" → code(op:"impact", name:"X") — catches interface dispatch + struct fields that grep misses.
+- "What does X look like?" → code(op:"read", name:"X") — one call, no scrolling.
+- "What's in this file?" → code(op:"overview", file:"server.go") — all definitions + relationships.
+
+**Use file tools (Read/Edit) when:** you need raw file content, imports, or surgical string replacements.
+
+**Rule of thumb:** Always run impact before modifying an existing definition. Skip it for brand-new definitions.
+
+## Editing
+
+Both paths work. For small changes, Edit is fine — the file watcher auto-reingests.
+For replacing a whole definition: code(op:"edit", name:"X", new_body:"...").
+For string replacement within a definition: code(op:"patch", name:"X", old:"...", new:"...").
 `, len(mods), len(defs))
 	}
 
@@ -439,7 +448,7 @@ File tools (Edit/Write) work too — call code(op:"sync") after file edits.
 		fmt.Fprintf(os.Stderr, "CLAUDE.md already exists — add defn instructions manually if needed\n")
 	}
 
-	fmt.Fprintln(os.Stderr, "start a new Claude Code session in this directory to use defn.")
+	fmt.Fprintln(os.Stderr, "start a new AI coding session in this directory to use defn.")
 }
 
 func cmdIngest(modulePath string) {
@@ -648,6 +657,41 @@ func cmdStatus() {
 	fmt.Printf("On branch %s\n", branch)
 	fmt.Printf("Database: %s\n", getDBPath())
 	fmt.Printf("%d modules, %d definitions\n", len(mods), len(defs))
+
+	// Check freshness: compare newest .go file against DB modtime.
+	dbPath := getDBPath()
+	dbStat, err := os.Stat(filepath.Join(dbPath, ".dolt", "noms"))
+	if err != nil {
+		return
+	}
+	dbTime := dbStat.ModTime()
+
+	var newestFile string
+	var newestTime time.Time
+	filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			base := filepath.Base(path)
+			if base == ".defn" || base == ".defn-server" || base == ".git" || base == "vendor" || base == "node_modules" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(path, ".go") && info.ModTime().After(newestTime) {
+			newestTime = info.ModTime()
+			newestFile = path
+		}
+		return nil
+	})
+
+	if newestTime.IsZero() {
+		return
+	}
+	if newestTime.After(dbTime) {
+		fmt.Fprintf(os.Stderr, "\nDatabase may be stale: %s is newer than DB\n", newestFile)
+		fmt.Fprintf(os.Stderr, "  run: defn ingest .\n")
+	} else {
+		fmt.Fprintf(os.Stderr, "\nDatabase is up to date\n")
+	}
 }
 
 func cmdBranch(args []string) {
@@ -899,7 +943,7 @@ func cmdLint() {
 }
 
 func printPrefixed(body, prefix string) {
-	for _, line := range strings.Split(body, "\n") {
+	for line := range strings.SplitSeq(body, "\n") {
 		fmt.Printf("%s%s\n", prefix, line)
 	}
 }
@@ -929,8 +973,8 @@ func printUnifiedDiff(oldBody, newBody string) {
 
 	// Skip the first two header lines (--- old / +++ new) and print
 	// the hunks indented.
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
+	lines := strings.SplitSeq(string(out), "\n")
+	for line := range lines {
 		if strings.HasPrefix(line, "---") || strings.HasPrefix(line, "+++") {
 			continue
 		}
@@ -940,11 +984,11 @@ func printUnifiedDiff(oldBody, newBody string) {
 
 func printSimpleDiff(oldBody, newBody string) {
 	fmt.Println("    --- old")
-	for _, line := range strings.Split(oldBody, "\n") {
+	for line := range strings.SplitSeq(oldBody, "\n") {
 		fmt.Printf("    -%s\n", line)
 	}
 	fmt.Println("    +++ new")
-	for _, line := range strings.Split(newBody, "\n") {
+	for line := range strings.SplitSeq(newBody, "\n") {
 		fmt.Printf("    +%s\n", line)
 	}
 }

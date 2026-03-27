@@ -69,34 +69,157 @@ func resolve(db *store.DB, projectDir, onlyModule string) error {
 		}
 	}
 
-	// Second pass: extract references from function bodies.
-	// If onlyModule is set, only process packages matching that module path.
+	// Second pass: interface satisfaction — build ifaceMethodToImpls map
+	// BEFORE extracting references, so collectRefs can resolve interface calls.
+	// Build a map from interface method objects → concrete method definition IDs.
+	// This is used by collectRefs to resolve interface dispatch calls.
+	ifaceMethodToImpls := map[types.Object][]int64{}
+
 	for _, pkg := range filtered {
 		pkgPath := pkg.PkgPath
 		if strings.HasSuffix(pkg.Name, "_test") {
 			pkgPath = strings.TrimSuffix(pkgPath, "_test")
 		}
-
 		if onlyModule != "" && pkgPath != onlyModule {
 			continue
 		}
 
+		scope := pkg.Types.Scope()
+		if scope == nil {
+			continue
+		}
+
+		// Collect all named types and interfaces in this package.
+		var namedTypes []*types.Named
+		var ifaces []*types.Named
+		for _, name := range scope.Names() {
+			obj := scope.Lookup(name)
+			tn, ok := obj.(*types.TypeName)
+			if !ok {
+				continue
+			}
+			named, ok := tn.Type().(*types.Named)
+			if !ok {
+				continue
+			}
+			if types.IsInterface(named) {
+				ifaces = append(ifaces, named)
+			} else {
+				namedTypes = append(namedTypes, named)
+			}
+		}
+
+		// Check each (concrete, interface) pair.
+		for _, concrete := range namedTypes {
+			for _, iface := range ifaces {
+				ifaceType, ok := iface.Underlying().(*types.Interface)
+				if !ok || ifaceType.NumMethods() == 0 {
+					continue
+				}
+
+				// Check T and *T.
+				satisfies := types.Implements(concrete, ifaceType) ||
+					types.Implements(types.NewPointer(concrete), ifaceType)
+				if !satisfies {
+					continue
+				}
+
+				// Find defn IDs for the concrete type and interface.
+				concreteID := lookupTypeDefID(db, pkgPath, concrete.Obj().Name())
+				ifaceID := lookupTypeDefID(db, pkgPath, iface.Obj().Name())
+
+				// Add "implements" edge: concrete type → interface.
+				if concreteID > 0 && ifaceID > 0 {
+					db.SetReferences(concreteID, []store.Reference{
+						{ToDef: ifaceID, Kind: "implements"},
+					})
+				}
+
+				// Map interface method objects → concrete method def IDs.
+				for ifaceMethod := range ifaceType.Methods() {
+					ifaceMethod := ifaceMethod
+					concreteMethodID := lookupMethodDefID(db, pkgPath, concrete.Obj().Name(), ifaceMethod.Name())
+					if concreteMethodID > 0 {
+						ifaceMethodToImpls[ifaceMethod] = append(ifaceMethodToImpls[ifaceMethod], concreteMethodID)
+					}
+				}
+			}
+		}
+	}
+
+	// Third pass: extract references from function bodies AND package-level
+	// var/const initializers and type definitions.
+	for _, pkg := range filtered {
+		pkgPath := pkg.PkgPath
+		if strings.HasSuffix(pkg.Name, "_test") {
+			pkgPath = strings.TrimSuffix(pkgPath, "_test")
+		}
+		if onlyModule != "" && pkgPath != onlyModule {
+			continue
+		}
 		for _, file := range pkg.Syntax {
 			for _, decl := range file.Decls {
-				fn, ok := decl.(*ast.FuncDecl)
-				if !ok || fn.Body == nil {
-					continue
-				}
+				switch d := decl.(type) {
+				case *ast.FuncDecl:
+					if d.Body == nil {
+						continue
+					}
+					fromID := lookupFuncDefID(db, pkgPath, d)
+					if fromID <= 0 {
+						continue
+					}
+					refs := collectRefs(d.Body, pkg.TypesInfo, objToDef, ifaceMethodToImpls)
+					if len(refs) > 0 {
+						if err := db.SetReferences(fromID, refs); err != nil {
+							return err
+						}
+					}
 
-				fromID := lookupFuncDefID(db, pkgPath, fn)
-				if fromID <= 0 {
-					continue
-				}
+				case *ast.GenDecl:
+					for _, spec := range d.Specs {
+						switch s := spec.(type) {
+						case *ast.ValueSpec:
+							// var/const initializers: var X = someFunc(...)
+							for i, name := range s.Names {
+								if name.Name == "_" {
+									continue
+								}
+								fromID := lookupVarDefID(db, pkgPath, name.Name)
+								if fromID <= 0 {
+									continue
+								}
+								// Collect refs from the value expression.
+								var nodes []ast.Node
+								if i < len(s.Values) {
+									nodes = append(nodes, s.Values[i])
+								}
+								// Also collect refs from the type expression.
+								if s.Type != nil {
+									nodes = append(nodes, s.Type)
+								}
+								for _, node := range nodes {
+									refs := collectRefs(node, pkg.TypesInfo, objToDef, ifaceMethodToImpls)
+									if len(refs) > 0 {
+										if err := db.SetReferences(fromID, refs); err != nil {
+											return err
+										}
+									}
+								}
+							}
 
-				refs := collectRefs(fn.Body, pkg.TypesInfo, objToDef)
-				if len(refs) > 0 {
-					if err := db.SetReferences(fromID, refs); err != nil {
-						return err
+						case *ast.TypeSpec:
+							// Type definitions: struct fields, embedded types, interface methods.
+							fromID := lookupTypeDefID(db, pkgPath, s.Name.Name)
+							if fromID <= 0 {
+								continue
+							}
+							refs := collectRefs(s.Type, pkg.TypesInfo, objToDef, ifaceMethodToImpls)
+							if len(refs) > 0 {
+								if err := db.SetReferences(fromID, refs); err != nil {
+									return err
+								}
+							}
+						}
 					}
 				}
 			}
@@ -106,11 +229,49 @@ func resolve(db *store.DB, projectDir, onlyModule string) error {
 	return nil
 }
 
-func collectRefs(body *ast.BlockStmt, info *types.Info, objToDef map[types.Object]int64) []store.Reference {
+func lookupTypeDefID(db *store.DB, pkgPath, typeName string) int64 {
+	d, err := db.GetDefinitionByName(typeName, pkgPath)
+	if err != nil {
+		return 0
+	}
+	return d.ID
+}
+
+func lookupMethodDefID(db *store.DB, pkgPath, typeName, methodName string) int64 {
+	// Try *Type first (most methods have pointer receivers).
+	d, err := db.GetDefinitionByNameAndReceiver(methodName, pkgPath, "*"+typeName)
+	if err == nil {
+		return d.ID
+	}
+	// Try value receiver.
+	d, err = db.GetDefinitionByNameAndReceiver(methodName, pkgPath, typeName)
+	if err == nil {
+		return d.ID
+	}
+	return 0
+}
+
+// lookupVarDefID finds the definition ID for a package-level var or const.
+func lookupVarDefID(db *store.DB, pkgPath, name string) int64 {
+	d, err := db.GetDefinitionByName(name, pkgPath)
+	if err != nil {
+		return 0
+	}
+	return d.ID
+}
+
+func collectRefs(node ast.Node, info *types.Info, objToDef map[types.Object]int64, ifaceMethodToImpls map[types.Object][]int64) []store.Reference {
 	seen := make(map[int64]string)
 	var refs []store.Reference
 
-	ast.Inspect(body, func(n ast.Node) bool {
+	addRef := func(toID int64, kind string) {
+		if _, dup := seen[toID]; !dup {
+			seen[toID] = kind
+			refs = append(refs, store.Reference{ToDef: toID, Kind: kind})
+		}
+	}
+
+	ast.Inspect(node, func(n ast.Node) bool {
 		ident, ok := n.(*ast.Ident)
 		if !ok {
 			return true
@@ -120,18 +281,17 @@ func collectRefs(body *ast.BlockStmt, info *types.Info, objToDef map[types.Objec
 			return true
 		}
 		toID, exists := objToDef[obj]
-		if !exists {
+		if exists {
+			addRef(toID, classifyRef(obj))
 			return true
 		}
 
-		kind := classifyRef(obj)
-		key := toID
-		if _, dup := seen[key]; !dup {
-			seen[key] = kind
-			refs = append(refs, store.Reference{
-				ToDef: toID,
-				Kind:  kind,
-			})
+		// Interface method dispatch: obj is an interface method not in objToDef.
+		// Connect to all concrete implementations.
+		if implIDs, ok := ifaceMethodToImpls[obj]; ok {
+			for _, implID := range implIDs {
+				addRef(implID, "interface_dispatch")
+			}
 		}
 		return true
 	})

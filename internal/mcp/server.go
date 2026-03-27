@@ -88,19 +88,23 @@ Ops: impact (blast radius — START HERE), read, search, explain, similar, untes
 //	apply: operations
 //	untested, diff, sync: (no params)
 type codeParam struct {
-	Op         string    `json:"op"`
-	Name       string    `json:"name,omitempty"`
-	Pattern    string    `json:"pattern,omitempty"`
-	Body       string    `json:"body,omitempty"`
-	NewBody    string    `json:"new_body,omitempty"`
-	Module     string    `json:"module,omitempty"`
-	OldName    string    `json:"old_name,omitempty"`
-	NewName    string    `json:"new_name,omitempty"`
-	SQL        string    `json:"sql,omitempty"`
-	File       string    `json:"file,omitempty"`
-	Line       int       `json:"line,omitempty"`
-	Operations []applyOp `json:"operations,omitempty"`
-	DryRun     bool      `json:"dry_run,omitempty"`
+	Op         string           `json:"op"`
+	Name       string           `json:"name,omitempty"`
+	Pattern    string           `json:"pattern,omitempty"`
+	Body       string           `json:"body,omitempty"`
+	NewBody    string           `json:"new_body,omitempty"`
+	Module     string           `json:"module,omitempty"`
+	OldName    string           `json:"old_name,omitempty"`
+	NewName    string           `json:"new_name,omitempty"`
+	SQL        string           `json:"sql,omitempty"`
+	File       string           `json:"file,omitempty"`
+	Line       int              `json:"line,omitempty"`
+	Names      []string         `json:"names,omitempty"`
+	Mutations  []store.Mutation `json:"mutations,omitempty"`
+	Depth      int              `json:"depth,omitempty"`
+	Receiver   string           `json:"receiver,omitempty"`
+	Operations []applyOp        `json:"operations,omitempty"`
+	DryRun     bool             `json:"dry_run,omitempty"`
 }
 
 type applyOp struct {
@@ -298,10 +302,22 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return s.handleQuery(ctx, req, sqlParam{SQL: args.SQL})
 	case "find":
 		return s.handleFind(ctx, req, findParam{File: args.File, Line: args.Line})
+	case "overview":
+		return s.handleOverview(ctx, req, args)
+	case "patch":
+		return s.handlePatch(ctx, req, args)
 	case "sync":
 		return s.handleSync(ctx, req, emptyParam{})
+	case "test-coverage":
+		return s.handleTestCoverage(ctx, req, args)
+	case "batch-impact":
+		return s.handleBatchImpact(ctx, req, args)
+	case "simulate":
+		return s.handleSimulate(ctx, req, args)
+	case "file-defs":
+		return s.handleFileDefs(ctx, req, args)
 	default:
-		return errResult(fmt.Errorf("unknown op %q — valid: read, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync", args.Op))
+		return errResult(fmt.Errorf("unknown op %q — valid: read, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact", args.Op))
 	}
 }
 
@@ -461,6 +477,18 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 	if buildResult != "" {
 		sb.WriteString("\n" + buildResult)
 	}
+
+	// Impact nudge: show callers if this definition has any.
+	if impact, err := s.db.GetImpact(id); err == nil && len(impact.DirectCallers) > 0 {
+		prodCallers := 0
+		for _, c := range impact.DirectCallers {
+			if !c.Test {
+				prodCallers++
+			}
+		}
+		sb.WriteString(fmt.Sprintf("\nFYI: %d callers, %d tests affected. Run code(op:\"test\", name:\"%s\") to verify.\n",
+			prodCallers, len(impact.Tests), d.Name))
+	}
 	return textResult(sb.String()), nil, nil
 }
 
@@ -565,7 +593,7 @@ func extractSignature(body string) string {
 	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
 	if err != nil || len(f.Decls) == 0 {
 		// Unparseable — return first non-comment line.
-		for _, line := range strings.Split(body, "\n") {
+		for line := range strings.SplitSeq(body, "\n") {
 			t := strings.TrimSpace(line)
 			if t != "" && !strings.HasPrefix(t, "//") {
 				return t
@@ -757,6 +785,13 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		return textResult(sb.String()), nil, nil
 	}
 
+	// Wrap in transaction for atomicity.
+	commit, rollback, txErr := s.db.Begin()
+	if txErr != nil {
+		return errResult(txErr)
+	}
+	defer rollback() // rollback if we don't commit
+
 	for _, op := range args.Operations {
 		switch op.Op {
 		case "create":
@@ -862,6 +897,19 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		for _, e := range errors {
 			sb.WriteString("  " + e + "\n")
 		}
+	}
+
+	// Commit transaction if no errors.
+	if len(errors) > 0 {
+		// Rollback happens via defer. Don't commit partial state.
+		sb.WriteString("\nErrors (transaction rolled back):\n")
+		for _, e := range errors {
+			sb.WriteString("- " + e + "\n")
+		}
+		return textResult(sb.String()), nil, nil
+	}
+	if err := commit(); err != nil {
+		return errResult(fmt.Errorf("commit: %w", err))
 	}
 
 	// One emit + build for all changes.
@@ -1076,6 +1124,111 @@ func (s *server) handleSimilar(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 	return textResult(fmt.Sprintf("Definitions with similar signatures to %s:\n\n%s", args.Name, text)), nil, nil
 }
 
+func (s *server) handleOverview(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	file := args.File
+	if file == "" {
+		file = args.Name
+	}
+	if strings.TrimSpace(file) == "" {
+		return errResult(fmt.Errorf("overview: file or name is required"))
+	}
+
+	// Strip filename to get package directory.
+	dir := file
+	if idx := strings.LastIndex(dir, "/"); idx >= 0 {
+		dir = dir[:idx]
+	} else {
+		dir = strings.TrimSuffix(dir, "_test.go")
+		dir = strings.TrimSuffix(dir, ".go")
+	}
+
+	defs, err := s.db.FindDefinitionsByFile(dir, 0)
+	if err != nil || len(defs) == 0 {
+		return errResult(fmt.Errorf("no definitions found for %s", file))
+	}
+
+	// Get full definitions with bodies to check relationships.
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("## %s (%d definitions)\n\n", file, len(defs)))
+
+	// Group by source file.
+	byFile := map[string][]store.Definition{}
+	for _, d := range defs {
+		f := d.SourceFile
+		if f == "" {
+			f = "(unknown)"
+		}
+		byFile[f] = append(byFile[f], d)
+	}
+
+	for f, fileDefs := range byFile {
+		if len(byFile) > 1 {
+			sb.WriteString(fmt.Sprintf("### %s\n", f))
+		}
+		for _, d := range fileDefs {
+			recv := formatReceiver(d.Receiver)
+			sb.WriteString(fmt.Sprintf("- %s%s (%s)", recv, d.Name, d.Kind))
+
+			// Show caller/callee counts.
+			full, err := s.db.GetDefinition(d.ID)
+			if err != nil {
+				sb.WriteString("\n")
+				continue
+			}
+			callers, _ := s.db.GetCallers(full.ID)
+			callees, _ := s.db.GetCallees(full.ID)
+			prodCallers := 0
+			for _, c := range callers {
+				if !c.Test {
+					prodCallers++
+				}
+			}
+			if prodCallers > 0 || len(callees) > 0 {
+				sb.WriteString(fmt.Sprintf(" — %d callers, %d callees", prodCallers, len(callees)))
+			}
+			sb.WriteString("\n")
+		}
+		sb.WriteString("\n")
+	}
+
+	return textResult(sb.String()), nil, nil
+}
+
+func (s *server) handlePatch(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	if strings.TrimSpace(args.Name) == "" {
+		return errResult(fmt.Errorf("patch: name is required"))
+	}
+	if args.OldName == "" || args.NewName == "" {
+		return errResult(fmt.Errorf("patch: old_name and new_name are required (the old and new text)"))
+	}
+
+	d, err := s.db.GetDefinitionByName(args.Name, "")
+	if err != nil {
+		return errResult(fmt.Errorf("definition %q not found", args.Name))
+	}
+
+	if !strings.Contains(d.Body, args.OldName) {
+		return errResult(fmt.Errorf("old text not found in %s body", args.Name))
+	}
+
+	d.Body = strings.Replace(d.Body, args.OldName, args.NewName, 1)
+	d.Signature = extractSignature(d.Body)
+
+	if _, err := s.db.UpsertDefinition(d); err != nil {
+		return errResult(err)
+	}
+
+	buildResult := s.autoEmitAndBuild()
+	s.autoResolve(s.modulePath(d.ModuleID))
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Patched %s: replaced %q → %q\n", args.Name, args.OldName, args.NewName))
+	if buildResult != "" {
+		sb.WriteString("\n" + buildResult)
+	}
+	return textResult(sb.String()), nil, nil
+}
+
 func (s *server) handleFind(_ context.Context, _ *sdkmcp.CallToolRequest, args findParam) (*sdkmcp.CallToolResult, any, error) {
 	if args.File == "" {
 		return errResult(fmt.Errorf("file is required"))
@@ -1111,4 +1264,144 @@ func (s *server) handleFind(_ context.Context, _ *sdkmcp.CallToolRequest, args f
 		sb.WriteString(fmt.Sprintf("- %s%s (%s) lines %d-%d\n", recv, d.Name, d.Kind, d.StartLine, d.EndLine))
 	}
 	return textResult(sb.String()), nil, nil
+}
+
+func (s *server) handleFileDefs(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	file := args.File
+	if file == "" {
+		file = args.Name
+	}
+	if strings.TrimSpace(file) == "" {
+		return errResult(fmt.Errorf("file-defs: file is required"))
+	}
+	// Strip filename to get package directory.
+	dir := file
+	if idx := strings.LastIndex(dir, "/"); idx >= 0 {
+		dir = dir[:idx]
+	} else {
+		dir = strings.TrimSuffix(dir, "_test.go")
+		dir = strings.TrimSuffix(dir, ".go")
+	}
+	defs, err := s.db.FindDefinitionsByFile(dir, 0)
+	if err != nil {
+		return errResult(err)
+	}
+	type defSummary struct {
+		Name      string `json:"name"`
+		Kind      string `json:"kind"`
+		Receiver  string `json:"receiver,omitempty"`
+		StartLine int    `json:"start_line"`
+		EndLine   int    `json:"end_line"`
+	}
+	var results []defSummary
+	for _, d := range defs {
+		results = append(results, defSummary{
+			Name: d.Name, Kind: d.Kind, Receiver: d.Receiver,
+			StartLine: d.StartLine, EndLine: d.EndLine,
+		})
+	}
+	text, err := toJSON(results)
+	if err != nil {
+		return errResult(err)
+	}
+	return textResult(fmt.Sprintf("%d definitions in %s:\n\n%s", len(results), file, text)), nil, nil
+}
+
+func (s *server) handleSimulate(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	if len(args.Mutations) == 0 {
+		return errResult(fmt.Errorf("simulate: mutations is required"))
+	}
+	result, err := s.db.Simulate(args.Mutations)
+	if err != nil {
+		return errResult(fmt.Errorf("simulate: %w", err))
+	}
+	text, err := toJSON(result)
+	if err != nil {
+		return errResult(err)
+	}
+	return textResult(text), nil, nil
+}
+
+func (s *server) handleTestCoverage(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	if strings.TrimSpace(args.Name) == "" {
+		return errResult(fmt.Errorf("test-coverage: name is required"))
+	}
+	d, err := s.db.GetDefinitionByName(args.Name, "")
+	if err != nil {
+		return errResult(fmt.Errorf("definition %q not found", args.Name))
+	}
+	impact, err := s.db.GetImpact(d.ID)
+	if err != nil {
+		return errResult(err)
+	}
+
+	type testInfo struct {
+		Name string `json:"name"`
+	}
+	var tests []testInfo
+	for _, t := range impact.Tests {
+		tests = append(tests, testInfo{Name: t.Name})
+	}
+
+	result := map[string]any{
+		"definition":         args.Name,
+		"test_count":         len(tests),
+		"transitive_callers": impact.TransitiveCount,
+		"tests":              tests,
+	}
+	text, err := toJSON(result)
+	if err != nil {
+		return errResult(err)
+	}
+	return textResult(text), nil, nil
+}
+
+func (s *server) handleBatchImpact(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	names := args.Names
+	if len(names) == 0 && args.Name != "" {
+		names = []string{args.Name}
+	}
+	if len(names) == 0 {
+		return errResult(fmt.Errorf("batch-impact: names is required"))
+	}
+
+	allCallers := map[string]bool{}
+	allTests := map[string]bool{}
+	var perDef []map[string]any
+
+	for _, name := range names {
+		d, err := s.db.GetDefinitionByName(name, "")
+		if err != nil {
+			perDef = append(perDef, map[string]any{"name": name, "error": "not found"})
+			continue
+		}
+		impact, err := s.db.GetImpact(d.ID)
+		if err != nil {
+			perDef = append(perDef, map[string]any{"name": name, "error": err.Error()})
+			continue
+		}
+		for _, c := range impact.DirectCallers {
+			allCallers[formatReceiver(c.Receiver)+c.Name] = true
+		}
+		for _, t := range impact.Tests {
+			allTests[t.Name] = true
+		}
+		perDef = append(perDef, map[string]any{
+			"name":               formatReceiver(d.Receiver) + d.Name,
+			"direct_callers":     len(impact.DirectCallers),
+			"transitive_callers": impact.TransitiveCount,
+			"tests":              len(impact.Tests),
+		})
+	}
+
+	result := map[string]any{
+		"definitions":      perDef,
+		"combined_callers": len(allCallers),
+		"combined_tests":   len(allTests),
+	}
+	text, err := toJSON(result)
+	if err != nil {
+		return errResult(err)
+	}
+	return textResult(text), nil, nil
 }

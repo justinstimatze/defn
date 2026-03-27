@@ -15,7 +15,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 - Impact analysis: blast radius, transitive callers, test coverage per definition
 - Smart disambiguation: ambiguous names resolved by most non-test callers
 - Reference resolution: includes test packages, receiver-qualified method lookups
-- Emit: database → compilable .go files (round-trip verified on chi, mux, gin, toml)
+- Lossless round-trip: all comments, file structure, and definitions preserved
+- Multi-file emit: writes to original filenames (server.go stays server.go)
+- Transactional apply: batch operations roll back on any failure
 - Auto-emit on edit: edit op updates DB and files simultaneously
 - Incremental resolve: edit op and create op only re-resolve the changed module
 - In-process resolve: no DB lock conflicts, no dependency on defn binary in PATH

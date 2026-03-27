@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS definitions (
     doc         TEXT,
     start_line  INT,
     end_line    INT,
+    source_file VARCHAR(500) DEFAULT '',
     hash        VARCHAR(64) NOT NULL,
     UNIQUE(module_id, name, kind, receiver, test),
     FOREIGN KEY (module_id) REFERENCES modules(id)
