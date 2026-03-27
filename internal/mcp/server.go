@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/ast"
+	"go/format"
 	"go/parser"
 	"go/token"
 	"go/types"
@@ -862,10 +863,9 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				errors = append(errors, fmt.Sprintf("rename %s: not found", op.Name))
 				continue
 			}
-			newBody := strings.ReplaceAll(d.Body, op.Name, op.NewName)
-			d.Body = newBody
+			d.Body, _ = astRename(d.Body, op.Name, op.NewName)
 			d.Name = op.NewName
-			d.Signature = extractSignature(newBody)
+			d.Signature = extractSignature(d.Body)
 			d.Exported = len(op.NewName) > 0 && op.NewName[0] >= 'A' && op.NewName[0] <= 'Z'
 			if _, err := s.db.UpsertDefinition(d); err != nil {
 				errors = append(errors, fmt.Sprintf("rename %s: %v", op.Name, err))
@@ -876,7 +876,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			callerCount := 0
 			for _, caller := range callers {
 				if strings.Contains(caller.Body, op.Name) {
-					caller.Body = strings.ReplaceAll(caller.Body, op.Name, op.NewName)
+					caller.Body, _ = astRename(caller.Body, op.Name, op.NewName)
 					caller.Signature = extractSignature(caller.Body)
 					if _, err := s.db.UpsertDefinition(&caller); err != nil {
 						errors = append(errors, fmt.Sprintf("rename caller %s: %v", caller.Name, err))
@@ -952,11 +952,12 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		return errResult(fmt.Errorf("definition %q not found", args.OldName))
 	}
 
-	// Update the definition name in its own body.
-	newBody := strings.Replace(d.Body, args.OldName, args.NewName, -1)
-	d.Body = newBody
+	// Update the definition name in its own body using AST rename.
+	// Only renames identifiers — preserves comments and string literals.
+	totalSkipped := 0
+	d.Body, _ = astRename(d.Body, args.OldName, args.NewName)
 	d.Name = args.NewName
-	d.Signature = extractSignature(newBody)
+	d.Signature = extractSignature(d.Body)
 	d.Exported = len(args.NewName) > 0 && args.NewName[0] >= 'A' && args.NewName[0] <= 'Z'
 
 	if _, err := s.db.UpsertDefinition(d); err != nil {
@@ -971,7 +972,9 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	updated := 0
 	for _, caller := range callers {
 		if strings.Contains(caller.Body, args.OldName) {
-			caller.Body = strings.ReplaceAll(caller.Body, args.OldName, args.NewName)
+			var skipped int
+			caller.Body, skipped = astRename(caller.Body, args.OldName, args.NewName)
+			totalSkipped += skipped
 			caller.Signature = extractSignature(caller.Body)
 			if _, err := s.db.UpsertDefinition(&caller); err != nil {
 				return errResult(fmt.Errorf("update caller %s: %w", caller.Name, err))
@@ -986,7 +989,9 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Renamed %s → %s\n", args.OldName, args.NewName))
 	sb.WriteString(fmt.Sprintf("Updated %d callers\n", updated))
-	sb.WriteString("\n**Warning:** This used string replacement, not AST transformation. Comments or strings containing the old name may have been affected. Run code(op:\"test\") to verify.\n")
+	if totalSkipped > 0 {
+		sb.WriteString(fmt.Sprintf("\nNote: %d local variable(s) named %q were preserved (not renamed).\n", totalSkipped, args.OldName))
+	}
 	if buildResult != "" {
 		sb.WriteString("\n" + buildResult)
 	}
@@ -1227,6 +1232,94 @@ func (s *server) handlePatch(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		sb.WriteString("\n" + buildResult)
 	}
 	return textResult(sb.String()), nil, nil
+}
+
+// astRename renames identifiers in Go source using go/parser.
+// Only renames *ast.Ident nodes — comments and string literals are preserved.
+// Falls back to string replacement if the source can't be parsed.
+func astRename(body, oldName, newName string) (string, int) {
+	src := "package x\n" + body
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	if err != nil {
+		return strings.ReplaceAll(body, oldName, newName), 0
+	}
+
+	// Collect locally-declared identifiers so we don't rename them.
+	// A local var/param named "Render" shouldn't be renamed when we're
+	// renaming the package-level "Render" definition.
+	localDecls := map[*ast.Ident]bool{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		switch d := n.(type) {
+		case *ast.FuncDecl:
+			// Params, receiver, results are local declarations.
+			if d.Recv != nil {
+				for _, field := range d.Recv.List {
+					for _, name := range field.Names {
+						localDecls[name] = true
+					}
+				}
+			}
+			if d.Type.Params != nil {
+				for _, field := range d.Type.Params.List {
+					for _, name := range field.Names {
+						localDecls[name] = true
+					}
+				}
+			}
+			if d.Type.Results != nil {
+				for _, field := range d.Type.Results.List {
+					for _, name := range field.Names {
+						localDecls[name] = true
+					}
+				}
+			}
+		case *ast.AssignStmt:
+			if d.Tok == token.DEFINE { // :=
+				for _, lhs := range d.Lhs {
+					if ident, ok := lhs.(*ast.Ident); ok {
+						localDecls[ident] = true
+					}
+				}
+			}
+		case *ast.ValueSpec: // var/const inside function
+			for _, name := range d.Names {
+				localDecls[name] = true
+			}
+		case *ast.RangeStmt:
+			if key, ok := d.Key.(*ast.Ident); ok && d.Tok == token.DEFINE {
+				localDecls[key] = true
+			}
+			if val, ok := d.Value.(*ast.Ident); ok && d.Tok == token.DEFINE {
+				localDecls[val] = true
+			}
+		}
+		return true
+	})
+
+	// Rename only non-local identifiers matching oldName.
+	skipped := 0
+	ast.Inspect(f, func(n ast.Node) bool {
+		ident, ok := n.(*ast.Ident)
+		if !ok || ident.Name != oldName {
+			return true
+		}
+		if localDecls[ident] {
+			skipped++
+			return true
+		}
+		ident.Name = newName
+		return true
+	})
+	var buf strings.Builder
+	if err := format.Node(&buf, fset, f); err != nil {
+		return strings.ReplaceAll(body, oldName, newName), 0
+	}
+	result := buf.String()
+	if idx := strings.Index(result, "\n"); idx >= 0 {
+		result = strings.TrimLeft(result[idx+1:], "\n")
+	}
+	return result, skipped
 }
 
 func (s *server) handleFind(_ context.Context, _ *sdkmcp.CallToolRequest, args findParam) (*sdkmcp.CallToolResult, any, error) {

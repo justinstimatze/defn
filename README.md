@@ -7,6 +7,8 @@
 
 **defn replaces files with a graph.** Every Go function, method, type, and constant becomes a node. Every call, reference, and interface implementation becomes an edge. AI agents query the graph instead of grepping through files.
 
+**The round-trip is lossless.** defn and your files stay perfectly in sync — all comments, file structure, and definitions are preserved. Edit through defn or edit files directly; the database auto-detects changes and re-ingests. Either can recover the other.
+
 ```
 "What breaks if I change Render?"
 
@@ -33,8 +35,6 @@ AND NOT EXISTS (
   WHERE r2.to_def = d.id
 )
 ```
-
-**The database and files stay in sync.** Edits through defn update the database and emit files. File edits are auto-detected and re-ingested. The round-trip is lossless — all comments, file structure, and definitions are preserved.
 
 ## Setup
 
@@ -140,7 +140,7 @@ Init is a one-time cost. Incremental resolve after edits is much faster.
 ## Limitations
 
 - **Go only.** The type-checked reference graph requires `go/types`.
-- **`rename` is string replacement**, not AST transformation. May affect comments/strings.
+- **`rename` uses AST-based identifier replacement** — preserves comments and string literals. Local variables that shadow the definition name are detected and preserved (with a warning).
 
 ## License
 
