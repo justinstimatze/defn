@@ -65,4 +65,4 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 - Go only (type-checked references require go/types)
 - Binary ~140MB due to embedded Dolt (requires CGO for zstd)
 - rename op, delete op, apply op use full resolve (touches multiple modules)
-- rename op is string replacement, may corrupt comments/strings
+- rename op uses AST-based replacement (fixed in v0.2.1)

@@ -1,16 +1,16 @@
 # Influences & Citations
 
-All dependencies and inspirations are MIT or BSD-2 licensed unless noted.
-defn is MIT licensed.
+All dependencies and inspirations are Apache 2.0, MIT, or BSD-2 licensed unless noted.
+defn is Apache 2.0 licensed.
 
 ## Direct Lineage
 
-- **adit-code** (MIT) — Measured structural properties of source code that
-  predict AI editing cost. Validated against SWE-bench agent trajectories
-  (1,840 files, 49 repos). Blast radius is the strongest
-  predictor (median Spearman +0.474, positive on all 49 repos). defn exists
-  because adit proved the cost is real — and that the root cause is storing
-  code as files.
+- **[adit-code](https://github.com/justinstimatze/adit-code)** (Apache 2.0) — Measured structural
+  properties of source code that predict AI editing cost. Validated against
+  SWE-bench agent trajectories (1,840 files, 49 repos). Blast radius is the
+  strongest predictor (median Spearman +0.474, positive on all 49 repos).
+  defn exists because adit proved the cost is real — and that the root cause
+  is storing code as files.
 
 ## Code-as-Database Systems
 

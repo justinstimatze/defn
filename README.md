@@ -9,13 +9,13 @@
 
 **The round-trip is lossless.** defn and your files stay perfectly in sync — all comments, file structure, and definitions are preserved. Edit through defn or edit files directly; the database auto-detects changes and re-ingests. Either can recover the other.
 
-```
-"What breaks if I change Render?"
+**"What breaks if I change Render?"**
 
-Without defn:  grep → read 5 files → scroll → guess    (9 calls, 144K tokens, 45s)
-With defn:     code(op:"impact", name:"Render")         (2 calls,  51K tokens, 12s)
-               → 33 callers, 341 transitive, 238 tests — including interface dispatch
-```
+> **Without defn:** grep → read 5 files → scroll → guess
+> 9 calls | 144K tokens | 45s | found 19 of 21 callers | no transitives | no test count
+
+> **With defn:** `code(op:"impact", name:"Render")`
+> **2 calls | 51K tokens | 12s | 33 callers | 341 transitive | 238 tests** — including interface dispatch
 
 ## What makes this different
 
@@ -74,7 +74,8 @@ One MCP tool — `code` — with an `op` field. Your AI agent calls it naturally
 |---|---|
 | "Show me Render" | `code(op:"read", name:"Render")` — full source, disambiguated by blast radius |
 | "What depends on this?" | `code(op:"impact", name:"X")` — callers, transitives, test coverage, interface dispatch |
-| "Edit this function" | `code(op:"edit", name:"X", new_body:"...")` — updates DB + emits files + verifies build |
+| "Change 3 lines in this function" | `code(op:"edit", name:"X", old_fragment:"...", new_fragment:"...")` — no need to provide the whole body |
+| "Rewrite this function" | `code(op:"edit", name:"X", new_body:"...")` — full replacement, auto-emits + builds |
 | "What's in this file?" | `code(op:"overview", file:"server.go")` — all definitions with caller/callee counts |
 | "Rename across the codebase" | `code(op:"rename", old_name:"X", new_name:"Y")` — updates definition + all callers |
 | "Run only affected tests" | `code(op:"test", name:"X")` — via reference graph, not `go test ./...` |
@@ -92,11 +93,11 @@ One MCP tool — `code` — with an `op` field. Your AI agent calls it naturally
 | `overview` | All definitions in a file with relationships | `file` |
 | `similar` | Find definitions with similar signatures | `name` |
 | `untested` | Definitions without test coverage | — |
-| `edit` | Replace body, auto-emit + build | `name`, `new_body` |
-| `patch` | String replacement within a definition | `name`, `old_name`, `new_name` |
+| `edit` | Full body replace, OR fragment replace via `old_fragment`+`new_fragment` | `name` |
+| `insert` | Insert code after an anchor string | `name`, `after`, `body` |
 | `create` | Create (infers name/kind from body) | `body`, optional `module` |
 | `delete` | Remove + clean up references | `name` |
-| `rename` | Rename + update callers (string replacement) | `old_name`, `new_name` |
+| `rename` | Rename + update callers (AST-based, preserves comments) | `old_name`, `new_name` |
 | `move` | Move to another module | `name`, `module` |
 | `test` | Run only affected tests | `name` |
 | `simulate` | Throwaway branch, apply mutations, ripple report | `mutations` |
