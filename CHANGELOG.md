@@ -4,6 +4,29 @@ All notable changes to defn will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.0] - 2026-03-26
+
+### Added
+- Interface dispatch: callers of interface methods connected to concrete implementations
+- Interface satisfaction edges: `types.Implements` adds `implements` reference kind
+- Expanded resolve: var/const initializers and type definitions (struct fields, embedded types) now captured — 30% more references
+- Fuzzy receiver lookup: `*Router` matches `*DefaultRouter`, suffix matching fallback chain
+- Lossless round-trip: `renderNode` slices original source by byte position, preserving all comments
+- `source_file` column: tracks original Go source filename per definition
+- Multi-file emit: writes to original filenames instead of one file per package
+- Transactional apply: `START TRANSACTION` / `ROLLBACK` on error
+- New ops: simulate, test-coverage, batch-impact, file-defs, overview, patch
+- Impact-on-edit nudge: edit response includes "FYI: N callers, M tests affected"
+- Richer CLAUDE.md: "when to use defn vs file tools" decision framework
+- Non-destructive freshness check in `defn status`
+- SessionStart hook for auto-init
+- File watcher source cache (avoids re-reading same file per definition)
+- Go 1.26: 30% lower CGO overhead, `strings.SplitSeq`, iterator methods
+
+### Benchmarked
+- gin: `responseWriter.WriteHeader` goes from 1 caller / 1 test → 33 callers / 238 tests (interface dispatch)
+- defn self-ingest: 398 → 515 references (+30%) from expanded resolve
+
 ## [0.1.0] - 2026-03-22
 
 ### Added
@@ -15,9 +38,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 - Impact analysis: blast radius, transitive callers, test coverage per definition
 - Smart disambiguation: ambiguous names resolved by most non-test callers
 - Reference resolution: includes test packages, receiver-qualified method lookups
-- Lossless round-trip: all comments, file structure, and definitions preserved
-- Multi-file emit: writes to original filenames (server.go stays server.go)
-- Transactional apply: batch operations roll back on any failure
 - Auto-emit on edit: edit op updates DB and files simultaneously
 - Incremental resolve: edit op and create op only re-resolve the changed module
 - In-process resolve: no DB lock conflicts, no dependency on defn binary in PATH

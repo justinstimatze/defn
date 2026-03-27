@@ -2,172 +2,24 @@
 
 [![CI](https://github.com/justinstimatze/defn/actions/workflows/ci.yml/badge.svg)](https://github.com/justinstimatze/defn/actions/workflows/ci.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/justinstimatze/defn)](https://goreportcard.com/report/github.com/justinstimatze/defn)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Release](https://img.shields.io/github/v/release/justinstimatze/defn)](https://github.com/justinstimatze/defn/releases)
 
-AI-native code database for Go. A **defn** is a definition — the atomic unit of code. Navigate, edit, and understand Go code by structure instead of by file.
-
-## Why
-
-AI agents spend most of their time *finding* code, not *changing* it. On gin-gonic/gin:
-
-**Reading a function — without defn:**
-```
-grep "Render" → 269 results across dozens of files
-Read context.go (1,489 lines) → scroll to find the right Render
-There are 20+ definitions named "Render" — which one?
-4+ tool calls, ~8K tokens of file content.
-```
-
-**Reading a function — with defn:**
-```
-code(op: "read", name: "Render")
-```
-One call. defn disambiguates by blast radius — returns `(*Context).Render`, the one with the most callers.
-
-**Editing — without defn:**
-```
-Read context.go → find function → craft str_replace with enough
-surrounding context to be unique → hope it matches exactly one location
-```
-
-**Editing — with defn:**
-```
-code(op: "edit", name: "Render", new_body: "func (c *Context) Render...")
-```
-
-This extends to harder queries. We asked Claude "blast radius of Render" on gin via `claude -p`:
-
-<details>
-<summary><b>Without defn</b> — 9 tool calls, 144K input tokens, 45s</summary>
-
-Claude used 9 Grep/Read calls to find callers of Render in context.go. Found 19 of 21 callers. Couldn't compute transitive callers or test coverage — would require reading every test file and tracing call chains manually.
-</details>
-
-<details>
-<summary><b>With defn</b> — 2 tool calls, 51K input tokens, 12s</summary>
-
-Claude called `code(op:"impact", name:"Context.Render")`. defn parsed the receiver, found `(*Context).Render`, and returned all 21 callers, 134 transitive callers, and 111 covering tests in one response.
-</details>
-
-**65% fewer tokens, 75% faster, more complete answer.** Measured via `claude -p` on gin-gonic/gin. Results vary by run.
-
-## Setup
-
-```bash
-go install github.com/justinstimatze/defn/cmd/defn@latest
-go install golang.org/x/tools/cmd/goimports@latest
-
-cd your-go-project
-defn init . --server    # recommended: starts Dolt server for multi-agent
-defn init .             # or: embedded mode, no server needed
-```
-
-To remove everything: `defn clean`
-
-Requires Go 1.26+, CGO, and `goimports`. Binary is ~140MB due to embedded Dolt engine.
-
-**macOS:** install ICU first: `brew install icu4c` then build with:
-```bash
-export CGO_CFLAGS="-I$(brew --prefix icu4c)/include"
-export CGO_LDFLAGS="-L$(brew --prefix icu4c)/lib"
-go install github.com/justinstimatze/defn/cmd/defn@latest
-```
-
-`defn init` parses your Go source, stores definitions and references in [Dolt](https://www.dolthub.com/), and configures MCP for Claude Code and OpenAI Codex.
-
-The database is a **lossless representation** of your source — all comments, file structure, and definitions are preserved on round-trip. Edits via defn update the database and emit files. File edits are auto-detected and re-ingested. Either can recover the other: `defn init` rebuilds the database from files; `defn emit` recreates files from the database. The `.defn/` directory is gitignored — rebuild on clone with `defn init`.
-
-### Embedded mode
-
-`defn init .` creates a `.defn/` directory with an embedded database. No server needed. Good for single-user workflows.
-
-### Server mode (recommended)
-
-`defn init . --server` starts a Dolt server automatically:
-- Installs to `.defn-server/`, binds to `127.0.0.1:3307`
-- Creates a `defn` user with a cryptographically random password (no root access)
-- Configures MCP with the authenticated DSN
-- Requires [Dolt](https://github.com/dolthub/dolt/releases) installed
-
-Manage the server: `defn server start`, `defn server stop`, `defn server status`.
-
-**Why server mode:**
-- Multiple agents work concurrently (each session has its own branch)
-- Standard MySQL clients for debugging (`mysql -h 127.0.0.1 -P 3307`)
-- `defn push` / `defn pull` to [DoltHub](https://www.dolthub.com/) for cloud hosting
-
-### Try it
-
-After `defn init`, start Claude Code or Codex and ask:
+**defn replaces files with a graph.** Every Go function, method, type, and constant becomes a node. Every call, reference, and interface implementation becomes an edge. AI agents query the graph instead of grepping through files.
 
 ```
-"What's the blast radius of changing the Render function?"
-"Which functions have no test coverage?"
-"Find all functions that handle authentication"
+"What breaks if I change Render?"
+
+Without defn:  grep → read 5 files → scroll → guess    (9 calls, 144K tokens, 45s)
+With defn:     code(op:"impact", name:"Render")         (2 calls,  51K tokens, 12s)
+               → 33 callers, 341 transitive, 238 tests — including interface dispatch
 ```
 
-## How agents actually spend their time
+## What makes this different
 
-Analysis of [SWE-bench agent trajectories](https://huggingface.co/datasets/nebius/SWE-rebench-openhands-trajectories) (via [adit-code](https://github.com/justinstimatze/adit-code)) across 1,840 files and 49 repos found that file size is the strongest predictor of agent cost. The common operations defn replaces:
+**Files don't know about each other.** grep finds text matches, not callers. Reading `context.go` doesn't tell you that `responseWriter` satisfies `ResponseWriter`, or that changing `WriteHeader` breaks 238 tests through interface dispatch. That information exists in the type system but dies when you close your editor.
 
-| Operation | With files | With defn |
-|---|---|---|
-| **Find a function** | grep → read file → scroll | `code(op:"read", name:"X")` |
-| **Edit a function** | read file → find it → str_replace | `code(op:"edit", name:"X", body:...)` |
-| **Understand callers** | grep → disambiguate → read each | `code(op:"impact", name:"X")` |
-| **Run affected tests** | `go test ./...` (everything) | `code(op:"test", name:"X")` |
-| **Rename across codebase** | grep → edit each file | `code(op:"rename", old_name:"X", new_name:"Y")` |
-
-Name-based ops accept `file:line` paths and `Receiver.Method` syntax.
-
-## Tool
-
-One MCP tool — `code` — with an `op` field. Single tool schema in context instead of 17 separate tool definitions, following the [Dynamic Context Loading](https://cefboud.com/posts/dynamic-context-loading-llm-mcp/) pattern.
-
-```
-code(op: "read", name: "Render")
-code(op: "impact", name: "Render")
-code(op: "edit", name: "Render", new_body: "func ...")
-code(op: "search", pattern: "%Auth%")
-```
-
-**Operations:**
-
-| Op | What it does | Key params |
-|---|---|---|
-| `read` | Full source of a definition | `name` or `file:line` |
-| `search` | Find by name pattern (%) or body text | `pattern` |
-| `impact` | Blast radius, callers, test coverage | `name` |
-| `explain` | Signature + callers + callees + tests | `name` |
-| `similar` | Find definitions with similar signatures | `name` |
-| `untested` | Definitions without test coverage | — |
-| `edit` | Replace body, auto-emit + build | `name`, `new_body` |
-| `create` | Create (infers name/kind from body) | `body`, optional `module` |
-| `delete` | Remove + clean up references | `name` |
-| `rename` | Rename + update callers (string replacement) | `old_name`, `new_name` |
-| `move` | Move to another module | `name`, `module` |
-| `test` | Run only affected tests | `name` |
-| `apply` | Batch operations | `operations` |
-| `diff` | Uncommitted changes | — |
-| `history` | Commit history for a definition | `name` |
-| `find` | Definition at a file:line | `file`, `line` |
-| `sync` | Re-ingest after file edits | — |
-| `query` | Read-only SQL | `sql` |
-
-Write operations auto-emit files and auto-resolve references. The MCP server watches for external file changes and auto-reingests, so editing via file tools stays in sync. Set `DEFN_LEGACY=1` to disable auto-emit.
-
-Configuration via `defn.toml` (optional):
-```toml
-db = ".defn"        # or a MySQL DSN for server mode
-port = "3307"       # server port
-build-timeout = "30s"
-test-timeout = "60s"
-```
-
-## What it stores
-
-Each function, method, type, and constant is a row. References between them are rows. Test coverage is derived from the reference graph.
+**defn makes it permanent.** It parses your code with `go/types` (the same type checker gopls uses) and stores the result in [Dolt](https://www.dolthub.com/) — a SQL database with git semantics. The reference graph persists across sessions, includes interface satisfaction, and is queryable:
 
 ```sql
 -- Who calls Render and has no tests?
@@ -182,73 +34,114 @@ AND NOT EXISTS (
 )
 ```
 
+**The database and files stay in sync.** Edits through defn update the database and emit files. File edits are auto-detected and re-ingested. The round-trip is lossless — all comments, file structure, and definitions are preserved.
+
+## Setup
+
+```bash
+go install github.com/justinstimatze/defn/cmd/defn@latest
+go install golang.org/x/tools/cmd/goimports@latest
+
+cd your-go-project
+defn init . --server    # recommended: starts Dolt server for multi-agent
+defn init .             # or: embedded mode, no server needed
+```
+
+Then start Claude Code or Codex and ask:
+
+```
+"What's the blast radius of changing the Render function?"
+"Which functions have no test coverage?"
+"Find all functions that handle authentication"
+```
+
+To remove everything: `defn clean`
+
+Requires Go 1.26+, CGO, and `goimports`. Binary is ~140MB due to embedded Dolt engine.
+
+**macOS:** `brew install icu4c` then:
+```bash
+export CGO_CFLAGS="-I$(brew --prefix icu4c)/include"
+export CGO_LDFLAGS="-L$(brew --prefix icu4c)/lib"
+go install github.com/justinstimatze/defn/cmd/defn@latest
+```
+
+## How it works
+
+One MCP tool — `code` — with an `op` field. Your AI agent calls it naturally:
+
+| What you ask | What defn does |
+|---|---|
+| "Show me Render" | `code(op:"read", name:"Render")` — full source, disambiguated by blast radius |
+| "What depends on this?" | `code(op:"impact", name:"X")` — callers, transitives, test coverage, interface dispatch |
+| "Edit this function" | `code(op:"edit", name:"X", new_body:"...")` — updates DB + emits files + verifies build |
+| "What's in this file?" | `code(op:"overview", file:"server.go")` — all definitions with caller/callee counts |
+| "Rename across the codebase" | `code(op:"rename", old_name:"X", new_name:"Y")` — updates definition + all callers |
+| "Run only affected tests" | `code(op:"test", name:"X")` — via reference graph, not `go test ./...` |
+| "Simulate a change" | `code(op:"simulate", mutations:[...])` — throwaway branch, ripple report, discard |
+
+<details>
+<summary>All operations</summary>
+
+| Op | What it does | Key params |
+|---|---|---|
+| `read` | Full source of a definition | `name` or `file:line` |
+| `search` | Find by name pattern (%) or body text | `pattern` |
+| `impact` | Blast radius, callers, test coverage | `name` |
+| `explain` | Signature + callers + callees + tests | `name` |
+| `overview` | All definitions in a file with relationships | `file` |
+| `similar` | Find definitions with similar signatures | `name` |
+| `untested` | Definitions without test coverage | — |
+| `edit` | Replace body, auto-emit + build | `name`, `new_body` |
+| `patch` | String replacement within a definition | `name`, `old_name`, `new_name` |
+| `create` | Create (infers name/kind from body) | `body`, optional `module` |
+| `delete` | Remove + clean up references | `name` |
+| `rename` | Rename + update callers (string replacement) | `old_name`, `new_name` |
+| `move` | Move to another module | `name`, `module` |
+| `test` | Run only affected tests | `name` |
+| `simulate` | Throwaway branch, apply mutations, ripple report | `mutations` |
+| `apply` | Batch operations (transactional) | `operations` |
+| `diff` | Uncommitted changes | — |
+| `history` | Commit history for a definition | `name` |
+| `find` | Definition at a file:line | `file`, `line` |
+| `sync` | Re-ingest after file edits | — |
+| `query` | Read-only SQL | `sql` |
+| `test-coverage` | Test names covering a definition | `name` |
+| `batch-impact` | Combined blast radius for multiple definitions | `names` |
+| `file-defs` | Map file path to definitions | `file` |
+
+</details>
+
+Name-based ops accept `file:line` paths and `Receiver.Method` syntax (`Context.Render`, `(*Router).Handle`).
+
 ## Versioning
 
 Dolt gives git semantics on SQL data. Branch, merge, diff, commit — natively, on definitions.
 
 ```bash
-defn branch feature
-defn checkout feature
+defn branch feature && defn checkout feature
 # make changes
 defn commit "add auth middleware"
-defn checkout main
-defn merge feature
+defn checkout main && defn merge feature
 ```
 
-**Multi-agent workflow (server mode):**
-
-```bash
-# Each agent gets its own branch on the shared server:
-defn branch agent-1 && defn checkout agent-1
-# ... agent 1 works ...
-defn commit "add auth middleware"
-
-defn branch agent-2 && defn checkout agent-2
-# ... agent 2 works ...
-defn commit "refactor handlers"
-
-# Merge both back
-defn checkout main
-defn merge agent-1
-defn merge agent-2
-```
-
-In server mode, each MySQL session has its own branch context via `CALL DOLT_CHECKOUT` — multiple agents work concurrently on the same Dolt server without interference. In embedded mode, `defn worktree <name>` copies the database to a separate directory.
-
-For remote collaboration (e.g. pushing to [DoltHub](https://www.dolthub.com/)): `defn push origin main`.
-
-Dolt handles row-level merge. Semantic conflicts (e.g. one agent renames a function, another adds a caller) require manual resolution.
-
-## Limitations
-
-- **Go only.** The type-checked reference graph requires `go/types`. Other languages would need their own type checkers.
-- **`rename` op is string replacement**, not AST transformation. May affect comments/strings containing the name.
-
-## Self-hosting
-
-defn can ingest, emit, and rebuild itself:
-
-```bash
-defn ingest . && defn emit /tmp/out
-cd /tmp/out && go build ./cmd/defn/
-```
-
-Verified on go-chi/chi, gorilla/mux, gin-gonic/gin, BurntSushi/toml.
+In server mode, multiple agents branch and merge concurrently on the same Dolt server.
 
 ## Scale
 
-| Project | Lines | Defs | Refs | Init time | DB size |
-|---------|-------|------|------|-----------|---------|
-| chi | 10K | 370 | 704 | 11s | 15M |
-| gin | 24K | 1,580 | 3,829 | 48s | 81M |
-| hugo | 218K | 10,221 | 22,209 | 7min | 714M |
+| Project | Lines | Defs | Refs | Init time |
+|---------|-------|------|------|-----------|
+| chi | 10K | 370 | 704 | 11s |
+| gin | 24K | 1,580 | 3,829 | 48s |
+| hugo | 218K | 10,221 | 22,209 | 7min |
 
-Tested up to ~200K lines. Projects with cgo imports (moby) are not yet supported. Init is a one-time cost — incremental resolve after edits is much faster.
+Init is a one-time cost. Incremental resolve after edits is much faster.
 
-## Why not gopls?
+## Limitations
 
-gopls answers "who calls X?" too. But it can't compose callers + transitives + test coverage into one answer. It doesn't persist across sessions. It doesn't version definitions. It needs `file:line:col` — defn just needs a name. And it can't edit, rename, or delete.
+- **Go only.** The type-checked reference graph requires `go/types`.
+- **`rename` is string replacement**, not AST transformation. May affect comments/strings.
 
 ## License
 
-MIT. Built on [Dolt](https://github.com/dolthub/dolt) (Apache 2.0) and [adit-code](https://github.com/justinstimatze/adit-code) research. See [INFLUENCES.md](INFLUENCES.md).
+Apache 2.0. Built on [Dolt](https://github.com/dolthub/dolt) (Apache 2.0) and [adit-code](https://github.com/justinstimatze/adit-code) research. See [INFLUENCES.md](INFLUENCES.md).

@@ -87,7 +87,7 @@ Dolt system tables (queryable via `code(op:"query")`):
 ## Conventions
 
 - **All comments are preserved** on round-trip — doc comments, inline comments, and comments between statements. The database is a lossless representation of the source.
-- All Go dependencies MIT or BSD-2 licensed (Dolt is Apache 2.0).
+- All Go dependencies MIT, BSD-2, or Apache 2.0 licensed.
 - `internal/store/schema.sql` is the schema source of truth (embedded via `//go:embed`).
 - `internal/store/` must not import other internal packages.
 - `.defn/` directory gitignored by `defn init`.
