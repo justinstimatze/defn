@@ -60,14 +60,14 @@ func Run(ctx context.Context, database *store.DB, projDir string) error {
 
 	server := sdkmcp.NewServer(&sdkmcp.Implementation{
 		Name:    "defn",
-		Version: "0.1.0",
+		Version: "0.2.0",
 	}, nil)
 
 	sdkmcp.AddTool(server, &sdkmcp.Tool{
 		Name: "code",
 		Description: `Go code database. One tool, many ops. Start with impact for blast radius — it returns callers, transitives, and test coverage in one call. Don't follow up with search/explain unless you need more.
 
-Ops: impact (blast radius — START HERE), read, search, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, find, sync, query`,
+Ops: impact (blast radius — START HERE), read, search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync, query, overview, patch`,
 	}, s.handleCode)
 
 	return server.Run(ctx, &sdkmcp.StdioTransport{})
@@ -80,7 +80,8 @@ Ops: impact (blast radius — START HERE), read, search, explain, similar, untes
 //
 //	read, impact, explain, delete, test, history: name
 //	search: pattern (or name as fallback)
-//	edit: name + new_body
+//	edit: name + new_body (full replace) OR name + old_fragment + new_fragment (fragment)
+//	insert: name + after + body
 //	create: body (+ optional module)
 //	rename: old_name + new_name
 //	move: name + module
@@ -104,16 +105,25 @@ type codeParam struct {
 	Mutations  []store.Mutation `json:"mutations,omitempty"`
 	Depth      int              `json:"depth,omitempty"`
 	Receiver   string           `json:"receiver,omitempty"`
-	Operations []applyOp        `json:"operations,omitempty"`
-	DryRun     bool             `json:"dry_run,omitempty"`
+	OldFragment string           `json:"old_fragment,omitempty"`
+	NewFragment string           `json:"new_fragment,omitempty"`
+	After       string           `json:"after,omitempty"`
+	ReplaceAll  bool             `json:"replace_all,omitempty"`
+	Operations  []applyOp        `json:"operations,omitempty"`
+	DryRun      bool             `json:"dry_run,omitempty"`
 }
 
 type applyOp struct {
-	Op      string `json:"op"`
-	Name    string `json:"name"`
-	NewName string `json:"new_name"`
-	Body    string `json:"body"`
-	Module  string `json:"module"`
+	Op          string `json:"op"`
+	Name        string `json:"name"`
+	NewName     string `json:"new_name"`
+	Body        string `json:"body"`
+	NewBody     string `json:"new_body"`
+	Module      string `json:"module"`
+	OldFragment string `json:"old_fragment"`
+	NewFragment string `json:"new_fragment"`
+	After       string `json:"after"`
+	ReplaceAll  bool   `json:"replace_all"`
 }
 
 // Legacy param types used by internal handlers.
@@ -225,11 +235,25 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if r, o, e := need(args.Name, "name"); r != nil {
 			return r, o, e
 		}
-		body := args.NewBody
-		if body == "" {
-			body = args.Body
+		// Fragment mode: old_fragment + new_fragment (new_fragment can be empty for deletion).
+		// Full mode: new_body.
+		if args.OldFragment == "" {
+			body := args.NewBody
+			if body == "" {
+				body = args.Body
+			}
+			if r, o, e := need(body, "new_body (or old_fragment + new_fragment for fragment edit)"); r != nil {
+				return r, o, e
+			}
 		}
-		if r, o, e := need(body, "new_body"); r != nil {
+	case "insert":
+		if r, o, e := need(args.Name, "name"); r != nil {
+			return r, o, e
+		}
+		if r, o, e := need(args.After, "after"); r != nil {
+			return r, o, e
+		}
+		if r, o, e := need(args.Body, "body"); r != nil {
 			return r, o, e
 		}
 	case "create":
@@ -276,11 +300,16 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "untested":
 		return s.handleUntested(ctx, req, emptyParam{})
 	case "edit":
+		if args.OldFragment != "" {
+			return s.handleFragmentEdit(ctx, req, args)
+		}
 		body := args.NewBody
 		if body == "" {
 			body = args.Body
 		}
 		return s.handleEdit(ctx, req, editParam{Name: args.Name, NewBody: body})
+	case "insert":
+		return s.handleInsert(ctx, req, args)
 	case "create":
 		return s.handleCreate(ctx, req, createParam{Body: args.Body, Module: args.Module})
 	case "delete":
@@ -459,6 +488,12 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 		return errResult(fmt.Errorf("definition %q not found", args.Name))
 	}
 
+	// Validate new body parses as Go.
+	src := "package x\n" + args.NewBody
+	if _, parseErr := parser.ParseFile(token.NewFileSet(), "", src, parser.ParseComments); parseErr != nil {
+		return errResult(fmt.Errorf("new_body has syntax error: %v", parseErr))
+	}
+
 	d.Body = args.NewBody
 	d.Signature = extractSignature(args.NewBody)
 
@@ -628,6 +663,119 @@ func extractSignature(body string) string {
 		}
 	}
 	return body
+}
+
+func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	d, err := s.db.GetDefinitionByName(args.Name, "")
+	if err != nil {
+		return errResult(fmt.Errorf("definition %q not found", args.Name))
+	}
+
+	// Reject empty old_fragment (strings.ReplaceAll inserts between every char).
+	if args.OldFragment == "" {
+		return errResult(fmt.Errorf("old_fragment cannot be empty"))
+	}
+
+	// Check old_fragment exists in body.
+	count := strings.Count(d.Body, args.OldFragment)
+	if count == 0 {
+		return errResult(fmt.Errorf("old_fragment not found in %s body", args.Name))
+	}
+	if count > 1 && !args.ReplaceAll {
+		return errResult(fmt.Errorf("old_fragment matches %d times in %s — use replace_all:true to replace all, or provide a more specific fragment", count, args.Name))
+	}
+
+	var newBody string
+	if args.ReplaceAll {
+		newBody = strings.ReplaceAll(d.Body, args.OldFragment, args.NewFragment)
+	} else {
+		newBody = strings.Replace(d.Body, args.OldFragment, args.NewFragment, 1)
+	}
+
+	// Validate syntax BEFORE dry-run response.
+	src := "package x\n" + newBody
+	if _, parseErr := parser.ParseFile(token.NewFileSet(), "", src, parser.ParseComments); parseErr != nil {
+		return errResult(fmt.Errorf("fragment edit produces invalid Go: %v", parseErr))
+	}
+
+	if args.DryRun {
+		return textResult(fmt.Sprintf("Dry run — would edit %s:\n\n--- old ---\n%s\n\n+++ new ---\n%s", args.Name, args.OldFragment, args.NewFragment)), nil, nil
+	}
+
+	d.Body = newBody
+	d.Signature = extractSignature(newBody)
+	recv := formatReceiver(d.Receiver)
+
+	id, err := s.db.UpsertDefinition(d)
+	if err != nil {
+		return errResult(err)
+	}
+
+	buildResult := s.autoEmitAndBuild()
+	s.autoResolve(s.modulePath(d.ModuleID))
+
+	var sb strings.Builder
+	replaced := "1 occurrence"
+	if args.ReplaceAll {
+		replaced = fmt.Sprintf("%d occurrences", count)
+	}
+	sb.WriteString(fmt.Sprintf("Edited %s%s — replaced %s\n", recv, d.Name, replaced))
+	if buildResult != "" {
+		sb.WriteString("\n" + buildResult)
+	}
+	if impact, err := s.db.GetImpact(id); err == nil && len(impact.DirectCallers) > 0 {
+		prodCallers := 0
+		for _, c := range impact.DirectCallers {
+			if !c.Test {
+				prodCallers++
+			}
+		}
+		sb.WriteString(fmt.Sprintf("\nFYI: %d callers, %d tests affected.\n", prodCallers, len(impact.Tests)))
+	}
+	return textResult(sb.String()), nil, nil
+}
+
+func (s *server) handleInsert(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	d, err := s.db.GetDefinitionByName(args.Name, "")
+	if err != nil {
+		return errResult(fmt.Errorf("definition %q not found", args.Name))
+	}
+
+	idx := strings.Index(d.Body, args.After)
+	if idx < 0 {
+		return errResult(fmt.Errorf("anchor text not found in %s body", args.Name))
+	}
+
+	insertAt := idx + len(args.After)
+	newBody := d.Body[:insertAt] + args.Body + d.Body[insertAt:]
+
+	if args.DryRun {
+		return textResult(fmt.Sprintf("Dry run — would insert into %s after %q:\n\n%s", args.Name, args.After, args.Body)), nil, nil
+	}
+
+	// Validate.
+	src := "package x\n" + newBody
+	if _, parseErr := parser.ParseFile(token.NewFileSet(), "", src, parser.ParseComments); parseErr != nil {
+		return errResult(fmt.Errorf("insert produces invalid Go: %v", parseErr))
+	}
+
+	d.Body = newBody
+	d.Signature = extractSignature(newBody)
+	recv := formatReceiver(d.Receiver)
+
+	if _, err := s.db.UpsertDefinition(d); err != nil {
+		return errResult(err)
+	}
+
+	buildResult := s.autoEmitAndBuild()
+	s.autoResolve(s.modulePath(d.ModuleID))
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Inserted into %s%s\n", recv, d.Name))
+	if buildResult != "" {
+		sb.WriteString("\n" + buildResult)
+	}
+	return textResult(sb.String()), nil, nil
 }
 
 func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args createParam) (*sdkmcp.CallToolResult, any, error) {
@@ -833,8 +981,36 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				errors = append(errors, fmt.Sprintf("edit %s: not found", op.Name))
 				continue
 			}
-			d.Body = op.Body
-			d.Signature = extractSignature(op.Body)
+			if op.OldFragment != "" {
+				// Fragment mode.
+				count := strings.Count(d.Body, op.OldFragment)
+				if count == 0 {
+					errors = append(errors, fmt.Sprintf("edit %s: old_fragment not found", op.Name))
+					continue
+				}
+				if count > 1 && !op.ReplaceAll {
+					errors = append(errors, fmt.Sprintf("edit %s: old_fragment matches %d times, use replace_all:true", op.Name, count))
+					continue
+				}
+				if op.ReplaceAll {
+					d.Body = strings.ReplaceAll(d.Body, op.OldFragment, op.NewFragment)
+				} else {
+					d.Body = strings.Replace(d.Body, op.OldFragment, op.NewFragment, 1)
+				}
+			} else {
+				body := op.NewBody
+				if body == "" {
+					body = op.Body
+				}
+				d.Body = body
+			}
+			// Validate syntax before saving.
+			validSrc := "package x\n" + d.Body
+			if _, parseErr := parser.ParseFile(token.NewFileSet(), "", validSrc, parser.ParseComments); parseErr != nil {
+				errors = append(errors, fmt.Sprintf("edit %s: produces invalid Go: %v", op.Name, parseErr))
+				continue
+			}
+			d.Signature = extractSignature(d.Body)
 			if _, err := s.db.UpsertDefinition(d); err != nil {
 				errors = append(errors, fmt.Sprintf("edit %s: %v", op.Name, err))
 			} else {
