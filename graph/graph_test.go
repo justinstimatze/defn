@@ -50,6 +50,33 @@ func TestGraphQueries(t *testing.T) {
 	if d := g.GetDef("Widget.Baz", ""); d == nil || d.ID != 4 {
 		t.Errorf("expected Baz (id=4), got %v", d)
 	}
+	// CallerDefs / CallerIDs
+	callerDefs := g.CallerDefs(1)
+	if len(callerDefs) != 2 {
+		t.Errorf("expected 2 direct callers of Foo, got %d", len(callerDefs))
+	}
+	if len(g.CallerIDs(1)) != 2 {
+		t.Errorf("expected 2 caller IDs, got %d", len(g.CallerIDs(1)))
+	}
+
+	// DefsInFile
+	defs := g.DefsInFile("foo.go", 1)
+	if len(defs) != 1 || defs[0].Name != "Foo" {
+		t.Errorf("DefsInFile(foo.go, 1) = %v, want [Foo]", defs)
+	}
+
+	// DefsInFile unscoped (moduleID=0)
+	allFoo := g.DefsInFile("foo.go", 0)
+	if len(allFoo) != 1 {
+		t.Errorf("DefsInFile(foo.go, 0) = %d, want 1", len(allFoo))
+	}
+
+	// CallerFiles unscoped
+	callerFilesAll := g.CallerFiles("foo.go", 0)
+	if callerFilesAll["bar.go"] != 1 {
+		t.Error("unscoped CallerFiles missing bar.go")
+	}
+
 	if len(g.TransitiveCallers(1)) != 2 {
 		t.Errorf("expected 2 transitive callers, got %d", len(g.TransitiveCallers(1)))
 	}

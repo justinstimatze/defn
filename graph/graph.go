@@ -105,11 +105,60 @@ type fileKey struct {
 	ModuleID int64
 }
 
+// CallerDefs returns the direct callers of a definition as Def objects.
+func (g *Graph) CallerDefs(defID int64) []*Def {
+	var result []*Def
+	for _, id := range g.callers[defID] {
+		if d, ok := g.byID[id]; ok {
+			result = append(result, d)
+		}
+	}
+	return result
+}
+
+// CallerIDs returns the direct caller definition IDs.
+func (g *Graph) CallerIDs(defID int64) []int64 {
+	return g.callers[defID]
+}
+
+// CalleeDefs returns the direct callees of a definition as Def objects.
+func (g *Graph) CalleeDefs(defID int64) []*Def {
+	var result []*Def
+	for _, id := range g.callees[defID] {
+		if d, ok := g.byID[id]; ok {
+			result = append(result, d)
+		}
+	}
+	return result
+}
+
+// CalleeIDs returns the direct callee definition IDs.
+func (g *Graph) CalleeIDs(defID int64) []int64 {
+	return g.callees[defID]
+}
+
+// DefsInFile returns all definitions in a source file. If moduleID is 0,
+// searches across all modules.
+func (g *Graph) DefsInFile(sourceFile string, moduleID int64) []*Def {
+	if moduleID != 0 {
+		return g.byFile[fileKey{sourceFile, moduleID}]
+	}
+	// Unscoped: search all modules for this file.
+	var result []*Def
+	for key, defs := range g.byFile {
+		if key.File == sourceFile {
+			result = append(result, defs...)
+		}
+	}
+	return result
+}
+
 // CallerFiles returns a map of source_file → count of callers for all
-// definitions in the given file and module.
+// definitions in the given file and module. If moduleID is 0, searches
+// across all modules.
 func (g *Graph) CallerFiles(sourceFile string, moduleID int64) map[string]int {
 	result := map[string]int{}
-	for _, d := range g.byFile[fileKey{sourceFile, moduleID}] {
+	for _, d := range g.DefsInFile(sourceFile, moduleID) {
 		for _, callerID := range g.callers[d.ID] {
 			if caller, ok := g.byID[callerID]; ok && caller.SourceFile != "" {
 				result[caller.SourceFile]++
@@ -123,7 +172,7 @@ func (g *Graph) CallerFiles(sourceFile string, moduleID int64) map[string]int {
 // definitions in the given file and module.
 func (g *Graph) CalleeFiles(sourceFile string, moduleID int64) map[string]int {
 	result := map[string]int{}
-	for _, d := range g.byFile[fileKey{sourceFile, moduleID}] {
+	for _, d := range g.DefsInFile(sourceFile, moduleID) {
 		for _, calleeID := range g.callees[d.ID] {
 			if callee, ok := g.byID[calleeID]; ok && callee.SourceFile != "" {
 				result[callee.SourceFile]++
@@ -146,10 +195,11 @@ func (g *Graph) SiblingFiles(sourceFile string, moduleID int64) []string {
 	return result
 }
 
-// ExportedNames returns exported definition names in a file.
+// ExportedNames returns exported definition names in a file. If moduleID is 0,
+// searches across all modules.
 func (g *Graph) ExportedNames(sourceFile string, moduleID int64) []string {
 	var result []string
-	for _, d := range g.byFile[fileKey{sourceFile, moduleID}] {
+	for _, d := range g.DefsInFile(sourceFile, moduleID) {
 		if d.Exported && !d.Test {
 			result = append(result, d.FullName())
 		}
