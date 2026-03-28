@@ -386,25 +386,25 @@ DEFN_DB = %q
 	claudeMDPath := filepath.Join(absModulePath, "CLAUDE.md")
 	var claudeMDContent string
 	if os.Getenv("DEFN_LEGACY") == "1" {
-		claudeMDContent = fmt.Sprintf(`# Code Navigation
+		claudeMDContent = `# Code Navigation
 
-This project is indexed in a defn database (%d modules, %d definitions).
+This project is indexed in a defn database.
 defn stores Go code as individually addressable definitions in SQL — queries
 like blast radius and test coverage are SQL joins, not grep.
 Use the **code** MCP tool for reading code (faster than grep):
 
 - code(op:"read", name:"X") — full source of a definition
 - code(op:"impact", name:"X") — blast radius, callers, test coverage
-- code(op:"search", pattern:"%%%%Auth%%%%") — find by name pattern or body text
+- code(op:"search", pattern:"%Auth%") — find by name pattern or body text
 - code(op:"untested") — list definitions without test coverage
 - code(op:"query", sql:"SELECT ...") — raw SQL
 
 Edit files normally with Edit/Write tools. defn is a read-only acceleration layer.
-`, len(mods), len(defs))
+`
 	} else {
-		claudeMDContent = fmt.Sprintf(`# defn
+		claudeMDContent = `# defn
 
-This project has a defn database (%d modules, %d definitions).
+This project has a defn database.
 Use the **code** MCP tool via the "op" field.
 
 ## When to use defn vs file tools
@@ -422,8 +422,8 @@ Use the **code** MCP tool via the "op" field.
 
 Both paths work. For small changes, Edit is fine — the file watcher auto-reingests.
 For replacing a whole definition: code(op:"edit", name:"X", new_body:"...").
-For string replacement within a definition: code(op:"patch", name:"X", old:"...", new:"...").
-`, len(mods), len(defs))
+For string replacement within a definition: code(op:"edit", name:"X", old_fragment:"...", new_fragment:"...").
+`
 	}
 
 	// Add .defn/ to .gitignore if not already there.

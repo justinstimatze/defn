@@ -53,8 +53,21 @@ type server struct {
 func Run(ctx context.Context, database *store.DB, projDir string) error {
 	s := &server{db: database, projectDir: projDir}
 
-	// Watch for .go file changes and auto-reingest.
 	if projDir != "" {
+		// Reconcile changes made while defn was not running (file moves,
+		// deletions, renames). Runs async so the MCP server starts immediately
+		// and serves from whatever's in the DB. PruneStaleDefinitions removes ghosts.
+		go func() {
+			if err := ingest.Ingest(s.db, projDir); err != nil {
+				fmt.Fprintf(os.Stderr, "defn: startup ingest failed: %v\n", err)
+				return
+			}
+			if err := resolve.Resolve(s.db, projDir); err != nil {
+				fmt.Fprintf(os.Stderr, "defn: startup resolve failed: %v\n", err)
+				return
+			}
+			s.lastResolved.Store(time.Now().UnixNano())
+		}()
 		go s.watchFiles(ctx)
 	}
 
@@ -554,7 +567,7 @@ func (s *server) autoResolve(modulePath string) {
 // This keeps the defn database in sync when files are edited outside defn
 // (e.g. via Edit/Write tools, vim, or other processes).
 func (s *server) watchFiles(ctx context.Context) {
-	var lastMod int64
+	var lastMod int64 // 0 means first poll — debounce window handles startup race
 	for {
 		select {
 		case <-ctx.Done():
@@ -580,8 +593,8 @@ func (s *server) watchFiles(ctx context.Context) {
 		})
 
 		if newest > lastMod && lastMod > 0 {
-			// Skip if autoResolve ran recently (avoids double-resolve after code_edit).
-			if time.Now().UnixNano()-s.lastResolved.Load() < int64(5*time.Second) {
+			// Skip if startup ingest or autoResolve ran recently.
+			if time.Now().UnixNano()-s.lastResolved.Load() < int64(10*time.Second) {
 				lastMod = newest
 				continue
 			}
@@ -749,14 +762,14 @@ func (s *server) handleInsert(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	insertAt := idx + len(args.After)
 	newBody := d.Body[:insertAt] + args.Body + d.Body[insertAt:]
 
-	if args.DryRun {
-		return textResult(fmt.Sprintf("Dry run — would insert into %s after %q:\n\n%s", args.Name, args.After, args.Body)), nil, nil
+	// Validate syntax BEFORE dry-run response.
+	insertSrc := "package x\n" + newBody
+	if _, parseErr := parser.ParseFile(token.NewFileSet(), "", insertSrc, parser.ParseComments); parseErr != nil {
+		return errResult(fmt.Errorf("insert produces invalid Go: %v", parseErr))
 	}
 
-	// Validate.
-	src := "package x\n" + newBody
-	if _, parseErr := parser.ParseFile(token.NewFileSet(), "", src, parser.ParseComments); parseErr != nil {
-		return errResult(fmt.Errorf("insert produces invalid Go: %v", parseErr))
+	if args.DryRun {
+		return textResult(fmt.Sprintf("Dry run — would insert into %s after %q:\n\n%s", args.Name, args.After, args.Body)), nil, nil
 	}
 
 	d.Body = newBody
@@ -1489,11 +1502,18 @@ func astRename(body, oldName, newName string) (string, int) {
 	})
 	var buf strings.Builder
 	if err := format.Node(&buf, fset, f); err != nil {
-		return strings.ReplaceAll(body, oldName, newName), 0
+		// format.Node failed — return original body unchanged rather than
+		// silently falling back to string replacement (which would corrupt
+		// comments and strings).
+		return body, 0
 	}
 	result := buf.String()
+	// Strip the "package x\n" prefix we added for parsing.
 	if idx := strings.Index(result, "\n"); idx >= 0 {
 		result = strings.TrimLeft(result[idx+1:], "\n")
+	} else {
+		// No newline — format.Node returned something unexpected. Return original.
+		return body, 0
 	}
 	return result, skipped
 }

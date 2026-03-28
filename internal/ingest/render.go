@@ -7,10 +7,14 @@ import (
 	"go/token"
 	"os"
 	"strings"
+	"sync"
 )
 
 // sourceFileCache avoids re-reading the same file for every definition.
-var sourceFileCache = map[string][]byte{}
+var (
+	sourceFileMu    sync.Mutex
+	sourceFileCache = map[string][]byte{}
+)
 
 // renderNode extracts Go source text for an AST node.
 // Uses the original source file to preserve all comments (including inline
@@ -20,6 +24,7 @@ func renderNode(fset *token.FileSet, node ast.Node) string {
 	start := fset.Position(node.Pos())
 	end := fset.Position(node.End())
 	if start.IsValid() && end.IsValid() && start.Filename != "" {
+		sourceFileMu.Lock()
 		data, ok := sourceFileCache[start.Filename]
 		if !ok {
 			var err error
@@ -29,6 +34,7 @@ func renderNode(fset *token.FileSet, node ast.Node) string {
 			}
 			sourceFileCache[start.Filename] = data
 		}
+		sourceFileMu.Unlock()
 		if data != nil && end.Offset <= len(data) {
 			// Include doc comment if present (it's before Pos).
 			startOffset := start.Offset

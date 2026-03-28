@@ -5,11 +5,11 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Release](https://img.shields.io/github/v/release/justinstimatze/defn)](https://github.com/justinstimatze/defn/releases)
 
-**defn replaces files with a graph.** Every Go function, method, type, and constant becomes a node. Every call, reference, and interface implementation becomes an edge. AI agents query the graph instead of grepping through files.
+**Your Go code lives in two places: files and a graph.** Both are complete, lossless representations of the same code — kept in sync automatically. Files work with every tool in the Go ecosystem. The graph adds structure: every function, method, type, and constant is a node; every call, reference, and interface implementation is an edge.
 
-**The round-trip is lossless.** defn and your files stay perfectly in sync — all comments, file structure, and definitions are preserved. Edit through defn or edit files directly; the database auto-detects changes and re-ingests. Either can recover the other.
+Edit through defn or edit files directly. Either side auto-syncs to the other. Either can recover the other.
 
-**"What breaks if I change Render?"**
+**"What breaks if I change this function?"** Tested on [gin-gonic/gin](https://github.com/gin-gonic/gin) (24K lines, 1,580 definitions):
 
 > **Without defn:** grep → read 5 files → scroll → guess
 > 9 calls | 144K tokens | 45s | found 19 of 21 callers | no transitives | no test count
