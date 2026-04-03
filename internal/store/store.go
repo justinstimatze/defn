@@ -16,6 +16,7 @@ import (
 	"time"
 
 	_ "github.com/dolthub/driver"
+	"github.com/dolthub/dolt/go/store/util/tempfiles"
 	_ "github.com/go-sql-driver/mysql"
 )
 
@@ -142,9 +143,13 @@ func splitSQL(s string) []string {
 	return stmts
 }
 
-// Close closes the database.
+// Close closes the database and cleans up Dolt's temporary files.
+// Note: temp file cleanup is global (Dolt's MovableTempFileProvider is
+// process-wide). Safe because defn uses one embedded DB per process.
 func (s *DB) Close() error {
-	return s.db.Close()
+	err := s.db.Close()
+	tempfiles.MovableTempFileProvider.Clean()
+	return err
 }
 
 // Path returns the filesystem path of this database.
