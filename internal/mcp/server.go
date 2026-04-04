@@ -55,25 +55,20 @@ func Run(ctx context.Context, database *store.DB, projDir string) error {
 
 	if projDir != "" {
 		// Reconcile changes made while defn was not running (file moves,
-		// deletions, renames). Runs async so the MCP server starts immediately
-		// and serves from whatever's in the DB. PruneStaleDefinitions removes ghosts.
-		go func() {
-			if err := ingest.Ingest(s.db, projDir); err != nil {
-				fmt.Fprintf(os.Stderr, "defn: startup ingest failed: %v\n", err)
-				return
-			}
-			if err := resolve.Resolve(s.db, projDir); err != nil {
-				fmt.Fprintf(os.Stderr, "defn: startup resolve failed: %v\n", err)
-				return
-			}
-			s.lastResolved.Store(time.Now().UnixNano())
-		}()
+		// deletions, renames). Runs synchronously so the graph is consistent
+		// before serving any queries. PruneStaleDefinitions removes ghosts.
+		if err := ingest.Ingest(s.db, projDir); err != nil {
+			fmt.Fprintf(os.Stderr, "defn: startup ingest failed: %v\n", err)
+		} else if err := resolve.Resolve(s.db, projDir); err != nil {
+			fmt.Fprintf(os.Stderr, "defn: startup resolve failed: %v\n", err)
+		}
+		s.lastResolved.Store(time.Now().UnixNano())
 		go s.watchFiles(ctx)
 	}
 
 	server := sdkmcp.NewServer(&sdkmcp.Implementation{
 		Name:    "defn",
-		Version: "0.2.0",
+		Version: "0.4.0",
 	}, nil)
 
 	sdkmcp.AddTool(server, &sdkmcp.Tool{
@@ -1336,7 +1331,7 @@ func (s *server) handleOverview(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 		dir = strings.TrimSuffix(dir, ".go")
 	}
 
-	defs, err := s.db.FindDefinitionsByFile(dir, 0)
+	defs, err := s.db.FindDefinitionsByFile(dir, file, 0)
 	if err != nil || len(defs) == 0 {
 		return errResult(fmt.Errorf("no definitions found for %s", file))
 	}
@@ -1534,7 +1529,7 @@ func (s *server) handleFind(_ context.Context, _ *sdkmcp.CallToolRequest, args f
 		dir = strings.TrimSuffix(dir, ".go")
 	}
 
-	defs, err := s.db.FindDefinitionsByFile(dir, args.Line)
+	defs, err := s.db.FindDefinitionsByFile(dir, args.File, args.Line)
 	if err != nil {
 		return errResult(err)
 	}
@@ -1571,7 +1566,7 @@ func (s *server) handleFileDefs(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 		dir = strings.TrimSuffix(dir, "_test.go")
 		dir = strings.TrimSuffix(dir, ".go")
 	}
-	defs, err := s.db.FindDefinitionsByFile(dir, 0)
+	defs, err := s.db.FindDefinitionsByFile(dir, file, 0)
 	if err != nil {
 		return errResult(err)
 	}

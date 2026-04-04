@@ -382,49 +382,9 @@ DEFN_DB = %q
 		}
 	}
 
-	// Write CLAUDE.md telling Claude Code to use defn tools.
+	// Write or update the defn section in CLAUDE.md.
 	claudeMDPath := filepath.Join(absModulePath, "CLAUDE.md")
-	var claudeMDContent string
-	if os.Getenv("DEFN_LEGACY") == "1" {
-		claudeMDContent = `# Code Navigation
-
-This project is indexed in a defn database.
-defn stores Go code as individually addressable definitions in SQL — queries
-like blast radius and test coverage are SQL joins, not grep.
-Use the **code** MCP tool for reading code (faster than grep):
-
-- code(op:"read", name:"X") — full source of a definition
-- code(op:"impact", name:"X") — blast radius, callers, test coverage
-- code(op:"search", pattern:"%Auth%") — find by name pattern or body text
-- code(op:"untested") — list definitions without test coverage
-- code(op:"query", sql:"SELECT ...") — raw SQL
-
-Edit files normally with Edit/Write tools. defn is a read-only acceleration layer.
-`
-	} else {
-		claudeMDContent = `# defn
-
-This project has a defn database.
-Use the **code** MCP tool via the "op" field.
-
-## When to use defn vs file tools
-
-**Use defn when:** you need to understand relationships between definitions.
-- "Who calls X?" → code(op:"impact", name:"X") — catches interface dispatch + struct fields that grep misses.
-- "What does X look like?" → code(op:"read", name:"X") — one call, no scrolling.
-- "What's in this file?" → code(op:"overview", file:"server.go") — all definitions + relationships.
-
-**Use file tools (Read/Edit) when:** you need raw file content, imports, or surgical string replacements.
-
-**Rule of thumb:** Always run impact before modifying an existing definition. Skip it for brand-new definitions.
-
-## Editing
-
-Both paths work. For small changes, Edit is fine — the file watcher auto-reingests.
-For replacing a whole definition: code(op:"edit", name:"X", new_body:"...").
-For string replacement within a definition: code(op:"edit", name:"X", old_fragment:"...", new_fragment:"...").
-`
-	}
+	defnSection := defnClaudeMDSection()
 
 	// Add .defn/ to .gitignore if not already there.
 	gitignorePath := filepath.Join(absModulePath, ".gitignore")
@@ -440,15 +400,68 @@ For string replacement within a definition: code(op:"edit", name:"X", old_fragme
 		}
 	}
 
-	// Only write if no CLAUDE.md exists, or append if it does.
-	if _, err := os.Stat(claudeMDPath); os.IsNotExist(err) {
-		os.WriteFile(claudeMDPath, []byte(claudeMDContent), 0644)
-		fmt.Fprintf(os.Stderr, "wrote %s\n", claudeMDPath)
+	// Write or update the defn section in CLAUDE.md.
+	// Sentinel markers allow updating the section on re-init without
+	// disturbing user-written content.
+	if existing, err := os.ReadFile(claudeMDPath); err == nil {
+		content := string(existing)
+		const beginMarker = "<!-- defn:begin -->"
+		const endMarker = "<!-- defn:end -->"
+		if bi := strings.Index(content, beginMarker); bi >= 0 {
+			if ei := strings.Index(content[bi:], endMarker); ei >= 0 {
+				// Replace existing defn section.
+				after := content[bi+ei+len(endMarker):]
+				content = content[:bi] + defnSection + after
+				os.WriteFile(claudeMDPath, []byte(content), 0644)
+				fmt.Fprintf(os.Stderr, "updated defn section in %s\n", claudeMDPath)
+			} else {
+				fmt.Fprintf(os.Stderr, "warning: found <!-- defn:begin --> but no <!-- defn:end --> in %s — skipping update\n", claudeMDPath)
+			}
+		} else {
+			// CLAUDE.md exists but has no defn section — append.
+			sep := "\n\n"
+			if strings.HasSuffix(content, "\n\n") {
+				sep = ""
+			} else if strings.HasSuffix(content, "\n") {
+				sep = "\n"
+			}
+			os.WriteFile(claudeMDPath, []byte(content+sep+defnSection), 0644)
+			fmt.Fprintf(os.Stderr, "appended defn section to %s\n", claudeMDPath)
+		}
 	} else {
-		fmt.Fprintf(os.Stderr, "CLAUDE.md already exists — add defn instructions manually if needed\n")
+		os.WriteFile(claudeMDPath, []byte(defnSection), 0644)
+		fmt.Fprintf(os.Stderr, "wrote %s\n", claudeMDPath)
 	}
 
 	fmt.Fprintln(os.Stderr, "start a new AI coding session in this directory to use defn.")
+}
+
+func defnClaudeMDSection() string {
+	return `<!-- defn:begin -->
+## Code Navigation and Editing
+
+This project is indexed in defn. Use the ` + "`code`" + ` MCP tool for **Go code**:
+
+` + "```" + `
+code(op: "read", name: "handleEdit")           -- full source by name
+code(op: "read", name: "server.go:272")        -- or by file:line
+code(op: "impact", name: "Render")             -- blast radius + test coverage
+code(op: "edit", name: "Foo", new_body: "...") -- edit, auto-emit + build
+code(op: "search", pattern: "%Auth%")          -- name pattern (% wildcard)
+code(op: "search", pattern: "authentication")  -- body text search
+code(op: "test", name: "Render")               -- run affected tests only
+code(op: "sync")                               -- re-ingest after file edits
+` + "```" + `
+
+All ops: read, search, impact, explain, untested, edit, create, delete, rename, move, test, apply, diff, history, find, sync, query, overview, patch.
+
+**Both editing paths work.** ` + "`code(op:\"edit\")`" + ` updates the database, emits files, and rebuilds references automatically. File tools (Read, Edit) work too — call ` + "`code(op:\"sync\")`" + ` after editing Go files.
+
+Prefer defn for Go code (fewer steps, auto-build verification). Use Read/Edit/Grep for non-Go files.
+
+**Rule of thumb:** Always run impact before modifying an existing definition. Skip it for brand-new definitions.
+<!-- defn:end -->
+`
 }
 
 func cmdIngest(modulePath string) {

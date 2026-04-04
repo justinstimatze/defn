@@ -555,7 +555,9 @@ func (s *DB) PruneStaleDefinitions(liveIDs map[int64]bool) (int, error) {
 // If line > 0, returns only the definition containing that line.
 // The fileSuffix is matched against module paths (e.g. "internal/mcp" matches
 // "github.com/justinstimatze/defn/internal/mcp").
-func (s *DB) FindDefinitionsByFile(fileSuffix string, line int) ([]Definition, error) {
+// If sourceFile is non-empty, results are further filtered to definitions
+// whose source_file matches exactly (e.g. "internal/mcp/server.go").
+func (s *DB) FindDefinitionsByFile(fileSuffix string, sourceFile string, line int) ([]Definition, error) {
 	query := `SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test,
 	            COALESCE(d.receiver,''), COALESCE(d.signature,''),
 	            COALESCE(d.start_line,0), COALESCE(d.end_line,0)
@@ -563,6 +565,11 @@ func (s *DB) FindDefinitionsByFile(fileSuffix string, line int) ([]Definition, e
 	          JOIN modules m ON d.module_id = m.id
 	          WHERE m.path LIKE ?`
 	args := []any{"%" + fileSuffix + "%"}
+
+	if sourceFile != "" {
+		query += " AND d.source_file = ?"
+		args = append(args, sourceFile)
+	}
 
 	if line > 0 {
 		query += " AND d.start_line <= ? AND d.end_line >= ? AND d.start_line > 0"
@@ -699,7 +706,7 @@ func (s *DB) GetDefinitionByName(name, modulePath string) (*Definition, error) {
 				dir = strings.TrimSuffix(dir, "_test.go")
 				dir = strings.TrimSuffix(dir, ".go")
 			}
-			defs, err := s.FindDefinitionsByFile(dir, line)
+			defs, err := s.FindDefinitionsByFile(dir, filePath, line)
 			if err != nil {
 				return nil, err
 			}

@@ -78,6 +78,7 @@ CREATE INDEX idx_ref_from ON `references`(from_def);
 CREATE INDEX idx_ref_to ON `references`(to_def);
 CREATE INDEX idx_def_exported ON definitions(name, module_id);
 CREATE INDEX idx_def_location ON definitions(module_id, start_line, end_line);
+CREATE INDEX idx_def_source_file ON definitions(source_file);
 -- Note: Dolt embedded driver creates FULLTEXT indexes in schema but MATCH AGAINST
 -- fails at query time. Using LIKE as fallback until Dolt fixes this.
 -- CREATE FULLTEXT INDEX idx_body_ft ON bodies(body);
