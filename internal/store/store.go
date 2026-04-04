@@ -485,6 +485,14 @@ func (s *DB) UpsertDefinition(d *Definition) (int64, error) {
 	}
 
 	if existingHash == d.Hash {
+		// Body unchanged — still update location fields (source_file,
+		// start_line, end_line) which can shift without changing the body.
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE definitions SET start_line=?, end_line=?, source_file=? WHERE id=?`,
+			d.StartLine, d.EndLine, d.SourceFile, existingID,
+		); err != nil {
+			return 0, fmt.Errorf("update location: %w", err)
+		}
 		return existingID, nil
 	}
 
