@@ -32,6 +32,7 @@ jobs:
         env:
           DEFN_DB: .defn
         run: |
+          EMIT_DIR=$(mktemp -d)
           ./defn ingest .
-          ./defn emit /tmp/defn-emit
-          cd /tmp/defn-emit && go build ./cmd/defn/
+          ./defn emit "$EMIT_DIR"
+          cd "$EMIT_DIR" && go build ./cmd/defn/

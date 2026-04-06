@@ -63,13 +63,15 @@ var questions = []question{
 }
 
 func main() {
-	// Setup project directories.
-	projects := map[string]string{
-		"chi":  "/tmp/gin", // will be overridden
-		"gin":  "/tmp/gin",
-		"mux":  "/tmp/mux",
-		"toml": "/tmp/toml",
+	// Setup project directories in a temp dir.
+	benchDir, err := os.MkdirTemp("", "defn-bench-*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create temp dir: %v\n", err)
+		os.Exit(1)
 	}
+	defer os.RemoveAll(benchDir)
+
+	projects := map[string]string{}
 
 	// Clone any missing repos.
 	repos := map[string]string{
@@ -79,7 +81,7 @@ func main() {
 		"toml": "github.com/BurntSushi/toml",
 	}
 	for name, repo := range repos {
-		dir := "/tmp/" + name
+		dir := filepath.Join(benchDir, name)
 		projects[name] = dir
 		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err != nil {
 			fmt.Printf("Cloning %s...\n", repo)
