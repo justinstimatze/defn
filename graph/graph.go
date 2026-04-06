@@ -184,6 +184,68 @@ func (g *Graph) CalleeFiles(sourceFile string, moduleID int64) map[string]int {
 	return result
 }
 
+// FileRef represents a file and the specific definitions involved in a relationship.
+type FileRef struct {
+	SourceFile string
+	Defs       []*Def
+}
+
+// FileDependencies is a structured view of a file's cross-file relationships.
+type FileDependencies struct {
+	File     string
+	Calls    []FileRef // files this file's definitions call into
+	CalledBy []FileRef // files whose definitions call into this file
+}
+
+// FileDeps returns structured cross-file dependencies for a source file,
+// including which specific definitions are involved in each relationship.
+func (g *Graph) FileDeps(sourceFile string, moduleID int64) *FileDependencies {
+	defs := g.DefsInFile(sourceFile, moduleID)
+
+	// Callees grouped by file.
+	calleeByFile := map[string][]*Def{}
+	for _, d := range defs {
+		for _, id := range g.callees[d.ID] {
+			if callee, ok := g.byID[id]; ok && callee.SourceFile != "" && callee.SourceFile != sourceFile {
+				calleeByFile[callee.SourceFile] = append(calleeByFile[callee.SourceFile], callee)
+			}
+		}
+	}
+
+	// Callers grouped by file.
+	callerByFile := map[string][]*Def{}
+	for _, d := range defs {
+		for _, id := range g.callers[d.ID] {
+			if caller, ok := g.byID[id]; ok && caller.SourceFile != "" && caller.SourceFile != sourceFile {
+				callerByFile[caller.SourceFile] = append(callerByFile[caller.SourceFile], caller)
+			}
+		}
+	}
+
+	// Deduplicate defs per file.
+	dedup := func(m map[string][]*Def) []FileRef {
+		var refs []FileRef
+		for file, defs := range m {
+			seen := map[int64]bool{}
+			var unique []*Def
+			for _, d := range defs {
+				if !seen[d.ID] {
+					seen[d.ID] = true
+					unique = append(unique, d)
+				}
+			}
+			refs = append(refs, FileRef{SourceFile: file, Defs: unique})
+		}
+		return refs
+	}
+
+	return &FileDependencies{
+		File:     sourceFile,
+		Calls:    dedup(calleeByFile),
+		CalledBy: dedup(callerByFile),
+	}
+}
+
 // SiblingFiles returns other files in the same module.
 func (g *Graph) SiblingFiles(sourceFile string, moduleID int64) []string {
 	seen := map[string]bool{sourceFile: true}

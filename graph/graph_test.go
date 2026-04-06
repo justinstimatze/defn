@@ -88,6 +88,43 @@ func TestGraphQueries(t *testing.T) {
 	}
 }
 
+func TestFileDeps(t *testing.T) {
+	g := NewGraph(
+		[]*Def{
+			{ID: 1, Name: "Foo", Kind: "function", SourceFile: "foo.go", ModuleID: 1},
+			{ID: 2, Name: "Bar", Kind: "function", SourceFile: "bar.go", ModuleID: 1},
+			{ID: 3, Name: "Baz", Kind: "function", SourceFile: "baz.go", ModuleID: 1},
+		},
+		[]Ref{
+			{FromDef: 1, ToDef: 2, Kind: "call"}, // Foo calls Bar
+			{FromDef: 3, ToDef: 1, Kind: "call"}, // Baz calls Foo
+		},
+		map[string]int64{"pkg": 1},
+		map[int64]string{1: "pkg"},
+	)
+
+	deps := g.FileDeps("foo.go", 1)
+	if deps.File != "foo.go" {
+		t.Errorf("File = %q, want foo.go", deps.File)
+	}
+
+	// foo.go calls into bar.go (Foo→Bar).
+	if len(deps.Calls) != 1 || deps.Calls[0].SourceFile != "bar.go" {
+		t.Errorf("Calls = %v, want [{bar.go [Bar]}]", deps.Calls)
+	}
+	if len(deps.Calls[0].Defs) != 1 || deps.Calls[0].Defs[0].Name != "Bar" {
+		t.Errorf("Calls[0].Defs = %v, want [Bar]", deps.Calls[0].Defs)
+	}
+
+	// foo.go is called by baz.go (Baz→Foo).
+	if len(deps.CalledBy) != 1 || deps.CalledBy[0].SourceFile != "baz.go" {
+		t.Errorf("CalledBy = %v, want [{baz.go [Baz]}]", deps.CalledBy)
+	}
+	if len(deps.CalledBy[0].Defs) != 1 || deps.CalledBy[0].Defs[0].Name != "Baz" {
+		t.Errorf("CalledBy[0].Defs = %v, want [Baz]", deps.CalledBy[0].Defs)
+	}
+}
+
 func TestDuplicates(t *testing.T) {
 	g := NewGraph(
 		[]*Def{
