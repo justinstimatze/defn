@@ -29,7 +29,7 @@ go test ./... -count=1
 go run ./cmd/defn-test    # integration tests against real Go projects (clones from GitHub)
 ```
 
-Go 1.25+ required.
+Go 1.26+ required.
 
 ## Self-Hosting Round-Trip
 

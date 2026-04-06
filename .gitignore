@@ -17,3 +17,4 @@
 .goreleaser-dist/
 .claude/settings.local.json
 .codex/
+.plancheck-debug.json

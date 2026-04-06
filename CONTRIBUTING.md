@@ -9,7 +9,7 @@ CGO_ENABLED=1 go build ./cmd/defn
 go test ./... -count=1
 ```
 
-Requires Go 1.25+ and CGO (for Dolt embedded database).
+Requires Go 1.26+ and CGO (for Dolt embedded database).
 
 ## Running Checks
 
