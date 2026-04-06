@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# Run CodeScene delta analysis on staged changes (non-blocking)
+if command -v cs &> /dev/null; then
+  echo "Running CodeScene delta analysis..."
+  if ! cs delta --staged; then
+    echo ""
+    echo "⚠️  CodeScene found code health issues (warning only, not blocking commit)"
+  fi
+  echo "CodeScene check complete!"
+fi

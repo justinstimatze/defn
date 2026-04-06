@@ -46,6 +46,7 @@ type server struct {
 	db           *store.DB
 	projectDir   string
 	lastResolved atomic.Int64 // UnixNano timestamp of last resolve (to debounce watcher)
+	ready        atomic.Bool  // true after startup ingest+resolve completes
 }
 
 // Run starts the MCP server. projDir is the project root where files
@@ -55,14 +56,18 @@ func Run(ctx context.Context, database *store.DB, projDir string) error {
 
 	if projDir != "" {
 		// Reconcile changes made while defn was not running (file moves,
-		// deletions, renames). Runs synchronously so the graph is consistent
-		// before serving any queries. PruneStaleDefinitions removes ghosts.
-		if err := ingest.Ingest(s.db, projDir); err != nil {
-			fmt.Fprintf(os.Stderr, "defn: startup ingest failed: %v\n", err)
-		} else if err := resolve.Resolve(s.db, projDir); err != nil {
-			fmt.Fprintf(os.Stderr, "defn: startup resolve failed: %v\n", err)
-		}
-		s.lastResolved.Store(time.Now().UnixNano())
+		// deletions, renames). Runs async so the MCP server starts within
+		// the client's connection timeout. Queries before completion serve
+		// from whatever's in the DB; results include a staleness notice.
+		go func() {
+			if err := ingest.Ingest(s.db, projDir); err != nil {
+				fmt.Fprintf(os.Stderr, "defn: startup ingest failed: %v\n", err)
+			} else if err := resolve.Resolve(s.db, projDir); err != nil {
+				fmt.Fprintf(os.Stderr, "defn: startup resolve failed: %v\n", err)
+			}
+			s.lastResolved.Store(time.Now().UnixNano())
+			s.ready.Store(true)
+		}()
 		go s.watchFiles(ctx)
 	}
 
@@ -292,21 +297,34 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		}
 	}
 
+	// Tag results from read-only ops while startup ingest is still running.
+	stale := !s.ready.Load() && s.projectDir != ""
+	wrapStale := func(r *sdkmcp.CallToolResult, o any, e error) (*sdkmcp.CallToolResult, any, error) {
+		if stale && r != nil && !r.IsError {
+			if len(r.Content) > 0 {
+				if tc, ok := r.Content[0].(*sdkmcp.TextContent); ok {
+					tc.Text = "[startup ingest in progress — results may be stale]\n\n" + tc.Text
+				}
+			}
+		}
+		return r, o, e
+	}
+
 	switch args.Op {
 	case "read":
-		return s.handleGetDefinition(ctx, req, nameParam{Name: args.Name})
+		return wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name}))
 	case "search":
 		p := args.Pattern
 		if p == "" {
 			p = args.Name
 		}
-		return s.handleSearch(ctx, req, patternParam{Pattern: p})
+		return wrapStale(s.handleSearch(ctx, req, patternParam{Pattern: p}))
 	case "impact":
-		return s.handleImpact(ctx, req, nameParam{Name: args.Name})
+		return wrapStale(s.handleImpact(ctx, req, nameParam{Name: args.Name}))
 	case "explain":
-		return s.handleExplain(ctx, req, nameParam{Name: args.Name})
+		return wrapStale(s.handleExplain(ctx, req, nameParam{Name: args.Name}))
 	case "untested":
-		return s.handleUntested(ctx, req, emptyParam{})
+		return wrapStale(s.handleUntested(ctx, req, emptyParam{}))
 	case "edit":
 		if args.OldFragment != "" {
 			return s.handleFragmentEdit(ctx, req, args)
@@ -329,27 +347,27 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "test":
 		return s.handleTest(ctx, req, nameParam{Name: args.Name})
 	case "similar":
-		return s.handleSimilar(ctx, req, nameParam{Name: args.Name})
+		return wrapStale(s.handleSimilar(ctx, req, nameParam{Name: args.Name}))
 	case "apply":
 		return s.handleApply(ctx, req, applyParam{Operations: args.Operations, DryRun: args.DryRun})
 	case "diff":
-		return s.handleCodeDiff(ctx, req, emptyParam{})
+		return wrapStale(s.handleCodeDiff(ctx, req, emptyParam{}))
 	case "history":
-		return s.handleHistory(ctx, req, nameParam{Name: args.Name})
+		return wrapStale(s.handleHistory(ctx, req, nameParam{Name: args.Name}))
 	case "query":
-		return s.handleQuery(ctx, req, sqlParam{SQL: args.SQL})
+		return wrapStale(s.handleQuery(ctx, req, sqlParam{SQL: args.SQL}))
 	case "find":
-		return s.handleFind(ctx, req, findParam{File: args.File, Line: args.Line})
+		return wrapStale(s.handleFind(ctx, req, findParam{File: args.File, Line: args.Line}))
 	case "overview":
-		return s.handleOverview(ctx, req, args)
+		return wrapStale(s.handleOverview(ctx, req, args))
 	case "patch":
 		return s.handlePatch(ctx, req, args)
 	case "sync":
 		return s.handleSync(ctx, req, emptyParam{})
 	case "test-coverage":
-		return s.handleTestCoverage(ctx, req, args)
+		return wrapStale(s.handleTestCoverage(ctx, req, args))
 	case "batch-impact":
-		return s.handleBatchImpact(ctx, req, args)
+		return wrapStale(s.handleBatchImpact(ctx, req, args))
 	case "simulate":
 		return s.handleSimulate(ctx, req, args)
 	case "file-defs":
