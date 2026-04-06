@@ -88,6 +88,46 @@ func TestGraphQueries(t *testing.T) {
 	}
 }
 
+func TestConstructors(t *testing.T) {
+	g := NewGraph(
+		[]*Def{
+			{ID: 1, Name: "Widget", Kind: "type", SourceFile: "widget.go", ModuleID: 1},
+			{ID: 2, Name: "NewWidget", Kind: "function", SourceFile: "widget.go", ModuleID: 1},
+			{ID: 3, Name: "CreateAll", Kind: "function", SourceFile: "factory.go", ModuleID: 1},
+			{ID: 4, Name: "UseWidget", Kind: "function", SourceFile: "use.go", ModuleID: 1},
+		},
+		[]Ref{
+			{FromDef: 2, ToDef: 1, Kind: "constructor"}, // NewWidget constructs Widget
+			{FromDef: 3, ToDef: 1, Kind: "constructor"}, // CreateAll constructs Widget
+			{FromDef: 4, ToDef: 1, Kind: "call"},         // UseWidget calls Widget (not a constructor)
+		},
+		map[string]int64{"pkg": 1},
+		map[int64]string{1: "pkg"},
+	)
+
+	ctors := g.Constructors(1)
+	if len(ctors) != 2 {
+		t.Fatalf("expected 2 constructors of Widget, got %d", len(ctors))
+	}
+	names := map[string]bool{}
+	for _, d := range ctors {
+		names[d.Name] = true
+	}
+	if !names["NewWidget"] || !names["CreateAll"] {
+		t.Errorf("expected NewWidget and CreateAll, got %v", names)
+	}
+
+	// Non-constructor caller should not appear.
+	if names["UseWidget"] {
+		t.Error("UseWidget is a caller, not a constructor")
+	}
+
+	// No constructors for a type that has none.
+	if len(g.Constructors(4)) != 0 {
+		t.Error("expected no constructors for UseWidget")
+	}
+}
+
 func TestFileDeps(t *testing.T) {
 	g := NewGraph(
 		[]*Def{

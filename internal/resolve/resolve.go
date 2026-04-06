@@ -272,10 +272,45 @@ func collectRefs(node ast.Node, info *types.Info, objToDef map[types.Object]int6
 	}
 
 	ast.Inspect(node, func(n ast.Node) bool {
-		ident, ok := n.(*ast.Ident)
-		if !ok {
+		switch x := n.(type) {
+		case *ast.CompositeLit:
+			// Struct literal: Type{...} or &Type{...}.
+			if x.Type != nil {
+				if tv, ok := info.Types[x.Type]; ok {
+					typ := tv.Type
+					if ptr, ok := typ.(*types.Pointer); ok {
+						typ = ptr.Elem()
+					}
+					if named, ok := typ.(*types.Named); ok {
+						if toID, ok := objToDef[named.Obj()]; ok {
+							addRef(toID, "constructor")
+						}
+					}
+				}
+			}
+			return true
+		case *ast.CallExpr:
+			// new(Type) builtin.
+			if ident, ok := x.Fun.(*ast.Ident); ok {
+				if bi, ok := info.Uses[ident].(*types.Builtin); ok && bi.Name() == "new" && len(x.Args) == 1 {
+					if tv, ok := info.Types[x.Args[0]]; ok {
+						if named, ok := tv.Type.(*types.Named); ok {
+							if toID, ok := objToDef[named.Obj()]; ok {
+								addRef(toID, "constructor")
+							}
+						}
+					}
+				}
+			}
+			return true
+		case *ast.Ident:
+			// Fall through to existing ident handling below.
+		default:
 			return true
 		}
+
+		// Ident handling (original logic).
+		ident := n.(*ast.Ident)
 		obj, exists := info.Uses[ident]
 		if !exists {
 			return true

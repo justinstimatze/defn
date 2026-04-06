@@ -52,8 +52,9 @@ type Graph struct {
 	byName    map[string][]*Def
 	byFile    map[fileKey][]*Def
 	byModule  map[int64][]*Def
-	callers   map[int64][]int64
-	callees   map[int64][]int64
+	callers       map[int64][]int64
+	callees       map[int64][]int64
+	constructorOf map[int64][]int64 // type def ID → constructor site IDs
 	byHash    map[string][]*Def
 	modByPath map[string][]int64 // path → IDs (multiple in merged graphs)
 	modByID   map[int64]string
@@ -137,6 +138,19 @@ func (g *Graph) CalleeDefs(defID int64) []*Def {
 // CalleeIDs returns the direct callee definition IDs.
 func (g *Graph) CalleeIDs(defID int64) []int64 {
 	return g.callees[defID]
+}
+
+// Constructors returns definitions that construct instances of the given type
+// (struct literals, new() calls). Only available when the resolver captures
+// "constructor" reference kinds.
+func (g *Graph) Constructors(defID int64) []*Def {
+	var result []*Def
+	for _, id := range g.constructorOf[defID] {
+		if d, ok := g.byID[id]; ok {
+			result = append(result, d)
+		}
+	}
+	return result
 }
 
 // DefsInFile returns all definitions in a source file. If moduleID is 0,
@@ -422,9 +436,13 @@ func (g *Graph) build() {
 		}
 	}
 
+	g.constructorOf = make(map[int64][]int64)
 	for _, r := range g.refs {
 		g.callers[r.ToDef] = append(g.callers[r.ToDef], r.FromDef)
 		g.callees[r.FromDef] = append(g.callees[r.FromDef], r.ToDef)
+		if r.Kind == "constructor" {
+			g.constructorOf[r.ToDef] = append(g.constructorOf[r.ToDef], r.FromDef)
+		}
 	}
 }
 
