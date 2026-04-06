@@ -185,14 +185,16 @@ func queryGraph(db *sql.DB) (*Graph, error) {
 
 	// Load definitions.
 	rows, err = db.Query(`SELECT id, name, kind, COALESCE(receiver,''), COALESCE(signature,''),
-		COALESCE(source_file,''), module_id, test, exported, COALESCE(hash,'') FROM definitions`)
+		COALESCE(source_file,''), module_id, test, exported, COALESCE(hash,''),
+		COALESCE(start_line,0), COALESCE(end_line,0) FROM definitions`)
 	if err != nil {
 		return nil, fmt.Errorf("query definitions: %w", err)
 	}
 	for rows.Next() {
 		d := &Def{}
 		if err := rows.Scan(&d.ID, &d.Name, &d.Kind, &d.Receiver, &d.Signature,
-			&d.SourceFile, &d.ModuleID, &d.Test, &d.Exported, &d.Hash); err != nil {
+			&d.SourceFile, &d.ModuleID, &d.Test, &d.Exported, &d.Hash,
+			&d.StartLine, &d.EndLine); err != nil {
 			rows.Close()
 			return nil, err
 		}

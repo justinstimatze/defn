@@ -24,10 +24,10 @@ func TestEmptyGraph(t *testing.T) {
 func TestGraphQueries(t *testing.T) {
 	g := NewGraph(
 		[]*Def{
-			{ID: 1, Name: "Foo", Kind: "function", SourceFile: "foo.go", ModuleID: 1, Exported: true},
-			{ID: 2, Name: "Bar", Kind: "function", SourceFile: "bar.go", ModuleID: 1, Exported: true},
-			{ID: 3, Name: "TestFoo", Kind: "function", SourceFile: "foo_test.go", ModuleID: 1, Test: true},
-			{ID: 4, Name: "Baz", Kind: "method", Receiver: "*Widget", SourceFile: "baz.go", ModuleID: 2, Exported: true},
+			{ID: 1, Name: "Foo", Kind: "function", SourceFile: "foo.go", ModuleID: 1, Exported: true, StartLine: 10, EndLine: 20},
+			{ID: 2, Name: "Bar", Kind: "function", SourceFile: "bar.go", ModuleID: 1, Exported: true, StartLine: 1, EndLine: 15},
+			{ID: 3, Name: "TestFoo", Kind: "function", SourceFile: "foo_test.go", ModuleID: 1, Test: true, StartLine: 1, EndLine: 30},
+			{ID: 4, Name: "Baz", Kind: "method", Receiver: "*Widget", SourceFile: "baz.go", ModuleID: 2, Exported: true, StartLine: 5, EndLine: 25},
 		},
 		[]Ref{
 			{FromDef: 2, ToDef: 1, Kind: "call"},
@@ -46,6 +46,8 @@ func TestGraphQueries(t *testing.T) {
 	}
 	if d := g.GetDef("Foo", ""); d == nil || d.ID != 1 {
 		t.Errorf("expected Foo (id=1), got %v", d)
+	} else if d.StartLine != 10 || d.EndLine != 20 {
+		t.Errorf("Foo lines = %d-%d, want 10-20", d.StartLine, d.EndLine)
 	}
 	if d := g.GetDef("Widget.Baz", ""); d == nil || d.ID != 4 {
 		t.Errorf("expected Baz (id=4), got %v", d)

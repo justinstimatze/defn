@@ -24,6 +24,8 @@ type Def struct {
 	Test       bool
 	Exported   bool
 	Hash       string
+	StartLine  int
+	EndLine    int
 }
 
 // FullName returns Receiver.Name or just Name.
