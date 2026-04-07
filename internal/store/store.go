@@ -26,8 +26,10 @@ var schemaSQL string
 // DB wraps a Dolt connection with code-database operations.
 // DB is NOT safe for concurrent use from multiple goroutines.
 type DB struct {
-	db   *sql.DB
-	path string // filesystem path to database directory
+	db     *sql.DB
+	conn   *sql.Conn // pinned connection for branch-state consistency
+	path   string    // filesystem path to database directory
+	dbName string    // database name (for USE db/branch)
 }
 
 // Open opens or creates a defn database.
@@ -93,12 +95,23 @@ func openEmbedded(path string) (*DB, error) {
 
 	ctx := context.Background()
 
+	// Pin a single connection for all operations. The embedded Dolt driver
+	// tracks branch state per-connection, so using the pool would lose
+	// checkout state between calls.
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("pin connection: %w", err)
+	}
+
 	// Create the database if it doesn't exist.
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", dbName)); err != nil {
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", dbName)); err != nil {
+		conn.Close()
 		db.Close()
 		return nil, fmt.Errorf("create database: %w", err)
 	}
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("USE `%s`", dbName)); err != nil {
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("USE `%s`", dbName)); err != nil {
+		conn.Close()
 		db.Close()
 		return nil, fmt.Errorf("use database: %w", err)
 	}
@@ -108,17 +121,18 @@ func openEmbedded(path string) (*DB, error) {
 		if strings.TrimSpace(stmt) == "" {
 			continue
 		}
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			errMsg := strings.ToLower(err.Error())
 			if !strings.Contains(errMsg, "already exists") &&
 				!strings.Contains(errMsg, "duplicate") {
+				conn.Close()
 				db.Close()
 				return nil, fmt.Errorf("init schema: %w\nstatement: %s", err, stmt)
 			}
 		}
 	}
 
-	return &DB{db: db, path: absPath}, nil
+	return &DB{db: db, conn: conn, path: absPath, dbName: dbName}, nil
 }
 
 // splitSQL splits a SQL script by semicolons, filtering out comment-only lines.
@@ -143,10 +157,37 @@ func splitSQL(s string) []string {
 	return stmts
 }
 
+// execContext runs ExecContext on the pinned connection (embedded) or pool (MySQL).
+func (s *DB) execContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if s.conn != nil {
+		return s.conn.ExecContext(ctx, query, args...)
+	}
+	return s.db.ExecContext(ctx, query, args...)
+}
+
+// queryContext runs QueryContext on the pinned connection (embedded) or pool (MySQL).
+func (s *DB) queryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	if s.conn != nil {
+		return s.conn.QueryContext(ctx, query, args...)
+	}
+	return s.db.QueryContext(ctx, query, args...)
+}
+
+// queryRowContext runs QueryRowContext on the pinned connection (embedded) or pool (MySQL).
+func (s *DB) queryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	if s.conn != nil {
+		return s.conn.QueryRowContext(ctx, query, args...)
+	}
+	return s.db.QueryRowContext(ctx, query, args...)
+}
+
 // Close closes the database and cleans up Dolt's temporary files.
 // Note: temp file cleanup is global (Dolt's MovableTempFileProvider is
 // process-wide). Safe because defn uses one embedded DB per process.
 func (s *DB) Close() error {
+	if s.conn != nil {
+		s.conn.Close()
+	}
 	err := s.db.Close()
 	tempfiles.MovableTempFileProvider.Clean()
 	return err
@@ -167,16 +208,16 @@ func (s *DB) Path() string {
 
 // Begin starts a transaction. Returns a function to commit or rollback.
 func (s *DB) Begin() (commit func() error, rollback func(), err error) {
-	_, err = s.db.ExecContext(s.Ctx(), "START TRANSACTION")
+	_, err = s.execContext(s.Ctx(), "START TRANSACTION")
 	if err != nil {
 		return nil, nil, fmt.Errorf("begin transaction: %w", err)
 	}
 	commit = func() error {
-		_, err := s.db.ExecContext(s.Ctx(), "COMMIT")
+		_, err := s.execContext(s.Ctx(), "COMMIT")
 		return err
 	}
 	rollback = func() {
-		s.db.ExecContext(s.Ctx(), "ROLLBACK")
+		s.execContext(s.Ctx(), "ROLLBACK")
 	}
 	return commit, rollback, nil
 }
@@ -194,10 +235,10 @@ func (s *DB) Ctx() context.Context {
 // Returns nil if there's nothing to commit.
 func (s *DB) Commit(message string) error {
 	ctx := s.Ctx()
-	if _, err := s.db.ExecContext(ctx, "CALL DOLT_ADD('-A')"); err != nil {
+	if _, err := s.execContext(ctx, "CALL DOLT_ADD('-A')"); err != nil {
 		return fmt.Errorf("dolt add: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, "CALL DOLT_COMMIT('-m', ?)", message); err != nil {
+	if _, err := s.execContext(ctx, "CALL DOLT_COMMIT('-m', ?)", message); err != nil {
 		if strings.Contains(err.Error(), "nothing to commit") {
 			return nil
 		}
@@ -209,57 +250,57 @@ func (s *DB) Commit(message string) error {
 
 // Branch creates a new branch at the current HEAD.
 func (s *DB) Branch(name string) error {
-	_, err := s.db.ExecContext(s.Ctx(), "CALL DOLT_BRANCH(?)", name)
+	_, err := s.execContext(s.Ctx(), "CALL DOLT_BRANCH(?)", name)
 	return err
 }
 
 // Checkout switches to a branch.
 func (s *DB) Checkout(name string) error {
-	_, err := s.db.ExecContext(s.Ctx(), "CALL DOLT_CHECKOUT(?)", name)
+	_, err := s.execContext(s.Ctx(), "CALL DOLT_CHECKOUT(?)", name)
 	return err
 }
 
 // Merge merges a branch into the current branch.
 func (s *DB) Merge(branchName string) error {
-	_, err := s.db.ExecContext(s.Ctx(), "CALL DOLT_MERGE(?)", branchName)
+	_, err := s.execContext(s.Ctx(), "CALL DOLT_MERGE(?)", branchName)
 	s.CleanTempFiles()
 	return err
 }
 
 // AddRemote adds a named remote pointing to a file path or URL.
 func (s *DB) AddRemote(name, url string) error {
-	_, err := s.db.ExecContext(s.Ctx(), "CALL DOLT_REMOTE('add', ?, ?)", name, url)
+	_, err := s.execContext(s.Ctx(), "CALL DOLT_REMOTE('add', ?, ?)", name, url)
 	return err
 }
 
 // Push pushes the current branch to a remote.
 func (s *DB) Push(remote, branch string) error {
-	_, err := s.db.ExecContext(s.Ctx(), "CALL DOLT_PUSH(?, ?)", remote, branch)
+	_, err := s.execContext(s.Ctx(), "CALL DOLT_PUSH(?, ?)", remote, branch)
 	return err
 }
 
 // Pull pulls from a remote into the current branch.
 func (s *DB) Pull(remote, branch string) error {
-	_, err := s.db.ExecContext(s.Ctx(), "CALL DOLT_PULL(?, ?)", remote, branch)
+	_, err := s.execContext(s.Ctx(), "CALL DOLT_PULL(?, ?)", remote, branch)
 	return err
 }
 
 // Fetch fetches from a remote without merging.
 func (s *DB) Fetch(remote string) error {
-	_, err := s.db.ExecContext(s.Ctx(), "CALL DOLT_FETCH(?)", remote)
+	_, err := s.execContext(s.Ctx(), "CALL DOLT_FETCH(?)", remote)
 	return err
 }
 
 // GetCurrentBranch returns the active branch name.
 func (s *DB) GetCurrentBranch() (string, error) {
 	var branch string
-	err := s.db.QueryRowContext(s.Ctx(), "SELECT active_branch()").Scan(&branch)
+	err := s.queryRowContext(s.Ctx(), "SELECT active_branch()").Scan(&branch)
 	return branch, err
 }
 
 // ListBranches returns all branch names.
 func (s *DB) ListBranches() ([]string, error) {
-	rows, err := s.db.QueryContext(s.Ctx(), "SELECT name FROM dolt_branches ORDER BY name")
+	rows, err := s.queryContext(s.Ctx(), "SELECT name FROM dolt_branches ORDER BY name")
 	if err != nil {
 		return nil, err
 	}
@@ -277,7 +318,7 @@ func (s *DB) ListBranches() ([]string, error) {
 
 // Log returns recent commits.
 func (s *DB) Log(limit int) ([]map[string]any, error) {
-	rows, err := s.db.QueryContext(s.Ctx(),
+	rows, err := s.queryContext(s.Ctx(),
 		"SELECT commit_hash, committer, message, date FROM dolt_log LIMIT ?", limit)
 	if err != nil {
 		return nil, err
@@ -298,7 +339,7 @@ func (s *DB) Log(limit int) ([]map[string]any, error) {
 
 // Diff returns changes in the working set (uncommitted changes).
 func (s *DB) Diff() ([]map[string]any, error) {
-	rows, err := s.db.QueryContext(s.Ctx(),
+	rows, err := s.queryContext(s.Ctx(),
 		`SELECT table_name, staged, status FROM dolt_status`)
 	if err != nil {
 		return nil, err
@@ -320,7 +361,7 @@ func (s *DB) Diff() ([]map[string]any, error) {
 
 // DiffDefinitions returns definitions that changed since the last commit.
 func (s *DB) DiffDefinitions() ([]map[string]any, error) {
-	rows, err := s.db.QueryContext(s.Ctx(),
+	rows, err := s.queryContext(s.Ctx(),
 		`SELECT diff_type, from_name, from_kind, to_name, to_kind, from_hash, to_hash
 		 FROM dolt_diff_definitions
 		 WHERE from_commit = HASHOF('HEAD') AND to_commit = 'WORKING'`)
@@ -393,11 +434,11 @@ type Import struct {
 // EnsureModule creates or returns an existing module.
 func (s *DB) EnsureModule(path, name, doc string) (*Module, error) {
 	var m Module
-	err := s.db.QueryRowContext(s.Ctx(),
+	err := s.queryRowContext(s.Ctx(),
 		"SELECT id, path, name, COALESCE(doc,'') FROM modules WHERE path = ?", path,
 	).Scan(&m.ID, &m.Path, &m.Name, &m.Doc)
 	if err == sql.ErrNoRows {
-		res, err := s.db.ExecContext(s.Ctx(),
+		res, err := s.execContext(s.Ctx(),
 			"INSERT INTO modules (path, name, doc) VALUES (?, ?, ?)", path, name, doc)
 		if err != nil {
 			return nil, fmt.Errorf("insert module: %w", err)
@@ -413,7 +454,7 @@ func (s *DB) EnsureModule(path, name, doc string) (*Module, error) {
 	}
 	// Update doc if changed.
 	if m.Doc != doc && doc != "" {
-		s.db.ExecContext(s.Ctx(), "UPDATE modules SET doc = ? WHERE id = ?", doc, m.ID)
+		s.execContext(s.Ctx(), "UPDATE modules SET doc = ? WHERE id = ?", doc, m.ID)
 		m.Doc = doc
 	}
 	return &m, nil
@@ -422,7 +463,7 @@ func (s *DB) EnsureModule(path, name, doc string) (*Module, error) {
 // GetModuleByPath returns a module by its path.
 func (s *DB) GetModuleByPath(path string) (*Module, error) {
 	var m Module
-	err := s.db.QueryRowContext(s.Ctx(),
+	err := s.queryRowContext(s.Ctx(),
 		"SELECT id, path, name, COALESCE(doc,'') FROM modules WHERE path = ?", path,
 	).Scan(&m.ID, &m.Path, &m.Name, &m.Doc)
 	if err != nil {
@@ -433,7 +474,7 @@ func (s *DB) GetModuleByPath(path string) (*Module, error) {
 
 // ListModules returns all modules.
 func (s *DB) ListModules() ([]Module, error) {
-	rows, err := s.db.QueryContext(s.Ctx(), "SELECT id, path, name, COALESCE(doc,'') FROM modules ORDER BY path")
+	rows, err := s.queryContext(s.Ctx(), "SELECT id, path, name, COALESCE(doc,'') FROM modules ORDER BY path")
 	if err != nil {
 		return nil, err
 	}
@@ -465,14 +506,14 @@ func (s *DB) UpsertDefinition(d *Definition) (int64, error) {
 
 	var existingID int64
 	var existingHash string
-	err := s.db.QueryRowContext(ctx,
+	err := s.queryRowContext(ctx,
 		`SELECT id, hash FROM definitions
 		 WHERE module_id = ? AND name = ? AND kind = ? AND COALESCE(receiver,'') = COALESCE(?,'') AND test = ?`,
 		d.ModuleID, d.Name, d.Kind, d.Receiver, d.Test,
 	).Scan(&existingID, &existingHash)
 
 	if err == sql.ErrNoRows {
-		res, err := s.db.ExecContext(ctx,
+		res, err := s.execContext(ctx,
 			`INSERT INTO definitions
 			 (module_id, name, kind, exported, test, receiver, signature, doc, start_line, end_line, source_file, hash)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -483,7 +524,7 @@ func (s *DB) UpsertDefinition(d *Definition) (int64, error) {
 			return 0, fmt.Errorf("insert definition: %w", err)
 		}
 		id, _ := res.LastInsertId()
-		if _, err := s.db.ExecContext(ctx,
+		if _, err := s.execContext(ctx,
 			`INSERT INTO bodies (def_id, body) VALUES (?, ?)`, id, d.Body,
 		); err != nil {
 			return 0, fmt.Errorf("insert body: %w", err)
@@ -497,7 +538,7 @@ func (s *DB) UpsertDefinition(d *Definition) (int64, error) {
 	if existingHash == d.Hash {
 		// Body unchanged — still update location fields (source_file,
 		// start_line, end_line) which can shift without changing the body.
-		if _, err := s.db.ExecContext(ctx,
+		if _, err := s.execContext(ctx,
 			`UPDATE definitions SET start_line=?, end_line=?, source_file=? WHERE id=?`,
 			d.StartLine, d.EndLine, d.SourceFile, existingID,
 		); err != nil {
@@ -506,7 +547,7 @@ func (s *DB) UpsertDefinition(d *Definition) (int64, error) {
 		return existingID, nil
 	}
 
-	if _, err := s.db.ExecContext(ctx,
+	if _, err := s.execContext(ctx,
 		`UPDATE definitions
 		 SET exported=?, signature=?, doc=?, start_line=?, end_line=?, source_file=?, hash=?
 		 WHERE id=?`,
@@ -515,7 +556,7 @@ func (s *DB) UpsertDefinition(d *Definition) (int64, error) {
 	); err != nil {
 		return 0, fmt.Errorf("update definition: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx,
+	if _, err := s.execContext(ctx,
 		`REPLACE INTO bodies (def_id, body) VALUES (?, ?)`,
 		existingID, d.Body,
 	); err != nil {
@@ -527,13 +568,13 @@ func (s *DB) UpsertDefinition(d *Definition) (int64, error) {
 // DeleteDefinition removes a definition and associated data.
 func (s *DB) DeleteDefinition(id int64) error {
 	ctx := s.Ctx()
-	if _, err := s.db.ExecContext(ctx, "DELETE FROM `references` WHERE from_def = ? OR to_def = ?", id, id); err != nil {
+	if _, err := s.execContext(ctx, "DELETE FROM `references` WHERE from_def = ? OR to_def = ?", id, id); err != nil {
 		return fmt.Errorf("delete references for def %d: %w", id, err)
 	}
-	if _, err := s.db.ExecContext(ctx, "DELETE FROM bodies WHERE def_id = ?", id); err != nil {
+	if _, err := s.execContext(ctx, "DELETE FROM bodies WHERE def_id = ?", id); err != nil {
 		return fmt.Errorf("delete body for def %d: %w", id, err)
 	}
-	if _, err := s.db.ExecContext(ctx, "DELETE FROM definitions WHERE id = ?", id); err != nil {
+	if _, err := s.execContext(ctx, "DELETE FROM definitions WHERE id = ?", id); err != nil {
 		return fmt.Errorf("delete definition %d: %w", id, err)
 	}
 	return nil
@@ -544,7 +585,7 @@ func (s *DB) PruneStaleDefinitions(liveIDs map[int64]bool) (int, error) {
 	if len(liveIDs) == 0 {
 		return 0, nil
 	}
-	rows, err := s.db.QueryContext(s.Ctx(), "SELECT id FROM definitions")
+	rows, err := s.queryContext(s.Ctx(), "SELECT id FROM definitions")
 	if err != nil {
 		return 0, err
 	}
@@ -595,7 +636,7 @@ func (s *DB) FindDefinitionsByFile(fileSuffix string, sourceFile string, line in
 	}
 	query += " ORDER BY d.start_line"
 
-	rows, err := s.db.QueryContext(s.Ctx(), query, args...)
+	rows, err := s.queryContext(s.Ctx(), query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -615,7 +656,7 @@ func (s *DB) FindDefinitionsByFile(fileSuffix string, sourceFile string, line in
 // GetDefinition returns a definition by ID, including its body.
 func (s *DB) GetDefinition(id int64) (*Definition, error) {
 	d := &Definition{}
-	err := s.db.QueryRowContext(s.Ctx(),
+	err := s.queryRowContext(s.Ctx(),
 		`SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
 		        d.signature, COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
 		 FROM definitions d
@@ -636,7 +677,7 @@ func (s *DB) SearchDefinitions(query string) ([]Definition, error) {
 	// Dolt's FULLTEXT indexes don't work with MATCH AGAINST in embedded mode,
 	// so we fall back to LIKE. Acceptable for typical project sizes (<10K defs).
 	likePattern := "%" + query + "%"
-	rows, err := s.db.QueryContext(s.Ctx(),
+	rows, err := s.queryContext(s.Ctx(),
 		`SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
 		        COALESCE(d.signature,''), '', COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
 		 FROM definitions d
@@ -653,7 +694,7 @@ func (s *DB) SearchDefinitions(query string) ([]Definition, error) {
 
 // FindDefinitions searches by name pattern (SQL LIKE). No bodies.
 func (s *DB) FindDefinitions(namePattern string) ([]Definition, error) {
-	rows, err := s.db.QueryContext(s.Ctx(),
+	rows, err := s.queryContext(s.Ctx(),
 		`SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
 		        COALESCE(d.signature,''), '', COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
 		 FROM definitions d
@@ -746,7 +787,7 @@ func (s *DB) GetDefinitionByName(name, modulePath string) (*Definition, error) {
 		// Try exact match first.
 		query := baseQuery + " JOIN modules m ON d.module_id = m.id WHERE d.name = ? AND m.path = ?"
 		d := &Definition{}
-		err := s.db.QueryRowContext(s.Ctx(), query, name, modulePath).Scan(
+		err := s.queryRowContext(s.Ctx(), query, name, modulePath).Scan(
 			&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &d.Receiver,
 			&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.SourceFile, &d.Hash,
 		)
@@ -757,7 +798,7 @@ func (s *DB) GetDefinitionByName(name, modulePath string) (*Definition, error) {
 		query = baseQuery + " JOIN modules m ON d.module_id = m.id WHERE d.name = ? AND m.path LIKE ?" +
 			` ORDER BY (SELECT COUNT(*) FROM ` + "`references`" + ` r WHERE r.to_def = d.id) DESC LIMIT 1`
 		d = &Definition{}
-		err = s.db.QueryRowContext(s.Ctx(), query, name, "%"+modulePath+"%").Scan(
+		err = s.queryRowContext(s.Ctx(), query, name, "%"+modulePath+"%").Scan(
 			&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &d.Receiver,
 			&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.SourceFile, &d.Hash,
 		)
@@ -777,7 +818,7 @@ func (s *DB) GetDefinitionByName(name, modulePath string) (*Definition, error) {
 	args = append(args, name)
 
 	d := &Definition{}
-	err := s.db.QueryRowContext(s.Ctx(), query, args...).Scan(
+	err := s.queryRowContext(s.Ctx(), query, args...).Scan(
 		&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &d.Receiver,
 		&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.SourceFile, &d.Hash,
 	)
@@ -811,7 +852,7 @@ func (s *DB) GetDefinitionByNameAndReceiver(name, modulePath, receiver string) (
 		  WHERE r.to_def = d.id) DESC LIMIT 1`
 		args = []any{name, receiver}
 	}
-	err := s.db.QueryRowContext(s.Ctx(), query, args...).Scan(
+	err := s.queryRowContext(s.Ctx(), query, args...).Scan(
 		&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &d.Receiver,
 		&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.SourceFile, &d.Hash)
 	if err != nil {
@@ -836,7 +877,7 @@ func (s *DB) fuzzyReceiverLookup(name, modulePath, bareRecv, prefix string) (*De
 		pattern = prefix + "%" + bareRecv
 	}
 	d := &Definition{}
-	err := s.db.QueryRowContext(s.Ctx(), query, name, pattern).Scan(
+	err := s.queryRowContext(s.Ctx(), query, name, pattern).Scan(
 		&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &d.Receiver,
 		&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.SourceFile, &d.Hash)
 	if err != nil {
@@ -993,7 +1034,7 @@ type SimulationResult struct {
 
 // GetCallers returns all definitions that reference the given definition.
 func (s *DB) GetCallers(defID int64) ([]Definition, error) {
-	rows, err := s.db.QueryContext(s.Ctx(),
+	rows, err := s.queryContext(s.Ctx(),
 		`SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
 		        COALESCE(d.signature,''), COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
 		 FROM definitions d
@@ -1010,7 +1051,7 @@ func (s *DB) GetCallers(defID int64) ([]Definition, error) {
 
 // GetCallees returns all definitions referenced by the given definition.
 func (s *DB) GetCallees(defID int64) ([]Definition, error) {
-	rows, err := s.db.QueryContext(s.Ctx(),
+	rows, err := s.queryContext(s.Ctx(),
 		`SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
 		        COALESCE(d.signature,''), COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
 		 FROM definitions d
@@ -1027,7 +1068,7 @@ func (s *DB) GetCallees(defID int64) ([]Definition, error) {
 
 // GetModuleDefinitions returns all definitions in a module, including bodies.
 func (s *DB) GetModuleDefinitions(moduleID int64) ([]Definition, error) {
-	rows, err := s.db.QueryContext(s.Ctx(),
+	rows, err := s.queryContext(s.Ctx(),
 		`SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
 		        COALESCE(d.signature,''), COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
 		 FROM definitions d
@@ -1046,11 +1087,11 @@ func (s *DB) GetModuleDefinitions(moduleID int64) ([]Definition, error) {
 // SetReferences replaces all references from a given definition.
 func (s *DB) SetReferences(fromDef int64, refs []Reference) error {
 	ctx := s.Ctx()
-	if _, err := s.db.ExecContext(ctx, "DELETE FROM `references` WHERE from_def = ?", fromDef); err != nil {
+	if _, err := s.execContext(ctx, "DELETE FROM `references` WHERE from_def = ?", fromDef); err != nil {
 		return fmt.Errorf("clear refs: %w", err)
 	}
 	for _, r := range refs {
-		if _, err := s.db.ExecContext(ctx,
+		if _, err := s.execContext(ctx,
 			"INSERT IGNORE INTO `references` (from_def, to_def, kind) VALUES (?, ?, ?)",
 			fromDef, r.ToDef, r.Kind,
 		); err != nil {
@@ -1065,11 +1106,11 @@ func (s *DB) SetReferences(fromDef int64, refs []Reference) error {
 // SetImports replaces all imports for a module.
 func (s *DB) SetImports(moduleID int64, imports []Import) error {
 	ctx := s.Ctx()
-	if _, err := s.db.ExecContext(ctx, "DELETE FROM imports WHERE module_id = ?", moduleID); err != nil {
+	if _, err := s.execContext(ctx, "DELETE FROM imports WHERE module_id = ?", moduleID); err != nil {
 		return fmt.Errorf("clear imports: %w", err)
 	}
 	for _, imp := range imports {
-		if _, err := s.db.ExecContext(ctx,
+		if _, err := s.execContext(ctx,
 			"INSERT IGNORE INTO imports (module_id, imported_path, alias) VALUES (?, ?, ?)",
 			moduleID, imp.ImportedPath, imp.Alias,
 		); err != nil {
@@ -1081,7 +1122,7 @@ func (s *DB) SetImports(moduleID int64, imports []Import) error {
 
 // GetImports returns all imports for a module.
 func (s *DB) GetImports(moduleID int64) ([]Import, error) {
-	rows, err := s.db.QueryContext(s.Ctx(),
+	rows, err := s.queryContext(s.Ctx(),
 		"SELECT module_id, imported_path, COALESCE(alias, '') FROM imports WHERE module_id = ? ORDER BY imported_path",
 		moduleID)
 	if err != nil {
@@ -1103,7 +1144,7 @@ func (s *DB) GetImports(moduleID int64) ([]Import, error) {
 
 // SetProjectFile stores a project-level file (go.mod, go.sum, etc.).
 func (s *DB) SetProjectFile(path, content string) error {
-	_, err := s.db.ExecContext(s.Ctx(),
+	_, err := s.execContext(s.Ctx(),
 		`REPLACE INTO project_files (path, content) VALUES (?, ?)`, path, content)
 	return err
 }
@@ -1111,7 +1152,7 @@ func (s *DB) SetProjectFile(path, content string) error {
 // GetProjectFile retrieves a project-level file by path.
 func (s *DB) GetProjectFile(path string) (string, error) {
 	var content string
-	err := s.db.QueryRowContext(s.Ctx(),
+	err := s.queryRowContext(s.Ctx(),
 		"SELECT content FROM project_files WHERE path = ?", path,
 	).Scan(&content)
 	return content, err
@@ -1119,7 +1160,7 @@ func (s *DB) GetProjectFile(path string) (string, error) {
 
 // ListProjectFiles returns all project file paths.
 func (s *DB) ListProjectFiles() ([]string, error) {
-	rows, err := s.db.QueryContext(s.Ctx(), "SELECT path FROM project_files ORDER BY path")
+	rows, err := s.queryContext(s.Ctx(), "SELECT path FROM project_files ORDER BY path")
 	if err != nil {
 		return nil, err
 	}
@@ -1149,7 +1190,7 @@ func (s *DB) Query(query string) ([]map[string]any, error) {
 	}
 	// The Dolt driver rejects multi-statement queries at the protocol level,
 	// so no additional semicolon checking is needed here.
-	rows, err := s.db.QueryContext(s.Ctx(), query)
+	rows, err := s.queryContext(s.Ctx(), query)
 	if err != nil {
 		return nil, err
 	}
@@ -1183,7 +1224,7 @@ func (s *DB) Query(query string) ([]map[string]any, error) {
 
 // ComputeRootHash computes a merkle-like root hash of all definitions.
 func (s *DB) ComputeRootHash() (string, error) {
-	rows, err := s.db.QueryContext(s.Ctx(), "SELECT hash FROM definitions ORDER BY id")
+	rows, err := s.queryContext(s.Ctx(), "SELECT hash FROM definitions ORDER BY id")
 	if err != nil {
 		return "", err
 	}
@@ -1225,7 +1266,7 @@ func (s *DB) GetImpact(defID int64) (*Impact, error) {
 	}
 
 	var modulePath string
-	if err := s.db.QueryRowContext(s.Ctx(), "SELECT path FROM modules WHERE id = ?", d.ModuleID).Scan(&modulePath); err != nil {
+	if err := s.queryRowContext(s.Ctx(), "SELECT path FROM modules WHERE id = ?", d.ModuleID).Scan(&modulePath); err != nil {
 		return nil, fmt.Errorf("get module path for def %d: %w", defID, err)
 	}
 
@@ -1323,7 +1364,7 @@ func (s *DB) getInterfaceDispatchCallers(d *Definition) []Definition {
 	concreteType := strings.TrimPrefix(d.Receiver, "*")
 
 	// Find interfaces this type implements (via "implements" edges).
-	rows, err := s.db.QueryContext(s.Ctx(),
+	rows, err := s.queryContext(s.Ctx(),
 		`SELECT d2.name FROM definitions d1
 		 JOIN `+"`references`"+` r ON r.from_def = d1.id
 		 JOIN definitions d2 ON d2.id = r.to_def
@@ -1361,7 +1402,7 @@ func (s *DB) getInterfaceDispatchCallers(d *Definition) []Definition {
 }
 
 func (s *DB) GetUntested() ([]Definition, error) {
-	rows, err := s.db.QueryContext(s.Ctx(), `
+	rows, err := s.queryContext(s.Ctx(), `
 		SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
 		       COALESCE(d.signature,''), '', COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
 		FROM definitions d

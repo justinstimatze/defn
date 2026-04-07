@@ -3,8 +3,8 @@ module github.com/justinstimatze/defn
 go 1.26
 
 require (
-	github.com/dolthub/dolt/go v0.40.5-0.20260320230712-858d651f552a
-	github.com/dolthub/driver v1.84.0
+	github.com/dolthub/dolt/go v0.40.5-0.20260326074512-005921bdd8ca
+	github.com/dolthub/driver v1.84.1
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/modelcontextprotocol/go-sdk v1.4.1
 	golang.org/x/tools v0.43.0
@@ -67,7 +67,7 @@ require (
 	github.com/dolthub/flatbuffers/v23 v23.3.3-dh.2 // indirect
 	github.com/dolthub/fslock v0.0.3 // indirect
 	github.com/dolthub/go-icu-regex v0.0.0-20250916051405-78a38d478790 // indirect
-	github.com/dolthub/go-mysql-server v0.20.1-0.20260319021557-3b1ba29f1e79 // indirect
+	github.com/dolthub/go-mysql-server v0.20.1-0.20260325173633-83a7fba2790f // indirect
 	github.com/dolthub/gozstd v0.0.0-20240423170813-23a2903bca63 // indirect
 	github.com/dolthub/ishell v0.0.0-20240701202509-2b217167d718 // indirect
 	github.com/dolthub/jsonpath v0.0.2-0.20240227200619-19675ab05c71 // indirect
