@@ -152,6 +152,14 @@ func (s *DB) Close() error {
 	return err
 }
 
+// CleanTempFiles removes Dolt's accumulated temp files. The embedded Dolt
+// storage engine creates UUID-named temp files in /tmp for table persistence
+// and manifests. In long-lived processes (defn serve), these leak because
+// Clean() is only called on Close(). Call this after write operations.
+func (s *DB) CleanTempFiles() {
+	tempfiles.MovableTempFileProvider.Clean()
+}
+
 // Path returns the filesystem path of this database.
 func (s *DB) Path() string {
 	return s.path
@@ -195,6 +203,7 @@ func (s *DB) Commit(message string) error {
 		}
 		return fmt.Errorf("dolt commit: %w", err)
 	}
+	s.CleanTempFiles()
 	return nil
 }
 
@@ -213,6 +222,7 @@ func (s *DB) Checkout(name string) error {
 // Merge merges a branch into the current branch.
 func (s *DB) Merge(branchName string) error {
 	_, err := s.db.ExecContext(s.Ctx(), "CALL DOLT_MERGE(?)", branchName)
+	s.CleanTempFiles()
 	return err
 }
 
@@ -859,6 +869,7 @@ func (s *DB) Simulate(mutations []Mutation) (*SimulationResult, error) {
 	defer func() {
 		conn.ExecContext(ctx, "CALL DOLT_CHECKOUT('main')")
 		conn.ExecContext(ctx, "CALL DOLT_BRANCH('-D', ?)", branchName)
+		s.CleanTempFiles()
 	}()
 
 	result := &SimulationResult{
