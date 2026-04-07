@@ -73,14 +73,14 @@ func Run(ctx context.Context, database *store.DB, projDir string) error {
 
 	server := sdkmcp.NewServer(&sdkmcp.Implementation{
 		Name:    "defn",
-		Version: "0.5.2",
+		Version: "0.5.3",
 	}, nil)
 
 	sdkmcp.AddTool(server, &sdkmcp.Tool{
 		Name: "code",
 		Description: `Go code database. One tool, many ops. Start with impact for blast radius — it returns callers, transitives, and test coverage in one call. Don't follow up with search/explain unless you need more.
 
-Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync, query, overview, patch, simulate, validate-plan`,
+Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan`,
 	}, s.handleCode)
 
 	return server.Run(ctx, &sdkmcp.StdioTransport{})
@@ -365,7 +365,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "patch":
 		return s.handlePatch(ctx, req, args)
 	case "sync":
-		return s.handleSync(ctx, req, emptyParam{})
+		return s.handleSync(ctx, req, args)
 	case "test-coverage":
 		return wrapStale(s.handleTestCoverage(ctx, req, args))
 	case "batch-impact":
@@ -1345,10 +1345,25 @@ func (s *server) handleQuery(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	return textResult(text), nil, nil
 }
 
-func (s *server) handleSync(_ context.Context, _ *sdkmcp.CallToolRequest, _ emptyParam) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) handleSync(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	if s.projectDir == "" {
 		return errResult(fmt.Errorf("no project directory configured"))
 	}
+
+	// Fast path: sync a single file without full packages.Load.
+	if args.File != "" {
+		filePath := args.File
+		if !filepath.IsAbs(filePath) {
+			filePath = filepath.Join(s.projectDir, filePath)
+		}
+		n, err := ingest.IngestFile(s.db, s.projectDir, filePath)
+		if err != nil {
+			return errResult(fmt.Errorf("ingest file: %w", err))
+		}
+		return textResult(fmt.Sprintf("Synced %s: updated %d definitions.", args.File, n)), nil, nil
+	}
+
+	// Full sync: re-ingest all packages and rebuild references.
 	if err := ingest.Ingest(s.db, s.projectDir); err != nil {
 		return errResult(fmt.Errorf("ingest: %w", err))
 	}
