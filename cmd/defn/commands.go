@@ -787,7 +787,7 @@ func cmdLog() {
 	}
 }
 
-func cmdImpact(name string) {
+func cmdImpact(name string, jsonOutput bool) {
 	db, err := store.Open(getDBPath())
 	if err != nil {
 		fatal(err)
@@ -803,6 +803,57 @@ func cmdImpact(name string) {
 	impact, err := db.GetImpact(d.ID)
 	if err != nil {
 		fatal(err)
+	}
+
+	if jsonOutput {
+		type defRef struct {
+			Name       string `json:"name"`
+			Kind       string `json:"kind"`
+			Receiver   string `json:"receiver,omitempty"`
+			SourceFile string `json:"source_file"`
+			StartLine  int    `json:"start_line,omitempty"`
+			Test       bool   `json:"test,omitempty"`
+		}
+		toRef := func(d store.Definition) defRef {
+			return defRef{Name: d.Name, Kind: d.Kind, Receiver: d.Receiver, SourceFile: d.SourceFile, StartLine: d.StartLine, Test: d.Test}
+		}
+
+		blastRadius := "low"
+		if impact.TransitiveCount > 20 {
+			blastRadius = "high"
+		} else if impact.TransitiveCount > 5 {
+			blastRadius = "medium"
+		}
+
+		callers := make([]defRef, 0, len(impact.DirectCallers))
+		for _, c := range impact.DirectCallers {
+			callers = append(callers, toRef(c))
+		}
+		ifaceDispatch := make([]defRef, 0, len(impact.InterfaceDispatchCallers))
+		for _, c := range impact.InterfaceDispatchCallers {
+			ifaceDispatch = append(ifaceDispatch, toRef(c))
+		}
+		tests := make([]defRef, 0, len(impact.Tests))
+		for _, t := range impact.Tests {
+			tests = append(tests, toRef(t))
+		}
+
+		result := map[string]any{
+			"definition":                 toRef(impact.Definition),
+			"module":                     impact.Module,
+			"direct_callers":             callers,
+			"interface_dispatch_callers": ifaceDispatch,
+			"transitive_count":           impact.TransitiveCount,
+			"tests":                      tests,
+			"uncovered_by":               impact.UncoveredBy,
+			"blast_radius":               blastRadius,
+		}
+		b, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			fatal(err)
+		}
+		fmt.Println(string(b))
+		return
 	}
 
 	// Module.pkg.Name (kind)

@@ -73,14 +73,14 @@ func Run(ctx context.Context, database *store.DB, projDir string) error {
 
 	server := sdkmcp.NewServer(&sdkmcp.Implementation{
 		Name:    "defn",
-		Version: "0.4.1",
+		Version: "0.5.0",
 	}, nil)
 
 	sdkmcp.AddTool(server, &sdkmcp.Tool{
 		Name: "code",
 		Description: `Go code database. One tool, many ops. Start with impact for blast radius — it returns callers, transitives, and test coverage in one call. Don't follow up with search/explain unless you need more.
 
-Ops: impact (blast radius — START HERE), read, search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync, query, overview, patch`,
+Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync, query, overview, patch, simulate, validate-plan`,
 	}, s.handleCode)
 
 	return server.Run(ctx, &sdkmcp.StdioTransport{})
@@ -124,6 +124,7 @@ type codeParam struct {
 	ReplaceAll  bool             `json:"replace_all,omitempty"`
 	Operations  []applyOp        `json:"operations,omitempty"`
 	DryRun      bool             `json:"dry_run,omitempty"`
+	Format      string           `json:"format,omitempty"`
 }
 
 type applyOp struct {
@@ -295,6 +296,10 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if r, o, e := need(args.File, "file"); r != nil {
 			return r, o, e
 		}
+	case "validate-plan":
+		if len(args.Mutations) == 0 {
+			return errResult(fmt.Errorf("validate-plan: mutations is required"))
+		}
 	}
 
 	// Tag results from read-only ops while startup ingest is still running.
@@ -320,7 +325,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		}
 		return wrapStale(s.handleSearch(ctx, req, patternParam{Pattern: p}))
 	case "impact":
-		return wrapStale(s.handleImpact(ctx, req, nameParam{Name: args.Name}))
+		return wrapStale(s.handleImpact(ctx, req, args))
 	case "explain":
 		return wrapStale(s.handleExplain(ctx, req, nameParam{Name: args.Name}))
 	case "untested":
@@ -372,14 +377,16 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return s.handleSimulate(ctx, req, args)
 	case "file-defs":
 		return s.handleFileDefs(ctx, req, args)
+	case "validate-plan":
+		return wrapStale(s.handleValidatePlan(ctx, req, args))
 	default:
-		return errResult(fmt.Errorf("unknown op %q — valid: read, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact", args.Op))
+		return errResult(fmt.Errorf("unknown op %q — valid: read, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan", args.Op))
 	}
 }
 
 // --- Handlers ---
 
-func (s *server) handleImpact(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) handleImpact(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", args.Name))
@@ -387,6 +394,10 @@ func (s *server) handleImpact(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	impact, err := s.db.GetImpact(d.ID)
 	if err != nil {
 		return errResult(err)
+	}
+
+	if args.Format == "json" {
+		return s.impactJSON(impact)
 	}
 
 	// Formatted markdown response.
@@ -416,6 +427,70 @@ func (s *server) handleImpact(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	}
 
 	return textResult(sb.String()), nil, nil
+}
+
+type impactDefRef struct {
+	Name       string `json:"name"`
+	Kind       string `json:"kind"`
+	Receiver   string `json:"receiver,omitempty"`
+	SourceFile string `json:"source_file"`
+	StartLine  int    `json:"start_line,omitempty"`
+	Test       bool   `json:"test,omitempty"`
+}
+
+func (s *server) impactJSON(impact *store.Impact) (*sdkmcp.CallToolResult, any, error) {
+	blastRadius := "low"
+	if impact.TransitiveCount > 20 {
+		blastRadius = "high"
+	} else if impact.TransitiveCount > 5 {
+		blastRadius = "medium"
+	}
+
+	toRef := func(d store.Definition) impactDefRef {
+		return impactDefRef{
+			Name:       d.Name,
+			Kind:       d.Kind,
+			Receiver:   d.Receiver,
+			SourceFile: d.SourceFile,
+			StartLine:  d.StartLine,
+			Test:       d.Test,
+		}
+	}
+
+	callers := make([]impactDefRef, 0, len(impact.DirectCallers))
+	for _, c := range impact.DirectCallers {
+		callers = append(callers, toRef(c))
+	}
+	ifaceDispatch := make([]impactDefRef, 0, len(impact.InterfaceDispatchCallers))
+	for _, c := range impact.InterfaceDispatchCallers {
+		ifaceDispatch = append(ifaceDispatch, toRef(c))
+	}
+	tests := make([]impactDefRef, 0, len(impact.Tests))
+	for _, t := range impact.Tests {
+		tests = append(tests, toRef(t))
+	}
+
+	result := map[string]any{
+		"definition": impactDefRef{
+			Name:       impact.Definition.Name,
+			Kind:       impact.Definition.Kind,
+			Receiver:   impact.Definition.Receiver,
+			SourceFile: impact.Definition.SourceFile,
+			StartLine:  impact.Definition.StartLine,
+		},
+		"module":                    impact.Module,
+		"direct_callers":            callers,
+		"interface_dispatch_callers": ifaceDispatch,
+		"transitive_count":          impact.TransitiveCount,
+		"tests":                     tests,
+		"uncovered_by":              impact.UncoveredBy,
+		"blast_radius":              blastRadius,
+	}
+	text, err := toJSON(result)
+	if err != nil {
+		return errResult(err)
+	}
+	return textResult(text), nil, nil
 }
 
 func (s *server) handleGetDefinition(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
@@ -1618,6 +1693,108 @@ func (s *server) handleSimulate(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 		return errResult(fmt.Errorf("simulate: %w", err))
 	}
 	text, err := toJSON(result)
+	if err != nil {
+		return errResult(err)
+	}
+	return textResult(text), nil, nil
+}
+
+func (s *server) handleValidatePlan(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	// Build set of all names in the plan for O(1) lookup.
+	planned := map[string]bool{}
+	for _, m := range args.Mutations {
+		key := m.Name
+		if m.Receiver != "" {
+			key = "(" + m.Receiver + ")." + m.Name
+		}
+		planned[key] = true
+	}
+
+	type callerGap struct {
+		Name       string `json:"name"`
+		Kind       string `json:"kind"`
+		Receiver   string `json:"receiver,omitempty"`
+		SourceFile string `json:"source_file"`
+	}
+	type changeResult struct {
+		Name             string      `json:"name"`
+		ChangeType       string      `json:"change_type"`
+		Error            string      `json:"error,omitempty"`
+		DirectCallers    int         `json:"direct_callers"`
+		TransitiveCount  int         `json:"transitive_count"`
+		TestCount        int         `json:"test_count"`
+		MissingTests     bool        `json:"missing_tests"`
+		UncoveredCallers []callerGap `json:"uncovered_callers"`
+		MissedInterfaces []string    `json:"missed_interfaces,omitempty"`
+	}
+
+	var results []changeResult
+	totalGaps := 0
+
+	for _, m := range args.Mutations {
+		cr := changeResult{Name: m.Name, ChangeType: m.Type}
+
+		d, err := s.db.GetDefinitionByName(m.Name, "")
+		if err != nil {
+			cr.Error = fmt.Sprintf("definition %q not found", m.Name)
+			results = append(results, cr)
+			continue
+		}
+
+		impact, err := s.db.GetImpact(d.ID)
+		if err != nil {
+			cr.Error = err.Error()
+			results = append(results, cr)
+			continue
+		}
+
+		cr.DirectCallers = len(impact.DirectCallers)
+		cr.TransitiveCount = impact.TransitiveCount
+		cr.TestCount = len(impact.Tests)
+		cr.MissingTests = len(impact.Tests) == 0
+
+		// Check which production callers are NOT in the plan.
+		for _, c := range impact.DirectCallers {
+			if c.Test {
+				continue
+			}
+			key := c.Name
+			if c.Receiver != "" {
+				key = "(" + c.Receiver + ")." + c.Name
+			}
+			if !planned[key] {
+				cr.UncoveredCallers = append(cr.UncoveredCallers, callerGap{
+					Name: c.Name, Kind: c.Kind, Receiver: c.Receiver, SourceFile: c.SourceFile,
+				})
+			}
+		}
+		totalGaps += len(cr.UncoveredCallers)
+
+		// Check interface dispatch callers not in plan.
+		for _, ic := range impact.InterfaceDispatchCallers {
+			key := ic.Name
+			if ic.Receiver != "" {
+				key = "(" + ic.Receiver + ")." + ic.Name
+			}
+			if !planned[key] {
+				cr.MissedInterfaces = append(cr.MissedInterfaces, key)
+			}
+		}
+
+		results = append(results, cr)
+	}
+
+	summary := "ok"
+	if totalGaps > 0 {
+		summary = fmt.Sprintf("%d uncovered production callers across %d changes", totalGaps, len(args.Mutations))
+	}
+
+	output := map[string]any{
+		"changes":    results,
+		"total_gaps": totalGaps,
+		"summary":    summary,
+	}
+	text, err := toJSON(output)
 	if err != nil {
 		return errResult(err)
 	}

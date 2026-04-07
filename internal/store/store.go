@@ -1197,12 +1197,13 @@ func (s *DB) ComputeRootHash() (string, error) {
 
 // Impact computes the blast radius of a definition.
 type Impact struct {
-	Definition      Definition
-	Module          string
-	DirectCallers   []Definition
-	TransitiveCount int
-	Tests           []Definition
-	UncoveredBy     int
+	Definition               Definition
+	Module                   string
+	DirectCallers            []Definition
+	InterfaceDispatchCallers []Definition // callers via interface dispatch (subset of DirectCallers)
+	TransitiveCount          int
+	Tests                    []Definition
+	UncoveredBy              int
 }
 
 // GetImpact computes the full impact analysis for a definition.
@@ -1224,9 +1225,10 @@ func (s *DB) GetImpact(defID int64) (*Impact, error) {
 
 	// If this is a method on a concrete type, also include callers of
 	// any interface method it satisfies (interface dispatch).
+	var ifaceDispatchCallers []Definition
 	if d.Receiver != "" {
-		ifaceMethodCallers := s.getInterfaceDispatchCallers(d)
-		for _, c := range ifaceMethodCallers {
+		ifaceDispatchCallers = s.getInterfaceDispatchCallers(d)
+		for _, c := range ifaceDispatchCallers {
 			found := false
 			for _, existing := range directCallers {
 				if existing.ID == c.ID {
@@ -1291,12 +1293,13 @@ func (s *DB) GetImpact(defID int64) (*Impact, error) {
 	}
 
 	return &Impact{
-		Definition:      *d,
-		Module:          modulePath,
-		DirectCallers:   directCallers,
-		TransitiveCount: len(allCallers),
-		Tests:           tests,
-		UncoveredBy:     uncovered,
+		Definition:               *d,
+		Module:                   modulePath,
+		DirectCallers:            directCallers,
+		InterfaceDispatchCallers: ifaceDispatchCallers,
+		TransitiveCount:          len(allCallers),
+		Tests:                    tests,
+		UncoveredBy:              uncovered,
 	}, nil
 }
 

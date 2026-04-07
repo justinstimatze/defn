@@ -260,7 +260,7 @@ func TestHandleImpact(t *testing.T) {
 	defer db.Close()
 	s := &server{db: db}
 
-	result, _, _ := s.handleImpact(context.Background(), nil, nameParam{Name: "Greet"})
+	result, _, _ := s.handleImpact(context.Background(), nil, codeParam{Name: "Greet"})
 	text := resultText(t, result)
 
 	if !strings.Contains(text, "Greet") {

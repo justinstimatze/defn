@@ -54,10 +54,20 @@ func main() {
 		cmdEmit(dir)
 	case "impact":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: defn impact <definition-name>")
+			fmt.Fprintln(os.Stderr, "usage: defn impact [--json] <definition-name>")
 			os.Exit(1)
 		}
-		cmdImpact(os.Args[2])
+		jsonFlag := false
+		impactName := os.Args[2]
+		if impactName == "--json" {
+			jsonFlag = true
+			if len(os.Args) < 4 {
+				fmt.Fprintln(os.Stderr, "usage: defn impact [--json] <definition-name>")
+				os.Exit(1)
+			}
+			impactName = os.Args[3]
+		}
+		cmdImpact(impactName, jsonFlag)
 	case "untested":
 		cmdUntested()
 	case "lint":
