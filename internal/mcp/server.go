@@ -125,6 +125,7 @@ type codeParam struct {
 	Operations  []applyOp        `json:"operations,omitempty"`
 	DryRun      bool             `json:"dry_run,omitempty"`
 	Format      string           `json:"format,omitempty"`
+	Limit       int              `json:"limit,omitempty"`
 }
 
 type applyOp struct {
@@ -143,9 +144,6 @@ type applyOp struct {
 // Legacy param types used by internal handlers.
 type nameParam struct {
 	Name string `json:"name"`
-}
-type patternParam struct {
-	Pattern string `json:"pattern"`
 }
 type editParam struct {
 	Name    string `json:"name"`
@@ -319,11 +317,10 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "read":
 		return wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name}))
 	case "search":
-		p := args.Pattern
-		if p == "" {
-			p = args.Name
+		if args.Pattern == "" {
+			args.Pattern = args.Name
 		}
-		return wrapStale(s.handleSearch(ctx, req, patternParam{Pattern: p}))
+		return wrapStale(s.handleSearch(ctx, req, args))
 	case "impact":
 		return wrapStale(s.handleImpact(ctx, req, args))
 	case "explain":
@@ -406,19 +403,23 @@ func (s *server) handleImpact(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	sb.WriteString(fmt.Sprintf("## %s%s (%s)\n", recv, impact.Definition.Name, impact.Definition.Kind))
 	sb.WriteString(fmt.Sprintf("Module: %s\n\n", impact.Module))
 
-	// Compact format: counts + caller names only (no test names — agent can get those via code(op:"test")).
-	var prodCallers, testCallers []string
+	// Compact format: caller names with file:line locations.
+	var prodCallers, testCallers []store.Definition
 	for _, c := range impact.DirectCallers {
-		name := formatReceiver(c.Receiver) + c.Name
 		if c.Test {
-			testCallers = append(testCallers, name)
+			testCallers = append(testCallers, c)
 		} else {
-			prodCallers = append(prodCallers, name)
+			prodCallers = append(prodCallers, c)
 		}
 	}
 	sb.WriteString(fmt.Sprintf("Direct callers: %d (%d production, %d test)\n", len(impact.DirectCallers), len(prodCallers), len(testCallers)))
-	for _, name := range prodCallers {
-		sb.WriteString(fmt.Sprintf("  %s\n", name))
+	for _, c := range prodCallers {
+		name := formatReceiver(c.Receiver) + c.Name
+		if c.SourceFile != "" && c.StartLine > 0 {
+			sb.WriteString(fmt.Sprintf("  %s  (%s:%d)\n", name, c.SourceFile, c.StartLine))
+		} else {
+			sb.WriteString(fmt.Sprintf("  %s\n", name))
+		}
 	}
 	sb.WriteString(fmt.Sprintf("Transitive callers: %d\n", impact.TransitiveCount))
 	sb.WriteString(fmt.Sprintf("Tests covering this: %d\n", len(impact.Tests)))
@@ -523,7 +524,7 @@ func (s *server) handleGetDefinition(_ context.Context, _ *sdkmcp.CallToolReques
 	return textResult(sb.String()), nil, nil
 }
 
-func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args patternParam) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	var defs []store.Definition
 	var err error
 
@@ -541,6 +542,12 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	if err != nil {
 		return errResult(err)
 	}
+
+	limit := maxSearchResults
+	if args.Limit > 0 {
+		limit = args.Limit
+	}
+
 	type summary struct {
 		Name     string `json:"name"`
 		Kind     string `json:"kind"`
@@ -548,7 +555,7 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	}
 	var results []summary
 	for _, d := range defs {
-		if len(results) >= maxSearchResults {
+		if len(results) >= limit {
 			break
 		}
 		results = append(results, summary{
@@ -556,8 +563,8 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		})
 	}
 	truncated := ""
-	if len(defs) > maxSearchResults {
-		truncated = fmt.Sprintf("\n(showing %d of %d results)", maxSearchResults, len(defs))
+	if len(defs) > limit {
+		truncated = fmt.Sprintf("\n(showing %d of %d results — pass limit:<n> to see more)", limit, len(defs))
 	}
 	text, err := toJSON(results)
 	if err != nil {

@@ -408,7 +408,7 @@ func TestHandleSearch(t *testing.T) {
 	defer db.Close()
 	s := &server{db: db}
 
-	result, _, _ := s.handleSearch(context.Background(), nil, patternParam{Pattern: "%Greet%"})
+	result, _, _ := s.handleSearch(context.Background(), nil, codeParam{Pattern: "%Greet%"})
 	text := resultText(t, result)
 
 	if !strings.Contains(text, "Greet") {
