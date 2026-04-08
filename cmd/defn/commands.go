@@ -520,6 +520,20 @@ func cmdEmit(outDir string) {
 	fmt.Fprintln(os.Stderr, "done.")
 }
 
+func cmdGC() {
+	db, err := store.Open(getDBPath())
+	if err != nil {
+		fatal(err)
+	}
+	defer db.Close()
+
+	fmt.Fprint(os.Stderr, "Running garbage collection...")
+	if err := db.GC(); err != nil {
+		fatal(err)
+	}
+	fmt.Fprintln(os.Stderr, " done.")
+}
+
 func cmdQuery(sql string) {
 	db, err := store.Open(getDBPath())
 	if err != nil {

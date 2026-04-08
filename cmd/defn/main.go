@@ -128,6 +128,8 @@ func main() {
 			os.Exit(1)
 		}
 		cmdPull(os.Args[2], os.Args[3])
+	case "gc":
+		cmdGC()
 	default:
 		usage()
 		os.Exit(1)
@@ -156,6 +158,7 @@ Usage:
   defn diff                    Show uncommitted changes
   defn log                     Commit history
   defn query <sql>             Read-only SQL query
+  defn gc                      Compact Dolt storage (garbage collection)
   defn worktree <branch>       Clone DB on a branch (for multi-agent)
   defn push <remote> <branch>  Push branch to remote
   defn pull <remote> <branch>  Pull from remote`)
