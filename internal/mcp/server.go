@@ -655,8 +655,16 @@ func (s *server) autoResolve(modulePath string) {
 	} else {
 		resolve.Resolve(s.db, s.projectDir)
 	}
-	s.db.CleanTempFiles()
+	s.autoCommit()
 	s.lastResolved.Store(time.Now().UnixNano())
+}
+
+// autoCommit commits the working set with an auto-generated message.
+// This keeps Dolt's working set small so chunk accumulation doesn't
+// cause storage bloat. No-op if nothing changed.
+func (s *server) autoCommit() {
+	s.db.Commit("auto-sync")
+	s.db.CleanTempFiles()
 }
 
 // watchFiles polls for .go file changes and auto-reingests when detected.
@@ -697,7 +705,7 @@ func (s *server) watchFiles(ctx context.Context) {
 			// Files changed externally — re-ingest and resolve.
 			ingest.Ingest(s.db, s.projectDir)
 			resolve.Resolve(s.db, s.projectDir)
-			s.db.CleanTempFiles()
+			s.autoCommit()
 			s.lastResolved.Store(time.Now().UnixNano())
 		}
 		lastMod = newest
@@ -1362,7 +1370,7 @@ func (s *server) handleSync(_ context.Context, _ *sdkmcp.CallToolRequest, args c
 		if err != nil {
 			return errResult(fmt.Errorf("ingest file: %w", err))
 		}
-		s.db.CleanTempFiles()
+		s.autoCommit()
 		return textResult(fmt.Sprintf("Synced %s: updated %d definitions.", args.File, n)), nil, nil
 	}
 
@@ -1373,7 +1381,7 @@ func (s *server) handleSync(_ context.Context, _ *sdkmcp.CallToolRequest, args c
 	if err := resolve.Resolve(s.db, s.projectDir); err != nil {
 		return errResult(fmt.Errorf("resolve: %w", err))
 	}
-	s.db.CleanTempFiles()
+	s.autoCommit()
 	return textResult("Synced: re-ingested source and rebuilt reference graph."), nil, nil
 }
 
