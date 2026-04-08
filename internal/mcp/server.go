@@ -43,10 +43,11 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 }
 
 type server struct {
-	db           *store.DB
-	projectDir   string
-	lastResolved atomic.Int64 // UnixNano timestamp of last resolve (to debounce watcher)
-	ready        atomic.Bool  // true after startup ingest+resolve completes
+	db              *store.DB
+	projectDir      string
+	lastResolved    atomic.Int64 // UnixNano timestamp of last resolve (to debounce watcher)
+	ready           atomic.Bool  // true after startup ingest+resolve completes
+	autoCommitCount atomic.Int64 // counts auto-commits; triggers GC every 50
 }
 
 // Run starts the MCP server. projDir is the project root where files
@@ -661,10 +662,14 @@ func (s *server) autoResolve(modulePath string) {
 
 // autoCommit commits the working set with an auto-generated message.
 // This keeps Dolt's working set small so chunk accumulation doesn't
-// cause storage bloat. No-op if nothing changed.
+// cause storage bloat. No-op if nothing changed. Runs GC every 50
+// auto-commits to compact the noms store.
 func (s *server) autoCommit() {
 	s.db.Commit("auto-sync")
 	s.db.CleanTempFiles()
+	if n := s.autoCommitCount.Add(1); n%50 == 0 {
+		s.db.GC()
+	}
 }
 
 // watchFiles polls for .go file changes and auto-reingests when detected.

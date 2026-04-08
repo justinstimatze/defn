@@ -201,6 +201,16 @@ func (s *DB) CleanTempFiles() {
 	tempfiles.MovableTempFileProvider.Clean()
 }
 
+// GC runs Dolt's garbage collection to compact the noms store.
+func (s *DB) GC() error {
+	_, err := s.execContext(s.Ctx(), "CALL DOLT_GC()")
+	if err != nil {
+		return fmt.Errorf("dolt gc: %w", err)
+	}
+	s.CleanTempFiles()
+	return nil
+}
+
 // Path returns the filesystem path of this database.
 func (s *DB) Path() string {
 	return s.path
