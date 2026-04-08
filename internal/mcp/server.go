@@ -655,6 +655,7 @@ func (s *server) autoResolve(modulePath string) {
 	} else {
 		resolve.Resolve(s.db, s.projectDir)
 	}
+	s.db.CleanTempFiles()
 	s.lastResolved.Store(time.Now().UnixNano())
 }
 
@@ -696,6 +697,7 @@ func (s *server) watchFiles(ctx context.Context) {
 			// Files changed externally — re-ingest and resolve.
 			ingest.Ingest(s.db, s.projectDir)
 			resolve.Resolve(s.db, s.projectDir)
+			s.db.CleanTempFiles()
 			s.lastResolved.Store(time.Now().UnixNano())
 		}
 		lastMod = newest
@@ -1360,6 +1362,7 @@ func (s *server) handleSync(_ context.Context, _ *sdkmcp.CallToolRequest, args c
 		if err != nil {
 			return errResult(fmt.Errorf("ingest file: %w", err))
 		}
+		s.db.CleanTempFiles()
 		return textResult(fmt.Sprintf("Synced %s: updated %d definitions.", args.File, n)), nil, nil
 	}
 
@@ -1370,6 +1373,7 @@ func (s *server) handleSync(_ context.Context, _ *sdkmcp.CallToolRequest, args c
 	if err := resolve.Resolve(s.db, s.projectDir); err != nil {
 		return errResult(fmt.Errorf("resolve: %w", err))
 	}
+	s.db.CleanTempFiles()
 	return textResult("Synced: re-ingested source and rebuilt reference graph."), nil, nil
 }
 

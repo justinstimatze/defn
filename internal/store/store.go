@@ -536,11 +536,12 @@ func (s *DB) UpsertDefinition(d *Definition) (int64, error) {
 	}
 
 	if existingHash == d.Hash {
-		// Body unchanged — still update location fields (source_file,
-		// start_line, end_line) which can shift without changing the body.
+		// Body unchanged — only update location fields if they actually differ.
 		if _, err := s.execContext(ctx,
-			`UPDATE definitions SET start_line=?, end_line=?, source_file=? WHERE id=?`,
-			d.StartLine, d.EndLine, d.SourceFile, existingID,
+			`UPDATE definitions SET start_line=?, end_line=?, source_file=?
+			 WHERE id=? AND (start_line != ? OR end_line != ? OR source_file != ?)`,
+			d.StartLine, d.EndLine, d.SourceFile,
+			existingID, d.StartLine, d.EndLine, d.SourceFile,
 		); err != nil {
 			return 0, fmt.Errorf("update location: %w", err)
 		}
@@ -1087,6 +1088,63 @@ func (s *DB) GetModuleDefinitions(moduleID int64) ([]Definition, error) {
 // SetReferences replaces all references from a given definition.
 func (s *DB) SetReferences(fromDef int64, refs []Reference) error {
 	ctx := s.Ctx()
+
+	// Build sorted set of new refs for comparison.
+	type refKey struct {
+		ToDef int64
+		Kind  string
+	}
+	newSet := make([]refKey, 0, len(refs))
+	seen := make(map[refKey]bool, len(refs))
+	for _, r := range refs {
+		k := refKey{r.ToDef, r.Kind}
+		if !seen[k] {
+			seen[k] = true
+			newSet = append(newSet, k)
+		}
+	}
+	sort.Slice(newSet, func(i, j int) bool {
+		if newSet[i].ToDef != newSet[j].ToDef {
+			return newSet[i].ToDef < newSet[j].ToDef
+		}
+		return newSet[i].Kind < newSet[j].Kind
+	})
+
+	// Read existing refs and compare.
+	rows, err := s.queryContext(ctx,
+		"SELECT to_def, kind FROM `references` WHERE from_def = ? ORDER BY to_def, kind",
+		fromDef)
+	if err != nil {
+		return fmt.Errorf("read refs: %w", err)
+	}
+	var oldSet []refKey
+	for rows.Next() {
+		var k refKey
+		if err := rows.Scan(&k.ToDef, &k.Kind); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan ref: %w", err)
+		}
+		oldSet = append(oldSet, k)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read refs: %w", err)
+	}
+
+	// Skip write if unchanged.
+	if len(oldSet) == len(newSet) {
+		match := true
+		for i := range oldSet {
+			if oldSet[i] != newSet[i] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return nil
+		}
+	}
+
 	if _, err := s.execContext(ctx, "DELETE FROM `references` WHERE from_def = ?", fromDef); err != nil {
 		return fmt.Errorf("clear refs: %w", err)
 	}
@@ -1106,6 +1164,63 @@ func (s *DB) SetReferences(fromDef int64, refs []Reference) error {
 // SetImports replaces all imports for a module.
 func (s *DB) SetImports(moduleID int64, imports []Import) error {
 	ctx := s.Ctx()
+
+	// Build sorted set of new imports for comparison.
+	type impKey struct {
+		Path  string
+		Alias string
+	}
+	newSet := make([]impKey, 0, len(imports))
+	seen := make(map[impKey]bool, len(imports))
+	for _, imp := range imports {
+		k := impKey{imp.ImportedPath, imp.Alias}
+		if !seen[k] {
+			seen[k] = true
+			newSet = append(newSet, k)
+		}
+	}
+	sort.Slice(newSet, func(i, j int) bool {
+		if newSet[i].Path != newSet[j].Path {
+			return newSet[i].Path < newSet[j].Path
+		}
+		return newSet[i].Alias < newSet[j].Alias
+	})
+
+	// Read existing imports and compare.
+	rows, err := s.queryContext(ctx,
+		"SELECT imported_path, COALESCE(alias, '') FROM imports WHERE module_id = ? ORDER BY imported_path, alias",
+		moduleID)
+	if err != nil {
+		return fmt.Errorf("read imports: %w", err)
+	}
+	var oldSet []impKey
+	for rows.Next() {
+		var k impKey
+		if err := rows.Scan(&k.Path, &k.Alias); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan import: %w", err)
+		}
+		oldSet = append(oldSet, k)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read imports: %w", err)
+	}
+
+	// Skip write if unchanged.
+	if len(oldSet) == len(newSet) {
+		match := true
+		for i := range oldSet {
+			if oldSet[i] != newSet[i] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return nil
+		}
+	}
+
 	if _, err := s.execContext(ctx, "DELETE FROM imports WHERE module_id = ?", moduleID); err != nil {
 		return fmt.Errorf("clear imports: %w", err)
 	}
