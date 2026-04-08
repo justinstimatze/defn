@@ -40,7 +40,7 @@ func main() {
 		cmdClean()
 	case "ingest":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: defn ingest <module-path>")
+			fmt.Fprintln(os.Stderr, "usage: defn ingest <path>")
 			os.Exit(1)
 		}
 		cmdIngest(os.Args[2])
@@ -144,7 +144,7 @@ Usage:
   defn init <path> --server    Same, but starts a Dolt server (recommended)
   defn server start|stop       Manage background Dolt server
   defn clean                   Remove all defn files from project
-  defn ingest <module-path>    Parse Go source → Dolt database
+  defn ingest <path>             Parse Go source → Dolt database
   defn serve                   MCP server for Claude Code
   defn emit <output-dir>       Dolt → .go files
   defn impact <name>           Blast radius + test coverage

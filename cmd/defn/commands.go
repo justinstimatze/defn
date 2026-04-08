@@ -326,11 +326,17 @@ func cmdInit(modulePath string) {
 	// Get absolute paths for the MCP config.
 	absDB, _ := filepath.Abs(dbPath)
 	absModulePath, _ := filepath.Abs(modulePath)
-	absBin, _ := filepath.Abs("defn")
-	if _, err := os.Stat(absBin); err != nil {
+	absBin, _ := os.Executable()
+	if absBin == "" {
 		if p, err := exec.LookPath("defn"); err == nil {
 			absBin = p
+		} else {
+			absBin = "defn" // fallback
 		}
+	}
+	// Resolve symlinks so the path is stable.
+	if resolved, err := filepath.EvalSymlinks(absBin); err == nil {
+		absBin = resolved
 	}
 
 	// Write .mcp.json at the project root (Claude Code's project-level MCP config).
