@@ -66,6 +66,7 @@ func Run(ctx context.Context, database *store.DB, projDir string) error {
 			} else if err := resolve.Resolve(s.db, projDir); err != nil {
 				fmt.Fprintf(os.Stderr, "defn: startup resolve failed: %v\n", err)
 			}
+			s.autoCommit()
 			s.lastResolved.Store(time.Now().UnixNano())
 			s.ready.Store(true)
 		}()
@@ -668,7 +669,7 @@ func (s *server) autoCommit() {
 	s.db.Commit("auto-sync")
 	s.db.CleanTempFiles()
 	if n := s.autoCommitCount.Add(1); n%50 == 0 {
-		s.db.GC()
+		go s.db.GC() // background — GC can be slow on large databases
 	}
 }
 

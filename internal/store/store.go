@@ -242,7 +242,9 @@ func (s *DB) Ctx() context.Context {
 // --- Dolt Version Control ---
 
 // Commit stages all changes and creates a Dolt commit.
-// Returns nil if there's nothing to commit.
+// Returns nil if there's nothing to commit. If there's nothing new to
+// commit but the last commit was an auto-sync, amends it with the
+// user's message so labeled commits aren't silently swallowed.
 func (s *DB) Commit(message string) error {
 	ctx := s.Ctx()
 	if _, err := s.execContext(ctx, "CALL DOLT_ADD('-A')"); err != nil {
@@ -250,11 +252,36 @@ func (s *DB) Commit(message string) error {
 	}
 	if _, err := s.execContext(ctx, "CALL DOLT_COMMIT('-m', ?)", message); err != nil {
 		if strings.Contains(err.Error(), "nothing to commit") {
+			// If the caller provided a real message and the last commit
+			// was an auto-sync, amend it with the user's message.
+			if message != "auto-sync" {
+				return s.amendLastAutoSync(ctx, message)
+			}
 			return nil
 		}
 		return fmt.Errorf("dolt commit: %w", err)
 	}
 	s.CleanTempFiles()
+	return nil
+}
+
+// amendLastAutoSync amends the most recent commit if its message is
+// "auto-sync", replacing it with the given message. Returns nil if the
+// last commit isn't an auto-sync (nothing to amend).
+func (s *DB) amendLastAutoSync(ctx context.Context, message string) error {
+	var lastMsg string
+	if err := s.queryRowContext(ctx,
+		"SELECT message FROM dolt_log LIMIT 1",
+	).Scan(&lastMsg); err != nil {
+		return nil // can't read log — not critical
+	}
+	if lastMsg != "auto-sync" {
+		return nil
+	}
+	if _, err := s.execContext(ctx,
+		"CALL DOLT_COMMIT('--amend', '-m', ?)", message); err != nil {
+		return fmt.Errorf("amend commit: %w", err)
+	}
 	return nil
 }
 
