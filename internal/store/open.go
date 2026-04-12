@@ -158,19 +158,23 @@ func migrateReferencesToRefs(ctx context.Context, db execQuerier) error {
 
 // splitSQL splits a SQL script by semicolons, filtering out comment-only lines.
 func splitSQL(s string) []string {
+	return splitSQLStatements(stripSQLComments(s))
+}
+
+func stripSQLComments(s string) string {
 	var lines []string
 	for line := range strings.SplitSeq(s, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if !strings.HasPrefix(trimmed, "--") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "--") {
 			lines = append(lines, line)
 		}
 	}
-	cleaned := strings.Join(lines, "\n")
+	return strings.Join(lines, "\n")
+}
 
+func splitSQLStatements(s string) []string {
 	var stmts []string
-	for part := range strings.SplitSeq(cleaned, ";") {
-		trimmed := strings.TrimSpace(part)
-		if trimmed != "" {
+	for part := range strings.SplitSeq(s, ";") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
 			stmts = append(stmts, trimmed)
 		}
 	}
