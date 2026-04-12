@@ -92,25 +92,34 @@ func renderSignature(fset *token.FileSet, fn *ast.FuncDecl) string {
 // (e.g. `var X = Foo{...}` → `var X Foo`). Falls back to `kind name`
 // if the type can't be recovered without running go/types.
 func valueSpecSignature(kind, name string, s *ast.ValueSpec) string {
-	if s.Type != nil {
-		if t := typeString(s.Type); t != "<unknown>" {
-			return fmt.Sprintf("%s %s %s", kind, name, t)
-		}
-	}
-	// Try to infer from the matching initializer.
-	idx := 0
-	for i, id := range s.Names {
-		if id.Name == name {
-			idx = i
-			break
-		}
-	}
-	if idx < len(s.Values) {
-		if t := inferInitType(s.Values[idx]); t != "" {
-			return fmt.Sprintf("%s %s %s", kind, name, t)
-		}
+	if t := valueSpecType(name, s); t != "" {
+		return fmt.Sprintf("%s %s %s", kind, name, t)
 	}
 	return fmt.Sprintf("%s %s", kind, name)
+}
+
+// valueSpecType returns the declared or inferrable type for `name` within
+// a ValueSpec, or "" if no type can be recovered without go/types.
+func valueSpecType(name string, s *ast.ValueSpec) string {
+	if s.Type != nil {
+		if t := typeString(s.Type); t != "<unknown>" {
+			return t
+		}
+	}
+	idx := identIndex(s.Names, name)
+	if idx < 0 || idx >= len(s.Values) {
+		return ""
+	}
+	return inferInitType(s.Values[idx])
+}
+
+func identIndex(names []*ast.Ident, target string) int {
+	for i, n := range names {
+		if n.Name == target {
+			return i
+		}
+	}
+	return -1
 }
 
 // inferInitType returns a type name for common initializer shapes:
@@ -122,30 +131,48 @@ func valueSpecSignature(kind, name string, s *ast.ValueSpec) string {
 func inferInitType(expr ast.Expr) string {
 	switch e := expr.(type) {
 	case *ast.CompositeLit:
-		if e.Type != nil {
-			if t := typeString(e.Type); t != "<unknown>" {
-				return t
-			}
-		}
+		return compositeLitType(e)
 	case *ast.BasicLit:
-		switch e.Kind {
-		case token.INT:
-			return "int"
-		case token.FLOAT:
-			return "float64"
-		case token.STRING:
-			return "string"
-		case token.CHAR:
-			return "rune"
-		}
+		return basicLitType(e.Kind)
 	case *ast.UnaryExpr:
-		if e.Op == token.AND {
-			if inner := inferInitType(e.X); inner != "" {
-				return "*" + inner
-			}
-		}
+		return unaryExprType(e)
 	}
 	return ""
+}
+
+func compositeLitType(e *ast.CompositeLit) string {
+	if e.Type == nil {
+		return ""
+	}
+	if t := typeString(e.Type); t != "<unknown>" {
+		return t
+	}
+	return ""
+}
+
+func basicLitType(kind token.Token) string {
+	switch kind {
+	case token.INT:
+		return "int"
+	case token.FLOAT:
+		return "float64"
+	case token.STRING:
+		return "string"
+	case token.CHAR:
+		return "rune"
+	}
+	return ""
+}
+
+func unaryExprType(e *ast.UnaryExpr) string {
+	if e.Op != token.AND {
+		return ""
+	}
+	inner := inferInitType(e.X)
+	if inner == "" {
+		return ""
+	}
+	return "*" + inner
 }
 
 // typeString returns a simple string representation of a type expression.

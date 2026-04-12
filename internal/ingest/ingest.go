@@ -383,62 +383,65 @@ func ingestGenDecl(db *store.DB, fset *token.FileSet, mod *store.Module, file *a
 			state.liveDefIDs[id] = true
 
 		case *ast.ValueSpec:
-			kind := "var"
-			if gd.Tok == token.CONST {
-				kind = "const"
-			}
-			// Find the first non-blank name to be the definition's name.
-			// For multi-name specs (var x, y int), store once under the
-			// first name — the body already contains all names.
-			firstName := ""
-			exported := false
-			for _, name := range s.Names {
-				if name.Name != "_" {
-					if firstName == "" {
-						firstName = name.Name
-						exported = name.IsExported()
-					}
-				}
-			}
-			if firstName == "" {
-				continue
-			}
-
-			// For grouped declarations, render just this spec.
-			// For standalone, render the whole GenDecl.
-			var body string
-			if grouped {
-				body = renderNode(fset, s)
-			} else {
-				body = renderNode(fset, gd)
-			}
-
-			doc := gd.Doc.Text()
-			if doc == "" {
-				doc = s.Doc.Text()
-			}
-			sig := valueSpecSignature(kind, firstName, s)
-			specStart := fset.Position(s.Pos())
-			specEnd := fset.Position(s.End())
-			def := &store.Definition{
-				ModuleID:   mod.ID,
-				Name:       firstName,
-				Kind:       kind,
-				Exported:   exported,
-				Test:       isTest,
-				Signature:  sig,
-				Body:       body,
-				Doc:        doc,
-				StartLine:  specStart.Line,
-				EndLine:    specEnd.Line,
-				SourceFile: sourceFile,
-			}
-			id, err := db.UpsertDefinition(def)
-			if err != nil {
+			if err := ingestValueSpec(db, fset, mod, gd, s, grouped, isTest, sourceFile, state); err != nil {
 				return err
 			}
-			state.liveDefIDs[id] = true
 		}
 	}
 	return nil
+}
+
+func ingestValueSpec(db *store.DB, fset *token.FileSet, mod *store.Module, gd *ast.GenDecl, s *ast.ValueSpec, grouped, isTest bool, sourceFile string, state *ingestState) error {
+	kind := "var"
+	if gd.Tok == token.CONST {
+		kind = "const"
+	}
+	// First non-blank name owns the spec. Multi-name specs (var x, y int)
+	// are stored once under the first name — the body contains all names.
+	firstName, exported := firstNonBlankName(s.Names)
+	if firstName == "" {
+		return nil
+	}
+
+	// Grouped specs render just the spec; standalone renders the whole
+	// GenDecl so the `var`/`const` keyword is preserved in the body.
+	body := renderNode(fset, s)
+	if !grouped {
+		body = renderNode(fset, gd)
+	}
+
+	doc := gd.Doc.Text()
+	if doc == "" {
+		doc = s.Doc.Text()
+	}
+	specStart := fset.Position(s.Pos())
+	specEnd := fset.Position(s.End())
+	def := &store.Definition{
+		ModuleID:   mod.ID,
+		Name:       firstName,
+		Kind:       kind,
+		Exported:   exported,
+		Test:       isTest,
+		Signature:  valueSpecSignature(kind, firstName, s),
+		Body:       body,
+		Doc:        doc,
+		StartLine:  specStart.Line,
+		EndLine:    specEnd.Line,
+		SourceFile: sourceFile,
+	}
+	id, err := db.UpsertDefinition(def)
+	if err != nil {
+		return err
+	}
+	state.liveDefIDs[id] = true
+	return nil
+}
+
+func firstNonBlankName(names []*ast.Ident) (string, bool) {
+	for _, n := range names {
+		if n.Name != "_" {
+			return n.Name, n.IsExported()
+		}
+	}
+	return "", false
 }
