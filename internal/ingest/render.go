@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"bytes"
+	"fmt"
 	"go/ast"
 	"go/format"
 	"go/token"
@@ -10,11 +11,23 @@ import (
 	"sync"
 )
 
-// sourceFileCache avoids re-reading the same file for every definition.
+// sourceFileCache avoids re-reading the same file for every definition
+// during a single ingest run. It must be cleared at the start of each
+// top-level ingest call — stale cached bytes combined with fresh AST
+// offsets produces misaligned body slices (the offsets match the new
+// parse, but the bytes are from before the file was edited).
 var (
 	sourceFileMu    sync.Mutex
 	sourceFileCache = map[string][]byte{}
 )
+
+// clearSourceFileCache drops all cached file contents. Call at the start
+// of each Ingest / IngestFile so later reads pick up current on-disk bytes.
+func clearSourceFileCache() {
+	sourceFileMu.Lock()
+	sourceFileCache = map[string][]byte{}
+	sourceFileMu.Unlock()
+}
 
 // renderNode extracts Go source text for an AST node.
 // Uses the original source file to preserve all comments (including inline
@@ -71,6 +84,68 @@ func renderSignature(fset *token.FileSet, fn *ast.FuncDecl) string {
 		return fn.Name.Name
 	}
 	return strings.TrimSpace(buf.String())
+}
+
+// valueSpecSignature renders a signature like `var Foo Bar` or
+// `const Baz int` for a ValueSpec. When no explicit type is given,
+// it infers the type from a composite-literal initializer if possible
+// (e.g. `var X = Foo{...}` → `var X Foo`). Falls back to `kind name`
+// if the type can't be recovered without running go/types.
+func valueSpecSignature(kind, name string, s *ast.ValueSpec) string {
+	if s.Type != nil {
+		if t := typeString(s.Type); t != "<unknown>" {
+			return fmt.Sprintf("%s %s %s", kind, name, t)
+		}
+	}
+	// Try to infer from the matching initializer.
+	idx := 0
+	for i, id := range s.Names {
+		if id.Name == name {
+			idx = i
+			break
+		}
+	}
+	if idx < len(s.Values) {
+		if t := inferInitType(s.Values[idx]); t != "" {
+			return fmt.Sprintf("%s %s %s", kind, name, t)
+		}
+	}
+	return fmt.Sprintf("%s %s", kind, name)
+}
+
+// inferInitType returns a type name for common initializer shapes:
+// composite literals, unary address-of, and basic literals. Function
+// calls are intentionally NOT handled — without go/types we can't
+// distinguish `T(x)` (conversion to type T) from `f(x)` (call to
+// function f), and mislabeling functions as types is worse than
+// leaving the signature untyped.
+func inferInitType(expr ast.Expr) string {
+	switch e := expr.(type) {
+	case *ast.CompositeLit:
+		if e.Type != nil {
+			if t := typeString(e.Type); t != "<unknown>" {
+				return t
+			}
+		}
+	case *ast.BasicLit:
+		switch e.Kind {
+		case token.INT:
+			return "int"
+		case token.FLOAT:
+			return "float64"
+		case token.STRING:
+			return "string"
+		case token.CHAR:
+			return "rune"
+		}
+	case *ast.UnaryExpr:
+		if e.Op == token.AND {
+			if inner := inferInitType(e.X); inner != "" {
+				return "*" + inner
+			}
+		}
+	}
+	return ""
 }
 
 // typeString returns a simple string representation of a type expression.

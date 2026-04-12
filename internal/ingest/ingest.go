@@ -19,6 +19,8 @@ import (
 // Ingest loads a Go module from modulePath and stores all definitions
 // into the database. modulePath should be a directory containing go.mod.
 func Ingest(db *store.DB, modulePath string) error {
+	clearSourceFileCache()
+
 	cfg := &packages.Config{
 		Mode: packages.NeedName |
 			packages.NeedFiles |
@@ -415,15 +417,20 @@ func ingestGenDecl(db *store.DB, fset *token.FileSet, mod *store.Module, file *a
 			if doc == "" {
 				doc = s.Doc.Text()
 			}
+			sig := valueSpecSignature(kind, firstName, s)
+			specStart := fset.Position(s.Pos())
+			specEnd := fset.Position(s.End())
 			def := &store.Definition{
 				ModuleID:   mod.ID,
 				Name:       firstName,
 				Kind:       kind,
 				Exported:   exported,
 				Test:       isTest,
-				Signature:  fmt.Sprintf("%s %s", kind, firstName),
+				Signature:  sig,
 				Body:       body,
 				Doc:        doc,
+				StartLine:  specStart.Line,
+				EndLine:    specEnd.Line,
 				SourceFile: sourceFile,
 			}
 			id, err := db.UpsertDefinition(def)
