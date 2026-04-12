@@ -131,19 +131,26 @@ func prepareSchema(ctx context.Context, db execQuerier) error {
 
 func initSchema(ctx context.Context, db execQuerier) error {
 	for _, stmt := range splitSQL(schemaSQL) {
-		if strings.TrimSpace(stmt) == "" {
-			continue
-		}
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			errMsg := strings.ToLower(err.Error())
-			if strings.Contains(errMsg, "already exists") ||
-				strings.Contains(errMsg, "duplicate") {
-				continue
-			}
-			return fmt.Errorf("init schema: %w\nstatement: %s", err, stmt)
+		if err := execSchemaStmt(ctx, db, stmt); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func execSchemaStmt(ctx context.Context, db execQuerier, stmt string) error {
+	if strings.TrimSpace(stmt) == "" {
+		return nil
+	}
+	_, err := db.ExecContext(ctx, stmt)
+	if err == nil {
+		return nil
+	}
+	errMsg := strings.ToLower(err.Error())
+	if strings.Contains(errMsg, "already exists") || strings.Contains(errMsg, "duplicate") {
+		return nil
+	}
+	return fmt.Errorf("init schema: %w\nstatement: %s", err, stmt)
 }
 
 // migrateReferencesToRefs renames the old `references` table to `refs`.

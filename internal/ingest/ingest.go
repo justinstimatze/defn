@@ -383,7 +383,11 @@ func ingestGenDecl(db *store.DB, fset *token.FileSet, mod *store.Module, file *a
 			state.liveDefIDs[id] = true
 
 		case *ast.ValueSpec:
-			if err := ingestValueSpec(db, fset, mod, gd, s, grouped, isTest, sourceFile, state); err != nil {
+			c := &valueSpecCtx{
+				db: db, fset: fset, mod: mod, gd: gd,
+				isTest: isTest, sourceFile: sourceFile, state: state,
+			}
+			if err := ingestValueSpec(c, s); err != nil {
 				return err
 			}
 		}
@@ -391,9 +395,21 @@ func ingestGenDecl(db *store.DB, fset *token.FileSet, mod *store.Module, file *a
 	return nil
 }
 
-func ingestValueSpec(db *store.DB, fset *token.FileSet, mod *store.Module, gd *ast.GenDecl, s *ast.ValueSpec, grouped, isTest bool, sourceFile string, state *ingestState) error {
+// valueSpecCtx bundles the per-file parameters a ValueSpec ingest
+// needs, so the helper doesn't have to pass nine positional args.
+type valueSpecCtx struct {
+	db         *store.DB
+	fset       *token.FileSet
+	mod        *store.Module
+	gd         *ast.GenDecl
+	isTest     bool
+	sourceFile string
+	state      *ingestState
+}
+
+func ingestValueSpec(c *valueSpecCtx, s *ast.ValueSpec) error {
 	kind := "var"
-	if gd.Tok == token.CONST {
+	if c.gd.Tok == token.CONST {
 		kind = "const"
 	}
 	// First non-blank name owns the spec. Multi-name specs (var x, y int)
@@ -405,35 +421,35 @@ func ingestValueSpec(db *store.DB, fset *token.FileSet, mod *store.Module, gd *a
 
 	// Grouped specs render just the spec; standalone renders the whole
 	// GenDecl so the `var`/`const` keyword is preserved in the body.
-	body := renderNode(fset, s)
-	if !grouped {
-		body = renderNode(fset, gd)
+	body := renderNode(c.fset, s)
+	if !c.gd.Lparen.IsValid() {
+		body = renderNode(c.fset, c.gd)
 	}
 
-	doc := gd.Doc.Text()
+	doc := c.gd.Doc.Text()
 	if doc == "" {
 		doc = s.Doc.Text()
 	}
-	specStart := fset.Position(s.Pos())
-	specEnd := fset.Position(s.End())
+	specStart := c.fset.Position(s.Pos())
+	specEnd := c.fset.Position(s.End())
 	def := &store.Definition{
-		ModuleID:   mod.ID,
+		ModuleID:   c.mod.ID,
 		Name:       firstName,
 		Kind:       kind,
 		Exported:   exported,
-		Test:       isTest,
+		Test:       c.isTest,
 		Signature:  valueSpecSignature(kind, firstName, s),
 		Body:       body,
 		Doc:        doc,
 		StartLine:  specStart.Line,
 		EndLine:    specEnd.Line,
-		SourceFile: sourceFile,
+		SourceFile: c.sourceFile,
 	}
-	id, err := db.UpsertDefinition(def)
+	id, err := c.db.UpsertDefinition(def)
 	if err != nil {
 		return err
 	}
-	state.liveDefIDs[id] = true
+	c.state.liveDefIDs[id] = true
 	return nil
 }
 
