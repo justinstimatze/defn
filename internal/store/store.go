@@ -71,7 +71,46 @@ func openMySQL(dsn string) (*DB, error) {
 		}
 	}
 
+	if err := migrateReferencesToRefs(ctx, db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate references table: %w", err)
+	}
+
 	return &DB{db: db, path: dsn}, nil
+}
+
+// migrateReferencesToRefs renames the old `references` table to `refs`.
+// The rename happened on 2026-04-11 to avoid having to backtick every
+// query (`references` is a reserved word in MySQL/Dolt). Databases
+// created before that point have data in the old table; this copies
+// it into the new one and drops the old table. Runs at Open so existing
+// databases keep working without a manual reingest.
+//
+// Takes any type with ExecContext + QueryRowContext so it works for
+// both the *sql.DB (MySQL) path and *sql.Conn (embedded) path.
+type execQuerier interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func migrateReferencesToRefs(ctx context.Context, db execQuerier) error {
+	var count int
+	err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'references'",
+	).Scan(&count)
+	if err != nil || count == 0 {
+		return nil // no old table, nothing to do
+	}
+	// Copy any rows into the new table (refs is already created by schema init).
+	if _, err := db.ExecContext(ctx,
+		"INSERT IGNORE INTO refs (from_def, to_def, kind) SELECT from_def, to_def, kind FROM `references`",
+	); err != nil {
+		return fmt.Errorf("copy rows: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, "DROP TABLE `references`"); err != nil {
+		return fmt.Errorf("drop old table: %w", err)
+	}
+	return nil
 }
 
 func openEmbedded(path string) (*DB, error) {
@@ -130,6 +169,12 @@ func openEmbedded(path string) (*DB, error) {
 				return nil, fmt.Errorf("init schema: %w\nstatement: %s", err, stmt)
 			}
 		}
+	}
+
+	if err := migrateReferencesToRefs(ctx, conn); err != nil {
+		conn.Close()
+		db.Close()
+		return nil, fmt.Errorf("migrate references table: %w", err)
 	}
 
 	return &DB{db: db, conn: conn, path: absPath, dbName: dbName}, nil
@@ -606,7 +651,7 @@ func (s *DB) UpsertDefinition(d *Definition) (int64, error) {
 // DeleteDefinition removes a definition and associated data.
 func (s *DB) DeleteDefinition(id int64) error {
 	ctx := s.Ctx()
-	if _, err := s.execContext(ctx, "DELETE FROM `references` WHERE from_def = ? OR to_def = ?", id, id); err != nil {
+	if _, err := s.execContext(ctx, "DELETE FROM refs WHERE from_def = ? OR to_def = ?", id, id); err != nil {
 		return fmt.Errorf("delete references for def %d: %w", id, err)
 	}
 	if _, err := s.execContext(ctx, "DELETE FROM bodies WHERE def_id = ?", id); err != nil {
@@ -834,7 +879,7 @@ func (s *DB) GetDefinitionByName(name, modulePath string) (*Definition, error) {
 		}
 		// Fuzzy match: module path contains the search term.
 		query = baseQuery + " JOIN modules m ON d.module_id = m.id WHERE d.name = ? AND m.path LIKE ?" +
-			` ORDER BY (SELECT COUNT(*) FROM ` + "`references`" + ` r WHERE r.to_def = d.id) DESC LIMIT 1`
+			` ORDER BY (SELECT COUNT(*) FROM refs r WHERE r.to_def = d.id) DESC LIMIT 1`
 		d = &Definition{}
 		err = s.queryRowContext(s.Ctx(), query, name, "%"+modulePath+"%").Scan(
 			&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &d.Receiver,
@@ -850,7 +895,7 @@ func (s *DB) GetDefinitionByName(name, modulePath string) (*Definition, error) {
 	// This prefers production code (e.g., (*Context).Render with 16 production callers)
 	// over interface implementations (e.g., render.BSON.Render called mainly by tests).
 	query := baseQuery + " WHERE d.name = ?" +
-		` ORDER BY (SELECT COUNT(*) FROM ` + "`references`" + ` r
+		` ORDER BY (SELECT COUNT(*) FROM refs r
 		  JOIN definitions caller ON caller.id = r.from_def AND caller.test = FALSE
 		  WHERE r.to_def = d.id) DESC LIMIT 1`
 	args = append(args, name)
@@ -885,7 +930,7 @@ func (s *DB) GetDefinitionByNameAndReceiver(name, modulePath, receiver string) (
 		 FROM definitions d
 		 LEFT JOIN bodies b ON b.def_id = d.id
 		 WHERE d.name = ? AND COALESCE(d.receiver,'') = ?
-		 ORDER BY (SELECT COUNT(*) FROM ` + "`references`" + ` r
+		 ORDER BY (SELECT COUNT(*) FROM refs r
 		  JOIN definitions caller ON caller.id = r.from_def AND caller.test = FALSE
 		  WHERE r.to_def = d.id) DESC LIMIT 1`
 		args = []any{name, receiver}
@@ -907,7 +952,7 @@ func (s *DB) fuzzyReceiverLookup(name, modulePath, bareRecv, prefix string) (*De
 	 FROM definitions d
 	 LEFT JOIN bodies b ON b.def_id = d.id
 	 WHERE d.name = ? AND COALESCE(d.receiver,'') LIKE ?
-	 ORDER BY (SELECT COUNT(*) FROM ` + "`references`" + ` r
+	 ORDER BY (SELECT COUNT(*) FROM refs r
 	   JOIN definitions caller ON caller.id = r.from_def AND caller.test = FALSE
 	   WHERE r.to_def = d.id) DESC LIMIT 1`
 	pattern := "%" + bareRecv
@@ -1077,7 +1122,7 @@ func (s *DB) GetCallers(defID int64) ([]Definition, error) {
 		        COALESCE(d.signature,''), COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
 		 FROM definitions d
 		 LEFT JOIN bodies b ON b.def_id = d.id
-		 JOIN `+"`references`"+` r ON r.from_def = d.id
+		 JOIN refs r ON r.from_def = d.id
 		 WHERE r.to_def = ?
 		 ORDER BY d.name`, defID)
 	if err != nil {
@@ -1094,7 +1139,7 @@ func (s *DB) GetCallees(defID int64) ([]Definition, error) {
 		        COALESCE(d.signature,''), COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
 		 FROM definitions d
 		 LEFT JOIN bodies b ON b.def_id = d.id
-		 JOIN `+"`references`"+` r ON r.to_def = d.id
+		 JOIN refs r ON r.to_def = d.id
 		 WHERE r.from_def = ?
 		 ORDER BY d.name`, defID)
 	if err != nil {
@@ -1149,7 +1194,7 @@ func (s *DB) SetReferences(fromDef int64, refs []Reference) error {
 
 	// Read existing refs and compare.
 	rows, err := s.queryContext(ctx,
-		"SELECT to_def, kind FROM `references` WHERE from_def = ? ORDER BY to_def, kind",
+		"SELECT to_def, kind FROM refs WHERE from_def = ? ORDER BY to_def, kind",
 		fromDef)
 	if err != nil {
 		return fmt.Errorf("read refs: %w", err)
@@ -1182,12 +1227,12 @@ func (s *DB) SetReferences(fromDef int64, refs []Reference) error {
 		}
 	}
 
-	if _, err := s.execContext(ctx, "DELETE FROM `references` WHERE from_def = ?", fromDef); err != nil {
+	if _, err := s.execContext(ctx, "DELETE FROM refs WHERE from_def = ?", fromDef); err != nil {
 		return fmt.Errorf("clear refs: %w", err)
 	}
 	for _, r := range refs {
 		if _, err := s.execContext(ctx,
-			"INSERT IGNORE INTO `references` (from_def, to_def, kind) VALUES (?, ?, ?)",
+			"INSERT IGNORE INTO refs (from_def, to_def, kind) VALUES (?, ?, ?)",
 			fromDef, r.ToDef, r.Kind,
 		); err != nil {
 			return fmt.Errorf("insert ref: %w", err)
@@ -1518,7 +1563,7 @@ func (s *DB) getInterfaceDispatchCallers(d *Definition) []Definition {
 	// Find interfaces this type implements (via "implements" edges).
 	rows, err := s.queryContext(s.Ctx(),
 		`SELECT d2.name FROM definitions d1
-		 JOIN `+"`references`"+` r ON r.from_def = d1.id
+		 JOIN refs r ON r.from_def = d1.id
 		 JOIN definitions d2 ON d2.id = r.to_def
 		 WHERE d1.name = ? AND r.kind = 'implements'`,
 		concreteType)
@@ -1560,7 +1605,7 @@ func (s *DB) GetUntested() ([]Definition, error) {
 		FROM definitions d
 		WHERE d.test = FALSE AND d.exported = TRUE AND d.kind IN ('function', 'method')
 		AND NOT EXISTS (
-			SELECT 1 FROM `+"`references`"+` r
+			SELECT 1 FROM refs r
 			JOIN definitions t ON t.id = r.from_def AND t.test = TRUE
 			WHERE r.to_def = d.id
 		)

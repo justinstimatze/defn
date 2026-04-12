@@ -206,7 +206,7 @@ func queryGraph(db *sql.DB) (*Graph, error) {
 	}
 
 	// Load references.
-	rows, err = db.Query("SELECT from_def, to_def, COALESCE(kind,'') FROM `references`")
+	rows, err = db.Query("SELECT from_def, to_def, COALESCE(kind,'') FROM refs")
 	if err != nil {
 		return nil, fmt.Errorf("query references: %w", err)
 	}
@@ -275,7 +275,7 @@ func loadFromSubprocess(defnPath string) (*Graph, error) {
 	}
 
 	// Query references.
-	out, err = doltQuery(doltBin, dbDir, "SELECT from_def, to_def, COALESCE(kind,'') as kind FROM `references`")
+	out, err = doltQuery(doltBin, dbDir, "SELECT from_def, to_def, COALESCE(kind,'') as kind FROM refs")
 	if err != nil {
 		return nil, fmt.Errorf("query references: %w", err)
 	}

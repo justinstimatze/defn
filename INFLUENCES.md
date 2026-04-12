@@ -132,7 +132,7 @@ than package-level tools, without requiring coverage instrumentation.
 
 defn's approach: the reference graph is pre-computed and persistent in
 Dolt. "Which tests call this definition?" is a SQL query traversing the
-`references` table — no coverage instrumentation, no build graph rebuild,
+`refs` table — no coverage instrumentation, no build graph rebuild,
 no CI service. Function-level, not package-level.
 
 ## Autonomous Software Engineering

@@ -62,9 +62,15 @@ Database stored in `.defn/` directory. Key tables:
 - `definitions` — name, kind, exported, test, receiver, signature, hash
 - `bodies` — source text (separate for fast metadata queries)
 - `modules` — Go packages
-- `` `references` `` — which definitions call/reference which (backtick-quoted: MySQL reserved word)
+- `refs` — which definitions call/reference which (edges in the call graph)
 - `imports` — per-module import paths
 - `project_files` — go.mod, go.sum, embedded files
+
+**Writing queries:** Dolt uses MySQL's reserved-word list, so column names
+like `kind`, `order`, `key`, `group` will fail parsing unless backticked.
+The safest habit is to backtick any identifier that looks English-ish
+(``SELECT `kind` FROM definitions``). Table names here (`definitions`,
+`refs`, `bodies`, etc.) are all non-reserved on purpose.
 
 Versioning via `CALL DOLT_COMMIT`, `DOLT_BRANCH`, `DOLT_MERGE`, `dolt_log`, `dolt_status`.
 

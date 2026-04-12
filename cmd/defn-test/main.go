@@ -166,7 +166,7 @@ func testProject(p project) error {
 	fmt.Printf("  definitions: %d (>= %d) ✓\n", len(defs), p.minDefs)
 
 	// Reference count.
-	refResults, err := db.Query("SELECT COUNT(*) as c FROM `references`")
+	refResults, err := db.Query("SELECT COUNT(*) as c FROM refs")
 	if err != nil {
 		return fmt.Errorf("count refs: %w", err)
 	}

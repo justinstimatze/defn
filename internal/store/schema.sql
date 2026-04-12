@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS bodies (
     FOREIGN KEY (def_id) REFERENCES definitions(id) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS `references` (
+CREATE TABLE IF NOT EXISTS refs (
     from_def  INT NOT NULL,
     to_def    INT NOT NULL,
     kind      VARCHAR(50) NOT NULL,
@@ -74,8 +74,8 @@ CREATE INDEX idx_def_name ON definitions(name);
 CREATE INDEX idx_def_module ON definitions(module_id);
 CREATE INDEX idx_def_kind ON definitions(kind);
 CREATE INDEX idx_def_hash ON definitions(hash);
-CREATE INDEX idx_ref_from ON `references`(from_def);
-CREATE INDEX idx_ref_to ON `references`(to_def);
+CREATE INDEX idx_ref_from ON refs(from_def);
+CREATE INDEX idx_ref_to ON refs(to_def);
 CREATE INDEX idx_def_exported ON definitions(name, module_id);
 CREATE INDEX idx_def_location ON definitions(module_id, start_line, end_line);
 CREATE INDEX idx_def_source_file ON definitions(source_file);

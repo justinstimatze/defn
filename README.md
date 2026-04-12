@@ -26,11 +26,11 @@ Edit through defn or edit files directly. Either side auto-syncs to the other. E
 ```sql
 -- Who calls Render and has no tests?
 SELECT d.name FROM definitions d
-JOIN `references` r ON r.from_def = d.id
+JOIN refs r ON r.from_def = d.id
 WHERE r.to_def = (SELECT id FROM definitions WHERE name = 'Render' AND receiver = '*Context')
 AND d.test = FALSE
 AND NOT EXISTS (
-  SELECT 1 FROM `references` r2
+  SELECT 1 FROM refs r2
   JOIN definitions t ON t.id = r2.from_def AND t.test = TRUE
   WHERE r2.to_def = d.id
 )
