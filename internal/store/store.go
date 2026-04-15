@@ -638,6 +638,72 @@ func (s *DB) FindDefinitions(namePattern string) ([]Definition, error) {
 	return scanDefinitions(rows)
 }
 
+// FilterDefinitions returns definitions matching optional filters.
+// All string filters support SQL LIKE patterns. Empty string means no filter.
+func (s *DB) FilterDefinitions(name, kind, file string) ([]Definition, error) {
+	q := `SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
+	        COALESCE(d.signature,''), '', COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
+	 FROM definitions d WHERE 1=1`
+	var args []any
+	if name != "" {
+		q += " AND d.name LIKE ?"
+		args = append(args, name)
+	}
+	if kind != "" {
+		q += " AND d.kind = ?"
+		args = append(args, kind)
+	}
+	if file != "" {
+		q += " AND d.source_file LIKE ?"
+		args = append(args, file)
+	}
+	q += " ORDER BY d.name LIMIT 500"
+	rows, err := s.queryContext(s.Ctx(), q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanDefinitions(rows)
+}
+
+// QueryRefs returns references matching optional filters.
+// fromName/toName are definition names (LIKE pattern). kind is exact match.
+func (s *DB) QueryRefs(fromName, toName, kind string) ([]Reference, error) {
+	q := `SELECT r.from_def, r.to_def, r.kind
+	      FROM refs r
+	      JOIN definitions df ON r.from_def = df.id
+	      JOIN definitions dt ON r.to_def = dt.id
+	      WHERE 1=1`
+	var args []any
+	if fromName != "" {
+		q += " AND df.name LIKE ?"
+		args = append(args, fromName)
+	}
+	if toName != "" {
+		q += " AND dt.name LIKE ?"
+		args = append(args, toName)
+	}
+	if kind != "" {
+		q += " AND r.kind = ?"
+		args = append(args, kind)
+	}
+	q += " ORDER BY df.name, dt.name LIMIT 500"
+	rows, err := s.queryContext(s.Ctx(), q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var refs []Reference
+	for rows.Next() {
+		var r Reference
+		if err := rows.Scan(&r.FromDef, &r.ToDef, &r.Kind); err != nil {
+			return nil, err
+		}
+		refs = append(refs, r)
+	}
+	return refs, rows.Err()
+}
+
 // GetDefinitionByName returns a definition by exact name and optional module path.
 // Module path supports fuzzy matching — "gin" matches "github.com/gin-gonic/gin".
 // When multiple definitions match the same name, returns the one with the most
