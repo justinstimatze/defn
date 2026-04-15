@@ -3,7 +3,10 @@
 package resolve
 
 import (
+	"bytes"
 	"go/ast"
+	"go/format"
+	"go/token"
 	"go/types"
 	"strings"
 
@@ -168,9 +171,14 @@ func resolve(db *store.DB, projectDir, onlyModule string) error {
 					if fromID <= 0 {
 						continue
 					}
-					refs := collectRefs(d.Body, pkg.TypesInfo, objToDef, ifaceMethodToImpls)
+					refs, litFields := collectRefs(d.Body, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls)
 					if len(refs) > 0 {
 						if err := db.SetReferences(fromID, refs); err != nil {
+							return err
+						}
+					}
+					if len(litFields) > 0 {
+						if err := db.SetLiteralFields(fromID, litFields); err != nil {
 							return err
 						}
 					}
@@ -198,9 +206,14 @@ func resolve(db *store.DB, projectDir, onlyModule string) error {
 									nodes = append(nodes, s.Type)
 								}
 								for _, node := range nodes {
-									refs := collectRefs(node, pkg.TypesInfo, objToDef, ifaceMethodToImpls)
+									refs, litFields := collectRefs(node, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls)
 									if len(refs) > 0 {
 										if err := db.SetReferences(fromID, refs); err != nil {
+											return err
+										}
+									}
+									if len(litFields) > 0 {
+										if err := db.SetLiteralFields(fromID, litFields); err != nil {
 											return err
 										}
 									}
@@ -213,9 +226,14 @@ func resolve(db *store.DB, projectDir, onlyModule string) error {
 							if fromID <= 0 {
 								continue
 							}
-							refs := collectRefs(s.Type, pkg.TypesInfo, objToDef, ifaceMethodToImpls)
+							refs, litFields := collectRefs(s.Type, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls)
 							if len(refs) > 0 {
 								if err := db.SetReferences(fromID, refs); err != nil {
+									return err
+								}
+							}
+							if len(litFields) > 0 {
+								if err := db.SetLiteralFields(fromID, litFields); err != nil {
 									return err
 								}
 							}
@@ -260,9 +278,10 @@ func lookupVarDefID(db *store.DB, pkgPath, name string) int64 {
 	return d.ID
 }
 
-func collectRefs(node ast.Node, info *types.Info, objToDef map[types.Object]int64, ifaceMethodToImpls map[types.Object][]int64) []store.Reference {
+func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef map[types.Object]int64, ifaceMethodToImpls map[types.Object][]int64) ([]store.Reference, []store.LiteralField) {
 	seen := make(map[int64]string)
 	var refs []store.Reference
+	var litFields []store.LiteralField
 
 	addRef := func(toID int64, kind string) {
 		if _, dup := seen[toID]; !dup {
@@ -270,6 +289,24 @@ func collectRefs(node ast.Node, info *types.Info, objToDef map[types.Object]int6
 			refs = append(refs, store.Reference{ToDef: toID, Kind: kind})
 		}
 	}
+
+	// Pre-scan: collect idents of embedded struct fields so we can
+	// classify them as "embed" instead of "type_ref" in the main walk.
+	embeddedIdents := map[*ast.Ident]bool{}
+	ast.Inspect(node, func(n ast.Node) bool {
+		st, ok := n.(*ast.StructType)
+		if !ok {
+			return true
+		}
+		for _, field := range st.Fields.List {
+			if len(field.Names) == 0 { // embedded field
+				if id := innerIdent(field.Type); id != nil {
+					embeddedIdents[id] = true
+				}
+			}
+		}
+		return true
+	})
 
 	ast.Inspect(node, func(n ast.Node) bool {
 		switch x := n.(type) {
@@ -284,6 +321,31 @@ func collectRefs(node ast.Node, info *types.Info, objToDef map[types.Object]int6
 					if named, ok := typ.(*types.Named); ok {
 						if toID, ok := objToDef[named.Obj()]; ok {
 							addRef(toID, "constructor")
+						}
+						// Extract field-level data from keyed composite literals.
+						typeName := named.Obj().Name()
+						if pkg := named.Obj().Pkg(); pkg != nil {
+							typeName = pkg.Path() + "." + typeName
+						}
+						for _, elt := range x.Elts {
+							kv, ok := elt.(*ast.KeyValueExpr)
+							if !ok {
+								continue
+							}
+							ident, ok := kv.Key.(*ast.Ident)
+							if !ok {
+								continue
+							}
+							var buf bytes.Buffer
+							if err := format.Node(&buf, fset, kv.Value); err != nil {
+								continue
+							}
+							litFields = append(litFields, store.LiteralField{
+								TypeName:   typeName,
+								FieldName:  ident.Name,
+								FieldValue: buf.String(),
+								Line:       fset.Position(kv.Pos()).Line,
+							})
 						}
 					}
 				}
@@ -317,7 +379,11 @@ func collectRefs(node ast.Node, info *types.Info, objToDef map[types.Object]int6
 		}
 		toID, exists := objToDef[obj]
 		if exists {
-			addRef(toID, classifyRef(obj))
+			kind := classifyRef(obj)
+			if kind == "type_ref" && embeddedIdents[ident] {
+				kind = "embed"
+			}
+			addRef(toID, kind)
 			return true
 		}
 
@@ -330,7 +396,30 @@ func collectRefs(node ast.Node, info *types.Info, objToDef map[types.Object]int6
 		}
 		return true
 	})
-	return refs
+	return refs, litFields
+}
+
+// innerIdent unwraps *ast.StarExpr and *ast.SelectorExpr to find the
+// leaf *ast.Ident. Used to identify embedded field type idents.
+func innerIdent(expr ast.Expr) *ast.Ident {
+	for {
+		switch x := expr.(type) {
+		case *ast.Ident:
+			return x
+		case *ast.StarExpr:
+			expr = x.X
+		case *ast.SelectorExpr:
+			return x.Sel
+		case *ast.IndexExpr:
+			// Generic instantiation: T[U]
+			expr = x.X
+		case *ast.IndexListExpr:
+			// Generic instantiation: T[U, V]
+			expr = x.X
+		default:
+			return nil
+		}
+	}
 }
 
 func classifyRef(obj types.Object) string {

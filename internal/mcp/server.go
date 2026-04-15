@@ -75,14 +75,14 @@ func Run(ctx context.Context, database *store.DB, projDir string) error {
 
 	server := sdkmcp.NewServer(&sdkmcp.Implementation{
 		Name:    "defn",
-		Version: "0.8.0",
+		Version: "0.9.0",
 	}, nil)
 
 	sdkmcp.AddTool(server, &sdkmcp.Tool{
 		Name: "code",
 		Description: `Go code database. One tool, many ops. Start with impact for blast radius — it returns callers, transitives, and test coverage in one call. Don't follow up with search/explain unless you need more.
 
-Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan`,
+Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal)`,
 	}, s.handleCode)
 
 	return server.Run(ctx, &sdkmcp.StdioTransport{})
@@ -128,6 +128,8 @@ type codeParam struct {
 	DryRun      bool             `json:"dry_run,omitempty"`
 	Format      string           `json:"format,omitempty"`
 	Limit       int              `json:"limit,omitempty"`
+	Direction   string           `json:"direction,omitempty"`
+	RefKinds    []string         `json:"ref_kinds,omitempty"`
 }
 
 type applyOp struct {
@@ -300,6 +302,16 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if len(args.Mutations) == 0 {
 			return errResult(fmt.Errorf("validate-plan: mutations is required"))
 		}
+	case "traverse":
+		if r, o, e := need(args.Name, "name"); r != nil {
+			return r, o, e
+		}
+		if r, o, e := need(args.Direction, "direction"); r != nil {
+			return r, o, e
+		}
+		if args.Direction != "callers" && args.Direction != "callees" {
+			return errResult(fmt.Errorf("traverse: direction must be 'callers' or 'callees', got %q", args.Direction))
+		}
 	}
 
 	// Tag results from read-only ops while startup ingest is still running.
@@ -378,8 +390,14 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return s.handleFileDefs(ctx, req, args)
 	case "validate-plan":
 		return wrapStale(s.handleValidatePlan(ctx, req, args))
+	case "pragmas":
+		return wrapStale(s.handlePragmas(ctx, req, args))
+	case "literals":
+		return wrapStale(s.handleLiterals(ctx, req, args))
+	case "traverse":
+		return wrapStale(s.handleTraverse(ctx, req, args))
 	default:
-		return errResult(fmt.Errorf("unknown op %q — valid: read, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan", args.Op))
+		return errResult(fmt.Errorf("unknown op %q — valid: read, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse", args.Op))
 	}
 }
 
@@ -1737,6 +1755,182 @@ func (s *server) handleSimulate(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 		return errResult(err)
 	}
 	return textResult(text), nil, nil
+}
+
+func (s *server) handleTraverse(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	d, err := s.db.GetDefinitionByName(args.Name, "")
+	if err != nil {
+		return errResult(fmt.Errorf("definition %q not found: %w", args.Name, err))
+	}
+
+	maxDepth := args.Depth
+	if maxDepth <= 0 {
+		maxDepth = 10
+	}
+
+	results, err := s.db.Traverse(d.ID, args.Direction, args.RefKinds, maxDepth)
+	if err != nil {
+		return errResult(fmt.Errorf("traverse: %w", err))
+	}
+
+	startName := d.Name
+	if d.Receiver != "" {
+		startName = "(" + d.Receiver + ")." + d.Name
+	}
+
+	if args.Format == "json" {
+		type jsonResult struct {
+			Name       string   `json:"name"`
+			Kind       string   `json:"kind"`
+			Receiver   string   `json:"receiver,omitempty"`
+			SourceFile string   `json:"source_file"`
+			Test       bool     `json:"test,omitempty"`
+			Depth      int      `json:"depth"`
+			Path       []string `json:"path"`
+		}
+		type jsonResponse struct {
+			Start     string       `json:"start"`
+			Direction string       `json:"direction"`
+			MaxDepth  int          `json:"max_depth"`
+			Results   []jsonResult `json:"results"`
+			Total     int          `json:"total"`
+		}
+		resp := jsonResponse{
+			Start:     startName,
+			Direction: args.Direction,
+			MaxDepth:  maxDepth,
+			Results:   []jsonResult{},
+			Total:     len(results),
+		}
+		for _, r := range results {
+			resp.Results = append(resp.Results, jsonResult{
+				Name:       r.Definition.Name,
+				Kind:       r.Definition.Kind,
+				Receiver:   r.Definition.Receiver,
+				SourceFile: r.Definition.SourceFile,
+				Test:       r.Definition.Test,
+				Depth:      r.Depth,
+				Path:       r.Path,
+			})
+		}
+		data, _ := json.Marshal(resp)
+		return textResult(string(data)), nil, nil
+	}
+
+	// Markdown output grouped by depth.
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "## Traverse: %s of %s (max %d hops, %d results)\n\n", args.Direction, startName, maxDepth, len(results))
+
+	if len(results) == 0 {
+		sb.WriteString("No results found.\n")
+		return textResult(sb.String()), nil, nil
+	}
+
+	currentDepth := 0
+	for _, r := range results {
+		if r.Depth != currentDepth {
+			currentDepth = r.Depth
+			count := 0
+			for _, r2 := range results {
+				if r2.Depth == currentDepth {
+					count++
+				}
+			}
+			fmt.Fprintf(&sb, "\n### Depth %d (%d definitions)\n", currentDepth, count)
+		}
+		name := r.Definition.Name
+		if r.Definition.Receiver != "" {
+			name = "(" + r.Definition.Receiver + ")." + name
+		}
+		testMark := ""
+		if r.Definition.Test {
+			testMark = " [test]"
+		}
+		fmt.Fprintf(&sb, "- %s (%s)%s — %s\n", name, r.Definition.Kind, testMark, r.Definition.SourceFile)
+	}
+	return textResult(sb.String()), nil, nil
+}
+
+func (s *server) handleLiterals(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	typeName := args.Pattern
+	if typeName == "" {
+		typeName = "%" // all types
+	} else if !strings.Contains(typeName, "%") {
+		typeName = "%" + typeName + "%" // convenience: partial match
+	}
+	fields, err := s.db.QueryLiteralFields(typeName, args.Name, args.Body)
+	if err != nil {
+		return errResult(fmt.Errorf("query literals: %w", err))
+	}
+	if len(fields) == 0 {
+		return textResult("No literal fields found"), nil, nil
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "## Literal fields (%d results)\n\n", len(fields))
+	fmt.Fprintf(&sb, "| Definition | Type | Field | Value | Line |\n")
+	fmt.Fprintf(&sb, "|---|---|---|---|---|\n")
+	for _, f := range fields {
+		defName := fmt.Sprintf("#%d", f.DefID)
+		if d, err := s.db.GetDefinition(f.DefID); err == nil {
+			defName = d.Name
+			if d.Receiver != "" {
+				defName = "(" + d.Receiver + ")." + d.Name
+			}
+		}
+		// Shorten type name: just the last component.
+		shortType := f.TypeName
+		if idx := strings.LastIndex(shortType, "."); idx >= 0 {
+			shortType = shortType[idx+1:]
+		}
+		val := f.FieldValue
+		if len(val) > 60 {
+			val = val[:57] + "..."
+		}
+		fmt.Fprintf(&sb, "| %s | %s | %s | `%s` | %d |\n", defName, shortType, f.FieldName, val, f.Line)
+	}
+	return textResult(sb.String()), nil, nil
+}
+
+func (s *server) handlePragmas(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	pragmaKey := args.Pattern
+	if pragmaKey == "" {
+		pragmaKey = "%" // all pragmas
+	}
+	comments, err := s.db.GetCommentsByPragma(pragmaKey)
+	if err != nil {
+		return errResult(fmt.Errorf("query pragmas: %w", err))
+	}
+	if len(comments) == 0 {
+		return textResult("No pragmas found matching " + pragmaKey), nil, nil
+	}
+
+	// Filter by file if specified.
+	if args.File != "" {
+		var filtered []store.Comment
+		for _, c := range comments {
+			if c.SourceFile == args.File || strings.HasSuffix(c.SourceFile, "/"+args.File) {
+				filtered = append(filtered, c)
+			}
+		}
+		comments = filtered
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "## Pragmas matching %q (%d results)\n\n", pragmaKey, len(comments))
+	for _, c := range comments {
+		defName := "(file-level)"
+		if c.DefID != nil {
+			if d, err := s.db.GetDefinition(*c.DefID); err == nil {
+				defName = d.Name
+				if d.Receiver != "" {
+					defName = "(" + d.Receiver + ")." + d.Name
+				}
+			}
+		}
+		fmt.Fprintf(&sb, "- `%s` %s — %s:%d → %s\n", c.PragmaKey, c.PragmaVal, c.SourceFile, c.Line, defName)
+	}
+	return textResult(sb.String()), nil, nil
 }
 
 func (s *server) handleValidatePlan(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {

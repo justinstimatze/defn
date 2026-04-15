@@ -81,3 +81,36 @@ CREATE INDEX idx_def_location ON definitions(module_id, start_line, end_line);
 CREATE INDEX idx_def_source_file ON definitions(source_file);
 CREATE FULLTEXT INDEX idx_def_doc_ft ON definitions(doc);
 CREATE FULLTEXT INDEX idx_body_ft ON bodies(body);
+
+-- Comments and pragmas extracted from Go source files.
+CREATE TABLE IF NOT EXISTS comments (
+    id          INT PRIMARY KEY AUTO_INCREMENT,
+    def_id      INT,
+    source_file VARCHAR(500) NOT NULL,
+    line        INT NOT NULL,
+    text        TEXT NOT NULL,
+    kind        VARCHAR(50) NOT NULL,
+    pragma_key  VARCHAR(255),
+    pragma_value TEXT,
+    FOREIGN KEY (def_id) REFERENCES definitions(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_comment_def ON comments(def_id);
+CREATE INDEX idx_comment_pragma ON comments(pragma_key);
+CREATE INDEX idx_comment_file ON comments(source_file, line);
+CREATE FULLTEXT INDEX idx_comment_text_ft ON comments(text);
+
+-- Composite literal field values extracted during resolve.
+CREATE TABLE IF NOT EXISTS literal_fields (
+    id          INT PRIMARY KEY AUTO_INCREMENT,
+    def_id      INT NOT NULL,
+    type_name   VARCHAR(500) NOT NULL,
+    field_name  VARCHAR(255) NOT NULL,
+    field_value TEXT NOT NULL,
+    line        INT NOT NULL,
+    FOREIGN KEY (def_id) REFERENCES definitions(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_litfield_type ON literal_fields(type_name);
+CREATE INDEX idx_litfield_field ON literal_fields(field_name);
+CREATE INDEX idx_litfield_def ON literal_fields(def_id);
+CREATE INDEX idx_litfield_type_field ON literal_fields(type_name, field_name);
+CREATE FULLTEXT INDEX idx_litfield_value_ft ON literal_fields(field_value);

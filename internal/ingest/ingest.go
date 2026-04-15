@@ -8,6 +8,8 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -225,7 +227,144 @@ func ingestFile(db *store.DB, pkg *packages.Package, mod *store.Module, file *as
 			}
 		}
 	}
+
+	// Extract comments and pragmas.
+	if sourceFile != "" && len(file.Comments) > 0 {
+		if err := ingestComments(db, fset, file, sourceFile); err != nil {
+			return fmt.Errorf("ingest comments: %w", err)
+		}
+	}
+
 	return nil
+}
+
+// pragmaRe matches comment pragmas like //go:generate, //lint:ignore, //winze:contested.
+var pragmaRe = regexp.MustCompile(`^//\s*([a-zA-Z_]\w*:[a-zA-Z_]\w*)\s*(.*)$`)
+
+// defInterval represents a definition's line range for comment association.
+type defInterval struct {
+	startLine int // extended to include doc comment if present
+	endLine   int
+	defID     int64
+}
+
+// ingestComments extracts all comments from a file, associates them with
+// definitions by line range, and stores them in the database.
+func ingestComments(db *store.DB, fset *token.FileSet, file *ast.File, sourceFile string) error {
+	// Build intervals from AST declarations, extended to include doc comments.
+	// We use the AST directly (not a DB query) so we get doc comment positions.
+	var intervals []defInterval
+	for _, decl := range file.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			start := fset.Position(d.Pos()).Line
+			if d.Doc != nil {
+				if docLine := fset.Position(d.Doc.Pos()).Line; docLine < start {
+					start = docLine
+				}
+			}
+			end := fset.Position(d.End()).Line
+			intervals = append(intervals, defInterval{startLine: start, endLine: end})
+		case *ast.GenDecl:
+			for _, spec := range d.Specs {
+				var start, end int
+				var doc *ast.CommentGroup
+				switch s := spec.(type) {
+				case *ast.TypeSpec:
+					start = fset.Position(s.Pos()).Line
+					end = fset.Position(s.End()).Line
+					doc = s.Doc
+					if doc == nil {
+						doc = d.Doc
+					}
+				case *ast.ValueSpec:
+					if len(s.Names) == 0 || s.Names[0].Name == "_" {
+						continue
+					}
+					start = fset.Position(s.Pos()).Line
+					end = fset.Position(s.End()).Line
+					doc = s.Doc
+					if doc == nil {
+						doc = d.Doc
+					}
+				default:
+					continue
+				}
+				if doc != nil {
+					if docLine := fset.Position(doc.Pos()).Line; docLine < start {
+						start = docLine
+					}
+				}
+				intervals = append(intervals, defInterval{startLine: start, endLine: end})
+			}
+		}
+	}
+	sort.Slice(intervals, func(i, j int) bool { return intervals[i].startLine < intervals[j].startLine })
+
+	// Query the DB for definitions in this file to get their IDs and line ranges.
+	// We match AST intervals to DB definitions by overlapping line ranges.
+	defs, err := db.FindDefinitionsByFile("", sourceFile, 0)
+	if err != nil {
+		return fmt.Errorf("find defs for comments: %w", err)
+	}
+	// Build a map from startLine to defID for matching.
+	defByLine := make(map[int]int64)
+	for _, d := range defs {
+		defByLine[int(d.StartLine)] = d.ID
+	}
+	// Assign defIDs to intervals by matching: the DB's startLine should be
+	// within the AST interval (since AST interval extends to doc comment).
+	for i := range intervals {
+		for dbStart, defID := range defByLine {
+			if dbStart >= intervals[i].startLine && dbStart <= intervals[i].endLine {
+				intervals[i].defID = defID
+				break
+			}
+		}
+	}
+
+	// Associate each comment with a definition by line containment.
+	findDef := func(line int) *int64 {
+		for i := range intervals {
+			if line >= intervals[i].startLine && line <= intervals[i].endLine && intervals[i].defID > 0 {
+				return &intervals[i].defID
+			}
+		}
+		return nil
+	}
+
+	var comments []store.Comment
+	for _, cg := range file.Comments {
+		for _, c := range cg.List {
+			line := fset.Position(c.Pos()).Line
+			text := c.Text
+			defID := findDef(line)
+
+			kind := "line"
+			if strings.HasPrefix(text, "/*") {
+				kind = "block"
+			}
+
+			var pragmaKey, pragmaVal string
+			if m := pragmaRe.FindStringSubmatch(text); m != nil {
+				kind = "pragma"
+				pragmaKey = m[1]
+				pragmaVal = strings.TrimSpace(m[2])
+			}
+
+			comments = append(comments, store.Comment{
+				DefID:      defID,
+				SourceFile: sourceFile,
+				Line:       line,
+				Text:       text,
+				Kind:       kind,
+				PragmaKey:  pragmaKey,
+				PragmaVal:  pragmaVal,
+			})
+		}
+	}
+
+	return db.SetFileComments(sourceFile, comments)
 }
 
 // ingestState holds mutable state for a single ingest run.

@@ -333,6 +333,28 @@ type Reference struct {
 	Kind    string
 }
 
+// Comment represents a comment or pragma extracted from Go source.
+type Comment struct {
+	ID         int64
+	DefID      *int64 // nil for file-level comments
+	SourceFile string
+	Line       int
+	Text       string
+	Kind       string // "doc", "line", "block", "pragma"
+	PragmaKey  string // e.g. "go:generate", "winze:contested"
+	PragmaVal  string // rest of line after pragma directive
+}
+
+// LiteralField represents a field in a composite literal (e.g. Config{Field: "val"}).
+type LiteralField struct {
+	ID         int64
+	DefID      int64  // definition containing the literal
+	TypeName   string // fully qualified type (e.g. "github.com/foo/bar.Config")
+	FieldName  string
+	FieldValue string // source text of the value
+	Line       int
+}
+
 // Import represents an import recorded for a module.
 type Import struct {
 	ModuleID     int64
@@ -1067,6 +1089,136 @@ func (s *DB) SetReferences(fromDef int64, refs []Reference) error {
 	return nil
 }
 
+// --- Comments ---
+
+// SetFileComments replaces all comments for a source file.
+// Uses DELETE+INSERT (not REPLACE INTO) to avoid dolthub/dolt#10882 FULLTEXT bug.
+func (s *DB) SetFileComments(sourceFile string, comments []Comment) error {
+	ctx := s.Ctx()
+	if _, err := s.execContext(ctx, "DELETE FROM comments WHERE source_file = ?", sourceFile); err != nil {
+		return fmt.Errorf("clear comments: %w", err)
+	}
+	for _, c := range comments {
+		if _, err := s.execContext(ctx,
+			`INSERT INTO comments (def_id, source_file, line, text, kind, pragma_key, pragma_value)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			c.DefID, sourceFile, c.Line, c.Text, c.Kind, c.PragmaKey, c.PragmaVal,
+		); err != nil {
+			return fmt.Errorf("insert comment: %w", err)
+		}
+	}
+	return nil
+}
+
+// GetCommentsByPragma returns all comments with the given pragma key.
+// pragmaKey supports SQL LIKE patterns (e.g. "go:%").
+func (s *DB) GetCommentsByPragma(pragmaKey string) ([]Comment, error) {
+	ctx := s.Ctx()
+	q := `SELECT c.id, c.def_id, c.source_file, c.line, c.text, c.kind, COALESCE(c.pragma_key,''), COALESCE(c.pragma_value,'')
+	      FROM comments c WHERE c.pragma_key LIKE ? ORDER BY c.source_file, c.line`
+	rows, err := s.queryContext(ctx, q, pragmaKey)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []Comment
+	for rows.Next() {
+		var c Comment
+		var defID sql.NullInt64
+		if err := rows.Scan(&c.ID, &defID, &c.SourceFile, &c.Line, &c.Text, &c.Kind, &c.PragmaKey, &c.PragmaVal); err != nil {
+			return nil, err
+		}
+		if defID.Valid {
+			c.DefID = &defID.Int64
+		}
+		result = append(result, c)
+	}
+	return result, rows.Err()
+}
+
+// GetCommentsForDef returns all comments associated with a definition.
+func (s *DB) GetCommentsForDef(defID int64) ([]Comment, error) {
+	ctx := s.Ctx()
+	rows, err := s.queryContext(ctx,
+		`SELECT id, def_id, source_file, line, text, kind, COALESCE(pragma_key,''), COALESCE(pragma_value,'')
+		 FROM comments WHERE def_id = ? ORDER BY line`, defID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []Comment
+	for rows.Next() {
+		var c Comment
+		var did sql.NullInt64
+		if err := rows.Scan(&c.ID, &did, &c.SourceFile, &c.Line, &c.Text, &c.Kind, &c.PragmaKey, &c.PragmaVal); err != nil {
+			return nil, err
+		}
+		if did.Valid {
+			c.DefID = &did.Int64
+		}
+		result = append(result, c)
+	}
+	return result, rows.Err()
+}
+
+// --- Literal Fields ---
+
+// SetLiteralFields replaces all literal fields for a definition.
+// Uses DELETE+INSERT (not REPLACE INTO) to avoid dolthub/dolt#10882 FULLTEXT bug.
+func (s *DB) SetLiteralFields(defID int64, fields []LiteralField) error {
+	ctx := s.Ctx()
+	if _, err := s.execContext(ctx, "DELETE FROM literal_fields WHERE def_id = ?", defID); err != nil {
+		return fmt.Errorf("clear literal_fields: %w", err)
+	}
+	for _, f := range fields {
+		if _, err := s.execContext(ctx,
+			`INSERT INTO literal_fields (def_id, type_name, field_name, field_value, line)
+			 VALUES (?, ?, ?, ?, ?)`,
+			defID, f.TypeName, f.FieldName, f.FieldValue, f.Line,
+		); err != nil {
+			return fmt.Errorf("insert literal_field: %w", err)
+		}
+	}
+	return nil
+}
+
+// QueryLiteralFields searches literal fields. All params are optional filters.
+// typeName and fieldValue support SQL LIKE patterns.
+func (s *DB) QueryLiteralFields(typeName, fieldName, fieldValue string) ([]LiteralField, error) {
+	ctx := s.Ctx()
+	q := `SELECT lf.id, lf.def_id, lf.type_name, lf.field_name, lf.field_value, lf.line
+	      FROM literal_fields lf WHERE 1=1`
+	var args []any
+	if typeName != "" {
+		q += " AND lf.type_name LIKE ?"
+		args = append(args, typeName)
+	}
+	if fieldName != "" {
+		q += " AND lf.field_name = ?"
+		args = append(args, fieldName)
+	}
+	if fieldValue != "" {
+		q += " AND lf.field_value LIKE ?"
+		args = append(args, fieldValue)
+	}
+	q += " ORDER BY lf.type_name, lf.field_name LIMIT 200"
+
+	rows, err := s.queryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []LiteralField
+	for rows.Next() {
+		var f LiteralField
+		if err := rows.Scan(&f.ID, &f.DefID, &f.TypeName, &f.FieldName, &f.FieldValue, &f.Line); err != nil {
+			return nil, err
+		}
+		result = append(result, f)
+	}
+	return result, rows.Err()
+}
+
 // --- Imports ---
 
 // SetImports replaces all imports for a module.
@@ -1422,6 +1574,146 @@ func (s *DB) getInterfaceDispatchCallers(d *Definition) []Definition {
 		allCallers = append(allCallers, callers...)
 	}
 	return allCallers
+}
+
+// TraverseResult holds a definition found during graph traversal with its depth and path.
+type TraverseResult struct {
+	Definition Definition
+	Depth      int
+	Path       []string // definition names from root to this node
+}
+
+// Traverse performs a BFS traversal of the reference graph.
+// direction: "callers" (who references me) or "callees" (what I reference).
+// refKinds: filter by ref kind (empty = all). maxDepth: BFS depth cap (0 = default 10, max 50).
+func (s *DB) Traverse(startID int64, direction string, refKinds []string, maxDepth int) ([]TraverseResult, error) {
+	if maxDepth <= 0 {
+		maxDepth = 10
+	}
+	if maxDepth > 50 {
+		maxDepth = 50
+	}
+
+	ctx := s.Ctx()
+	visited := map[int64]bool{startID: true}
+	parent := map[int64]int64{}
+	nameOf := map[int64]string{}
+
+	// Get the start definition's name for path building.
+	if d, err := s.GetDefinition(startID); err == nil {
+		name := d.Name
+		if d.Receiver != "" {
+			name = "(" + d.Receiver + ")." + d.Name
+		}
+		nameOf[startID] = name
+	}
+
+	// Build kind filter clause.
+	kindClause := ""
+	var kindArgs []any
+	if len(refKinds) > 0 {
+		placeholders := make([]string, len(refKinds))
+		for i, k := range refKinds {
+			placeholders[i] = "?"
+			kindArgs = append(kindArgs, k)
+		}
+		kindClause = " AND r.kind IN (" + strings.Join(placeholders, ",") + ")"
+	}
+
+	var results []TraverseResult
+	frontier := []int64{startID}
+
+	for depth := 1; depth <= maxDepth && len(frontier) > 0; depth++ {
+		// Build IN clause for current frontier.
+		placeholders := make([]string, len(frontier))
+		var args []any
+		for i, id := range frontier {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		args = append(args, kindArgs...)
+
+		var q string
+		if direction == "callers" {
+			q = `SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test,
+			       COALESCE(d.receiver,''), COALESCE(d.signature,''), '',
+			       COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0),
+			       COALESCE(d.source_file,''), d.hash, r.to_def
+			     FROM definitions d
+			     JOIN refs r ON r.from_def = d.id
+			     WHERE r.to_def IN (` + strings.Join(placeholders, ",") + `)` + kindClause +
+				` ORDER BY d.name`
+		} else {
+			q = `SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test,
+			       COALESCE(d.receiver,''), COALESCE(d.signature,''), '',
+			       COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0),
+			       COALESCE(d.source_file,''), d.hash, r.from_def
+			     FROM definitions d
+			     JOIN refs r ON r.to_def = d.id
+			     WHERE r.from_def IN (` + strings.Join(placeholders, ",") + `)` + kindClause +
+				` ORDER BY d.name`
+		}
+
+		rows, err := s.queryContext(ctx, q, args...)
+		if err != nil {
+			return results, fmt.Errorf("traverse depth %d: %w", depth, err)
+		}
+
+		var nextFrontier []int64
+		for rows.Next() {
+			var d Definition
+			var parentID int64
+			if err := rows.Scan(&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test,
+				&d.Receiver, &d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine,
+				&d.SourceFile, &d.Hash, &parentID); err != nil {
+				rows.Close()
+				return results, err
+			}
+			if visited[d.ID] {
+				continue
+			}
+			visited[d.ID] = true
+			parent[d.ID] = parentID
+
+			name := d.Name
+			if d.Receiver != "" {
+				name = "(" + d.Receiver + ")." + d.Name
+			}
+			nameOf[d.ID] = name
+
+			// Build path from root.
+			var path []string
+			cur := d.ID
+			for {
+				path = append([]string{nameOf[cur]}, path...)
+				p, ok := parent[cur]
+				if !ok || p == startID {
+					path = append([]string{nameOf[startID]}, path...)
+					break
+				}
+				cur = p
+			}
+
+			results = append(results, TraverseResult{
+				Definition: d,
+				Depth:      depth,
+				Path:       path,
+			})
+			nextFrontier = append(nextFrontier, d.ID)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return results, err
+		}
+
+		// Safety cap: stop expanding if a level is too wide.
+		if len(nextFrontier) > 1000 {
+			break
+		}
+		frontier = nextFrontier
+	}
+
+	return results, nil
 }
 
 func (s *DB) GetUntested() ([]Definition, error) {
