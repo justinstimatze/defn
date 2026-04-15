@@ -469,8 +469,8 @@ func (s *DB) UpsertDefinition(d *Definition) (int64, error) {
 		return 0, fmt.Errorf("update definition: %w", err)
 	}
 	if _, err := s.execContext(ctx,
-		`REPLACE INTO bodies (def_id, body) VALUES (?, ?)`,
-		existingID, d.Body,
+		`UPDATE bodies SET body = ? WHERE def_id = ?`,
+		d.Body, existingID,
 	); err != nil {
 		return 0, fmt.Errorf("update body: %w", err)
 	}
@@ -585,18 +585,15 @@ func (s *DB) GetDefinition(id int64) (*Definition, error) {
 // SearchDefinitions performs full-text search on definition bodies and doc comments.
 // Returns definitions ranked by relevance.
 func (s *DB) SearchDefinitions(query string) ([]Definition, error) {
-	// Search doc comments and bodies via LIKE.
-	// Dolt's FULLTEXT indexes don't work with MATCH AGAINST in embedded mode,
-	// so we fall back to LIKE. Acceptable for typical project sizes (<10K defs).
-	likePattern := "%" + query + "%"
 	rows, err := s.queryContext(s.Ctx(),
 		`SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
 		        COALESCE(d.signature,''), '', COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
 		 FROM definitions d
-		 WHERE d.doc LIKE ?
-		    OR d.id IN (SELECT def_id FROM bodies WHERE body LIKE ?)
+		 LEFT JOIN bodies b ON b.def_id = d.id
+		 WHERE MATCH(d.doc) AGAINST(?)
+		    OR MATCH(b.body) AGAINST(?)
 		 ORDER BY d.name
-		 LIMIT 100`, likePattern, likePattern)
+		 LIMIT 100`, query, query)
 	if err != nil {
 		return nil, err
 	}

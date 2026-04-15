@@ -3,8 +3,8 @@ module github.com/justinstimatze/defn
 go 1.26
 
 require (
-	github.com/dolthub/dolt/go v0.40.5-0.20260326074512-005921bdd8ca
-	github.com/dolthub/driver v1.84.1
+	github.com/dolthub/dolt/go v0.40.5-0.20260415052817-250fcf57cd3d
+	github.com/dolthub/driver v1.84.2-0.20260415010027-81fe8bae47a0
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/modelcontextprotocol/go-sdk v1.4.1
 	golang.org/x/tools v0.43.0
@@ -66,10 +66,10 @@ require (
 	github.com/dolthub/eventsapi_schema v0.0.0-20260310172945-37a9265ade69 // indirect
 	github.com/dolthub/flatbuffers/v23 v23.3.3-dh.2 // indirect
 	github.com/dolthub/fslock v0.0.3 // indirect
-	github.com/dolthub/go-icu-regex v0.0.0-20250916051405-78a38d478790 // indirect
-	github.com/dolthub/go-mysql-server v0.20.1-0.20260325173633-83a7fba2790f // indirect
+	github.com/dolthub/go-icu-regex v0.0.0-20260412212219-49724d547866 // indirect
+	github.com/dolthub/go-mysql-server v0.20.1-0.20260412215059-d7fc9477f4b7 // indirect
 	github.com/dolthub/gozstd v0.0.0-20240423170813-23a2903bca63 // indirect
-	github.com/dolthub/ishell v0.0.0-20240701202509-2b217167d718 // indirect
+	github.com/dolthub/ishell v0.0.0-20260414231531-5f031e3e9037 // indirect
 	github.com/dolthub/jsonpath v0.0.2-0.20240227200619-19675ab05c71 // indirect
 	github.com/dolthub/vitess v0.0.0-20260309181228-a99af9c518ab // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
@@ -118,6 +118,7 @@ require (
 	github.com/pkg/profile v1.7.0 // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
+	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/segmentio/asm v1.2.1 // indirect
 	github.com/segmentio/encoding v0.5.4 // indirect

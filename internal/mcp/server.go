@@ -75,7 +75,7 @@ func Run(ctx context.Context, database *store.DB, projDir string) error {
 
 	server := sdkmcp.NewServer(&sdkmcp.Implementation{
 		Name:    "defn",
-		Version: "0.7.0",
+		Version: "0.8.0",
 	}, nil)
 
 	sdkmcp.AddTool(server, &sdkmcp.Tool{
