@@ -10,17 +10,19 @@
 //	defer d.Close()
 //	defs, err := d.Definitions(defndb.DefinitionFilter{Kind: "type"})
 //
-// The DB handle uses a single pinned database connection and is NOT
-// safe for concurrent use from multiple goroutines.
+// All methods are safe for concurrent use from multiple goroutines.
 package db
 
 import (
+	"sync"
+
 	"github.com/justinstimatze/defn/internal/store"
 )
 
 // DB is a read-only handle to a defn database.
 type DB struct {
-	s *store.DB
+	mu sync.Mutex
+	s  *store.DB
 }
 
 // Open opens a defn database at the given path (e.g. ".defn").
@@ -37,12 +39,16 @@ func Open(path string) (*DB, error) {
 
 // Close releases database resources.
 func (db *DB) Close() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	return db.s.Close()
 }
 
 // Query executes a read-only SQL query and returns rows as maps.
 // Only SELECT, SHOW, DESCRIBE, EXPLAIN, and WITH (CTE) queries are allowed.
 func (db *DB) Query(sql string) ([]map[string]any, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	return db.s.Query(sql)
 }
 
@@ -74,6 +80,8 @@ type DefinitionFilter struct {
 
 // Definitions returns definitions matching the filter.
 func (db *DB) Definitions(f DefinitionFilter) ([]Definition, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	defs, err := db.s.FilterDefinitions(f.Name, f.Kind, f.File)
 	if err != nil {
 		return nil, err
@@ -81,8 +89,22 @@ func (db *DB) Definitions(f DefinitionFilter) ([]Definition, error) {
 	return convertDefs(defs), nil
 }
 
+// DefinitionByID returns a single definition by its ID.
+func (db *DB) DefinitionByID(id int64) (*Definition, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	d, err := db.s.GetDefinition(id)
+	if err != nil {
+		return nil, err
+	}
+	out := convertDef(*d)
+	return &out, nil
+}
+
 // Search runs a FULLTEXT search across definition docs and bodies.
 func (db *DB) Search(query string) ([]Definition, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	defs, err := db.s.SearchDefinitions(query)
 	if err != nil {
 		return nil, err
@@ -96,6 +118,7 @@ func (db *DB) Search(query string) ([]Definition, error) {
 type LiteralField struct {
 	ID         int64
 	DefID      int64  // definition containing the literal
+	DefName    string // name of containing definition
 	TypeName   string // fully qualified (e.g. "github.com/foo/bar.Config")
 	FieldName  string
 	FieldValue string // source text of the value expression
@@ -105,22 +128,25 @@ type LiteralField struct {
 // LiteralFieldFilter controls which literal fields are returned.
 // All fields are optional. TypeName and Value support SQL LIKE patterns.
 type LiteralFieldFilter struct {
-	TypeName  string // LIKE pattern (e.g. "%Claim%")
-	FieldName string // exact match (e.g. "Subject")
-	Value     string // LIKE pattern on field_value
+	TypeName   string   // LIKE pattern (e.g. "%Claim%")
+	FieldName  string   // exact match (e.g. "Subject") — mutually exclusive with FieldNames
+	FieldNames []string // IN match (e.g. []string{"Subject", "Object", "Prov"})
+	Value      string   // LIKE pattern on field_value
 }
 
 // LiteralFields returns composite literal fields matching the filter.
 func (db *DB) LiteralFields(f LiteralFieldFilter) ([]LiteralField, error) {
-	fields, err := db.s.QueryLiteralFields(f.TypeName, f.FieldName, f.Value)
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	fields, err := db.s.QueryLiteralFields(f.TypeName, f.FieldName, f.Value, f.FieldNames)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]LiteralField, len(fields))
-	for i, f := range fields {
+	for i, sf := range fields {
 		out[i] = LiteralField{
-			ID: f.ID, DefID: f.DefID, TypeName: f.TypeName,
-			FieldName: f.FieldName, FieldValue: f.FieldValue, Line: f.Line,
+			ID: sf.ID, DefID: sf.DefID, DefName: sf.DefName, TypeName: sf.TypeName,
+			FieldName: sf.FieldName, FieldValue: sf.FieldValue, Line: sf.Line,
 		}
 	}
 	return out, nil
@@ -132,6 +158,7 @@ func (db *DB) LiteralFields(f LiteralFieldFilter) ([]LiteralField, error) {
 type Pragma struct {
 	ID         int64
 	DefID      *int64 // nil for file-level pragmas
+	DefName    string // name of associated definition (empty if file-level)
 	SourceFile string
 	Line       int
 	Text       string // full comment text
@@ -142,6 +169,8 @@ type Pragma struct {
 // Pragmas returns pragma comments matching the key pattern.
 // keyPattern supports SQL LIKE (e.g. "winze:%" for all winze pragmas).
 func (db *DB) Pragmas(keyPattern string) ([]Pragma, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	comments, err := db.s.GetCommentsByPragma(keyPattern)
 	if err != nil {
 		return nil, err
@@ -149,7 +178,7 @@ func (db *DB) Pragmas(keyPattern string) ([]Pragma, error) {
 	out := make([]Pragma, len(comments))
 	for i, c := range comments {
 		out[i] = Pragma{
-			ID: c.ID, DefID: c.DefID, SourceFile: c.SourceFile,
+			ID: c.ID, DefID: c.DefID, DefName: c.DefName, SourceFile: c.SourceFile,
 			Line: c.Line, Text: c.Text, Key: c.PragmaKey, Value: c.PragmaVal,
 		}
 	}
@@ -175,6 +204,8 @@ type RefFilter struct {
 
 // Refs returns references matching the filter.
 func (db *DB) Refs(f RefFilter) ([]Ref, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	refs, err := db.s.QueryRefs(f.FromName, f.ToName, f.Kind)
 	if err != nil {
 		return nil, err
@@ -199,6 +230,8 @@ type TraverseResult struct {
 // direction: "callers" (who references me) or "callees" (what I reference).
 // refKinds filters by ref kind (nil = all). maxDepth caps BFS depth (0 = default 10, max 50).
 func (db *DB) Traverse(name, direction string, refKinds []string, maxDepth int) ([]TraverseResult, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	d, err := db.s.GetDefinitionByName(name, "")
 	if err != nil {
 		return nil, err

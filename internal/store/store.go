@@ -337,6 +337,7 @@ type Reference struct {
 type Comment struct {
 	ID         int64
 	DefID      *int64 // nil for file-level comments
+	DefName    string // name of associated definition (empty if file-level)
 	SourceFile string
 	Line       int
 	Text       string
@@ -349,6 +350,7 @@ type Comment struct {
 type LiteralField struct {
 	ID         int64
 	DefID      int64  // definition containing the literal
+	DefName    string // name of containing definition
 	TypeName   string // fully qualified type (e.g. "github.com/foo/bar.Config")
 	FieldName  string
 	FieldValue string // source text of the value
@@ -1180,8 +1182,10 @@ func (s *DB) SetFileComments(sourceFile string, comments []Comment) error {
 // pragmaKey supports SQL LIKE patterns (e.g. "go:%").
 func (s *DB) GetCommentsByPragma(pragmaKey string) ([]Comment, error) {
 	ctx := s.Ctx()
-	q := `SELECT c.id, c.def_id, c.source_file, c.line, c.text, c.kind, COALESCE(c.pragma_key,''), COALESCE(c.pragma_value,'')
-	      FROM comments c WHERE c.pragma_key LIKE ? ORDER BY c.source_file, c.line`
+	q := `SELECT c.id, c.def_id, COALESCE(d.name,''), c.source_file, c.line, c.text, c.kind, COALESCE(c.pragma_key,''), COALESCE(c.pragma_value,'')
+	      FROM comments c
+	      LEFT JOIN definitions d ON c.def_id = d.id
+	      WHERE c.pragma_key LIKE ? ORDER BY c.source_file, c.line`
 	rows, err := s.queryContext(ctx, q, pragmaKey)
 	if err != nil {
 		return nil, err
@@ -1191,7 +1195,7 @@ func (s *DB) GetCommentsByPragma(pragmaKey string) ([]Comment, error) {
 	for rows.Next() {
 		var c Comment
 		var defID sql.NullInt64
-		if err := rows.Scan(&c.ID, &defID, &c.SourceFile, &c.Line, &c.Text, &c.Kind, &c.PragmaKey, &c.PragmaVal); err != nil {
+		if err := rows.Scan(&c.ID, &defID, &c.DefName, &c.SourceFile, &c.Line, &c.Text, &c.Kind, &c.PragmaKey, &c.PragmaVal); err != nil {
 			return nil, err
 		}
 		if defID.Valid {
@@ -1206,8 +1210,10 @@ func (s *DB) GetCommentsByPragma(pragmaKey string) ([]Comment, error) {
 func (s *DB) GetCommentsForDef(defID int64) ([]Comment, error) {
 	ctx := s.Ctx()
 	rows, err := s.queryContext(ctx,
-		`SELECT id, def_id, source_file, line, text, kind, COALESCE(pragma_key,''), COALESCE(pragma_value,'')
-		 FROM comments WHERE def_id = ? ORDER BY line`, defID)
+		`SELECT c.id, c.def_id, COALESCE(d.name,''), c.source_file, c.line, c.text, c.kind, COALESCE(c.pragma_key,''), COALESCE(c.pragma_value,'')
+		 FROM comments c
+		 LEFT JOIN definitions d ON c.def_id = d.id
+		 WHERE c.def_id = ? ORDER BY c.line`, defID)
 	if err != nil {
 		return nil, err
 	}
@@ -1216,7 +1222,7 @@ func (s *DB) GetCommentsForDef(defID int64) ([]Comment, error) {
 	for rows.Next() {
 		var c Comment
 		var did sql.NullInt64
-		if err := rows.Scan(&c.ID, &did, &c.SourceFile, &c.Line, &c.Text, &c.Kind, &c.PragmaKey, &c.PragmaVal); err != nil {
+		if err := rows.Scan(&c.ID, &did, &c.DefName, &c.SourceFile, &c.Line, &c.Text, &c.Kind, &c.PragmaKey, &c.PragmaVal); err != nil {
 			return nil, err
 		}
 		if did.Valid {
@@ -1250,10 +1256,12 @@ func (s *DB) SetLiteralFields(defID int64, fields []LiteralField) error {
 
 // QueryLiteralFields searches literal fields. All params are optional filters.
 // typeName and fieldValue support SQL LIKE patterns.
-func (s *DB) QueryLiteralFields(typeName, fieldName, fieldValue string) ([]LiteralField, error) {
+func (s *DB) QueryLiteralFields(typeName, fieldName, fieldValue string, fieldNames []string) ([]LiteralField, error) {
 	ctx := s.Ctx()
-	q := `SELECT lf.id, lf.def_id, lf.type_name, lf.field_name, lf.field_value, lf.line
-	      FROM literal_fields lf WHERE 1=1`
+	q := `SELECT lf.id, lf.def_id, COALESCE(d.name,''), lf.type_name, lf.field_name, lf.field_value, lf.line
+	      FROM literal_fields lf
+	      LEFT JOIN definitions d ON lf.def_id = d.id
+	      WHERE 1=1`
 	var args []any
 	if typeName != "" {
 		q += " AND lf.type_name LIKE ?"
@@ -1262,6 +1270,14 @@ func (s *DB) QueryLiteralFields(typeName, fieldName, fieldValue string) ([]Liter
 	if fieldName != "" {
 		q += " AND lf.field_name = ?"
 		args = append(args, fieldName)
+	}
+	if len(fieldNames) > 0 {
+		placeholders := make([]string, len(fieldNames))
+		for i, n := range fieldNames {
+			placeholders[i] = "?"
+			args = append(args, n)
+		}
+		q += " AND lf.field_name IN (" + strings.Join(placeholders, ",") + ")"
 	}
 	if fieldValue != "" {
 		q += " AND lf.field_value LIKE ?"
@@ -1277,7 +1293,7 @@ func (s *DB) QueryLiteralFields(typeName, fieldName, fieldValue string) ([]Liter
 	var result []LiteralField
 	for rows.Next() {
 		var f LiteralField
-		if err := rows.Scan(&f.ID, &f.DefID, &f.TypeName, &f.FieldName, &f.FieldValue, &f.Line); err != nil {
+		if err := rows.Scan(&f.ID, &f.DefID, &f.DefName, &f.TypeName, &f.FieldName, &f.FieldValue, &f.Line); err != nil {
 			return nil, err
 		}
 		result = append(result, f)

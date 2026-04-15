@@ -75,7 +75,7 @@ func Run(ctx context.Context, database *store.DB, projDir string) error {
 
 	server := sdkmcp.NewServer(&sdkmcp.Implementation{
 		Name:    "defn",
-		Version: "0.10.0",
+		Version: "0.10.1",
 	}, nil)
 
 	sdkmcp.AddTool(server, &sdkmcp.Tool{
@@ -1858,7 +1858,7 @@ func (s *server) handleLiterals(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 	} else if !strings.Contains(typeName, "%") {
 		typeName = "%" + typeName + "%" // convenience: partial match
 	}
-	fields, err := s.db.QueryLiteralFields(typeName, args.Name, args.Body)
+	fields, err := s.db.QueryLiteralFields(typeName, args.Name, args.Body, nil)
 	if err != nil {
 		return errResult(fmt.Errorf("query literals: %w", err))
 	}
@@ -1871,12 +1871,9 @@ func (s *server) handleLiterals(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 	fmt.Fprintf(&sb, "| Definition | Type | Field | Value | Line |\n")
 	fmt.Fprintf(&sb, "|---|---|---|---|---|\n")
 	for _, f := range fields {
-		defName := fmt.Sprintf("#%d", f.DefID)
-		if d, err := s.db.GetDefinition(f.DefID); err == nil {
-			defName = d.Name
-			if d.Receiver != "" {
-				defName = "(" + d.Receiver + ")." + d.Name
-			}
+		defName := f.DefName
+		if defName == "" {
+			defName = fmt.Sprintf("#%d", f.DefID)
 		}
 		// Shorten type name: just the last component.
 		shortType := f.TypeName
@@ -1919,14 +1916,9 @@ func (s *server) handlePragmas(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "## Pragmas matching %q (%d results)\n\n", pragmaKey, len(comments))
 	for _, c := range comments {
-		defName := "(file-level)"
-		if c.DefID != nil {
-			if d, err := s.db.GetDefinition(*c.DefID); err == nil {
-				defName = d.Name
-				if d.Receiver != "" {
-					defName = "(" + d.Receiver + ")." + d.Name
-				}
-			}
+		defName := c.DefName
+		if defName == "" {
+			defName = "(file-level)"
 		}
 		fmt.Fprintf(&sb, "- `%s` %s — %s:%d → %s\n", c.PragmaKey, c.PragmaVal, c.SourceFile, c.Line, defName)
 	}
