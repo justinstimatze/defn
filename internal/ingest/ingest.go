@@ -10,7 +10,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/justinstimatze/defn/internal/goload"
@@ -75,6 +77,11 @@ func IngestPackages(db *store.DB, pkgs []*packages.Package, modulePath string) e
 		return fmt.Errorf("prune stale: %w", err)
 	} else if pruned > 0 {
 		fmt.Fprintf(os.Stderr, "pruned %d stale definitions\n", pruned)
+	}
+
+	// Record last ingest timestamp for staleness detection.
+	if err := db.SetMeta("last_ingest", strconv.FormatInt(time.Now().Unix(), 10)); err != nil {
+		return fmt.Errorf("set last_ingest: %w", err)
 	}
 
 	return nil

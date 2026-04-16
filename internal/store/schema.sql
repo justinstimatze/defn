@@ -114,3 +114,9 @@ CREATE INDEX idx_litfield_field ON literal_fields(field_name);
 CREATE INDEX idx_litfield_def ON literal_fields(def_id);
 CREATE INDEX idx_litfield_type_field ON literal_fields(type_name, field_name);
 CREATE FULLTEXT INDEX idx_litfield_value_ft ON literal_fields(field_value);
+
+-- Key/value metadata (last_ingest timestamp, schema version, etc.).
+CREATE TABLE IF NOT EXISTS defn_meta (
+    `key`   VARCHAR(64) PRIMARY KEY,
+    `value` TEXT NOT NULL
+);

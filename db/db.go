@@ -14,6 +14,11 @@
 package db
 
 import (
+	"fmt"
+	"io/fs"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/justinstimatze/defn/internal/store"
@@ -249,6 +254,61 @@ func (db *DB) Traverse(name, direction string, refKinds []string, maxDepth int) 
 		}
 	}
 	return out, nil
+}
+
+// --- Staleness ---
+
+// StaleFiles returns paths of .go files under projectDir that have been
+// modified more recently than the last ingest. Empty slice means the
+// database is in sync with the filesystem (or no ingest timestamp has
+// been recorded — e.g. databases created before this feature).
+//
+// Walks projectDir recursively, skipping .defn/, .git/, vendor/,
+// node_modules/, and testdata/ directories.
+func (db *DB) StaleFiles(projectDir string) ([]string, error) {
+	db.mu.Lock()
+	lastIngestStr, err := db.s.GetMeta("last_ingest")
+	db.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	if lastIngestStr == "" {
+		return nil, nil
+	}
+	lastIngest, err := strconv.ParseInt(lastIngestStr, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("parse last_ingest: %w", err)
+	}
+
+	var stale []string
+	err = filepath.WalkDir(projectDir, func(path string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if name == ".defn" || name == ".git" || name == "vendor" ||
+				name == "node_modules" || name == "testdata" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil // skip unreadable files
+		}
+		if info.ModTime().Unix() > lastIngest {
+			stale = append(stale, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return stale, nil
 }
 
 // --- Helpers ---

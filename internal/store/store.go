@@ -1311,6 +1311,34 @@ func (s *DB) QueryLiteralFields(typeName, fieldName, fieldValue string, fieldNam
 	return result, rows.Err()
 }
 
+// --- Metadata (key/value) ---
+
+// SetMeta upserts a key/value pair into the defn_meta table.
+func (s *DB) SetMeta(key, value string) error {
+	ctx := s.Ctx()
+	_, err := s.execContext(ctx,
+		"REPLACE INTO defn_meta (`key`, `value`) VALUES (?, ?)", key, value)
+	if err != nil {
+		return fmt.Errorf("set meta %q: %w", key, err)
+	}
+	return nil
+}
+
+// GetMeta returns the value for a key, or "" if not set.
+func (s *DB) GetMeta(key string) (string, error) {
+	ctx := s.Ctx()
+	var value string
+	err := s.queryRowContext(ctx,
+		"SELECT `value` FROM defn_meta WHERE `key` = ?", key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return value, nil
+}
+
 // --- Imports ---
 
 // SetImports replaces all imports for a module.

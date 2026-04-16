@@ -6,12 +6,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
@@ -58,10 +60,64 @@ func init() {
 }
 
 func getDBPath() string {
+	// Explicit DSN always wins.
+	if dsn := os.Getenv("DEFN_DSN"); dsn != "" {
+		return dsn
+	}
+	// Explicit DB path honored as-is (may be filesystem path or DSN).
 	if p := os.Getenv("DEFN_DB"); p != "" {
 		return p
 	}
+	// Auto-detect a running dolt sql-server so the CLI falls back to it
+	// when the local .defn/ is missing or corrupted, matching the
+	// behavior of the db/ library's Open.
+	if dsn := detectRunningServer(".defn"); dsn != "" {
+		return dsn
+	}
 	return ".defn"
+}
+
+// detectRunningServer returns a DSN for a running dolt sql-server hosting
+// this project's database, or "" if none is reachable. Checks
+// .defn/server.port for a custom port, falling back to 3307.
+//
+// Uses a short TCP dial first to avoid driver-level timeouts when
+// nothing is listening.
+func detectRunningServer(dbPath string) string {
+	port := "3307"
+	if data, err := os.ReadFile(filepath.Join(dbPath, "server.port")); err == nil {
+		port = strings.TrimSpace(string(data))
+	}
+	addr := "127.0.0.1:" + port
+	conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+	if err != nil {
+		return ""
+	}
+	conn.Close()
+
+	absPath, err := filepath.Abs(dbPath)
+	if err != nil {
+		return ""
+	}
+	dbName := filepath.Base(absPath)
+	for _, user := range []string{"defn", "root"} {
+		dsn := fmt.Sprintf("%s@tcp(%s)/%s", user, addr, dbName)
+		sqlDB, err := sql.Open("mysql", dsn)
+		if err != nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		// Verify this is actually a defn database — a random MySQL server
+		// on the same port wouldn't have a definitions table.
+		var n int
+		err = sqlDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM definitions").Scan(&n)
+		cancel()
+		sqlDB.Close()
+		if err == nil {
+			return dsn
+		}
+	}
+	return ""
 }
 
 func cmdInitServer(modulePath string) {
@@ -632,6 +688,8 @@ func cmdQuery(sql string) {
 	}
 	defer db.Close()
 
+	warnIfStale(db, ".")
+
 	results, err := db.Query(sql)
 	if err != nil {
 		fatal(err)
@@ -640,6 +698,57 @@ func cmdQuery(sql string) {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	enc.Encode(results)
+}
+
+// warnIfStale prints a warning to stderr if any .go file under projectDir
+// is newer than the last recorded ingest timestamp. Silent if the
+// database has no last_ingest recorded (older DBs) or nothing is stale.
+func warnIfStale(db *store.DB, projectDir string) {
+	lastIngestStr, err := db.GetMeta("last_ingest")
+	if err != nil || lastIngestStr == "" {
+		return
+	}
+	lastIngest, err := strconv.ParseInt(lastIngestStr, 10, 64)
+	if err != nil {
+		return
+	}
+	var count int
+	var sample string
+	_ = filepath.WalkDir(projectDir, func(path string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if name == ".defn" || name == ".git" || name == "vendor" ||
+				name == "node_modules" || name == "testdata" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if info.ModTime().Unix() > lastIngest {
+			count++
+			if sample == "" {
+				sample = path
+			}
+		}
+		return nil
+	})
+	if count == 0 {
+		return
+	}
+	if count == 1 {
+		fmt.Fprintf(os.Stderr, "defn: 1 file modified since last ingest (%s) — results may be stale (run 'defn ingest .')\n", sample)
+	} else {
+		fmt.Fprintf(os.Stderr, "defn: %d files modified since last ingest — results may be stale (run 'defn ingest .')\n", count)
+	}
 }
 
 func cmdWorktree(branchName string) {
