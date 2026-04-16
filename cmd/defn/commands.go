@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -504,7 +505,7 @@ func cmdIngest(modulePath string) {
 	fmt.Fprintf(os.Stderr, "done. root hash: %s\n", hash[:16])
 }
 
-func cmdServe() {
+func cmdServe(httpAddr string) {
 	// Cap Go heap so Dolt's embedded caches scale down (v1.86.2+ reads
 	// GOMEMLIMIT via its memlimit package). 1 GiB is plenty for the MCP
 	// server; without this the noms chunk store + prolly node cache +
@@ -513,21 +514,87 @@ func cmdServe() {
 		debug.SetMemoryLimit(1 << 30) // 1 GiB
 	}
 
+	ctx := context.Background()
+
+	// Explicit --http mode: just start the HTTP server.
+	if httpAddr != "" {
+		db, err := store.Open(getDBPath())
+		if err != nil {
+			fatal(err)
+		}
+		defer db.Close()
+		projDir := serveProjectDir()
+		if err := mcpserver.RunHTTP(ctx, db, projDir, httpAddr); err != nil {
+			fatal(err)
+		}
+		return
+	}
+
+	// Auto-sharing: derive a port from the database path. If another
+	// defn serve is already listening on that port, proxy to it (~5 MB).
+	// Otherwise, start both HTTP and stdio (first session pays full cost,
+	// subsequent sessions are lightweight proxies).
+	port := portForDB(getDBPath())
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	sseURL := fmt.Sprintf("http://%s/sse", addr)
+
+	if isDefnListening(addr) {
+		fmt.Fprintf(os.Stderr, "defn: proxying to shared server on %s\n", addr)
+		if err := mcpserver.RunProxy(ctx, sseURL); err != nil {
+			fatal(err)
+		}
+		return
+	}
+
+	// First session: start shared HTTP + serve this client over stdio.
 	db, err := store.Open(getDBPath())
 	if err != nil {
 		fatal(err)
 	}
 	defer db.Close()
+	projDir := serveProjectDir()
+	if err := mcpserver.RunShared(ctx, db, projDir, addr); err != nil {
+		fatal(err)
+	}
+}
 
-	// Determine project directory from DEFN_DB path.
-	// .defn/ is inside the project root, so go up one level.
+// serveProjectDir returns the project root from the DEFN_DB path.
+func serveProjectDir() string {
 	projDir := filepath.Dir(getDBPath())
 	if projDir == "." {
 		projDir, _ = os.Getwd()
 	}
-	if err := mcpserver.Run(context.Background(), db, projDir); err != nil {
-		fatal(err)
+	return projDir
+}
+
+// portForDB derives a deterministic port from the database path.
+// Range: 9420-9999 (580 ports, collision unlikely for typical dev machines).
+func portForDB(dbPath string) int {
+	abs, err := filepath.Abs(dbPath)
+	if err != nil {
+		abs = dbPath
 	}
+	// FNV-style hash.
+	var h uint32
+	for _, b := range []byte(abs) {
+		h ^= uint32(b)
+		h *= 16777619
+	}
+	return 9420 + int(h%580)
+}
+
+// isDefnListening checks if a defn HTTP/SSE server is already on addr.
+// Verifies content-type to avoid proxying to an unrelated service.
+func isDefnListening(addr string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("http://%s/sse", addr), nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.Header.Get("Content-Type") == "text/event-stream"
 }
 
 func cmdEmit(outDir string) {

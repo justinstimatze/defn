@@ -45,7 +45,11 @@ func main() {
 		}
 		cmdIngest(os.Args[2])
 	case "serve":
-		cmdServe()
+		httpAddr := ""
+		if len(os.Args) >= 4 && os.Args[2] == "--http" {
+			httpAddr = os.Args[3]
+		}
+		cmdServe(httpAddr)
 	case "emit":
 		dir := "."
 		if len(os.Args) >= 3 {

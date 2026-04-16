@@ -11,6 +11,7 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -51,9 +52,107 @@ type server struct {
 	autoCommitCount atomic.Int64 // counts auto-commits; triggers GC every 50
 }
 
-// Run starts the MCP server. projDir is the project root where files
-// should be emitted (for in-place sync with file-based tools).
+// Run starts the MCP server over stdio. projDir is the project root where
+// files should be emitted (for in-place sync with file-based tools).
 func Run(ctx context.Context, database *store.DB, projDir string) error {
+	s, mcpServer := newMCPServer(ctx, database, projDir)
+	_ = s
+	return mcpServer.Run(ctx, &sdkmcp.StdioTransport{})
+}
+
+// RunHTTP starts the MCP server over HTTP/SSE on addr (e.g. ":9420").
+// Multiple clients can connect to the same server, sharing one defn process.
+func RunHTTP(ctx context.Context, database *store.DB, projDir, addr string) error {
+	_, mcpServer := newMCPServer(ctx, database, projDir)
+	handler := sdkmcp.NewSSEHandler(func(*http.Request) *sdkmcp.Server {
+		return mcpServer
+	}, nil)
+	fmt.Fprintf(os.Stderr, "defn: listening on %s\n", addr)
+	srv := &http.Server{Addr: addr, Handler: handler}
+	go func() {
+		<-ctx.Done()
+		srv.Close()
+	}()
+	return srv.ListenAndServe()
+}
+
+// RunShared starts an HTTP/SSE server on addr and simultaneously serves
+// this client over stdio. Used for auto-sharing: first session starts the
+// HTTP daemon; subsequent sessions proxy to it via RunProxy.
+func RunShared(ctx context.Context, database *store.DB, projDir, addr string) error {
+	_, mcpServer := newMCPServer(ctx, database, projDir)
+
+	// Start HTTP/SSE in background.
+	handler := sdkmcp.NewSSEHandler(func(*http.Request) *sdkmcp.Server {
+		return mcpServer
+	}, nil)
+	fmt.Fprintf(os.Stderr, "defn: shared server on %s\n", addr)
+	srv := &http.Server{Addr: addr, Handler: handler}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Fprintf(os.Stderr, "defn: http server error: %v\n", err)
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		srv.Close()
+	}()
+
+	// Serve this client over stdio (blocks until client disconnects).
+	return mcpServer.Run(ctx, &sdkmcp.StdioTransport{})
+}
+
+// RunProxy bridges a stdio MCP client to an existing HTTP/SSE defn server.
+// This is the lightweight path (~5 MB) for the second+ session.
+func RunProxy(ctx context.Context, sseEndpoint string) error {
+	// Connect stdio side.
+	stdioConn, err := (&sdkmcp.StdioTransport{}).Connect(ctx)
+	if err != nil {
+		return fmt.Errorf("stdio connect: %w", err)
+	}
+	defer stdioConn.Close()
+
+	// Connect to the SSE server.
+	sseConn, err := (&sdkmcp.SSEClientTransport{Endpoint: sseEndpoint}).Connect(ctx)
+	if err != nil {
+		return fmt.Errorf("sse connect: %w", err)
+	}
+	defer sseConn.Close()
+
+	// Bridge: stdio → SSE and SSE → stdio.
+	errc := make(chan error, 2)
+	go func() {
+		for {
+			msg, err := stdioConn.Read(ctx)
+			if err != nil {
+				errc <- err
+				return
+			}
+			if err := sseConn.Write(ctx, msg); err != nil {
+				errc <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		for {
+			msg, err := sseConn.Read(ctx)
+			if err != nil {
+				errc <- err
+				return
+			}
+			if err := stdioConn.Write(ctx, msg); err != nil {
+				errc <- err
+				return
+			}
+		}
+	}()
+	return <-errc
+}
+
+// newMCPServer creates the internal server state and MCP server instance.
+// Shared by both stdio and HTTP transports.
+func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*server, *sdkmcp.Server) {
 	s := &server{db: database, projectDir: projDir}
 
 	if projDir != "" {
@@ -70,19 +169,19 @@ func Run(ctx context.Context, database *store.DB, projDir string) error {
 		go s.watchFiles(ctx)
 	}
 
-	server := sdkmcp.NewServer(&sdkmcp.Implementation{
+	mcpServer := sdkmcp.NewServer(&sdkmcp.Implementation{
 		Name:    "defn",
-		Version: "0.10.2",
+		Version: "0.10.3",
 	}, nil)
 
-	sdkmcp.AddTool(server, &sdkmcp.Tool{
+	sdkmcp.AddTool(mcpServer, &sdkmcp.Tool{
 		Name: "code",
 		Description: `Go code database. One tool, many ops. Start with impact for blast radius — it returns callers, transitives, and test coverage in one call. Don't follow up with search/explain unless you need more.
 
 Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal)`,
 	}, s.handleCode)
 
-	return server.Run(ctx, &sdkmcp.StdioTransport{})
+	return s, mcpServer
 }
 
 // --- Params ---
