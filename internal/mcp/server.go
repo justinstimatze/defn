@@ -171,7 +171,7 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 
 	mcpServer := sdkmcp.NewServer(&sdkmcp.Implementation{
 		Name:    "defn",
-		Version: "0.10.3",
+		Version: "0.10.4",
 	}, nil)
 
 	sdkmcp.AddTool(mcpServer, &sdkmcp.Tool{
@@ -1965,7 +1965,7 @@ func (s *server) handleLiterals(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 	} else if !strings.Contains(typeName, "%") {
 		typeName = "%" + typeName + "%" // convenience: partial match
 	}
-	fields, err := s.db.QueryLiteralFields(typeName, args.Name, args.Body, nil)
+	fields, err := s.db.QueryLiteralFields(typeName, args.Name, args.Body, nil, 200)
 	if err != nil {
 		return errResult(fmt.Errorf("query literals: %w", err))
 	}

@@ -642,7 +642,8 @@ func (s *DB) FindDefinitions(namePattern string) ([]Definition, error) {
 
 // FilterDefinitions returns definitions matching optional filters.
 // All string filters support SQL LIKE patterns. Empty string means no filter.
-func (s *DB) FilterDefinitions(name, kind, file string) ([]Definition, error) {
+// limit caps the number of rows returned; 0 means unlimited.
+func (s *DB) FilterDefinitions(name, kind, file string, limit int) ([]Definition, error) {
 	q := `SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
 	        COALESCE(d.signature,''), '', COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
 	 FROM definitions d WHERE 1=1`
@@ -659,7 +660,10 @@ func (s *DB) FilterDefinitions(name, kind, file string) ([]Definition, error) {
 		q += " AND d.source_file LIKE ?"
 		args = append(args, file)
 	}
-	q += " ORDER BY d.name LIMIT 500"
+	q += " ORDER BY d.name"
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT %d", limit)
+	}
 	rows, err := s.queryContext(s.Ctx(), q, args...)
 	if err != nil {
 		return nil, err
@@ -670,7 +674,8 @@ func (s *DB) FilterDefinitions(name, kind, file string) ([]Definition, error) {
 
 // QueryRefs returns references matching optional filters.
 // fromName/toName are definition names (LIKE pattern). kind is exact match.
-func (s *DB) QueryRefs(fromName, toName, kind string) ([]Reference, error) {
+// limit caps the number of rows returned; 0 means unlimited.
+func (s *DB) QueryRefs(fromName, toName, kind string, limit int) ([]Reference, error) {
 	q := `SELECT r.from_def, r.to_def, r.kind
 	      FROM refs r
 	      JOIN definitions df ON r.from_def = df.id
@@ -689,7 +694,10 @@ func (s *DB) QueryRefs(fromName, toName, kind string) ([]Reference, error) {
 		q += " AND r.kind = ?"
 		args = append(args, kind)
 	}
-	q += " ORDER BY df.name, dt.name LIMIT 500"
+	q += " ORDER BY df.name, dt.name"
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT %d", limit)
+	}
 	rows, err := s.queryContext(s.Ctx(), q, args...)
 	if err != nil {
 		return nil, err
@@ -1254,7 +1262,8 @@ func (s *DB) SetLiteralFields(defID int64, fields []LiteralField) error {
 
 // QueryLiteralFields searches literal fields. All params are optional filters.
 // typeName and fieldValue support SQL LIKE patterns.
-func (s *DB) QueryLiteralFields(typeName, fieldName, fieldValue string, fieldNames []string) ([]LiteralField, error) {
+// limit caps the number of rows returned; 0 means unlimited.
+func (s *DB) QueryLiteralFields(typeName, fieldName, fieldValue string, fieldNames []string, limit int) ([]LiteralField, error) {
 	ctx := s.Ctx()
 	q := `SELECT lf.id, lf.def_id, COALESCE(d.name,''), lf.type_name, lf.field_name, lf.field_value, lf.line
 	      FROM literal_fields lf
@@ -1281,7 +1290,10 @@ func (s *DB) QueryLiteralFields(typeName, fieldName, fieldValue string, fieldNam
 		q += " AND lf.field_value LIKE ?"
 		args = append(args, fieldValue)
 	}
-	q += " ORDER BY lf.type_name, lf.field_name LIMIT 200"
+	q += " ORDER BY lf.type_name, lf.field_name"
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT %d", limit)
+	}
 
 	rows, err := s.queryContext(ctx, q, args...)
 	if err != nil {

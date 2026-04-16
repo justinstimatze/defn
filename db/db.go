@@ -82,7 +82,7 @@ type DefinitionFilter struct {
 func (db *DB) Definitions(f DefinitionFilter) ([]Definition, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	defs, err := db.s.FilterDefinitions(f.Name, f.Kind, f.File)
+	defs, err := db.s.FilterDefinitions(f.Name, f.Kind, f.File, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +138,7 @@ type LiteralFieldFilter struct {
 func (db *DB) LiteralFields(f LiteralFieldFilter) ([]LiteralField, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	fields, err := db.s.QueryLiteralFields(f.TypeName, f.FieldName, f.Value, f.FieldNames)
+	fields, err := db.s.QueryLiteralFields(f.TypeName, f.FieldName, f.Value, f.FieldNames, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -206,7 +206,7 @@ type RefFilter struct {
 func (db *DB) Refs(f RefFilter) ([]Ref, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	refs, err := db.s.QueryRefs(f.FromName, f.ToName, f.Kind)
+	refs, err := db.s.QueryRefs(f.FromName, f.ToName, f.Kind, 0)
 	if err != nil {
 		return nil, err
 	}
