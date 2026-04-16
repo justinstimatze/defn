@@ -1160,7 +1160,6 @@ func (s *DB) SetReferences(fromDef int64, refs []Reference) error {
 // --- Comments ---
 
 // SetFileComments replaces all comments for a source file.
-// Uses DELETE+INSERT (not REPLACE INTO) to avoid dolthub/dolt#10882 FULLTEXT bug.
 func (s *DB) SetFileComments(sourceFile string, comments []Comment) error {
 	ctx := s.Ctx()
 	if _, err := s.execContext(ctx, "DELETE FROM comments WHERE source_file = ?", sourceFile); err != nil {
@@ -1236,7 +1235,6 @@ func (s *DB) GetCommentsForDef(defID int64) ([]Comment, error) {
 // --- Literal Fields ---
 
 // SetLiteralFields replaces all literal fields for a definition.
-// Uses DELETE+INSERT (not REPLACE INTO) to avoid dolthub/dolt#10882 FULLTEXT bug.
 func (s *DB) SetLiteralFields(defID int64, fields []LiteralField) error {
 	ctx := s.Ctx()
 	if _, err := s.execContext(ctx, "DELETE FROM literal_fields WHERE def_id = ?", defID); err != nil {

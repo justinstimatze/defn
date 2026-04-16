@@ -18,7 +18,14 @@ import (
 // Resolve analyzes all loaded packages and populates the references table.
 // Includes test packages so test→definition references are captured.
 func Resolve(db *store.DB, modulePath string) error {
-	return resolve(db, modulePath, "")
+	return resolve(db, nil, modulePath, "")
+}
+
+// ResolvePackages is like Resolve but accepts pre-loaded packages.
+// Use with goload.LoadAll to share one packages.Load between ingest
+// and resolve, saving ~1-2 GB of memory.
+func ResolvePackages(db *store.DB, pkgs []*packages.Package, projectDir string) error {
+	return resolve(db, pkgs, projectDir, "")
 }
 
 // ResolveModule is like Resolve but only updates references for definitions
@@ -26,29 +33,30 @@ func Resolve(db *store.DB, modulePath string) error {
 // but skips reference extraction for other modules. Much faster for
 // single-definition edits.
 func ResolveModule(db *store.DB, projectDir, modulePath string) error {
-	return resolve(db, projectDir, modulePath)
+	return resolve(db, nil, projectDir, modulePath)
 }
 
-func resolve(db *store.DB, projectDir, onlyModule string) error {
-	cfg := &packages.Config{
-		Mode: packages.NeedName |
-			packages.NeedFiles |
-			packages.NeedSyntax |
-			packages.NeedTypes |
-			packages.NeedTypesInfo |
-			packages.NeedImports |
-			packages.NeedDeps,
-		Dir:   projectDir,
-		Tests: true,
-	}
-
-	// Always load all packages for the objToDef map (cross-package references
-	// need type info from sibling packages, not just dependencies).
-	// When onlyModule is set, the second pass only extracts references from
-	// that module — skipping the expensive body walk for other packages.
-	pkgs, err := packages.Load(cfg, "./...")
-	if err != nil {
-		return err
+func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule string) error {
+	var pkgs []*packages.Package
+	if preloaded != nil {
+		pkgs = preloaded
+	} else {
+		cfg := &packages.Config{
+			Mode: packages.NeedName |
+				packages.NeedFiles |
+				packages.NeedSyntax |
+				packages.NeedTypes |
+				packages.NeedTypesInfo |
+				packages.NeedImports |
+				packages.NeedDeps,
+			Dir:   projectDir,
+			Tests: true,
+		}
+		var err error
+		pkgs, err = packages.Load(cfg, "./...")
+		if err != nil {
+			return err
+		}
 	}
 
 	filtered := goload.FilterPackages(pkgs)

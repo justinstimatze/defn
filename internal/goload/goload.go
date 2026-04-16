@@ -3,10 +3,35 @@
 package goload
 
 import (
+	"fmt"
 	"strings"
 
 	"golang.org/x/tools/go/packages"
 )
+
+// LoadAll loads all Go packages in dir with the superset of modes needed
+// by both ingest and resolve. The result can be passed to both
+// ingest.IngestPackages and resolve.ResolvePackages, avoiding a second
+// packages.Load call (~1-2 GB savings).
+func LoadAll(dir string) ([]*packages.Package, error) {
+	cfg := &packages.Config{
+		Mode: packages.NeedName |
+			packages.NeedFiles |
+			packages.NeedSyntax |
+			packages.NeedTypes |
+			packages.NeedTypesInfo |
+			packages.NeedImports |
+			packages.NeedDeps |
+			packages.NeedEmbedPatterns,
+		Dir:   dir,
+		Tests: true,
+	}
+	pkgs, err := packages.Load(cfg, "./...")
+	if err != nil {
+		return nil, fmt.Errorf("load packages: %w", err)
+	}
+	return pkgs, nil
+}
 
 // FilterPackages removes synthetic test binaries and deduplicates packages
 // by preferring test variants (which include both test and non-test files)

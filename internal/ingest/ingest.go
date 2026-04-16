@@ -21,25 +21,18 @@ import (
 // Ingest loads a Go module from modulePath and stores all definitions
 // into the database. modulePath should be a directory containing go.mod.
 func Ingest(db *store.DB, modulePath string) error {
-	clearSourceFileCache()
-
-	cfg := &packages.Config{
-		Mode: packages.NeedName |
-			packages.NeedFiles |
-			packages.NeedSyntax |
-			packages.NeedTypes |
-			packages.NeedTypesInfo |
-			packages.NeedImports |
-			packages.NeedDeps |
-			packages.NeedEmbedPatterns,
-		Dir:   modulePath,
-		Tests: true, // include test packages
-	}
-
-	pkgs, err := packages.Load(cfg, "./...")
+	pkgs, err := goload.LoadAll(modulePath)
 	if err != nil {
-		return fmt.Errorf("load packages: %w", err)
+		return err
 	}
+	return IngestPackages(db, pkgs, modulePath)
+}
+
+// IngestPackages is like Ingest but accepts pre-loaded packages.
+// Use with goload.LoadAll to share one packages.Load between ingest
+// and resolve, saving ~1-2 GB of memory.
+func IngestPackages(db *store.DB, pkgs []*packages.Package, modulePath string) error {
+	clearSourceFileCache()
 
 	// Check for load errors.
 	var errs []string

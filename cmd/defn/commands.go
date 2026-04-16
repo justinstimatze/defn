@@ -10,10 +10,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
 	"github.com/justinstimatze/defn/internal/emit"
+	"github.com/justinstimatze/defn/internal/goload"
 	"github.com/justinstimatze/defn/internal/ingest"
 	"github.com/justinstimatze/defn/internal/lint"
 	mcpserver "github.com/justinstimatze/defn/internal/mcp"
@@ -300,11 +302,15 @@ func cmdInit(modulePath string) {
 	defer db.Close()
 
 	fmt.Fprintf(os.Stderr, "ingesting %s...\n", modulePath)
-	if err := ingest.Ingest(db, modulePath); err != nil {
+	pkgs, err := goload.LoadAll(modulePath)
+	if err != nil {
+		fatal(err)
+	}
+	if err := ingest.IngestPackages(db, pkgs, modulePath); err != nil {
 		fatal(err)
 	}
 	fmt.Fprintf(os.Stderr, "resolving references...\n")
-	if err := resolve.Resolve(db, modulePath); err != nil {
+	if err := resolve.ResolvePackages(db, pkgs, modulePath); err != nil {
 		fatal(err)
 	}
 
@@ -478,12 +484,16 @@ func cmdIngest(modulePath string) {
 	defer db.Close()
 
 	fmt.Fprintf(os.Stderr, "ingesting %s...\n", modulePath)
-	if err := ingest.Ingest(db, modulePath); err != nil {
+	pkgs, err := goload.LoadAll(modulePath)
+	if err != nil {
+		fatal(err)
+	}
+	if err := ingest.IngestPackages(db, pkgs, modulePath); err != nil {
 		fatal(err)
 	}
 
 	fmt.Fprintf(os.Stderr, "resolving references...\n")
-	if err := resolve.Resolve(db, modulePath); err != nil {
+	if err := resolve.ResolvePackages(db, pkgs, modulePath); err != nil {
 		fatal(err)
 	}
 
@@ -495,6 +505,14 @@ func cmdIngest(modulePath string) {
 }
 
 func cmdServe() {
+	// Cap Go heap so Dolt's embedded caches scale down (v1.86.2+ reads
+	// GOMEMLIMIT via its memlimit package). 1 GiB is plenty for the MCP
+	// server; without this the noms chunk store + prolly node cache +
+	// memtable balloon to ~544 MB at defaults.
+	if os.Getenv("GOMEMLIMIT") == "" {
+		debug.SetMemoryLimit(1 << 30) // 1 GiB
+	}
+
 	db, err := store.Open(getDBPath())
 	if err != nil {
 		fatal(err)
@@ -986,9 +1004,12 @@ func cmdWatch(modulePath string) {
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "  error: %v\n", err)
 			} else {
-				if err := ingest.Ingest(db, absPath); err != nil {
+				pkgs, loadErr := goload.LoadAll(absPath)
+				if loadErr != nil {
+					fmt.Fprintf(os.Stderr, "  load error: %v\n", loadErr)
+				} else if err := ingest.IngestPackages(db, pkgs, absPath); err != nil {
 					fmt.Fprintf(os.Stderr, "  ingest error: %v\n", err)
-				} else if err := resolve.Resolve(db, absPath); err != nil {
+				} else if err := resolve.ResolvePackages(db, pkgs, absPath); err != nil {
 					fmt.Fprintf(os.Stderr, "  resolve error: %v\n", err)
 				} else {
 					db.Commit("auto-ingest")

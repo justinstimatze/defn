@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/justinstimatze/defn/internal/emit"
+	"github.com/justinstimatze/defn/internal/goload"
 	"github.com/justinstimatze/defn/internal/ingest"
 	"github.com/justinstimatze/defn/internal/resolve"
 	"github.com/justinstimatze/defn/internal/store"
@@ -61,13 +62,9 @@ func Run(ctx context.Context, database *store.DB, projDir string) error {
 		// the client's connection timeout. Queries before completion serve
 		// from whatever's in the DB; results include a staleness notice.
 		go func() {
-			if err := ingest.Ingest(s.db, projDir); err != nil {
-				fmt.Fprintf(os.Stderr, "defn: startup ingest failed: %v\n", err)
-			} else if err := resolve.Resolve(s.db, projDir); err != nil {
-				fmt.Fprintf(os.Stderr, "defn: startup resolve failed: %v\n", err)
+			if err := s.ingestAndResolve(); err != nil {
+				fmt.Fprintf(os.Stderr, "defn: startup ingest/resolve failed: %v\n", err)
 			}
-			s.autoCommit()
-			s.lastResolved.Store(time.Now().UnixNano())
 			s.ready.Store(true)
 		}()
 		go s.watchFiles(ctx)
@@ -75,7 +72,7 @@ func Run(ctx context.Context, database *store.DB, projDir string) error {
 
 	server := sdkmcp.NewServer(&sdkmcp.Implementation{
 		Name:    "defn",
-		Version: "0.10.1",
+		Version: "0.10.2",
 	}, nil)
 
 	sdkmcp.AddTool(server, &sdkmcp.Tool{
@@ -691,6 +688,24 @@ func (s *server) autoCommit() {
 	}
 }
 
+// ingestAndResolve loads packages once and runs both ingest and resolve
+// against the shared result, avoiding a redundant packages.Load (~1-2 GB).
+func (s *server) ingestAndResolve() error {
+	pkgs, err := goload.LoadAll(s.projectDir)
+	if err != nil {
+		return fmt.Errorf("load packages: %w", err)
+	}
+	if err := ingest.IngestPackages(s.db, pkgs, s.projectDir); err != nil {
+		return fmt.Errorf("ingest: %w", err)
+	}
+	if err := resolve.ResolvePackages(s.db, pkgs, s.projectDir); err != nil {
+		return fmt.Errorf("resolve: %w", err)
+	}
+	s.autoCommit()
+	s.lastResolved.Store(time.Now().UnixNano())
+	return nil
+}
+
 // watchFiles polls for .go file changes and auto-reingests when detected.
 // This keeps the defn database in sync when files are edited outside defn
 // (e.g. via Edit/Write tools, vim, or other processes).
@@ -726,11 +741,8 @@ func (s *server) watchFiles(ctx context.Context) {
 				lastMod = newest
 				continue
 			}
-			// Files changed externally — re-ingest and resolve.
-			ingest.Ingest(s.db, s.projectDir)
-			resolve.Resolve(s.db, s.projectDir)
-			s.autoCommit()
-			s.lastResolved.Store(time.Now().UnixNano())
+			// Files changed externally — shared load for ingest+resolve.
+			s.ingestAndResolve()
 		}
 		lastMod = newest
 	}
@@ -1399,13 +1411,9 @@ func (s *server) handleSync(_ context.Context, _ *sdkmcp.CallToolRequest, args c
 	}
 
 	// Full sync: re-ingest all packages and rebuild references.
-	if err := ingest.Ingest(s.db, s.projectDir); err != nil {
-		return errResult(fmt.Errorf("ingest: %w", err))
+	if err := s.ingestAndResolve(); err != nil {
+		return errResult(err)
 	}
-	if err := resolve.Resolve(s.db, s.projectDir); err != nil {
-		return errResult(fmt.Errorf("resolve: %w", err))
-	}
-	s.autoCommit()
 	return textResult("Synced: re-ingested source and rebuilt reference graph."), nil, nil
 }
 
