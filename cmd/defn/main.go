@@ -38,12 +38,24 @@ func main() {
 		cmdServer(os.Args[2])
 	case "clean":
 		cmdClean()
+	case "repair":
+		dir := "."
+		if len(os.Args) >= 3 {
+			dir = os.Args[2]
+		}
+		cmdRepair(dir)
 	case "ingest":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: defn ingest <path>")
+			fmt.Fprintln(os.Stderr, "usage: defn ingest <path> [--server]")
 			os.Exit(1)
 		}
-		cmdIngest(os.Args[2])
+		serverMode := false
+		for _, a := range os.Args[3:] {
+			if a == "--server" {
+				serverMode = true
+			}
+		}
+		cmdIngest(os.Args[2], serverMode)
 	case "serve":
 		httpAddr := ""
 		if len(os.Args) >= 4 && os.Args[2] == "--http" {
@@ -148,7 +160,8 @@ Usage:
   defn init <path> --server    Same, but starts a Dolt server (recommended)
   defn server start|stop       Manage background Dolt server
   defn clean                   Remove all defn files from project
-  defn ingest <path>             Parse Go source → Dolt database
+  defn repair [path]           Delete .defn and re-ingest (recovers from corruption)
+  defn ingest <path> [--server]  Parse Go source → Dolt database (--server: use running sql-server)
   defn serve                   MCP server for Claude Code
   defn emit <output-dir>       Dolt → .go files
   defn impact <name>           Blast radius + test coverage

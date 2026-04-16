@@ -533,8 +533,17 @@ Prefer defn for Go code (fewer steps, auto-build verification). Use Read/Edit/Gr
 `
 }
 
-func cmdIngest(modulePath string) {
-	db, err := store.Open(getDBPath())
+func cmdIngest(modulePath string, serverMode bool) {
+	dbPath := getDBPath()
+	if serverMode {
+		dsn := detectRunningServer(".defn")
+		if dsn == "" {
+			fatal(fmt.Errorf("--server: no dolt sql-server reachable on 127.0.0.1:3307 — start one with 'defn server start' or 'defn init <path> --server'"))
+		}
+		dbPath = dsn
+		fmt.Fprintf(os.Stderr, "using server: %s\n", dsn)
+	}
+	db, err := store.Open(dbPath)
 	if err != nil {
 		fatal(err)
 	}
@@ -559,6 +568,71 @@ func cmdIngest(modulePath string) {
 		fatal(err)
 	}
 	fmt.Fprintf(os.Stderr, "done. root hash: %s\n", hash[:16])
+}
+
+// cmdRepair deletes the embedded .defn/ database and re-ingests from
+// source. Useful when the Dolt journal or indexes get corrupted — since
+// .defn/ is a derived artifact, it can always be rebuilt from .go files.
+//
+// Preserves .mcp.json, CLAUDE.md, .codex/, and .defn-server/ (server
+// mode has its own repair path — drop the database and reingest via
+// 'defn ingest --server').
+func cmdRepair(modulePath string) {
+	// Refuse to repair a server-backed DB — Dolt server has its own
+	// tools for that; our job here is just the embedded cache.
+	if dsn := os.Getenv("DEFN_DSN"); dsn != "" {
+		fatal(fmt.Errorf("repair is for embedded .defn/ only — unset DEFN_DSN to repair embedded, or use dolt tooling to repair the server"))
+	}
+	if p := os.Getenv("DEFN_DB"); p != "" && strings.Contains(p, "@") {
+		fatal(fmt.Errorf("repair is for embedded .defn/ only — DEFN_DB points to a DSN (%s)", p))
+	}
+
+	absModulePath, err := filepath.Abs(modulePath)
+	if err != nil {
+		fatal(err)
+	}
+	defnDir := filepath.Join(absModulePath, ".defn")
+
+	if _, err := os.Stat(defnDir); os.IsNotExist(err) {
+		fmt.Fprintln(os.Stderr, "no .defn/ found — running a fresh ingest")
+	} else {
+		fmt.Fprintf(os.Stderr, "removing %s...\n", defnDir)
+		if err := os.RemoveAll(defnDir); err != nil {
+			fatal(fmt.Errorf("remove .defn: %w", err))
+		}
+	}
+
+	// Always open the embedded path directly so auto-detection doesn't
+	// redirect us to a running server — repair rebuilds the embedded copy.
+	db, err := store.Open(filepath.Join(absModulePath, ".defn"))
+	if err != nil {
+		fatal(err)
+	}
+	defer db.Close()
+
+	fmt.Fprintf(os.Stderr, "ingesting %s...\n", absModulePath)
+	pkgs, err := goload.LoadAll(absModulePath)
+	if err != nil {
+		fatal(err)
+	}
+	if err := ingest.IngestPackages(db, pkgs, absModulePath); err != nil {
+		fatal(err)
+	}
+
+	fmt.Fprintf(os.Stderr, "resolving references...\n")
+	if err := resolve.ResolvePackages(db, pkgs, absModulePath); err != nil {
+		fatal(err)
+	}
+
+	if err := db.Commit("repair (reingest)"); err != nil {
+		fatal(err)
+	}
+
+	mods, _ := db.ListModules()
+	defs, _ := db.FindDefinitions("%")
+	hash, _ := db.ComputeRootHash()
+	fmt.Fprintf(os.Stderr, "done. %d modules, %d definitions, root hash: %s\n",
+		len(mods), len(defs), hash[:16])
 }
 
 func cmdServe(httpAddr string) {
