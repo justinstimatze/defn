@@ -324,3 +324,42 @@ func (s *server) handleMergeAbort(_ context.Context, _ *sdkmcp.CallToolRequest, 
 	}
 	return textResult("Merge aborted; working state restored."), nil, nil
 }
+
+func (s *server) handleDiffDefs(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	diffs, err := s.db.DiffDefinitionsBetween(args.From, args.To)
+	if err != nil {
+		return errResult(err)
+	}
+	toLabel := args.To
+	if toLabel == "" {
+		toLabel = "working"
+	}
+	if len(diffs) == 0 {
+		return textResult(fmt.Sprintf("No definition-level changes between %s and %s.", args.From, toLabel)), nil, nil
+	}
+
+	// Bucket by diff_type for a compact summary.
+	buckets := map[string][]store.DefDiff{}
+	for _, d := range diffs {
+		buckets[d.DiffType] = append(buckets[d.DiffType], d)
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("**%d definition change(s) between %s and %s:**\n\n", len(diffs), args.From, toLabel))
+	for _, kind := range []string{"added", "modified", "removed"} {
+		ds := buckets[kind]
+		if len(ds) == 0 {
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("### %s (%d)\n", kind, len(ds)))
+		for _, d := range ds {
+			recv := ""
+			if d.Receiver != "" {
+				recv = "(" + d.Receiver + ") "
+			}
+			sb.WriteString(fmt.Sprintf("- %s%s  [%s]\n", recv, d.Name, d.Kind))
+		}
+		sb.WriteString("\n")
+	}
+	sb.WriteString("Use code(op:\"read\", name:\"<name>\") after checkout to see the full body.")
+	return textResult(sb.String()), nil, nil
+}

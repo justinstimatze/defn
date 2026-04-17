@@ -407,6 +407,56 @@ func (s *DB) DiffDefinitions() ([]map[string]any, error) {
 	return results, rows.Err()
 }
 
+// DefDiff is a single changed definition between two refs. Bodies are
+// omitted (callers can fetch via code(op:"read") after a checkout, or
+// via SELECT body FROM bodies AS OF HASHOF(...)).
+type DefDiff struct {
+	DiffType string // "added", "removed", "modified"
+	Name     string
+	Kind     string
+	Receiver string
+	FromHash string
+	ToHash   string
+}
+
+// DiffDefinitionsBetween returns definitions that differ between two refs
+// (branch names or commit hashes). If to is "" it defaults to WORKING.
+func (s *DB) DiffDefinitionsBetween(from, to string) ([]DefDiff, error) {
+	if from == "" {
+		return nil, fmt.Errorf("DiffDefinitionsBetween: from is required")
+	}
+	toExpr := "HASHOF(?)"
+	qArgs := []any{from, to}
+	if to == "" {
+		toExpr = "'WORKING'"
+		qArgs = []any{from}
+	}
+	q := fmt.Sprintf(`
+		SELECT diff_type,
+		       COALESCE(to_name, from_name) AS name,
+		       COALESCE(to_kind, from_kind) AS kind,
+		       COALESCE(to_receiver, from_receiver, '') AS receiver,
+		       COALESCE(from_hash, '') AS from_hash,
+		       COALESCE(to_hash, '')   AS to_hash
+		FROM dolt_diff_definitions
+		WHERE from_commit = HASHOF(?) AND to_commit = %s
+	`, toExpr)
+	rows, err := s.queryContext(s.Ctx(), q, qArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("query dolt_diff_definitions: %w", err)
+	}
+	defer rows.Close()
+	var out []DefDiff
+	for rows.Next() {
+		var d DefDiff
+		if err := rows.Scan(&d.DiffType, &d.Name, &d.Kind, &d.Receiver, &d.FromHash, &d.ToHash); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 // --- Types ---
 
 // Module represents a Go package/module in the database.
