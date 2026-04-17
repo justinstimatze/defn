@@ -66,23 +66,31 @@ func openMySQL(dsn string) (*DB, error) {
 	}
 	s := &DB{db: db, path: dsn}
 
-	// If DEFN_BRANCH is set, pin the session to that branch.
-	// We grab a dedicated conn and run CALL DOLT_CHECKOUT — the checkout
-	// state is connection-local, so all subsequent ops must go through
-	// this conn. Reuses the existing pinned-conn machinery in DB.
+	// Always pin a conn in MySQL mode so session vars (branch checkout,
+	// merge-conflict permission) stick and subsequent ops see the same
+	// session state. Each Open() gets its own conn; distinct MCP sessions
+	// are naturally isolated.
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("acquire pinned conn: %w", err)
+	}
 	if branch := strings.TrimSpace(os.Getenv("DEFN_BRANCH")); branch != "" {
-		conn, err := db.Conn(ctx)
-		if err != nil {
-			db.Close()
-			return nil, fmt.Errorf("acquire conn for branch pin: %w", err)
-		}
 		if _, err := conn.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", branch); err != nil {
 			conn.Close()
 			db.Close()
 			return nil, fmt.Errorf("pin session to branch %q: %w", branch, err)
 		}
-		s.conn = conn
 	}
+	// Allow commits with unresolved conflicts so the conflict state
+	// persists across the merge → resolve → commit flow. Without this,
+	// DOLT_MERGE rolls back on conflict and the caller can't inspect
+	// what collided. Best-effort: older Dolt builds may not recognize
+	// this var — log and proceed.
+	if _, err := conn.ExecContext(ctx, "SET @@dolt_allow_commit_conflicts = 1"); err != nil {
+		fmt.Fprintf(os.Stderr, "defn: warning: could not enable dolt_allow_commit_conflicts: %v\n", err)
+	}
+	s.conn = conn
 	return s, nil
 }
 
@@ -211,6 +219,10 @@ func openEmbedded(path string) (*DB, error) {
 		conn.Close()
 		db.Close()
 		return nil, err
+	}
+	// See openMySQL for rationale. Best-effort.
+	if _, err := conn.ExecContext(ctx, "SET @@dolt_allow_commit_conflicts = 1"); err != nil {
+		fmt.Fprintf(os.Stderr, "defn: warning: could not enable dolt_allow_commit_conflicts: %v\n", err)
 	}
 	return &DB{db: db, conn: conn, path: absPath, dbName: dbName}, nil
 }

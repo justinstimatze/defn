@@ -231,6 +231,16 @@ func (s *server) handleMerge(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	if err := s.db.Merge(args.Branch); err != nil {
 		return errResult(err)
 	}
+	// With dolt_allow_commit_conflicts=1 the merge succeeds even when
+	// conflicts exist — surface them instead of claiming success.
+	conflicts, _ := s.db.Conflicts()
+	if len(conflicts) > 0 {
+		return textResult(fmt.Sprintf(
+			"Merged %s into %s with %d conflict(s). Run code(op:\"conflicts\") to inspect, "+
+				"code(op:\"resolve\", ...) to fix, code(op:\"commit\", message:...) to finalize, "+
+				"or code(op:\"merge-abort\") to bail.",
+			args.Branch, current, len(conflicts))), nil, nil
+	}
 	return textResult(fmt.Sprintf("Merged %s into %s.", args.Branch, current)), nil, nil
 }
 
@@ -261,4 +271,56 @@ func (s *server) handleStatus(_ context.Context, _ *sdkmcp.CallToolRequest, _ co
 		}
 	}
 	return textResult(sb.String()), nil, nil
+}
+
+func (s *server) handleConflicts(_ context.Context, _ *sdkmcp.CallToolRequest, _ codeParam) (*sdkmcp.CallToolResult, any, error) {
+	conflicts, err := s.db.Conflicts()
+	if err != nil {
+		return errResult(err)
+	}
+	if len(conflicts) == 0 {
+		return textResult("No unresolved conflicts."), nil, nil
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("**%d unresolved conflict(s):**\n\n", len(conflicts)))
+	for _, c := range conflicts {
+		recv := ""
+		if c.Receiver != "" {
+			recv = "(" + c.Receiver + ") "
+		}
+		sb.WriteString(fmt.Sprintf("### %s%s  (%s, def_id=%d)\n", recv, c.Name, c.Kind, c.DefID))
+		sb.WriteString("**base:**\n```go\n" + c.Base + "\n```\n")
+		sb.WriteString("**ours:**\n```go\n" + c.Ours + "\n```\n")
+		sb.WriteString("**theirs:**\n```go\n" + c.Theirs + "\n```\n\n")
+	}
+	sb.WriteString("Resolve with `code(op:\"resolve\", name:\"<name>\", body:\"<new body>\")` ")
+	sb.WriteString("or `code(op:\"resolve\", pick:\"ours\"|\"theirs\")` for bulk pick. ")
+	sb.WriteString("Then `code(op:\"commit\", message:\"...\")` to finalize the merge.")
+	return textResult(sb.String()), nil, nil
+}
+
+func (s *server) handleResolve(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	// Bulk-pick path.
+	if args.Pick != "" {
+		if err := s.db.ResolveAll(args.Pick); err != nil {
+			return errResult(err)
+		}
+		return textResult(fmt.Sprintf("Resolved all conflicts (picked %s). Commit to finalize the merge.", args.Pick)), nil, nil
+	}
+	// Per-definition resolution: look up the def on the current branch.
+	d, err := s.db.GetDefinitionByName(args.Name, "")
+	if err != nil {
+		return errResult(fmt.Errorf("definition %q not found: %w", args.Name, err))
+	}
+	if err := s.db.ResolveConflict(d.ID, args.Body); err != nil {
+		return errResult(err)
+	}
+	return textResult(fmt.Sprintf("Resolved %s. Commit to finalize the merge.", args.Name)), nil, nil
+}
+
+func (s *server) handleMergeAbort(_ context.Context, _ *sdkmcp.CallToolRequest, _ codeParam) (*sdkmcp.CallToolResult, any, error) {
+	if err := s.db.MergeAbort(); err != nil {
+		return errResult(err)
+	}
+	return textResult("Merge aborted; working state restored."), nil, nil
 }

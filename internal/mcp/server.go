@@ -178,7 +178,7 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 		Name: "code",
 		Description: `Go code database. One tool, many ops. Start with impact for blast radius — it returns callers, transitives, and test coverage in one call. Don't follow up with search/explain unless you need more.
 
-Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state)`,
+Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge)`,
 	}, s.handleCode)
 
 	return s, mcpServer
@@ -235,6 +235,7 @@ type codeParam struct {
 	From        string           `json:"from,omitempty"`
 	Message     string           `json:"message,omitempty"`
 	Force       bool             `json:"force,omitempty"`
+	Pick        string           `json:"pick,omitempty"`
 }
 
 type applyOp struct {
@@ -430,6 +431,21 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if args.Force && strings.TrimSpace(args.Branch) == "" {
 			return errResult(fmt.Errorf("branch: force requires branch"))
 		}
+	case "resolve":
+		// Either (name + body) for a custom resolution, or pick=ours|theirs
+		// for a one-shot shortcut. name alone with no body/pick is an error.
+		if args.Pick != "" {
+			if args.Pick != "ours" && args.Pick != "theirs" {
+				return errResult(fmt.Errorf("resolve: pick must be 'ours' or 'theirs', got %q", args.Pick))
+			}
+		} else {
+			if r, o, e := need(args.Name, "name"); r != nil {
+				return r, o, e
+			}
+			if r, o, e := need(args.Body, "body (or pick:'ours'|'theirs')"); r != nil {
+				return r, o, e
+			}
+		}
 	}
 
 	// Tag results from read-only ops while startup ingest is still running.
@@ -524,8 +540,14 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return s.handleCommit(ctx, req, args)
 	case "status":
 		return wrapStale(s.handleStatus(ctx, req, args))
+	case "conflicts":
+		return wrapStale(s.handleConflicts(ctx, req, args))
+	case "resolve":
+		return s.handleResolve(ctx, req, args)
+	case "merge-abort":
+		return s.handleMergeAbort(ctx, req, args)
 	default:
-		return errResult(fmt.Errorf("unknown op %q — valid: read, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status", args.Op))
+		return errResult(fmt.Errorf("unknown op %q — valid: read, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort", args.Op))
 	}
 }
 

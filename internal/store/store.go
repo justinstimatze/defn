@@ -187,11 +187,104 @@ func (s *DB) Checkout(name string) error {
 	return err
 }
 
-// Merge merges a branch into the current branch.
+// Merge merges a branch into the current branch. If a merge conflict
+// occurs, the error is returned but conflict state persists (because
+// we enabled dolt_allow_commit_conflicts at session start). Callers can
+// inspect Conflicts() and ResolveConflict() to reconcile, or MergeAbort().
 func (s *DB) Merge(branchName string) error {
 	_, err := s.execContext(s.Ctx(), "CALL DOLT_MERGE(?)", branchName)
 	s.CleanTempFiles()
 	return err
+}
+
+// MergeAbort cancels an in-progress merge and restores the pre-merge state.
+func (s *DB) MergeAbort() error {
+	_, err := s.execContext(s.Ctx(), "CALL DOLT_MERGE('--abort')")
+	return err
+}
+
+// Conflict describes one definition whose body differs between the
+// current branch (ours) and the branch being merged (theirs), with the
+// common-ancestor body (base).
+type Conflict struct {
+	DefID    int64
+	Name     string
+	Receiver string
+	Kind     string
+	Base     string
+	Ours     string
+	Theirs   string
+}
+
+// Conflicts returns all unresolved conflicts from the most recent merge.
+// Currently focuses on body-level conflicts (the common case); schema and
+// metadata conflicts are not surfaced.
+func (s *DB) Conflicts() ([]Conflict, error) {
+	rows, err := s.queryContext(s.Ctx(), `
+		SELECT COALESCE(c.our_def_id, c.their_def_id, c.base_def_id) AS def_id,
+		       COALESCE(c.base_body, '') AS base_body,
+		       COALESCE(c.our_body, '')  AS our_body,
+		       COALESCE(c.their_body,'') AS their_body,
+		       d.name, COALESCE(d.receiver, '') AS receiver, d.kind
+		FROM dolt_conflicts_bodies c
+		LEFT JOIN definitions d
+		  ON d.id = COALESCE(c.our_def_id, c.their_def_id, c.base_def_id)
+	`)
+	if err != nil {
+		// Table may not exist when there are no conflicts — treat as empty.
+		return nil, nil
+	}
+	defer rows.Close()
+
+	var out []Conflict
+	for rows.Next() {
+		var c Conflict
+		if err := rows.Scan(&c.DefID, &c.Base, &c.Ours, &c.Theirs, &c.Name, &c.Receiver, &c.Kind); err != nil {
+			return nil, fmt.Errorf("scan conflict row: %w", err)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ResolveConflict writes body as the resolution for def_id, updates the
+// definition's hash, and clears the conflict row. Caller must still Commit
+// to finalize the merge.
+func (s *DB) ResolveConflict(defID int64, body string) error {
+	ctx := s.Ctx()
+	if _, err := s.execContext(ctx, "UPDATE bodies SET body = ? WHERE def_id = ?", body, defID); err != nil {
+		return fmt.Errorf("update body: %w", err)
+	}
+	if _, err := s.execContext(ctx, "UPDATE definitions SET hash = ? WHERE id = ?", HashBody(body), defID); err != nil {
+		return fmt.Errorf("update hash: %w", err)
+	}
+	if _, err := s.execContext(ctx,
+		"DELETE FROM dolt_conflicts_bodies WHERE our_def_id = ? OR their_def_id = ? OR base_def_id = ?",
+		defID, defID, defID); err != nil {
+		return fmt.Errorf("clear body conflict: %w", err)
+	}
+	// Best-effort: any definitions-level conflict row for the same id.
+	_, _ = s.execContext(ctx,
+		"DELETE FROM dolt_conflicts_definitions WHERE our_id = ? OR their_id = ? OR base_id = ?",
+		defID, defID, defID)
+	return nil
+}
+
+// ResolveAll picks a side for every outstanding conflict in bodies and
+// definitions. side must be "ours" or "theirs".
+func (s *DB) ResolveAll(side string) error {
+	if side != "ours" && side != "theirs" {
+		return fmt.Errorf("ResolveAll: side must be 'ours' or 'theirs', got %q", side)
+	}
+	flag := "--" + side
+	ctx := s.Ctx()
+	if _, err := s.execContext(ctx, "CALL DOLT_CONFLICTS_RESOLVE(?, 'bodies')", flag); err != nil {
+		return fmt.Errorf("resolve bodies: %w", err)
+	}
+	if _, err := s.execContext(ctx, "CALL DOLT_CONFLICTS_RESOLVE(?, 'definitions')", flag); err != nil {
+		return fmt.Errorf("resolve definitions: %w", err)
+	}
+	return nil
 }
 
 // AddRemote adds a named remote pointing to a file path or URL.
