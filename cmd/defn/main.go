@@ -135,11 +135,7 @@ func main() {
 		}
 		cmdQuery(os.Args[2])
 	case "worktree":
-		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: defn worktree <branch-name>")
-			os.Exit(1)
-		}
-		cmdWorktree(os.Args[2])
+		cmdWorktree(os.Args[2:])
 	case "push":
 		if len(os.Args) < 4 {
 			fmt.Fprintln(os.Stderr, "usage: defn push <remote> <branch>")

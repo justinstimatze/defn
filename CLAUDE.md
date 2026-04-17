@@ -2,7 +2,7 @@
 
 ## Code Navigation and Editing
 
-This project is self-hosted in defn. Use the `code` MCP tool for **Go code**:
+**The database is authoritative. Files are an I/O projection.** For Go code, use the `code` MCP tool — not Edit/Write/Read. Edit/Write are for non-Go files (YAML, JSON, Markdown, shell scripts).
 
 ```
 code(op: "read", name: "handleEdit")           -- full source by name
@@ -16,11 +16,17 @@ code(op: "sync")                               -- re-ingest after file edits
 code(op: "sync", file: "pkg/foo.go")           -- fast single-file sync (~10ms)
 ```
 
-All ops: read, search, impact, explain, untested, edit, create, delete, rename, move, test, apply, diff, history, find, sync, query.
+All ops: read, search, impact, explain, untested, edit, create, delete, rename, move, test, apply, diff, history, find, sync, query, branch, checkout, merge, commit, status.
 
-**Both editing paths work.** `code(op:"edit")` updates the database, emits files, and rebuilds references automatically. File tools (Read, Edit) work too — call `code(op:"sync")` after editing Go files.
+### Why defn for Go, not Edit/Write
 
-Prefer defn for Go code (fewer steps, auto-build verification). Use Read/Edit/Grep for non-Go files.
+- **`code(op:"edit")`** updates a single row and emits one file — no full-package reparse. `Edit` on a `.go` file triggers full resync.
+- **`code(op:"rename")`** renames across every file that references the definition, in one call. Doing this with `Edit` is 20+ tool calls and fragile.
+- **`code(op:"move")`** moves a definition between packages, updates all import sites, and deletes the old file if empty. Not expressible in Edit/Write.
+- **`code(op:"apply")`** batches mutations atomically — all-or-nothing. Edit/Write can't do this.
+- **Ref graph stays consistent.** Every `code` edit keeps the refs table current. Edit/Write leave it stale until sync.
+
+Rule of thumb: if you're changing a function body, signature, or name, use `code`. If you're editing `go.mod`, a YAML file, a Markdown doc, or emitting a template, use Edit/Write.
 
 ## Build & Test
 

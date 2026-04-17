@@ -64,7 +64,26 @@ func openMySQL(dsn string) (*DB, error) {
 		db.Close()
 		return nil, err
 	}
-	return &DB{db: db, path: dsn}, nil
+	s := &DB{db: db, path: dsn}
+
+	// If DEFN_BRANCH is set, pin the session to that branch.
+	// We grab a dedicated conn and run CALL DOLT_CHECKOUT — the checkout
+	// state is connection-local, so all subsequent ops must go through
+	// this conn. Reuses the existing pinned-conn machinery in DB.
+	if branch := strings.TrimSpace(os.Getenv("DEFN_BRANCH")); branch != "" {
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("acquire conn for branch pin: %w", err)
+		}
+		if _, err := conn.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", branch); err != nil {
+			conn.Close()
+			db.Close()
+			return nil, fmt.Errorf("pin session to branch %q: %w", branch, err)
+		}
+		s.conn = conn
+	}
+	return s, nil
 }
 
 // injectTimeouts adds timeout, readTimeout, and writeTimeout params to

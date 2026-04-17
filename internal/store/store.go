@@ -165,6 +165,22 @@ func (s *DB) Branch(name string) error {
 	return err
 }
 
+// BranchFrom creates a new branch starting from the given source branch or commit.
+func (s *DB) BranchFrom(name, from string) error {
+	_, err := s.execContext(s.Ctx(), "CALL DOLT_BRANCH(?, ?)", name, from)
+	return err
+}
+
+// DeleteBranch removes a branch. If force is true, deletes even if unmerged.
+func (s *DB) DeleteBranch(name string, force bool) error {
+	flag := "-d"
+	if force {
+		flag = "-D"
+	}
+	_, err := s.execContext(s.Ctx(), "CALL DOLT_BRANCH(?, ?)", flag, name)
+	return err
+}
+
 // Checkout switches to a branch.
 func (s *DB) Checkout(name string) error {
 	_, err := s.execContext(s.Ctx(), "CALL DOLT_CHECKOUT(?)", name)

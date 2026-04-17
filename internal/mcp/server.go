@@ -178,7 +178,7 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 		Name: "code",
 		Description: `Go code database. One tool, many ops. Start with impact for blast radius — it returns callers, transitives, and test coverage in one call. Don't follow up with search/explain unless you need more.
 
-Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal)`,
+Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state)`,
 	}, s.handleCode)
 
 	return s, mcpServer
@@ -200,6 +200,11 @@ Ops: impact (blast radius — START HERE; pass format:"json" for structured outp
 //	query: sql
 //	apply: operations
 //	untested, diff, sync: (no params)
+//	branch: (none to list; branch + optional from to create; branch + force=true to delete)
+//	checkout: branch
+//	merge: branch
+//	commit: message
+//	status: (no params)
 type codeParam struct {
 	Op         string           `json:"op"`
 	Name       string           `json:"name,omitempty"`
@@ -226,6 +231,10 @@ type codeParam struct {
 	Limit       int              `json:"limit,omitempty"`
 	Direction   string           `json:"direction,omitempty"`
 	RefKinds    []string         `json:"ref_kinds,omitempty"`
+	Branch      string           `json:"branch,omitempty"`
+	From        string           `json:"from,omitempty"`
+	Message     string           `json:"message,omitempty"`
+	Force       bool             `json:"force,omitempty"`
 }
 
 type applyOp struct {
@@ -408,6 +417,19 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if args.Direction != "callers" && args.Direction != "callees" {
 			return errResult(fmt.Errorf("traverse: direction must be 'callers' or 'callees', got %q", args.Direction))
 		}
+	case "checkout", "merge":
+		if r, o, e := need(args.Branch, "branch"); r != nil {
+			return r, o, e
+		}
+	case "commit":
+		if r, o, e := need(args.Message, "message"); r != nil {
+			return r, o, e
+		}
+	case "branch":
+		// Deleting requires branch; creating requires branch; listing needs nothing.
+		if args.Force && strings.TrimSpace(args.Branch) == "" {
+			return errResult(fmt.Errorf("branch: force requires branch"))
+		}
 	}
 
 	// Tag results from read-only ops while startup ingest is still running.
@@ -492,8 +514,18 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return wrapStale(s.handleLiterals(ctx, req, args))
 	case "traverse":
 		return wrapStale(s.handleTraverse(ctx, req, args))
+	case "branch":
+		return s.handleBranch(ctx, req, args)
+	case "checkout":
+		return s.handleCheckout(ctx, req, args)
+	case "merge":
+		return s.handleMerge(ctx, req, args)
+	case "commit":
+		return s.handleCommit(ctx, req, args)
+	case "status":
+		return wrapStale(s.handleStatus(ctx, req, args))
 	default:
-		return errResult(fmt.Errorf("unknown op %q — valid: read, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse", args.Op))
+		return errResult(fmt.Errorf("unknown op %q — valid: read, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status", args.Op))
 	}
 }
 

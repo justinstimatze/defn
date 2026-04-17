@@ -177,3 +177,88 @@ func (s *server) handleHistory(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 
 	return textResult(sb.String()), nil, nil
 }
+
+func (s *server) handleBranch(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	// No branch arg → list.
+	if strings.TrimSpace(args.Branch) == "" {
+		current, _ := s.db.GetCurrentBranch()
+		branches, err := s.db.ListBranches()
+		if err != nil {
+			return errResult(err)
+		}
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("**%d branches:**\n\n", len(branches)))
+		for _, name := range branches {
+			marker := "  "
+			if name == current {
+				marker = "* "
+			}
+			sb.WriteString(fmt.Sprintf("%s%s\n", marker, name))
+		}
+		return textResult(sb.String()), nil, nil
+	}
+
+	// Delete mode.
+	if args.Force {
+		if err := s.db.DeleteBranch(args.Branch, true); err != nil {
+			return errResult(err)
+		}
+		return textResult(fmt.Sprintf("Deleted branch %s.", args.Branch)), nil, nil
+	}
+
+	// Create mode. With or without `from`.
+	if args.From != "" {
+		if err := s.db.BranchFrom(args.Branch, args.From); err != nil {
+			return errResult(err)
+		}
+		return textResult(fmt.Sprintf("Created branch %s from %s.", args.Branch, args.From)), nil, nil
+	}
+	if err := s.db.Branch(args.Branch); err != nil {
+		return errResult(err)
+	}
+	return textResult(fmt.Sprintf("Created branch %s.", args.Branch)), nil, nil
+}
+
+func (s *server) handleCheckout(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	if err := s.db.Checkout(args.Branch); err != nil {
+		return errResult(err)
+	}
+	return textResult(fmt.Sprintf("Switched to branch %s.", args.Branch)), nil, nil
+}
+
+func (s *server) handleMerge(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	current, _ := s.db.GetCurrentBranch()
+	if err := s.db.Merge(args.Branch); err != nil {
+		return errResult(err)
+	}
+	return textResult(fmt.Sprintf("Merged %s into %s.", args.Branch, current)), nil, nil
+}
+
+func (s *server) handleCommit(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	if err := s.db.Commit(args.Message); err != nil {
+		return errResult(err)
+	}
+	return textResult(fmt.Sprintf("Committed: %s", args.Message)), nil, nil
+}
+
+func (s *server) handleStatus(_ context.Context, _ *sdkmcp.CallToolRequest, _ codeParam) (*sdkmcp.CallToolResult, any, error) {
+	current, err := s.db.GetCurrentBranch()
+	if err != nil {
+		return errResult(err)
+	}
+	status, err := s.db.Diff()
+	if err != nil {
+		return errResult(err)
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("**Branch:** %s\n", current))
+	if len(status) == 0 {
+		sb.WriteString("**State:** clean\n")
+	} else {
+		sb.WriteString(fmt.Sprintf("**State:** %d tables with uncommitted changes\n", len(status)))
+		for _, row := range status {
+			sb.WriteString(fmt.Sprintf("- %s: %s\n", row["status"], row["table"]))
+		}
+	}
+	return textResult(sb.String()), nil, nil
+}

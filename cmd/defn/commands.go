@@ -70,6 +70,15 @@ func getDBPath() string {
 		logBackend("using DEFN_DB=" + sanitizeDSN(p))
 		return p
 	}
+	// Worktree marker: this dir is a worktree on a specific branch of
+	// a shared defn server. Marker sets DSN + branch pin.
+	if dsn, branch := readWorktreeMarker("."); dsn != "" {
+		if branch != "" && os.Getenv("DEFN_BRANCH") == "" {
+			os.Setenv("DEFN_BRANCH", branch)
+		}
+		logBackend(fmt.Sprintf("using worktree dsn=%s branch=%s", sanitizeDSN(dsn), branch))
+		return dsn
+	}
 	// Auto-detect a running dolt sql-server so the CLI falls back to it
 	// when the local .defn/ is missing or corrupted, matching the
 	// behavior of the db/ library's Open.
@@ -79,6 +88,23 @@ func getDBPath() string {
 	}
 	logBackend("using embedded .defn/")
 	return ".defn"
+}
+
+// readWorktreeMarker reads .defn-worktree.json in dir if present, returning
+// the (dsn, branch) it pins to.
+func readWorktreeMarker(dir string) (dsn, branch string) {
+	data, err := os.ReadFile(filepath.Join(dir, ".defn-worktree.json"))
+	if err != nil {
+		return "", ""
+	}
+	var m struct {
+		DSN    string `json:"dsn"`
+		Branch string `json:"branch"`
+	}
+	if err := json.Unmarshal(data, &m); err != nil {
+		return "", ""
+	}
+	return m.DSN, m.Branch
 }
 
 // logBackend prints a one-line backend selection notice to stderr so
@@ -988,65 +1014,87 @@ func warnIfStale(db *store.DB, projectDir string) {
 	}
 }
 
-func cmdWorktree(branchName string) {
+func cmdWorktree(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: defn worktree <branch> [<path>]")
+		fmt.Fprintln(os.Stderr, "  creates a worktree (new file tree) pinned to <branch> on the defn server.")
+		fmt.Fprintln(os.Stderr, "  default path is ../<cwd-basename>-<branch>")
+		os.Exit(1)
+	}
+	branchName := args[0]
+
 	srcPath := getDBPath()
-
-	// Server mode: branches are shared — no worktree copy needed.
-	if strings.Contains(srcPath, "@") {
-		fmt.Fprintln(os.Stderr, "server mode: use 'defn branch' and 'defn checkout' directly.")
-		fmt.Fprintln(os.Stderr, "Each agent session has its own branch via CALL DOLT_CHECKOUT.")
-		fmt.Fprintf(os.Stderr, "\n  defn branch %s && defn checkout %s\n", branchName, branchName)
-		return
+	isServer := strings.Contains(srcPath, "@")
+	if !isServer {
+		fatal(fmt.Errorf("worktree requires server mode — run 'defn init . --server' first"))
 	}
 
-	// Embedded mode: copy directory and set up branch.
-	dstPath := srcPath + "-" + branchName
-
-	if _, err := os.Stat(srcPath); os.IsNotExist(err) {
-		fatal(fmt.Errorf("database %s not found — run defn init first", srcPath))
-	}
-	if _, err := os.Stat(dstPath); err == nil {
-		fatal(fmt.Errorf("worktree %s already exists", dstPath))
-	}
-	cmd := exec.Command("cp", "-r", srcPath, dstPath)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		fatal(fmt.Errorf("copy database: %s", out))
-	}
-
-	// Open the copy and create the branch.
-	db, err := store.Open(dstPath)
+	cwd, err := os.Getwd()
 	if err != nil {
 		fatal(err)
 	}
+	var wtPath string
+	if len(args) >= 2 {
+		wtPath = args[1]
+		if !filepath.IsAbs(wtPath) {
+			wtPath = filepath.Join(cwd, wtPath)
+		}
+	} else {
+		wtPath = filepath.Join(filepath.Dir(cwd), filepath.Base(cwd)+"-"+branchName)
+	}
+	if _, err := os.Stat(wtPath); err == nil {
+		fatal(fmt.Errorf("worktree path %s already exists", wtPath))
+	}
 
-	if err := db.Branch(branchName); err != nil {
-		fatal(fmt.Errorf("create branch: %w", err))
+	// Create branch on server if it doesn't already exist.
+	db, err := store.Open(srcPath)
+	if err != nil {
+		fatal(err)
+	}
+	branches, _ := db.ListBranches()
+	exists := false
+	for _, b := range branches {
+		if b == branchName {
+			exists = true
+			break
+		}
+	}
+	if !exists {
+		if err := db.Branch(branchName); err != nil {
+			db.Close()
+			fatal(fmt.Errorf("create branch: %w", err))
+		}
+		fmt.Fprintf(os.Stderr, "created branch %s\n", branchName)
 	}
 	db.Close()
 
-	// Set the default branch in Dolt's repo state so future connections
-	// open on the right branch (embedded Dolt starts on the default branch).
-	repoStatePath := filepath.Join(dstPath, ".dolt", "repo_state.json")
-	repoState, err := os.ReadFile(repoStatePath)
+	// Re-open with the branch pinned so emit sees the branch's state.
+	_ = os.Setenv("DEFN_BRANCH", branchName)
+	db2, err := store.Open(srcPath)
 	if err != nil {
-		fatal(fmt.Errorf("read repo state: %w", err))
+		fatal(fmt.Errorf("reopen pinned to %s: %w", branchName, err))
 	}
-	var state map[string]any
-	if err := json.Unmarshal(repoState, &state); err != nil {
-		fatal(fmt.Errorf("parse repo state: %w", err))
+	defer db2.Close()
+
+	if err := os.MkdirAll(wtPath, 0755); err != nil {
+		fatal(fmt.Errorf("create worktree dir: %w", err))
 	}
-	state["head"] = "refs/heads/" + branchName
-	updated, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		fatal(fmt.Errorf("marshal repo state: %w", err))
-	}
-	if err := os.WriteFile(repoStatePath, updated, 0644); err != nil {
-		fatal(fmt.Errorf("write repo state: %w", err))
+	fmt.Fprintf(os.Stderr, "emitting branch %s to %s...\n", branchName, wtPath)
+	if err := emit.Emit(db2, wtPath); err != nil {
+		fatal(err)
 	}
 
-	fmt.Fprintf(os.Stderr, "created worktree %s on branch %s\n", dstPath, branchName)
-	fmt.Fprintf(os.Stderr, "push back: DEFN_DB=%s defn push origin %s\n", dstPath, branchName)
-	fmt.Fprintf(os.Stderr, "serve:     DEFN_DB=%s defn serve\n", dstPath)
+	marker := struct {
+		DSN    string `json:"dsn"`
+		Branch string `json:"branch"`
+	}{DSN: srcPath, Branch: branchName}
+	data, _ := json.MarshalIndent(marker, "", "  ")
+	if err := os.WriteFile(filepath.Join(wtPath, ".defn-worktree.json"), data, 0644); err != nil {
+		fatal(fmt.Errorf("write worktree marker: %w", err))
+	}
+
+	fmt.Fprintf(os.Stderr, "worktree ready at %s (branch %s)\n", wtPath, branchName)
+	fmt.Fprintf(os.Stderr, "  cd %s && defn serve\n", wtPath)
 }
 
 func cmdPush(remote, branch string) {
