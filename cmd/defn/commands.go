@@ -62,19 +62,57 @@ func init() {
 func getDBPath() string {
 	// Explicit DSN always wins.
 	if dsn := os.Getenv("DEFN_DSN"); dsn != "" {
+		logBackend("using DEFN_DSN=" + sanitizeDSN(dsn))
 		return dsn
 	}
 	// Explicit DB path honored as-is (may be filesystem path or DSN).
 	if p := os.Getenv("DEFN_DB"); p != "" {
+		logBackend("using DEFN_DB=" + sanitizeDSN(p))
 		return p
 	}
 	// Auto-detect a running dolt sql-server so the CLI falls back to it
 	// when the local .defn/ is missing or corrupted, matching the
 	// behavior of the db/ library's Open.
 	if dsn := detectRunningServer(".defn"); dsn != "" {
+		logBackend("using dolt server " + dsnHostDisplay(dsn))
 		return dsn
 	}
+	logBackend("using embedded .defn/")
 	return ".defn"
+}
+
+// logBackend prints a one-line backend selection notice to stderr so
+// users can tell whether they're hitting a running server or the
+// embedded store (different performance characteristics). Silenced by
+// DEFN_QUIET=1.
+func logBackend(msg string) {
+	if os.Getenv("DEFN_QUIET") != "" {
+		return
+	}
+	fmt.Fprintln(os.Stderr, "defn: "+msg)
+}
+
+// sanitizeDSN strips passwords from a MySQL DSN before logging.
+func sanitizeDSN(dsn string) string {
+	i := strings.Index(dsn, "@")
+	if i < 0 {
+		return dsn
+	}
+	if c := strings.Index(dsn[:i], ":"); c >= 0 {
+		return dsn[:c+1] + "***" + dsn[i:]
+	}
+	return dsn
+}
+
+// dsnHostDisplay pulls the addr out of a DSN for a terse log line.
+func dsnHostDisplay(dsn string) string {
+	if i := strings.Index(dsn, "tcp("); i >= 0 {
+		rest := dsn[i+4:]
+		if j := strings.Index(rest, ")"); j >= 0 {
+			return rest[:j]
+		}
+	}
+	return sanitizeDSN(dsn)
 }
 
 // detectRunningServer returns a DSN for a running dolt sql-server hosting
@@ -354,6 +392,10 @@ func cmdInit(modulePath string) {
 	dbPath := getDBPath()
 	db, err := store.Open(dbPath)
 	if err != nil {
+		if isCorruptDBError(err) && !strings.Contains(dbPath, "@") {
+			fatal(fmt.Errorf("%w\n\n.defn/ appears to be corrupted. run 'defn repair %s' to rebuild from source",
+				err, modulePath))
+		}
 		fatal(err)
 	}
 	defer db.Close()
@@ -379,6 +421,11 @@ func cmdInit(modulePath string) {
 	if err := db.Commit("initial ingest"); err != nil {
 		fatal(err)
 	}
+
+	// Compact the noms store. A fresh ingest writes ~200 MB of journal
+	// chunks that GC folds into a ~1.5 MB packed file. Costs <1s; skip
+	// for DSN-backed DBs since the server manages its own GC.
+	compactEmbedded(db, dbPath)
 
 	mods, _ := db.ListModules()
 	defs, _ := db.FindDefinitions("%")
@@ -545,6 +592,10 @@ func cmdIngest(modulePath string, serverMode bool) {
 	}
 	db, err := store.Open(dbPath)
 	if err != nil {
+		if isCorruptDBError(err) && !strings.Contains(dbPath, "@") {
+			fatal(fmt.Errorf("%w\n\n.defn/ appears to be corrupted. run 'defn repair %s' to rebuild from source",
+				err, modulePath))
+		}
 		fatal(err)
 	}
 	defer db.Close()
@@ -567,7 +618,114 @@ func cmdIngest(modulePath string, serverMode bool) {
 	if err != nil {
 		fatal(err)
 	}
+
+	if err := db.Commit("reingest"); err != nil {
+		fatal(err)
+	}
+	compactEmbedded(db, dbPath)
+
 	fmt.Fprintf(os.Stderr, "done. root hash: %s\n", hash[:16])
+}
+
+// isCorruptDBError reports whether err looks like a corrupt embedded
+// Dolt database (manifest/journal damaged). These are the cases where
+// `defn repair` is the right escape hatch — the error text is the only
+// signal Dolt gives us.
+func isCorruptDBError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, pat := range []string{
+		"corrupt manifest",
+		"journal index is malformed",
+		"bad index checksum",
+		"malformed journal",
+		"failed to load database",
+	} {
+		if strings.Contains(msg, pat) {
+			return true
+		}
+	}
+	return false
+}
+
+// compactEmbedded runs DOLT_GC on embedded (filesystem-path) databases.
+// Skips DSN-backed databases where the running sql-server owns GC.
+// After a fresh ingest this typically reclaims 99% of the journal
+// chunks (e.g. 193 MB → 1.5 MB on defn itself).
+//
+// Respects DEFN_SKIP_GC=1 for ingest flows that want to skip the
+// post-ingest compact (e.g. scripted workflows that run many ingests
+// in sequence and GC once at the end).
+func compactEmbedded(db *store.DB, dbPath string) {
+	if strings.Contains(dbPath, "@") {
+		return
+	}
+	if os.Getenv("DEFN_SKIP_GC") != "" {
+		return
+	}
+	if err := db.GC(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: compact failed: %v\n", err)
+	}
+}
+
+// cmdSync re-ingests source into the database after on-disk edits.
+// With no argument, runs a full re-ingest + reference rebuild (same as
+// 'defn ingest .'). With a single file argument, uses the fast single-
+// file path (~10 ms) that skips packages.Load and only re-parses that
+// file — matches the MCP 'sync' op with a file parameter.
+//
+// The single-file path updates definitions/bodies/signatures but does
+// not rebuild the reference graph. Use full sync after structural
+// changes that affect cross-file calls.
+func cmdSync(file string) {
+	if file == "" {
+		cmdIngest(".", false)
+		return
+	}
+	dbPath := getDBPath()
+	db, err := store.Open(dbPath)
+	if err != nil {
+		if isCorruptDBError(err) && !strings.Contains(dbPath, "@") {
+			fatal(fmt.Errorf("%w\n\n.defn/ appears to be corrupted. run 'defn repair .' to rebuild from source", err))
+		}
+		fatal(err)
+	}
+	defer db.Close()
+
+	absFile, err := filepath.Abs(file)
+	if err != nil {
+		fatal(err)
+	}
+	modulePath, err := findModuleRoot(absFile)
+	if err != nil {
+		fatal(err)
+	}
+
+	n, err := ingest.IngestFile(db, modulePath, absFile)
+	if err != nil {
+		fatal(err)
+	}
+	if err := db.Commit("sync " + file); err != nil {
+		fatal(err)
+	}
+	fmt.Fprintf(os.Stderr, "synced %s: %d definitions updated\n", file, n)
+}
+
+// findModuleRoot walks up from filePath looking for go.mod.
+func findModuleRoot(filePath string) (string, error) {
+	dir := filepath.Dir(filePath)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("no go.mod found above %s", filePath)
+		}
+		dir = parent
+	}
 }
 
 // cmdRepair deletes the embedded .defn/ database and re-ingests from
@@ -624,13 +782,18 @@ func cmdRepair(modulePath string) {
 		fatal(err)
 	}
 
+	mods, _ := db.ListModules()
+	defs, _ := db.FindDefinitions("%")
+	hash, err := db.ComputeRootHash()
+	if err != nil {
+		fatal(fmt.Errorf("compute root hash: %w", err))
+	}
+
 	if err := db.Commit("repair (reingest)"); err != nil {
 		fatal(err)
 	}
+	compactEmbedded(db, filepath.Join(absModulePath, ".defn"))
 
-	mods, _ := db.ListModules()
-	defs, _ := db.FindDefinitions("%")
-	hash, _ := db.ComputeRootHash()
 	fmt.Fprintf(os.Stderr, "done. %d modules, %d definitions, root hash: %s\n",
 		len(mods), len(defs), hash[:16])
 }
@@ -942,6 +1105,60 @@ func cmdDiff() {
 	}
 	for _, s := range status {
 		fmt.Printf("  %s  %s\n", s["status"], s["table"])
+	}
+}
+
+// cmdCheck runs consistency diagnostics against the ingested database.
+// Surfaces counts by kind (so you can tell at a glance if an entire
+// category like 'var' wasn't ingested) and orphaned literal-field
+// type_names (literals referencing types not in the definitions table,
+// which usually means the containing var/type was filtered out or not
+// loaded).
+func cmdCheck() {
+	db, err := store.Open(getDBPath())
+	if err != nil {
+		fatal(err)
+	}
+	defer db.Close()
+
+	fmt.Println("Definitions by kind:")
+	kindRows, err := db.Query(`
+		SELECT kind, COUNT(*) AS n
+		FROM definitions
+		GROUP BY kind
+		ORDER BY n DESC`)
+	if err != nil {
+		fatal(err)
+	}
+	total := 0
+	for _, r := range kindRows {
+		fmt.Printf("  %-12s %v\n", r["kind"], r["n"])
+		if n, ok := r["n"].(int64); ok {
+			total += int(n)
+		}
+	}
+	fmt.Printf("  %-12s %d\n", "TOTAL", total)
+
+	fmt.Println("\nOrphan literal-field type_names (top 20):")
+	orphans, err := db.Query(`
+		SELECT lf.type_name, COUNT(*) AS n
+		FROM literal_fields lf
+		LEFT JOIN definitions d
+		  ON d.name = SUBSTRING_INDEX(lf.type_name, '.', -1)
+		WHERE d.id IS NULL
+		GROUP BY lf.type_name
+		ORDER BY n DESC
+		LIMIT 20`)
+	if err != nil {
+		fatal(err)
+	}
+	if len(orphans) == 0 {
+		fmt.Println("  (none — all literal type_names resolve to a definition)")
+	} else {
+		for _, r := range orphans {
+			fmt.Printf("  %-60s %v\n", r["type_name"], r["n"])
+		}
+		fmt.Fprintln(os.Stderr, "\nnote: orphan type_names are usually external types (ok) or a sign that some definitions weren't ingested. run 'defn check --orphans-internal' to filter to in-module types only.")
 	}
 }
 

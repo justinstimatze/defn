@@ -3,7 +3,7 @@ module github.com/justinstimatze/defn
 go 1.26
 
 require (
-	github.com/dolthub/dolt/go v0.40.5-0.20260416005252-1f991da3d959
+	github.com/dolthub/dolt/go v0.40.5-0.20260416223919-b2acc3421e62
 	github.com/dolthub/driver v1.84.2-0.20260415010027-81fe8bae47a0
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/modelcontextprotocol/go-sdk v1.4.1

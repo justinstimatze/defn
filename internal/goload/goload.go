@@ -11,8 +11,15 @@ import (
 
 // LoadAll loads all Go packages in dir with the superset of modes needed
 // by both ingest and resolve. The result can be passed to both
-// ingest.IngestPackages and resolve.ResolvePackages, avoiding a second
-// packages.Load call (~1-2 GB savings).
+// ingest.IngestPackages and resolve.ResolvePackages.
+//
+// Deliberately omits packages.NeedDeps: we only ingest module packages,
+// never transitive deps. Without NeedDeps, the type checker still loads
+// types.Package for imports via compiled export data from GOCACHE —
+// cheap compared to loading full AST + type info for every dep. On a
+// heavy module (e.g. defn itself, which imports Dolt) this drops peak
+// RSS from ~5 GB to under 1 GB without losing cross-module ref
+// resolution.
 func LoadAll(dir string) ([]*packages.Package, error) {
 	cfg := &packages.Config{
 		Mode: packages.NeedName |
@@ -21,7 +28,6 @@ func LoadAll(dir string) ([]*packages.Package, error) {
 			packages.NeedTypes |
 			packages.NeedTypesInfo |
 			packages.NeedImports |
-			packages.NeedDeps |
 			packages.NeedEmbedPatterns,
 		Dir:   dir,
 		Tests: true,

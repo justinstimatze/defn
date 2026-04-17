@@ -56,6 +56,12 @@ func main() {
 			}
 		}
 		cmdIngest(os.Args[2], serverMode)
+	case "sync":
+		file := ""
+		if len(os.Args) >= 3 {
+			file = os.Args[2]
+		}
+		cmdSync(file)
 	case "serve":
 		httpAddr := ""
 		if len(os.Args) >= 4 && os.Args[2] == "--http" {
@@ -90,6 +96,8 @@ func main() {
 		cmdLint()
 	case "status":
 		cmdStatus()
+	case "check":
+		cmdCheck()
 	case "branch":
 		cmdBranch(os.Args[2:])
 	case "checkout":
@@ -162,12 +170,14 @@ Usage:
   defn clean                   Remove all defn files from project
   defn repair [path]           Delete .defn and re-ingest (recovers from corruption)
   defn ingest <path> [--server]  Parse Go source → Dolt database (--server: use running sql-server)
+  defn sync [file]             Re-ingest (full or single file ~10ms)
   defn serve                   MCP server for Claude Code
   defn emit <output-dir>       Dolt → .go files
   defn impact <name>           Blast radius + test coverage
   defn untested                Definitions without test coverage
   defn lint                    Lint with diagnostics → definitions
   defn status                  Current branch + stats
+  defn check                   Consistency diagnostics (defs by kind, orphan literal types)
   defn branch [name]           List or create branches
   defn checkout <branch>       Switch branch
   defn merge <branch>          Merge a branch (Dolt 3-way merge)
