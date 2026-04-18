@@ -57,6 +57,24 @@ CREATE TABLE IF NOT EXISTS project_files (
     content  LONGTEXT NOT NULL
 );
 
+-- Raw Go source per file. This is the authoritative on-disk representation
+-- — emit writes file_sources.raw directly (after merging in pending edits
+-- from bodies via AST patch), and ingest populates it from disk verbatim.
+-- The definitions/bodies/refs tables are derived indexes over this source,
+-- kept consistent for fast query.
+--
+-- Stores project-relative paths (same convention as definitions.source_file)
+-- so the (module_id, source_file) pair uniquely identifies a file.
+CREATE TABLE IF NOT EXISTS file_sources (
+    module_id   INT NOT NULL,
+    source_file VARCHAR(500) NOT NULL,
+    raw         MEDIUMTEXT NOT NULL,
+    file_hash   VARCHAR(64) NOT NULL,
+    PRIMARY KEY (module_id, source_file),
+    FOREIGN KEY (module_id) REFERENCES modules(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_file_sources_hash ON file_sources(file_hash);
+
 -- Pending merge conflicts. Populated by Dolt merge, surfaced by defn.
 CREATE TABLE IF NOT EXISTS merge_conflicts (
     id         INT PRIMARY KEY AUTO_INCREMENT,

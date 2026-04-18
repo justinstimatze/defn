@@ -147,14 +147,26 @@ func ingestPackage(db *store.DB, pkg *packages.Package, modulePath string, state
 		// Get source filename from the token.FileSet.
 		isTest := false
 		sourceFile := ""
+		absFile := ""
 		if file.Pos().IsValid() {
-			absFile := pkg.Fset.Position(file.Pos()).Filename
+			absFile = pkg.Fset.Position(file.Pos()).Filename
 			isTest = strings.HasSuffix(absFile, "_test.go")
 			// Make relative to module root.
 			if rel, err := filepath.Rel(modulePath, absFile); err == nil {
 				sourceFile = rel
 			} else {
 				sourceFile = filepath.Base(absFile)
+			}
+		}
+		// Phase C: capture the raw on-disk source as the authoritative
+		// representation for this file. Emit uses it verbatim (or as the
+		// merge base when defs have been edited). Read failures are
+		// non-fatal — the definitions/bodies path still works for queries.
+		if absFile != "" && sourceFile != "" {
+			if raw, err := os.ReadFile(absFile); err == nil {
+				if err := db.SetFileSource(mod.ID, sourceFile, string(raw)); err != nil {
+					return fmt.Errorf("set file source for %s: %w", sourceFile, err)
+				}
 			}
 		}
 		if err := ingestFile(db, pkg, mod, file, isTest, sourceFile, state); err != nil {

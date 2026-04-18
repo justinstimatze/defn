@@ -220,6 +220,12 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string) ([]D
 	var allLocs []DefLocation
 	docWritten := false
 
+	// Phase C: pre-fetch the raw sources for this module. When present,
+	// writeFile uses them as the authoritative merge base — that's the
+	// byte-faithful copy, unaffected by whatever's on disk (which might
+	// be stale or never have existed, e.g. fresh `defn emit /tmp/out`).
+	rawMap, _ := db.ListFileSources(mod.ID)
+
 	for file, fileDefs := range byFile {
 		path := filepath.Join(pkgDir, file)
 		// Only include package doc on the first non-test file.
@@ -228,7 +234,19 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string) ([]D
 			pkgDoc = mod.Doc
 			docWritten = true
 		}
-		locs, err := writeFile(path, mod.Name, mod.Path, pkgDoc, imports, fileDefs)
+		// Find the raw source for this file. source_file in the DB is
+		// project-relative (e.g. "internal/mcp/tools_extra.go"), so look
+		// up by the source_file of any def in this bucket.
+		var rawFromDB []byte
+		for _, d := range fileDefs {
+			if d.SourceFile != "" {
+				if r, ok := rawMap[d.SourceFile]; ok {
+					rawFromDB = []byte(r)
+					break
+				}
+			}
+		}
+		locs, err := writeFile(path, mod.Name, mod.Path, pkgDoc, imports, fileDefs, rawFromDB)
 		if err != nil {
 			return nil, err
 		}
@@ -238,32 +256,34 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string) ([]D
 	return allLocs, nil
 }
 
-func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import, defs []store.Definition) ([]DefLocation, error) {
-	// Phase A: if the target file already exists and parses, patch the
-	// changed declaration bodies into the existing AST and write it back.
-	// This preserves everything defn's schema doesn't represent —
-	// package doc comments, //go:build constraints, per-file import
-	// grouping, floating comments, original init() names.
-	//
-	// The regeneration path below is reserved for (a) brand-new files
-	// that don't yet exist on disk, and (b) files that don't parse
-	// cleanly (malformed, or the DB and disk have drifted so far that
-	// identity matching fails).
-	if merged, ok := astMergeIntoExisting(path, defs); ok {
-		wrote, lost, err := safeWriteGoFile(path, merged)
-		if err != nil {
-			return nil, err
+func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import, defs []store.Definition, rawFromDB []byte) ([]DefLocation, error) {
+	// Phase C: file_sources.raw is the authoritative byte-faithful
+	// representation. Prefer it over whatever is on disk, which might
+	// be stale. Fall through to disk (Phase A) if the DB has nothing.
+	existingSrc := rawFromDB
+	if len(existingSrc) == 0 {
+		if data, err := os.ReadFile(path); err == nil {
+			existingSrc = data
 		}
-		if wrote {
-			return buildLocIndex(path, modulePath, defs), nil
+	}
+
+	// AST-merge path: if we have a base file that parses, patch the
+	// changed decl bodies into its AST and write the result. Preserves
+	// everything defn's schema doesn't represent (package doc, build
+	// constraints, per-file imports, init() names, floating comments).
+	if len(existingSrc) > 0 {
+		if merged, ok := mergeFuncBodiesIntoSource(existingSrc, defs); ok {
+			wrote, lost, err := safeWriteGoFile(path, merged)
+			if err != nil {
+				return nil, err
+			}
+			if wrote {
+				return buildLocIndex(path, modulePath, defs), nil
+			}
+			fmt.Fprintf(os.Stderr,
+				"defn: ast-merge safety net unexpectedly flagged %s (lost: %v) — falling back to regenerate\n",
+				path, lost)
 		}
-		// AST merge preserves on-disk decls by construction, so the
-		// safety net shouldn't fire. Log and fall through to regenerate
-		// defensively — at worst the regenerate path's own safety net
-		// keeps the file intact.
-		fmt.Fprintf(os.Stderr,
-			"defn: ast-merge safety net unexpectedly flagged %s (lost: %v) — falling back to regenerate\n",
-			path, lost)
 	}
 
 	// Build source by assembling each definition body into a parseable Go file.
@@ -503,25 +523,21 @@ func groupKeyword(d store.Definition) string {
 	return d.Kind
 }
 
-// astMergeIntoExisting parses the on-disk file at path, replaces the
+// mergeFuncBodiesIntoSource parses existing Go source, replaces the
 // bodies of top-level functions/methods that defn's database has a
 // current version of, and returns the re-formatted bytes.
 //
 // Ok=true means a merged file was produced and is safe to write.
 // Ok=false means the caller should fall back to regenerating from
-// the database — the file doesn't exist, doesn't parse, or nothing
-// in defs could be identified in the AST.
+// the database — the source doesn't parse, or nothing in defs could
+// be identified in the AST.
 //
 // Limited to FuncDecl (functions and methods) in v1. Type/const/var
 // changes go through regeneration for now; the safety net on the
 // regenerate path keeps them from destroying existing decls.
-func astMergeIntoExisting(path string, defs []store.Definition) ([]byte, bool) {
-	existing, err := os.ReadFile(path)
-	if err != nil {
-		return nil, false
-	}
+func mergeFuncBodiesIntoSource(existing []byte, defs []store.Definition) ([]byte, bool) {
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, path, existing, parser.ParseComments|parser.SkipObjectResolution)
+	f, err := parser.ParseFile(fset, "", existing, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
 		return nil, false
 	}

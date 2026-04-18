@@ -88,6 +88,66 @@ func TestEmitSkipsFilesThatWouldLoseDeclarations(t *testing.T) {
 	}
 }
 
+func TestEmitPrefersFileSourcesOverDisk(t *testing.T) {
+	// Phase C: file_sources.raw is authoritative. When it's populated,
+	// emit uses it as the merge base — even if the on-disk file is
+	// missing or differs. Proves that ingest→emit roundtrip via the DB
+	// preserves content that disk no longer has.
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+
+	// Seed file_sources with a rich file the DB's definitions table
+	// can't fully represent (build tag, package doc, init, plus Foo).
+	rawSeed := `//go:build linux
+
+// Package test is rich.
+package test
+
+import "fmt"
+
+func init() {
+	fmt.Println("hi")
+}
+
+func Foo() string { return "OLD" }
+`
+	if err := db.SetFileSource(mod.ID, "test.go", rawSeed); err != nil {
+		t.Fatal(err)
+	}
+	// Definitions table only knows about Foo — the DB's named-decl view.
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true,
+		Body: `func Foo() string { return "NEW" }`, SourceFile: "test.go",
+	})
+
+	// Emit to a directory that has NO file on disk. Without file_sources,
+	// we'd regenerate and lose everything except Foo. With file_sources,
+	// everything is preserved and only Foo's body is swapped.
+	outDir := t.TempDir()
+	if err := Emit(db, outDir); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(outDir, "test.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+
+	if !strings.Contains(got, `"NEW"`) {
+		t.Fatalf("Foo body not updated:\n%s", got)
+	}
+	if !strings.Contains(got, "//go:build linux") {
+		t.Fatalf("build tag lost:\n%s", got)
+	}
+	if !strings.Contains(got, "Package test is rich") {
+		t.Fatalf("package doc lost:\n%s", got)
+	}
+	if !strings.Contains(got, "func init()") {
+		t.Fatalf("init() lost:\n%s", got)
+	}
+}
+
 func TestEmitASTMergePreservesUnknownContent(t *testing.T) {
 	// Phase A: when the target file already exists and parses, emit
 	// should patch changed decl bodies into the existing AST and leave

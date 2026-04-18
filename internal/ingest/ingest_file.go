@@ -68,6 +68,13 @@ func IngestFile(db *store.DB, modulePath string, filePath string) (int, error) {
 		return 0, fmt.Errorf("ensure module: %w", err)
 	}
 
+	// Phase C: capture raw source as the authoritative representation.
+	if raw, err := os.ReadFile(absFile); err == nil {
+		if err := db.SetFileSource(mod.ID, relFile, string(raw)); err != nil {
+			return 0, fmt.Errorf("set file source: %w", err)
+		}
+	}
+
 	// Clear the source file cache so renderNode reads fresh content.
 	sourceFileMu.Lock()
 	delete(sourceFileCache, absFile)

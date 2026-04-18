@@ -1354,6 +1354,57 @@ func (s *DB) SetProjectFile(path, content string) error {
 	return err
 }
 
+// SetFileSource stores the raw Go source for a single file. Called by
+// ingest with the on-disk bytes, and by emit after writing a merged
+// version back to disk so the two stay in sync.
+//
+// DELETE+INSERT rather than REPLACE INTO to dodge the dolthub/dolt#10882
+// FULLTEXT bug in case we add a fulltext index on raw in the future.
+func (s *DB) SetFileSource(moduleID int64, sourceFile, raw string) error {
+	ctx := s.Ctx()
+	hash := HashBody(raw)
+	if _, err := s.execContext(ctx,
+		`DELETE FROM file_sources WHERE module_id = ? AND source_file = ?`,
+		moduleID, sourceFile); err != nil {
+		return fmt.Errorf("clear file_sources row: %w", err)
+	}
+	if _, err := s.execContext(ctx,
+		`INSERT INTO file_sources (module_id, source_file, raw, file_hash) VALUES (?, ?, ?, ?)`,
+		moduleID, sourceFile, raw, hash); err != nil {
+		return fmt.Errorf("insert file_sources: %w", err)
+	}
+	return nil
+}
+
+// GetFileSource returns the raw Go source for (moduleID, sourceFile).
+// Returns sql.ErrNoRows if there's no row yet (file has never been ingested).
+func (s *DB) GetFileSource(moduleID int64, sourceFile string) (string, error) {
+	var raw string
+	err := s.queryRowContext(s.Ctx(),
+		`SELECT raw FROM file_sources WHERE module_id = ? AND source_file = ?`,
+		moduleID, sourceFile).Scan(&raw)
+	return raw, err
+}
+
+// ListFileSources returns all (source_file, raw) pairs for a module.
+func (s *DB) ListFileSources(moduleID int64) (map[string]string, error) {
+	rows, err := s.queryContext(s.Ctx(),
+		`SELECT source_file, raw FROM file_sources WHERE module_id = ?`, moduleID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var sf, raw string
+		if err := rows.Scan(&sf, &raw); err != nil {
+			return nil, err
+		}
+		out[sf] = raw
+	}
+	return out, rows.Err()
+}
+
 // SetReferences replaces all references from a given definition.
 func (s *DB) SetReferences(fromDef int64, refs []Reference) error {
 	ctx := s.Ctx()
