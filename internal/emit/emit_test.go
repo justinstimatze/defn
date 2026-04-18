@@ -224,6 +224,282 @@ func Bar() int { return 42 }
 	}
 }
 
+func TestEmitMergePatchesTypeSpecInPlace(t *testing.T) {
+	// Edits to a type body should patch the TypeSpec inside its existing
+	// GenDecl, preserving surrounding type decls, comments, and ordering.
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Foo", Kind: "type", Exported: true,
+		Body: "type Foo struct {\n\tNewField int\n}", SourceFile: "test.go",
+	})
+
+	outDir := t.TempDir()
+	existing := []byte(`package test
+
+// Bar is a neighbor that must survive.
+type Bar struct {
+	X int
+}
+
+// Foo gets patched.
+type Foo struct {
+	OldField string
+}
+
+// Baz is another neighbor.
+type Baz int
+`)
+	if err := os.WriteFile(filepath.Join(outDir, "test.go"), existing, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Emit(db, outDir); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(outDir, "test.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(got)
+	if !strings.Contains(s, "NewField int") {
+		t.Fatalf("Foo body not patched:\n%s", s)
+	}
+	if strings.Contains(s, "OldField string") {
+		t.Fatalf("old Foo body still present:\n%s", s)
+	}
+	if !strings.Contains(s, "type Bar struct") {
+		t.Fatalf("Bar was lost:\n%s", s)
+	}
+	if !strings.Contains(s, "type Baz int") {
+		t.Fatalf("Baz was lost:\n%s", s)
+	}
+	if !strings.Contains(s, "Bar is a neighbor") {
+		t.Fatalf("Bar's doc comment was lost:\n%s", s)
+	}
+}
+
+func TestEmitMergePreservesGroupedDocComments(t *testing.T) {
+	// Regression: AST-surgery (replacing a spec node with one parsed from
+	// a foreign fset) orphans the original Doc CommentGroup, leaving the
+	// comment floating between unrelated specs. Byte-range splicing
+	// preserves each spec's leading doc comment because it only touches
+	// the bytes inside s.Pos()..s.End() — comments live outside that.
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "B", Kind: "const", Exported: true,
+		Body: "B = 99", SourceFile: "test.go",
+	})
+
+	outDir := t.TempDir()
+	existing := []byte(`package test
+
+const (
+	// DocA is the doc for A.
+	A = 1
+	// DocB is the doc for B.
+	B = 2
+	// DocC is the doc for C.
+	C = 3
+)
+`)
+	if err := os.WriteFile(filepath.Join(outDir, "test.go"), existing, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Emit(db, outDir); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(outDir, "test.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(got)
+
+	// Each doc comment must immediately precede its own spec — no
+	// floating or reordered comments.
+	checks := []struct{ before, after string }{
+		{"// DocA is the doc for A.", "A = 1"},
+		{"// DocB is the doc for B.", "B = 99"},
+		{"// DocC is the doc for C.", "C = 3"},
+	}
+	for _, c := range checks {
+		i := strings.Index(s, c.before)
+		j := strings.Index(s, c.after)
+		if i < 0 || j < 0 {
+			t.Fatalf("missing %q or %q in output:\n%s", c.before, c.after, s)
+		}
+		if i > j {
+			t.Fatalf("%q appears after %q (doc comment drifted):\n%s", c.before, c.after, s)
+		}
+		// And no other spec text should appear between them.
+		between := s[i+len(c.before) : j]
+		if strings.Contains(between, "=") {
+			t.Fatalf("unexpected spec between %q and %q:\n%q\nfull:\n%s",
+				c.before, c.after, between, s)
+		}
+	}
+}
+
+func TestEmitMergePatchesIotaConstBlock(t *testing.T) {
+	// Iota const blocks ingest as a single definition under the first
+	// name, with the whole "const ( A = iota; B; C )" block as the body.
+	// Per-spec splicing would cram the whole block into A's byte range,
+	// producing a nested const block. The merge must detect a grouped-
+	// GenDecl body and replace the enclosing GenDecl whole.
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Red", Kind: "const", Exported: true,
+		Body: "const (\n\tRed = iota + 1\n\tGreen\n\tBlue\n\tYellow\n)",
+		SourceFile: "test.go",
+	})
+
+	outDir := t.TempDir()
+	existing := []byte(`package test
+
+// Color is a neighboring type that must survive.
+type Color int
+
+const (
+	Red = iota
+	Green
+	Blue
+)
+
+// Max is another neighbor.
+const Max = 100
+`)
+	if err := os.WriteFile(filepath.Join(outDir, "test.go"), existing, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Emit(db, outDir); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(outDir, "test.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(got)
+
+	// The iota block was replaced: new members appear, old "= iota"
+	// (without "+ 1") does not.
+	if !strings.Contains(s, "Red = iota + 1") {
+		t.Fatalf("iota block not patched:\n%s", s)
+	}
+	if !strings.Contains(s, "Yellow") {
+		t.Fatalf("new iota member Yellow missing:\n%s", s)
+	}
+	// No nested const block (would indicate per-spec splicing misfire).
+	if strings.Count(s, "const (") > 1 {
+		t.Fatalf("nested const block (per-spec splice misfired):\n%s", s)
+	}
+	// Neighbors survive.
+	if !strings.Contains(s, "type Color int") {
+		t.Fatalf("Color type lost:\n%s", s)
+	}
+	if !strings.Contains(s, "const Max = 100") {
+		t.Fatalf("Max const lost:\n%s", s)
+	}
+}
+
+func TestEmitMergePatchesGroupedConstInPlace(t *testing.T) {
+	// Editing one const inside a grouped const block should patch only
+	// that spec and leave the rest of the block intact.
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "B", Kind: "const", Exported: true,
+		Body: "B = 99", SourceFile: "test.go",
+	})
+
+	outDir := t.TempDir()
+	existing := []byte(`package test
+
+const (
+	A = 1
+	B = 2
+	C = 3
+)
+`)
+	if err := os.WriteFile(filepath.Join(outDir, "test.go"), existing, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Emit(db, outDir); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(outDir, "test.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(got)
+	if !strings.Contains(s, "B = 99") {
+		t.Fatalf("B not patched:\n%s", s)
+	}
+	if strings.Contains(s, "B = 2") {
+		t.Fatalf("old B = 2 still present:\n%s", s)
+	}
+	if !strings.Contains(s, "A = 1") || !strings.Contains(s, "C = 3") {
+		t.Fatalf("sibling consts lost:\n%s", s)
+	}
+	if !strings.Contains(s, "const (") {
+		t.Fatalf("grouped const block structure lost:\n%s", s)
+	}
+}
+
+func TestEmitRefreshesFileSourcesAfterWrite(t *testing.T) {
+	// After emit writes a file (and goimports post-processes it), the
+	// authoritative raw source stored in file_sources must be updated to
+	// match what's on disk. Without this refresh, file_sources drifts
+	// from disk on every body edit until the next full re-ingest.
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+
+	// Seed file_sources with the "old" version and definitions pointing to
+	// the "new" body.
+	rawSeed := `package test
+
+func Foo() string { return "OLD" }
+`
+	if err := db.SetFileSource(mod.ID, "test.go", rawSeed); err != nil {
+		t.Fatal(err)
+	}
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true,
+		Body: `func Foo() string { return "NEW" }`, SourceFile: "test.go",
+	})
+
+	outDir := t.TempDir()
+	if err := Emit(db, outDir); err != nil {
+		t.Fatal(err)
+	}
+
+	refreshed, err := db.GetFileSource(mod.ID, "test.go")
+	if err != nil {
+		t.Fatalf("GetFileSource: %v", err)
+	}
+	if !strings.Contains(refreshed, `"NEW"`) {
+		t.Fatalf("file_sources not refreshed, still contains OLD body:\n%s", refreshed)
+	}
+	if strings.Contains(refreshed, `"OLD"`) {
+		t.Fatalf("file_sources still contains OLD body:\n%s", refreshed)
+	}
+
+	onDisk, err := os.ReadFile(filepath.Join(outDir, "test.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(onDisk) != refreshed {
+		t.Fatalf("file_sources doesn't match disk:\n-- disk --\n%s\n-- file_sources --\n%s",
+			onDisk, refreshed)
+	}
+}
+
 func TestEmitWritesNewFileWithoutSafetyCheck(t *testing.T) {
 	// When the target path doesn't exist, emit should just write — the
 	// safety net only protects against losing existing on-disk content.

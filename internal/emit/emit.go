@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/justinstimatze/defn/internal/store"
@@ -75,12 +76,14 @@ func EmitWithMap(db *store.DB, outDir string) ([]DefLocation, error) {
 	// relative directories for each package.
 	moduleRoot := detectModuleRoot(modules)
 
+	var writtenFiles []writtenFile
 	for _, mod := range modules {
-		locs, err := emitModule(db, &mod, outDir, moduleRoot)
+		locs, written, err := emitModule(db, &mod, outDir, moduleRoot)
 		if err != nil {
 			return nil, fmt.Errorf("emit %s: %w", mod.Path, err)
 		}
 		allLocs = append(allLocs, locs...)
+		writtenFiles = append(writtenFiles, written...)
 	}
 
 	// Run goimports to fix unused imports and formatting.
@@ -90,6 +93,32 @@ func EmitWithMap(db *store.DB, outDir string) ([]DefLocation, error) {
 	}
 	if out, err := exec.Command(goimports, "-w", outDir).CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("goimports: %s", out)
+	}
+
+	// Refresh file_sources with the post-goimports bytes so it stays in
+	// sync with disk. Without this, the authoritative raw source drifts
+	// every time emit rewrites a file (body edits, reorders, import
+	// additions) until the next full re-ingest.
+	//
+	// Note on the safety-net case: if safeWriteGoFile declined to write
+	// (because regenerating would drop an on-disk decl defn's schema
+	// can't represent), disk still has its pre-emit content. We re-read
+	// that and stamp it here, which is the correct invariant — the
+	// authoritative raw source must always match what's on disk. The
+	// next merge will use this refreshed base, so hand-edited decls
+	// that tripped the safety net are now carried forward rather than
+	// lost on the following emit.
+	for _, wf := range writtenFiles {
+		if wf.SourceFile == "" {
+			continue
+		}
+		raw, err := os.ReadFile(wf.Path)
+		if err != nil {
+			continue
+		}
+		if err := db.SetFileSource(wf.ModuleID, wf.SourceFile, string(raw)); err != nil {
+			return nil, fmt.Errorf("refresh file_sources for %s: %w", wf.SourceFile, err)
+		}
 	}
 
 	// Rebuild location index after goimports (it may shift line numbers).
@@ -153,10 +182,19 @@ func detectModuleRoot(modules []store.Module) string {
 	return prefix
 }
 
-func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string) ([]DefLocation, error) {
+// writtenFile records an emitted file so its post-goimports bytes can be
+// written back to file_sources, keeping the authoritative raw source in
+// sync with what's on disk.
+type writtenFile struct {
+	Path       string
+	ModuleID   int64
+	SourceFile string // project-relative; empty means don't refresh file_sources
+}
+
+func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string) ([]DefLocation, []writtenFile, error) {
 	defs, err := db.GetModuleDefinitions(mod.ID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(defs) == 0 {
 		// No definitions — clean up any previously emitted files for this module.
@@ -172,13 +210,13 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string) ([]D
 			os.Remove(mainFile)
 			os.Remove(testFile)
 		}
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	// Get imports for this module.
 	imports, err := db.GetImports(mod.ID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Compute the relative directory path by stripping the module root.
@@ -194,7 +232,7 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string) ([]D
 	}
 	pkgDir := filepath.Join(outDir, relPath)
 	if err := os.MkdirAll(pkgDir, 0755); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Group definitions by source file. Use the basename because
@@ -218,6 +256,7 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string) ([]D
 	}
 
 	var allLocs []DefLocation
+	var written []writtenFile
 	docWritten := false
 
 	// Phase C: pre-fetch the raw sources for this module. When present,
@@ -237,23 +276,36 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string) ([]D
 		// Find the raw source for this file. source_file in the DB is
 		// project-relative (e.g. "internal/mcp/tools_extra.go"), so look
 		// up by the source_file of any def in this bucket.
+		//
+		// Invariant: all defs in a byFile bucket share the same
+		// SourceFile. Buckets are keyed by basename, and within a
+		// single module (one package directory) each basename maps to
+		// exactly one project-relative path. So breaking at the first
+		// def with a non-empty SourceFile yields the canonical one.
 		var rawFromDB []byte
+		var projectRelSource string
 		for _, d := range fileDefs {
 			if d.SourceFile != "" {
+				projectRelSource = d.SourceFile
 				if r, ok := rawMap[d.SourceFile]; ok {
 					rawFromDB = []byte(r)
-					break
 				}
+				break
 			}
 		}
 		locs, err := writeFile(path, mod.Name, mod.Path, pkgDoc, imports, fileDefs, rawFromDB)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		allLocs = append(allLocs, locs...)
+		written = append(written, writtenFile{
+			Path:       path,
+			ModuleID:   mod.ID,
+			SourceFile: projectRelSource,
+		})
 	}
 
-	return allLocs, nil
+	return allLocs, written, nil
 }
 
 func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import, defs []store.Definition, rawFromDB []byte) ([]DefLocation, error) {
@@ -272,7 +324,7 @@ func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import,
 	// everything defn's schema doesn't represent (package doc, build
 	// constraints, per-file imports, init() names, floating comments).
 	if len(existingSrc) > 0 {
-		if merged, ok := mergeFuncBodiesIntoSource(existingSrc, defs); ok {
+		if merged, ok := mergeDeclsIntoSource(existingSrc, defs); ok {
 			wrote, lost, err := safeWriteGoFile(path, merged)
 			if err != nil {
 				return nil, err
@@ -523,76 +575,227 @@ func groupKeyword(d store.Definition) string {
 	return d.Kind
 }
 
-// mergeFuncBodiesIntoSource parses existing Go source, replaces the
-// bodies of top-level functions/methods that defn's database has a
-// current version of, and returns the re-formatted bytes.
+// mergeDeclsIntoSource patches declaration bodies in existing Go source
+// by splicing DB bodies into the byte ranges occupied by their on-disk
+// counterparts. Works at the byte level rather than editing the parsed
+// AST, which preserves:
+//
+//   - Per-spec doc comments on grouped declarations (AST surgery with a
+//     foreign fset drops the position association and format.Node then
+//     renders the comment as an orphan floating between specs).
+//   - Whitespace, blank-line grouping, and free-floating comments
+//     outside the replaced ranges.
+//
+// The parsed AST is only used to find each decl's byte offsets; no
+// tree mutation happens.
 //
 // Ok=true means a merged file was produced and is safe to write.
-// Ok=false means the caller should fall back to regenerating from
-// the database — the source doesn't parse, or nothing in defs could
-// be identified in the AST.
-//
-// Limited to FuncDecl (functions and methods) in v1. Type/const/var
-// changes go through regeneration for now; the safety net on the
-// regenerate path keeps them from destroying existing decls.
-func mergeFuncBodiesIntoSource(existing []byte, defs []store.Definition) ([]byte, bool) {
+// Ok=false means the caller should fall back to regenerating — the
+// source doesn't parse, the result after splicing doesn't parse, or
+// nothing in defs matched an on-disk decl.
+func mergeDeclsIntoSource(existing []byte, defs []store.Definition) ([]byte, bool) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "", existing, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
 		return nil, false
 	}
 
-	// Build identity → body map for functions and methods only.
-	wantBodies := make(map[string]string, len(defs))
+	wantFuncs := make(map[string]string)
+	wantTypes := make(map[string]string)
+	wantConsts := make(map[string]string)
+	wantVars := make(map[string]string)
+	// wantGrouped holds bodies that represent a whole grouped GenDecl
+	// (e.g. an iota const block that ingest stores as a single def under
+	// the first name). These can't be spliced into one spec's range —
+	// the whole parenthesized block has to be replaced.
+	wantGrouped := make(map[string]string)
 	for _, d := range defs {
-		if d.Kind != "function" && d.Kind != "method" {
-			continue
+		switch d.Kind {
+		case "function", "method":
+			wantFuncs[funcIdentity(d.Name, d.Receiver)] = d.Body
+		case "type", "interface", "const", "var":
+			if bodyIsGroupedGenDecl(d.Body) {
+				wantGrouped[d.Name] = d.Body
+				continue
+			}
+			switch d.Kind {
+			case "type", "interface":
+				wantTypes[d.Name] = d.Body
+			case "const":
+				wantConsts[d.Name] = d.Body
+			case "var":
+				wantVars[d.Name] = d.Body
+			}
 		}
-		wantBodies[funcIdentity(d.Name, d.Receiver)] = d.Body
 	}
-	if len(wantBodies) == 0 {
-		// Nothing function-shaped to merge; regeneration path handles it.
+	if len(wantFuncs) == 0 && len(wantTypes) == 0 &&
+		len(wantConsts) == 0 && len(wantVars) == 0 &&
+		len(wantGrouped) == 0 {
 		return nil, false
 	}
 
-	pkgName := f.Name.Name
-	replaced := 0
-	for i, decl := range f.Decls {
-		fd, ok := decl.(*ast.FuncDecl)
-		if !ok {
-			continue
+	type replacement struct {
+		start, end int
+		body       string
+	}
+	var reps []replacement
+
+	// declRange returns the byte range for a declaration or spec, using
+	// the Doc position as the start when includeDoc is true. This
+	// matches renderNode's behavior at ingest: FuncDecl/GenDecl bodies
+	// include the leading doc comment (so the replacement range must
+	// too); grouped-spec bodies don't, so we use s.Pos() directly.
+	declRange := func(start, end token.Pos, doc *ast.CommentGroup, includeDoc bool) (int, int) {
+		sp := fset.Position(start).Offset
+		if includeDoc && doc != nil {
+			if dp := fset.Position(doc.Pos()).Offset; dp >= 0 && dp < sp {
+				sp = dp
+			}
 		}
-		recv := ""
-		if fd.Recv != nil && len(fd.Recv.List) > 0 {
-			recv = recvTypeName(fd.Recv.List[0].Type)
-		}
-		key := funcIdentity(fd.Name.Name, recv)
-		newBody, ok := wantBodies[key]
-		if !ok {
-			continue
-		}
-		newFd, ok := parseStandaloneFunc(newBody, pkgName)
-		if !ok {
-			// DB body doesn't parse — leave the on-disk version in place.
-			continue
-		}
-		f.Decls[i] = newFd
-		replaced++
+		return sp, fset.Position(end).Offset
 	}
 
-	// If we didn't replace anything, return false so the caller falls
-	// back to regeneration. Without this, a noop merge would overwrite
-	// the file with a byte-shuffled but semantically-identical copy on
-	// every emit, churning mtimes and git diffs.
-	if replaced == 0 {
+	for _, decl := range f.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			recv := ""
+			if d.Recv != nil && len(d.Recv.List) > 0 {
+				recv = recvTypeName(d.Recv.List[0].Type)
+			}
+			body, ok := wantFuncs[funcIdentity(d.Name.Name, recv)]
+			if !ok {
+				continue
+			}
+			s, e := declRange(d.Pos(), d.End(), d.Doc, true)
+			reps = append(reps, replacement{s, e, body})
+		case *ast.GenDecl:
+			// Whole-decl replacement: ingest bundles iota const blocks
+			// (and any future whole-GenDecl case) under the first spec
+			// name. Match on that before falling through to per-spec
+			// splicing, which would otherwise try to cram the whole
+			// parenthesized block into a single spec's byte range.
+			if name := firstSpecName(d); name != "" {
+				if body, ok := wantGrouped[name]; ok {
+					sp, ep := declRange(d.Pos(), d.End(), d.Doc, true)
+					reps = append(reps, replacement{sp, ep, body})
+					continue
+				}
+			}
+			grouped := d.Lparen.IsValid()
+			for _, spec := range d.Specs {
+				switch s := spec.(type) {
+				case *ast.TypeSpec:
+					if d.Tok != token.TYPE {
+						continue
+					}
+					body, ok := wantTypes[s.Name.Name]
+					if !ok {
+						continue
+					}
+					if grouped {
+						sp, ep := declRange(s.Pos(), s.End(), nil, false)
+						reps = append(reps, replacement{sp, ep, body})
+					} else {
+						sp, ep := declRange(d.Pos(), d.End(), d.Doc, true)
+						reps = append(reps, replacement{sp, ep, body})
+					}
+				case *ast.ValueSpec:
+					// Multi-name specs (var a, b = 1, 2) share a single
+					// DB def under the first name; partial patching
+					// would leak the wrong value into siblings. Fall
+					// through to regeneration.
+					if len(s.Names) != 1 {
+						continue
+					}
+					name := s.Names[0].Name
+					var body string
+					var ok bool
+					switch d.Tok {
+					case token.CONST:
+						body, ok = wantConsts[name]
+					case token.VAR:
+						body, ok = wantVars[name]
+					}
+					if !ok {
+						continue
+					}
+					if grouped {
+						sp, ep := declRange(s.Pos(), s.End(), nil, false)
+						reps = append(reps, replacement{sp, ep, body})
+					} else {
+						sp, ep := declRange(d.Pos(), d.End(), d.Doc, true)
+						reps = append(reps, replacement{sp, ep, body})
+					}
+				}
+			}
+		}
+	}
+
+	if len(reps) == 0 {
 		return nil, false
 	}
 
-	var buf bytes.Buffer
-	if err := format.Node(&buf, fset, f); err != nil {
+	// Apply in reverse offset order so earlier splices don't invalidate
+	// later offsets. Byte ranges for distinct decls never overlap (Go
+	// syntax forbids it), so ordering by start offset is total.
+	sort.Slice(reps, func(i, j int) bool { return reps[i].start > reps[j].start })
+	result := append([]byte{}, existing...)
+	for _, r := range reps {
+		if r.start < 0 || r.end > len(result) || r.start > r.end {
+			return nil, false
+		}
+		var buf bytes.Buffer
+		buf.Grow(len(result) - (r.end - r.start) + len(r.body))
+		buf.Write(result[:r.start])
+		buf.WriteString(r.body)
+		buf.Write(result[r.end:])
+		result = buf.Bytes()
+	}
+
+	// Validate the spliced result parses. DB bodies are trusted, but a
+	// corrupted body or an off-by-one offset should fail safe rather
+	// than write invalid Go to disk.
+	if _, err := parser.ParseFile(token.NewFileSet(), "", result,
+		parser.ParseComments|parser.SkipObjectResolution); err != nil {
 		return nil, false
 	}
-	return buf.Bytes(), true
+	return result, true
+}
+
+// bodyIsGroupedGenDecl reports whether a DB body is a parenthesized
+// GenDecl (type (...), const (...), var (...)). Ingest renders iota
+// const blocks this way: one def under the first name with the whole
+// block as body. For those, the splice target must be the on-disk
+// GenDecl's full range, not just the first spec's.
+func bodyIsGroupedGenDecl(body string) bool {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", "package x\n\n"+body, parser.SkipObjectResolution)
+	if err != nil || len(f.Decls) == 0 {
+		return false
+	}
+	gd, ok := f.Decls[0].(*ast.GenDecl)
+	if !ok {
+		return false
+	}
+	return gd.Lparen.IsValid()
+}
+
+// firstSpecName returns the first declared name in a GenDecl, or "" if
+// the decl is empty or imports-only. Used to match on-disk GenDecls
+// against whole-decl DB bodies (which are keyed by first-spec name).
+func firstSpecName(d *ast.GenDecl) string {
+	if len(d.Specs) == 0 {
+		return ""
+	}
+	switch s := d.Specs[0].(type) {
+	case *ast.TypeSpec:
+		return s.Name.Name
+	case *ast.ValueSpec:
+		if len(s.Names) > 0 {
+			return s.Names[0].Name
+		}
+	}
+	return ""
 }
 
 // funcIdentity produces the identity key used to match DB definitions
@@ -605,15 +808,3 @@ func funcIdentity(name, receiver string) string {
 	return receiver + "." + name
 }
 
-// parseStandaloneFunc parses a single function declaration by wrapping
-// it in a synthetic package. Returns the FuncDecl and ok=true on success.
-func parseStandaloneFunc(body, pkgName string) (*ast.FuncDecl, bool) {
-	wrapped := "package " + pkgName + "\n\n" + body
-	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "", wrapped, parser.ParseComments|parser.SkipObjectResolution)
-	if err != nil || len(f.Decls) == 0 {
-		return nil, false
-	}
-	fd, ok := f.Decls[0].(*ast.FuncDecl)
-	return fd, ok
-}
