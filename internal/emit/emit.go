@@ -5,7 +5,10 @@ package emit
 
 import (
 	"fmt"
+	"go/ast"
 	"go/format"
+	"go/parser"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -193,7 +196,10 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string) ([]D
 		return nil, err
 	}
 
-	// Group definitions by source file.
+	// Group definitions by source file. Use the basename because
+	// source_file is stored as a project-relative path (e.g.
+	// "internal/mcp/tools_extra.go"); joining that with pkgDir doubles
+	// the directory prefix and writes land in a non-existent path.
 	// If source_file is empty (old data), fall back to one file per package.
 	byFile := map[string][]store.Definition{}
 	for _, d := range defs {
@@ -204,6 +210,8 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string) ([]D
 			} else {
 				file = strings.ToLower(mod.Name) + ".go"
 			}
+		} else {
+			file = filepath.Base(file)
 		}
 		byFile[file] = append(byFile[file], d)
 	}
@@ -289,11 +297,121 @@ func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import,
 		// go build will catch syntax errors.
 		formatted = []byte(src.String())
 	}
-	if err := os.WriteFile(path, formatted, 0644); err != nil {
+	wrote, lost, err := safeWriteGoFile(path, formatted)
+	if err != nil {
 		return nil, err
 	}
-
+	if !wrote {
+		// The DB's reconstruction would remove top-level declarations that
+		// exist on disk (most often init(), ingested under a renamed name,
+		// or top-level code the current schema can't represent). Keep the
+		// file intact; downstream callers (lint, etc.) that need locations
+		// will get an empty slice for this file — safer than corruption.
+		fmt.Fprintf(os.Stderr,
+			"defn: skipping emit of %s to preserve %d on-disk declaration(s) not in the database: %v\n",
+			path, len(lost), lost)
+		return nil, nil
+	}
 	return buildLocIndex(path, modulePath, defs), nil
+}
+
+// safeWriteGoFile writes content to path only if doing so will not remove
+// any top-level named declaration that currently exists on disk. If a
+// declaration would be lost, returns wrote=false with the list of lost
+// names and no error; the caller is expected to log and move on.
+//
+// This is a defense against the database's representation being lossier
+// than the on-disk source: a roundtrip edit/emit should never silently
+// delete user code.
+func safeWriteGoFile(path string, content []byte) (wrote bool, lost []string, err error) {
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return true, nil, os.WriteFile(path, content, 0644)
+		}
+		return false, nil, err
+	}
+
+	oldDecls, oldParseErr := topLevelDeclNames(existing)
+	if oldParseErr != nil {
+		// On-disk file doesn't parse — safer to leave it alone than to
+		// blindly replace broken code with something the caller may not
+		// expect. A human can delete the file and re-emit explicitly.
+		return false, nil, fmt.Errorf("cannot safety-check %s: existing file doesn't parse: %w", path, oldParseErr)
+	}
+	newDecls, newParseErr := topLevelDeclNames(content)
+	if newParseErr != nil {
+		return false, nil, fmt.Errorf("cannot safety-check %s: generated content doesn't parse: %w", path, newParseErr)
+	}
+
+	newSet := make(map[string]bool, len(newDecls))
+	for _, n := range newDecls {
+		newSet[n] = true
+	}
+	for _, n := range oldDecls {
+		if !newSet[n] {
+			lost = append(lost, n)
+		}
+	}
+	if len(lost) > 0 {
+		return false, lost, nil
+	}
+	return true, nil, os.WriteFile(path, content, 0644)
+}
+
+// topLevelDeclNames returns the qualified names of every top-level
+// declaration in a Go source file: free functions as "Name", methods as
+// "<Recv>.Name", and var/const/type specs as their spec name. Anonymous
+// specs and blank identifiers are skipped.
+func topLevelDeclNames(src []byte) ([]string, error) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, parser.SkipObjectResolution)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, decl := range f.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			name := d.Name.Name
+			if d.Recv != nil && len(d.Recv.List) > 0 {
+				if recv := recvTypeName(d.Recv.List[0].Type); recv != "" {
+					name = recv + "." + name
+				}
+			}
+			names = append(names, name)
+		case *ast.GenDecl:
+			for _, spec := range d.Specs {
+				switch s := spec.(type) {
+				case *ast.ValueSpec:
+					for _, n := range s.Names {
+						if n.Name != "_" {
+							names = append(names, n.Name)
+						}
+					}
+				case *ast.TypeSpec:
+					names = append(names, s.Name.Name)
+				}
+			}
+		}
+	}
+	return names, nil
+}
+
+// recvTypeName extracts the receiver type name for a method declaration,
+// unwrapping pointer receivers and generic type params.
+func recvTypeName(e ast.Expr) string {
+	switch t := e.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.StarExpr:
+		return "*" + recvTypeName(t.X)
+	case *ast.IndexExpr:
+		return recvTypeName(t.X)
+	case *ast.IndexListExpr:
+		return recvTypeName(t.X)
+	}
+	return ""
 }
 
 // buildLocIndex re-reads an emitted file and finds each definition's line.
