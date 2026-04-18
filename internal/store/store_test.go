@@ -1,253 +1,76 @@
 package store
 
 import (
+	_ "embed"
 	"os"
 	"path/filepath"
 	"testing"
+
+	_ "github.com/dolthub/driver"
 )
 
-func testDB(t *testing.T) *DB {
-	t.Helper()
-	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "testdb"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
-	return db
-}
-
-func TestOpenClose(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "testdb")
-	db, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.Close()
-
-	// Directory should exist.
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("database directory not created: %v", err)
-	}
-}
-
-func TestEnsureModule(t *testing.T) {
-	db := testDB(t)
-
-	m1, err := db.EnsureModule("example.com/foo", "foo", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if m1.Path != "example.com/foo" || m1.Name != "foo" || m1.ID == 0 {
-		t.Fatalf("unexpected module: %+v", m1)
-	}
-
-	m2, err := db.EnsureModule("example.com/foo", "foo", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if m2.ID != m1.ID {
-		t.Fatalf("expected same ID %d, got %d", m1.ID, m2.ID)
-	}
-}
-
-func TestUpsertDefinition(t *testing.T) {
-	db := testDB(t)
-	mod, _ := db.EnsureModule("example.com/test", "test", "")
-
-	d := &Definition{
-		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true, Body: "func Foo() {}",
-	}
-	id1, err := db.UpsertDefinition(d)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if id1 == 0 {
-		t.Fatal("expected non-zero ID")
-	}
-
-	// Same content → same ID (hash dedup).
-	d2 := &Definition{
-		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true, Body: "func Foo() {}",
-	}
-	id2, err := db.UpsertDefinition(d2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if id2 != id1 {
-		t.Fatalf("expected same ID %d on dedup, got %d", id1, id2)
-	}
-
-	// Changed body → same ID, new hash.
-	d3 := &Definition{
-		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true, Body: "func Foo() { return }",
-	}
-	id3, err := db.UpsertDefinition(d3)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if id3 != id1 {
-		t.Fatalf("expected same ID %d on update, got %d", id1, id3)
-	}
-
-	got, err := db.GetDefinition(id1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Body != "func Foo() { return }" {
-		t.Fatalf("body not updated: %q", got.Body)
-	}
-}
-
-func TestGetDefinitionByName(t *testing.T) {
+func TestComputeRootHash(t *testing.T) {
 	db := testDB(t)
 	mod, _ := db.EnsureModule("example.com/test", "test", "")
 
 	db.UpsertDefinition(&Definition{
-		ModuleID: mod.ID, Name: "Alpha", Kind: "function", Exported: true, Body: "func Alpha() {}",
+		ModuleID: mod.ID, Name: "A", Kind: "function", Exported: true, Body: "func A() {}",
 	})
 	db.UpsertDefinition(&Definition{
-		ModuleID: mod.ID, Name: "Beta", Kind: "function", Exported: true, Body: "func Beta() {}",
+		ModuleID: mod.ID, Name: "B", Kind: "function", Exported: true, Body: "func B() {}",
 	})
 
-	d, err := db.GetDefinitionByName("Alpha", "")
+	h1, err := db.ComputeRootHash()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.Name != "Alpha" {
-		t.Fatalf("expected Alpha, got %s", d.Name)
+	if len(h1) != 64 {
+		t.Fatalf("unexpected hash length: %d", len(h1))
 	}
 
-	d, err = db.GetDefinitionByName("Beta", "example.com/test")
+	h2, err := db.ComputeRootHash()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.Name != "Beta" {
-		t.Fatalf("expected Beta, got %s", d.Name)
+	if h1 != h2 {
+		t.Fatal("root hash not deterministic")
 	}
 }
 
-func TestFindDefinitions(t *testing.T) {
-	db := testDB(t)
-	mod, _ := db.EnsureModule("example.com/test", "test", "")
-
-	db.UpsertDefinition(&Definition{
-		ModuleID: mod.ID, Name: "GetUser", Kind: "function", Exported: true, Body: "func GetUser() {}",
-	})
-	db.UpsertDefinition(&Definition{
-		ModuleID: mod.ID, Name: "GetOrder", Kind: "function", Exported: true, Body: "func GetOrder() {}",
-	})
-	db.UpsertDefinition(&Definition{
-		ModuleID: mod.ID, Name: "SetUser", Kind: "function", Exported: true, Body: "func SetUser() {}",
-	})
-
-	defs, err := db.FindDefinitions("Get%")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(defs) != 2 {
-		t.Fatalf("expected 2 results, got %d", len(defs))
-	}
-}
-
-func TestReferences(t *testing.T) {
-	db := testDB(t)
-	mod, _ := db.EnsureModule("example.com/test", "test", "")
-
-	id1, _ := db.UpsertDefinition(&Definition{
-		ModuleID: mod.ID, Name: "Caller", Kind: "function", Exported: true, Body: "func Caller() {}",
-	})
-	id2, _ := db.UpsertDefinition(&Definition{
-		ModuleID: mod.ID, Name: "Callee", Kind: "function", Exported: true, Body: "func Callee() {}",
-	})
-
-	err := db.SetReferences(id1, []Reference{{ToDef: id2, Kind: "call"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	callers, err := db.GetCallers(id2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(callers) != 1 || callers[0].Name != "Caller" {
-		t.Fatalf("expected [Caller], got %v", callers)
-	}
-
-	callees, err := db.GetCallees(id1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(callees) != 1 || callees[0].Name != "Callee" {
-		t.Fatalf("expected [Callee], got %v", callees)
-	}
-}
-
-func TestImports(t *testing.T) {
-	db := testDB(t)
-	mod, _ := db.EnsureModule("example.com/test", "test", "")
-
-	imports := []Import{
-		{ModuleID: mod.ID, ImportedPath: "fmt"},
-		{ModuleID: mod.ID, ImportedPath: "os"},
-		{ModuleID: mod.ID, ImportedPath: "modernc.org/sqlite", Alias: "_"},
-	}
-	if err := db.SetImports(mod.ID, imports); err != nil {
-		t.Fatal(err)
-	}
-
-	got, err := db.GetImports(mod.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 3 {
-		t.Fatalf("expected 3 imports, got %d", len(got))
-	}
-}
-
-func TestProjectFiles(t *testing.T) {
-	db := testDB(t)
-
-	if err := db.SetProjectFile("go.mod", "module example.com/test\n"); err != nil {
-		t.Fatal(err)
-	}
-
-	content, err := db.GetProjectFile("go.mod")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if content != "module example.com/test\n" {
-		t.Fatalf("unexpected content: %q", content)
-	}
-
-	paths, err := db.ListProjectFiles()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(paths) != 1 {
-		t.Fatalf("expected 1 project file, got %d", len(paths))
-	}
-}
-
-func TestDoltCommitAndLog(t *testing.T) {
+func TestGCSurvivesConnInvalidation(t *testing.T) {
+	// Regression: DOLT_GC invalidates the pinned connection. Before the
+	// fix, the next query would fail with "this connection was
+	// established when this server performed an online garbage
+	// collection". Now GC() proactively swaps the pinned conn.
 	db := testDB(t)
 	mod, _ := db.EnsureModule("example.com/test", "test", "")
 	db.UpsertDefinition(&Definition{
-		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true, Body: "func Foo() {}",
+		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true,
+		Body: "func Foo() {}",
 	})
-
-	if err := db.Commit("test commit"); err != nil {
-		t.Fatal(err)
+	if err := db.Commit("seed"); err != nil {
+		t.Fatalf("commit: %v", err)
 	}
 
-	entries, err := db.Log(5)
+	if err := db.GC(); err != nil {
+		t.Fatalf("gc: %v", err)
+	}
+
+	// Read through queryContext — must succeed on the freshly-swapped conn.
+	defs, err := db.FindDefinitions("%")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("read after GC: %v", err)
 	}
-	// Should have at least 2 commits: init + our commit.
-	if len(entries) < 2 {
-		t.Fatalf("expected at least 2 log entries, got %d", len(entries))
+	if len(defs) == 0 {
+		t.Fatal("expected at least one definition after GC")
+	}
+
+	// Write through execContext — must also succeed.
+	if _, err := db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "Bar", Kind: "function", Exported: true,
+		Body: "func Bar() {}",
+	}); err != nil {
+		t.Fatalf("write after GC: %v", err)
 	}
 }
 
@@ -280,53 +103,95 @@ func TestDoltBranch(t *testing.T) {
 	}
 }
 
-func TestQueryIsReadOnly(t *testing.T) {
+func TestDoltCommitAndLog(t *testing.T) {
 	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+	db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true, Body: "func Foo() {}",
+	})
 
-	// SELECT should work.
-	_, err := db.Query("SELECT 1")
-	if err != nil {
+	if err := db.Commit("test commit"); err != nil {
 		t.Fatal(err)
 	}
 
-	// DROP should fail.
-	_, err = db.Query("DROP TABLE definitions")
-	if err == nil {
-		t.Fatal("expected error from DROP")
+	entries, err := db.Log(5)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	// DELETE should fail.
-	_, err = db.Query("DELETE FROM definitions")
-	if err == nil {
-		t.Fatal("expected error from DELETE")
+	// Should have at least 2 commits: init + our commit.
+	if len(entries) < 2 {
+		t.Fatalf("expected at least 2 log entries, got %d", len(entries))
 	}
 }
 
-func TestComputeRootHash(t *testing.T) {
+func TestEnsureModule(t *testing.T) {
+	db := testDB(t)
+
+	m1, err := db.EnsureModule("example.com/foo", "foo", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m1.Path != "example.com/foo" || m1.Name != "foo" || m1.ID == 0 {
+		t.Fatalf("unexpected module: %+v", m1)
+	}
+
+	m2, err := db.EnsureModule("example.com/foo", "foo", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m2.ID != m1.ID {
+		t.Fatalf("expected same ID %d, got %d", m1.ID, m2.ID)
+	}
+}
+
+func TestFindDefinitions(t *testing.T) {
 	db := testDB(t)
 	mod, _ := db.EnsureModule("example.com/test", "test", "")
 
 	db.UpsertDefinition(&Definition{
-		ModuleID: mod.ID, Name: "A", Kind: "function", Exported: true, Body: "func A() {}",
+		ModuleID: mod.ID, Name: "GetUser", Kind: "function", Exported: true, Body: "func GetUser() {}",
 	})
 	db.UpsertDefinition(&Definition{
-		ModuleID: mod.ID, Name: "B", Kind: "function", Exported: true, Body: "func B() {}",
+		ModuleID: mod.ID, Name: "GetOrder", Kind: "function", Exported: true, Body: "func GetOrder() {}",
+	})
+	db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "SetUser", Kind: "function", Exported: true, Body: "func SetUser() {}",
 	})
 
-	h1, err := db.ComputeRootHash()
+	defs, err := db.FindDefinitions("Get%")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(h1) != 64 {
-		t.Fatalf("unexpected hash length: %d", len(h1))
+	if len(defs) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(defs))
+	}
+}
+
+func TestGetDefinitionByName(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+
+	db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "Alpha", Kind: "function", Exported: true, Body: "func Alpha() {}",
+	})
+	db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "Beta", Kind: "function", Exported: true, Body: "func Beta() {}",
+	})
+
+	d, err := db.GetDefinitionByName("Alpha", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Name != "Alpha" {
+		t.Fatalf("expected Alpha, got %s", d.Name)
 	}
 
-	h2, err := db.ComputeRootHash()
+	d, err = db.GetDefinitionByName("Beta", "example.com/test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h1 != h2 {
-		t.Fatal("root hash not deterministic")
+	if d.Name != "Beta" {
+		t.Fatalf("expected Beta, got %s", d.Name)
 	}
 }
 
@@ -418,4 +283,179 @@ func TestGetImpact(t *testing.T) {
 	if len(impactF.Tests) != 1 {
 		t.Fatalf("Foo: expected 1 test, got %d", len(impactF.Tests))
 	}
+}
+
+func TestImports(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+
+	imports := []Import{
+		{ModuleID: mod.ID, ImportedPath: "fmt"},
+		{ModuleID: mod.ID, ImportedPath: "os"},
+		{ModuleID: mod.ID, ImportedPath: "modernc.org/sqlite", Alias: "_"},
+	}
+	if err := db.SetImports(mod.ID, imports); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := db.GetImports(mod.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected 3 imports, got %d", len(got))
+	}
+}
+
+func TestOpenClose(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "testdb")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	// Directory should exist.
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("database directory not created: %v", err)
+	}
+}
+
+func TestProjectFiles(t *testing.T) {
+	db := testDB(t)
+
+	if err := db.SetProjectFile("go.mod", "module example.com/test\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	content, err := db.GetProjectFile("go.mod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content != "module example.com/test\n" {
+		t.Fatalf("unexpected content: %q", content)
+	}
+
+	paths, err := db.ListProjectFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("expected 1 project file, got %d", len(paths))
+	}
+}
+
+func TestQueryIsReadOnly(t *testing.T) {
+	db := testDB(t)
+
+	// SELECT should work.
+	_, err := db.Query("SELECT 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// DROP should fail.
+	_, err = db.Query("DROP TABLE definitions")
+	if err == nil {
+		t.Fatal("expected error from DROP")
+	}
+
+	// DELETE should fail.
+	_, err = db.Query("DELETE FROM definitions")
+	if err == nil {
+		t.Fatal("expected error from DELETE")
+	}
+}
+
+func TestReferences(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+
+	id1, _ := db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "Caller", Kind: "function", Exported: true, Body: "func Caller() {}",
+	})
+	id2, _ := db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "Callee", Kind: "function", Exported: true, Body: "func Callee() {}",
+	})
+
+	err := db.SetReferences(id1, []Reference{{ToDef: id2, Kind: "call"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	callers, err := db.GetCallers(id2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(callers) != 1 || callers[0].Name != "Caller" {
+		t.Fatalf("expected [Caller], got %v", callers)
+	}
+
+	callees, err := db.GetCallees(id1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(callees) != 1 || callees[0].Name != "Callee" {
+		t.Fatalf("expected [Callee], got %v", callees)
+	}
+}
+
+func TestUpsertDefinition(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+
+	d := &Definition{
+		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true, Body: "func Foo() {}",
+	}
+	id1, err := db.UpsertDefinition(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id1 == 0 {
+		t.Fatal("expected non-zero ID")
+	}
+
+	// Same content → same ID (hash dedup).
+	d2 := &Definition{
+		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true, Body: "func Foo() {}",
+	}
+	id2, err := db.UpsertDefinition(d2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id2 != id1 {
+		t.Fatalf("expected same ID %d on dedup, got %d", id1, id2)
+	}
+
+	// Changed body → same ID, new hash.
+	d3 := &Definition{
+		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true, Body: "func Foo() { return }",
+	}
+	id3, err := db.UpsertDefinition(d3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id3 != id1 {
+		t.Fatalf("expected same ID %d on update, got %d", id1, id3)
+	}
+
+	got, err := db.GetDefinition(id1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Body != "func Foo() { return }" {
+		t.Fatalf("body not updated: %q", got.Body)
+	}
+}
+
+func testDB(t *testing.T) *DB {
+	t.Helper()
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "testdb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
 }
