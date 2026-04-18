@@ -209,6 +209,7 @@ Ops: impact (blast radius — START HERE; pass format:"json" for structured outp
 //	merge: branch
 //	commit: message
 //	status: (no params)
+//	emit: out (directory path — absolute or relative to the project root)
 type codeParam struct {
 	Op         string           `json:"op"`
 	Name       string           `json:"name,omitempty"`
@@ -241,6 +242,7 @@ type codeParam struct {
 	Force       bool             `json:"force,omitempty"`
 	Pick        string           `json:"pick,omitempty"`
 	To          string           `json:"to,omitempty"`
+	Out         string           `json:"out,omitempty"`
 }
 
 type applyOp struct {
@@ -455,6 +457,10 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if r, o, e := need(args.From, "from"); r != nil {
 			return r, o, e
 		}
+	case "emit":
+		if r, o, e := need(args.Out, "out"); r != nil {
+			return r, o, e
+		}
 	}
 
 	// Tag results from read-only ops while startup ingest is still running.
@@ -557,8 +563,10 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return s.handleMergeAbort(ctx, req, args)
 	case "diff-defs":
 		return wrapStale(s.handleDiffDefs(ctx, req, args))
+	case "emit":
+		return s.handleEmit(ctx, req, args)
 	default:
-		return errResult(fmt.Errorf("unknown op %q — valid: read, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs", args.Op))
+		return errResult(fmt.Errorf("unknown op %q — valid: read, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit", args.Op))
 	}
 }
 
@@ -1579,6 +1587,32 @@ func (s *server) handleSync(_ context.Context, _ *sdkmcp.CallToolRequest, args c
 		return errResult(err)
 	}
 	return textResult("Synced: re-ingested source and rebuilt reference graph."), nil, nil
+}
+
+// handleEmit writes the current database state as .go files under
+// args.Out. Relative paths resolve against the project root so agents
+// can say `out:"."` or `out:"build/"` without needing absolute paths.
+//
+// This op exists so CLI-side workflows (lint, self-host checks, fresh
+// checkouts) can run while defn serve is holding the embedded DB —
+// the serve process has direct DB access and writes the emitted tree
+// from its own goroutine.
+func (s *server) handleEmit(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	out := args.Out
+	if !filepath.IsAbs(out) {
+		if s.projectDir == "" {
+			return errResult(fmt.Errorf("relative out=%q but no project directory configured", out))
+		}
+		out = filepath.Join(s.projectDir, out)
+	}
+	if err := os.MkdirAll(out, 0755); err != nil {
+		return errResult(fmt.Errorf("create out dir: %w", err))
+	}
+	locs, err := emit.EmitWithMap(s.db, out)
+	if err != nil {
+		return errResult(fmt.Errorf("emit: %w", err))
+	}
+	return textResult(fmt.Sprintf("Emitted %d definitions to %s.", len(locs), out)), nil, nil
 }
 
 func (s *server) handleSimilar(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {

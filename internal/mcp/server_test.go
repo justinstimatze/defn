@@ -255,6 +255,53 @@ func TestFarewell(t *testing.T) {
 	return db, projDir
 }
 
+func TestHandleEmit(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db, projectDir: projDir}
+
+	// Relative path resolves against projDir.
+	outRel := filepath.Join("out-rel")
+	result, _, _ := s.handleEmit(context.Background(), nil, codeParam{Out: outRel})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Emitted") {
+		t.Fatalf("expected success message, got: %s", text)
+	}
+	// Verify the emitted file exists and has Greet/Farewell.
+	data, err := os.ReadFile(filepath.Join(projDir, outRel, "main.go"))
+	if err != nil {
+		t.Fatalf("read emitted file: %v", err)
+	}
+	if !strings.Contains(string(data), "func Greet(") {
+		t.Errorf("emitted main.go missing Greet:\n%s", data)
+	}
+	if !strings.Contains(string(data), "func Farewell(") {
+		t.Errorf("emitted main.go missing Farewell:\n%s", data)
+	}
+
+	// Absolute paths also work.
+	outAbs := t.TempDir()
+	result, _, _ = s.handleEmit(context.Background(), nil, codeParam{Out: outAbs})
+	if !strings.Contains(resultText(t, result), "Emitted") {
+		t.Fatalf("absolute emit failed: %s", resultText(t, result))
+	}
+	if _, err := os.Stat(filepath.Join(outAbs, "main.go")); err != nil {
+		t.Fatalf("absolute emit didn't write main.go: %v", err)
+	}
+}
+
+func TestHandleEmitRequiresOut(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "emit"})
+	text := resultText(t, result)
+	if !strings.Contains(text, "out is required") {
+		t.Errorf("expected 'out is required' error, got: %s", text)
+	}
+}
+
 func TestHandleImpact(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
