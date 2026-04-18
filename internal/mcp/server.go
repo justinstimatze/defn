@@ -175,7 +175,7 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 
 	mcpServer := sdkmcp.NewServer(&sdkmcp.Implementation{
 		Name:    "defn",
-		Version: "0.12.0",
+		Version: "0.13.0",
 	}, nil)
 
 	sdkmcp.AddTool(mcpServer, &sdkmcp.Tool{
