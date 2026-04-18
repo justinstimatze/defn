@@ -88,6 +88,82 @@ func TestEmitSkipsFilesThatWouldLoseDeclarations(t *testing.T) {
 	}
 }
 
+func TestEmitASTMergePreservesUnknownContent(t *testing.T) {
+	// Phase A: when the target file already exists and parses, emit
+	// should patch changed decl bodies into the existing AST and leave
+	// everything else alone — build constraints, package docs, per-file
+	// imports, init() functions, floating comments, original decl
+	// ordering. All of those are things defn's schema doesn't track
+	// faithfully; AST-merge lets Go's parser + format do the roundtrip.
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true,
+		Body: "func Foo() string { return \"NEW\" }", SourceFile: "test.go",
+	})
+
+	outDir := t.TempDir()
+	existing := []byte(`//go:build linux
+
+// Package test is an example with content defn doesn't track.
+package test
+
+import (
+	"fmt"
+	_ "embed"
+)
+
+// init runs at startup.
+func init() {
+	fmt.Println("hi")
+}
+
+// Foo is the one defn knows about.
+func Foo() string { return "OLD" }
+
+// Bar is not in the DB; must be preserved.
+func Bar() int { return 42 }
+`)
+	if err := os.WriteFile(filepath.Join(outDir, "test.go"), existing, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Emit(db, outDir); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(outDir, "test.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+
+	// Body update happened.
+	if !strings.Contains(got, `"NEW"`) {
+		t.Fatalf("Foo body not updated to NEW:\n%s", got)
+	}
+	// Build constraint preserved.
+	if !strings.Contains(got, "//go:build linux") {
+		t.Fatalf("//go:build constraint was lost:\n%s", got)
+	}
+	// Package doc preserved.
+	if !strings.Contains(got, "Package test is an example") {
+		t.Fatalf("package doc was lost:\n%s", got)
+	}
+	// init() preserved (not renamed, not deleted).
+	if !strings.Contains(got, "func init()") {
+		t.Fatalf("init() was lost:\n%s", got)
+	}
+	// Non-DB decl Bar preserved.
+	if !strings.Contains(got, "func Bar()") {
+		t.Fatalf("Bar was lost:\n%s", got)
+	}
+	// Per-file import preserved.
+	if !strings.Contains(got, `_ "embed"`) {
+		t.Fatalf("blank import was lost:\n%s", got)
+	}
+}
+
 func TestEmitWritesNewFileWithoutSafetyCheck(t *testing.T) {
 	// When the target path doesn't exist, emit should just write — the
 	// safety net only protects against losing existing on-disk content.

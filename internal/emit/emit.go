@@ -4,6 +4,7 @@
 package emit
 
 import (
+	"bytes"
 	"fmt"
 	"go/ast"
 	"go/format"
@@ -238,6 +239,33 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string) ([]D
 }
 
 func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import, defs []store.Definition) ([]DefLocation, error) {
+	// Phase A: if the target file already exists and parses, patch the
+	// changed declaration bodies into the existing AST and write it back.
+	// This preserves everything defn's schema doesn't represent —
+	// package doc comments, //go:build constraints, per-file import
+	// grouping, floating comments, original init() names.
+	//
+	// The regeneration path below is reserved for (a) brand-new files
+	// that don't yet exist on disk, and (b) files that don't parse
+	// cleanly (malformed, or the DB and disk have drifted so far that
+	// identity matching fails).
+	if merged, ok := astMergeIntoExisting(path, defs); ok {
+		wrote, lost, err := safeWriteGoFile(path, merged)
+		if err != nil {
+			return nil, err
+		}
+		if wrote {
+			return buildLocIndex(path, modulePath, defs), nil
+		}
+		// AST merge preserves on-disk decls by construction, so the
+		// safety net shouldn't fire. Log and fall through to regenerate
+		// defensively — at worst the regenerate path's own safety net
+		// keeps the file intact.
+		fmt.Fprintf(os.Stderr,
+			"defn: ast-merge safety net unexpectedly flagged %s (lost: %v) — falling back to regenerate\n",
+			path, lost)
+	}
+
 	// Build source by assembling each definition body into a parseable Go file.
 	// This lets go/parser + go/format handle all formatting and line tracking,
 	// eliminating manual line counting and grouped spec handling.
@@ -473,4 +501,103 @@ func groupKeyword(d store.Definition) string {
 		return "type"
 	}
 	return d.Kind
+}
+
+// astMergeIntoExisting parses the on-disk file at path, replaces the
+// bodies of top-level functions/methods that defn's database has a
+// current version of, and returns the re-formatted bytes.
+//
+// Ok=true means a merged file was produced and is safe to write.
+// Ok=false means the caller should fall back to regenerating from
+// the database — the file doesn't exist, doesn't parse, or nothing
+// in defs could be identified in the AST.
+//
+// Limited to FuncDecl (functions and methods) in v1. Type/const/var
+// changes go through regeneration for now; the safety net on the
+// regenerate path keeps them from destroying existing decls.
+func astMergeIntoExisting(path string, defs []store.Definition) ([]byte, bool) {
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, path, existing, parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		return nil, false
+	}
+
+	// Build identity → body map for functions and methods only.
+	wantBodies := make(map[string]string, len(defs))
+	for _, d := range defs {
+		if d.Kind != "function" && d.Kind != "method" {
+			continue
+		}
+		wantBodies[funcIdentity(d.Name, d.Receiver)] = d.Body
+	}
+	if len(wantBodies) == 0 {
+		// Nothing function-shaped to merge; regeneration path handles it.
+		return nil, false
+	}
+
+	pkgName := f.Name.Name
+	replaced := 0
+	for i, decl := range f.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		recv := ""
+		if fd.Recv != nil && len(fd.Recv.List) > 0 {
+			recv = recvTypeName(fd.Recv.List[0].Type)
+		}
+		key := funcIdentity(fd.Name.Name, recv)
+		newBody, ok := wantBodies[key]
+		if !ok {
+			continue
+		}
+		newFd, ok := parseStandaloneFunc(newBody, pkgName)
+		if !ok {
+			// DB body doesn't parse — leave the on-disk version in place.
+			continue
+		}
+		f.Decls[i] = newFd
+		replaced++
+	}
+
+	// If we didn't replace anything, return false so the caller falls
+	// back to regeneration. Without this, a noop merge would overwrite
+	// the file with a byte-shuffled but semantically-identical copy on
+	// every emit, churning mtimes and git diffs.
+	if replaced == 0 {
+		return nil, false
+	}
+
+	var buf bytes.Buffer
+	if err := format.Node(&buf, fset, f); err != nil {
+		return nil, false
+	}
+	return buf.Bytes(), true
+}
+
+// funcIdentity produces the identity key used to match DB definitions
+// to AST FuncDecls. Free functions and methods share the same space:
+// "Foo" for a free function, "*Server.Foo" for a pointer-receiver method.
+func funcIdentity(name, receiver string) string {
+	if receiver == "" {
+		return name
+	}
+	return receiver + "." + name
+}
+
+// parseStandaloneFunc parses a single function declaration by wrapping
+// it in a synthetic package. Returns the FuncDecl and ok=true on success.
+func parseStandaloneFunc(body, pkgName string) (*ast.FuncDecl, bool) {
+	wrapped := "package " + pkgName + "\n\n" + body
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", wrapped, parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil || len(f.Decls) == 0 {
+		return nil, false
+	}
+	fd, ok := f.Decls[0].(*ast.FuncDecl)
+	return fd, ok
 }
