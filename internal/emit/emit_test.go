@@ -52,23 +52,20 @@ func TestEmitHandlesProjectRelativeSourceFile(t *testing.T) {
 	}
 }
 
-func TestEmitSkipsFilesThatWouldLoseDeclarations(t *testing.T) {
-	// The database-reconstructed file must not be allowed to clobber an
-	// on-disk file if doing so would remove a top-level declaration. This
-	// matters because the current ingest doesn't round-trip everything
-	// (init functions get renamed to init0/init1, file-level doc comments
-	// aren't per-file, etc.). Better to skip with a warning than to
-	// destroy user code.
+func TestEmitMergePreservesUntouchedInit(t *testing.T) {
+	// init() can't round-trip through defn's schema faithfully (ingest
+	// renames it to init0/init1 to side-step name collisions), so a
+	// regenerate-from-DB path would emit the renamed variant instead
+	// of init(). Byte-range merge sidesteps the round-trip problem:
+	// it only touches the byte ranges of decls the DB is actually
+	// patching — init()'s bytes are left exactly as they were on disk.
 	db := testDB(t)
 	mod, _ := db.EnsureModule("example.com/test", "test", "")
 	db.UpsertDefinition(&store.Definition{
 		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true,
-		Body: "func Foo() {}", SourceFile: "test.go",
+		Body: "func Foo() { _ = 1 }", SourceFile: "test.go",
 	})
 
-	// Pre-populate outDir with a file that declares both Foo and an init
-	// function. Emit will try to write only Foo; it should refuse because
-	// init() would be lost.
 	outDir := t.TempDir()
 	existing := []byte("package test\n\nfunc init() {}\n\nfunc Foo() {}\n")
 	if err := os.WriteFile(filepath.Join(outDir, "test.go"), existing, 0644); err != nil {
@@ -83,8 +80,69 @@ func TestEmitSkipsFilesThatWouldLoseDeclarations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), "func init()") {
-		t.Fatalf("init() was removed by emit; safety net failed:\n%s", data)
+	s := string(data)
+	if !strings.Contains(s, "func init()") {
+		t.Fatalf("init() lost during merge:\n%s", s)
+	}
+	if !strings.Contains(s, "_ = 1") {
+		t.Fatalf("Foo body not patched:\n%s", s)
+	}
+}
+
+func TestEmitSafetyNetBlocksRegenerateThatWouldDropOnDiskDecls(t *testing.T) {
+	// When merge bails (here: because a newly-created DB def has no
+	// on-disk counterpart), emit falls through to regeneration. If
+	// regeneration would drop an on-disk decl the schema doesn't
+	// represent (init, hand-edited helpers not yet ingested, etc.),
+	// safeWriteGoFile must refuse the write. This keeps destructive
+	// emits from clobbering user code — the user sees a warning and
+	// the file stays intact rather than losing content.
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true,
+		Body: "func Foo() {}", SourceFile: "test.go",
+	})
+	// Bar exists in DB but not on disk → merge bails → regenerate runs.
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Bar", Kind: "function", Exported: true,
+		Body: "func Bar() int { return 42 }", SourceFile: "test.go",
+	})
+
+	outDir := t.TempDir()
+	// Disk has init (schema can't round-trip) and Baz (hand-edited,
+	// not yet ingested). Both must survive.
+	existing := []byte(`package test
+
+func init() {}
+
+func Foo() {}
+
+func Baz() string { return "hand-edited" }
+`)
+	if err := os.WriteFile(filepath.Join(outDir, "test.go"), existing, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Emit(db, outDir); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(outDir, "test.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(data)
+	if !strings.Contains(s, "func init()") {
+		t.Fatalf("init() was destroyed by regenerate — safety net failed:\n%s", s)
+	}
+	if !strings.Contains(s, "func Baz()") {
+		t.Fatalf("hand-edited Baz was destroyed by regenerate — safety net failed:\n%s", s)
+	}
+	// File should be untouched — matches the "existing" byte-for-byte.
+	if string(data) != string(existing) {
+		t.Fatalf("file content drifted when safety net should have blocked:\nwant:\n%s\ngot:\n%s",
+			existing, data)
 	}
 }
 
@@ -277,6 +335,51 @@ type Baz int
 	}
 	if !strings.Contains(s, "Bar is a neighbor") {
 		t.Fatalf("Bar's doc comment was lost:\n%s", s)
+	}
+}
+
+func TestEmitMergeFallsBackToRegenerateForNewDefs(t *testing.T) {
+	// Regression: merge can only REPLACE existing on-disk decls; it has
+	// no path to ADD a new one. If the DB has a newly-created def that
+	// doesn't appear on disk, merge must bail so regeneration builds
+	// the file from the full def set. Without this, new defs created
+	// via the MCP `create` op never land in the emitted file — the
+	// safety net doesn't catch it either (on-disk decls all survive;
+	// only the new def is missing).
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+
+	// file_sources represents the pre-creation state: Foo only.
+	seed := "package test\n\nfunc Foo() {}\n"
+	if err := db.SetFileSource(mod.ID, "test.go", seed); err != nil {
+		t.Fatal(err)
+	}
+
+	// DB now has Foo AND Bar (Bar is newly created).
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true,
+		Body: "func Foo() {}", SourceFile: "test.go",
+	})
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Bar", Kind: "function", Exported: true,
+		Body: "func Bar() int { return 42 }", SourceFile: "test.go",
+	})
+
+	outDir := t.TempDir()
+	if err := Emit(db, outDir); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(outDir, "test.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(data)
+	if !strings.Contains(s, "func Bar()") {
+		t.Fatalf("newly-created Bar def missing from emitted file:\n%s", s)
+	}
+	if !strings.Contains(s, "func Foo()") {
+		t.Fatalf("Foo dropped during regenerate fallback:\n%s", s)
 	}
 }
 

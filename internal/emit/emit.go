@@ -628,9 +628,9 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition) ([]byte, boo
 			}
 		}
 	}
-	if len(wantFuncs) == 0 && len(wantTypes) == 0 &&
-		len(wantConsts) == 0 && len(wantVars) == 0 &&
-		len(wantGrouped) == 0 {
+	totalWants := len(wantFuncs) + len(wantTypes) +
+		len(wantConsts) + len(wantVars) + len(wantGrouped)
+	if totalWants == 0 {
 		return nil, false
 	}
 
@@ -732,6 +732,16 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition) ([]byte, boo
 	}
 
 	if len(reps) == 0 {
+		return nil, false
+	}
+
+	// If any DB def has no on-disk counterpart to patch, fall through
+	// to regeneration. Merge can only *replace* existing decls — it has
+	// no path to *add* missing ones. A newly-created DB def would be
+	// silently dropped if we kept merging here. Regeneration rebuilds
+	// from the full def set and safeWriteGoFile's check still prevents
+	// losing any on-disk decls that aren't tracked in the database.
+	if len(reps) < totalWants {
 		return nil, false
 	}
 
