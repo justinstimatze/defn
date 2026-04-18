@@ -106,10 +106,17 @@ One MCP tool — `code` — with an `op` field. Your AI agent calls it naturally
 | `history` | Commit history for a definition | `name` |
 | `find` | Definition at a file:line | `file`, `line` |
 | `sync` | Re-ingest after file edits | — |
+| `emit` | Emit the tree to a directory (works while serve holds the DB) | `out` |
 | `query` | Read-only SQL | `sql` |
 | `test-coverage` | Test names covering a definition | `name` |
 | `batch-impact` | Combined blast radius for multiple definitions | `names` |
 | `file-defs` | Map file path to definitions | `file` |
+| `traverse` | BFS over the ref graph, direction + kind filtered | `name`, `direction` |
+| `literals` | Composite literal fields (type/field/value) | `pattern`, `name`, `body` |
+| `pragmas` | Comment pragmas (`//go:generate`, `//winze:...`) | `pattern` |
+| `branch`, `checkout`, `merge`, `commit`, `status` | git-style versioning on the DB | see Versioning |
+| `conflicts`, `resolve`, `merge-abort` | Definition-level merge conflict resolution | `name`, `body` or `pick` |
+| `diff-defs` | Structural diff between two refs | `from`, optional `to` |
 
 </details>
 
@@ -126,7 +133,9 @@ defn commit "add auth middleware"
 defn checkout main && defn merge feature
 ```
 
-In server mode, multiple agents branch and merge concurrently on the same Dolt server.
+In server mode, multiple agents branch and merge concurrently on the same Dolt server. For filesystem isolation, `defn worktree <branch> [<path>]` emits a new tree pinned to a branch (writes `.defn-worktree.json` so all CLI invocations in that dir stay on that branch).
+
+Only one `defn serve` process can own an embedded `.defn/` at a time — enforced via `syscall.Flock` on `.defn/serve.pid`. A concurrent CLI gets an actionable error pointing at `defn worktree` or `DEFN_DSN`, and `defn status` shows who's holding the lock along with any version skew between the running serve and the on-disk binary.
 
 ## Scale
 

@@ -14,9 +14,10 @@ code(op: "search", pattern: "authentication")  -- body text search
 code(op: "test", name: "Render")               -- run affected tests only
 code(op: "sync")                               -- re-ingest after file edits
 code(op: "sync", file: "pkg/foo.go")           -- fast single-file sync (~10ms)
+code(op: "emit", out: "/tmp/out")              -- emit the tree (works while serve holds the DB)
 ```
 
-All ops: read, search, impact, explain, untested, edit, create, delete, rename, move, test, apply, diff, history, find, sync, query, branch, checkout, merge, commit, status.
+All ops: read, search, impact, explain, untested, edit, create, delete, rename, move, test, apply, diff, history, find, sync, emit, query, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, traverse, literals, pragmas, file-defs, overview, patch.
 
 ### Why defn for Go, not Edit/Write
 
