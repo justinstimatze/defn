@@ -631,6 +631,7 @@ func cmdIngest(modulePath string, serverMode bool) {
 	}
 	defer db.Close()
 
+	announceStaleIngest(db, modulePath)
 	fmt.Fprintf(os.Stderr, "ingesting %s...\n", modulePath)
 	pkgs, err := goload.LoadAll(modulePath)
 	if err != nil {
@@ -971,6 +972,67 @@ func embeddedLockStatus(dbPath string) (msg string, held bool) {
 	return sb.String(), true
 }
 
+// reportServeLock prints a "running serve" section to stdout if a serve
+// is holding the flock on dbPath. Includes PID, HTTP addr, uptime, and
+// a skew warning if the running server's /version differs from this
+// binary's Version. Returns whether a lock was found.
+func reportServeLock(dbPath string) bool {
+	lock := readServeLock(dbPath)
+	if lock == nil {
+		return false
+	}
+	fmt.Println("Running serve:")
+	fmt.Printf("  pid:        %d\n", lock.PID)
+	if lock.HTTPAddr != "" {
+		fmt.Printf("  http:       http://%s/sse\n", lock.HTTPAddr)
+	}
+	if lock.Started > 0 {
+		uptime := time.Since(time.Unix(lock.Started, 0)).Round(time.Second)
+		fmt.Printf("  started:    %s ago (%s)\n", uptime,
+			time.Unix(lock.Started, 0).Format(time.RFC3339))
+	}
+	// Version skew: ask the running serve what version it is. Silent
+	// if the endpoint isn't reachable (older serve predating /version,
+	// or transient network issue) — don't cry wolf.
+	if lock.HTTPAddr != "" {
+		if runningVer := fetchServerVersion(lock.HTTPAddr); runningVer != "" {
+			if runningVer != mcpserver.Version {
+				fmt.Printf("  version:    %s (on-disk defn: %s)\n", runningVer, mcpserver.Version)
+				fmt.Fprintf(os.Stderr,
+					"\nVersion skew: running serve is %s but $(which defn) is %s.\n"+
+						"  restart 'defn serve' to pick up the new binary.\n",
+					runningVer, mcpserver.Version)
+			} else {
+				fmt.Printf("  version:    %s\n", runningVer)
+			}
+		}
+	}
+	fmt.Println()
+	return true
+}
+
+// fetchServerVersion GETs http://<addr>/version on the running MCP
+// serve. Returns "" on any error so callers can silently skip when the
+// running server predates the /version endpoint.
+func fetchServerVersion(addr string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("http://%s/version", addr), nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return ""
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(body))
+}
+
 // checkEmbeddedAvailable aborts with an actionable message if a defn
 // serve process is holding the embedded DB at dbPath. Called by CLI
 // commands that want to open embedded before they pay for a Dolt
@@ -1130,17 +1192,19 @@ func cmdQuery(sql string) {
 // warnIfStale prints a warning to stderr if any .go file under projectDir
 // is newer than the last recorded ingest timestamp. Silent if the
 // database has no last_ingest recorded (older DBs) or nothing is stale.
-func warnIfStale(db *store.DB, projectDir string) {
+// countStaleFiles reports how many .go files under projectDir have
+// been modified since the last ingest. Returns (0, "") when the DB
+// has no last_ingest meta (older DBs) or nothing is stale. sample is
+// the first stale path encountered, for user-facing messages.
+func countStaleFiles(db *store.DB, projectDir string) (count int, sample string) {
 	lastIngestStr, err := db.GetMeta("last_ingest")
 	if err != nil || lastIngestStr == "" {
-		return
+		return 0, ""
 	}
 	lastIngest, err := strconv.ParseInt(lastIngestStr, 10, 64)
 	if err != nil {
-		return
+		return 0, ""
 	}
-	var count int
-	var sample string
 	_ = filepath.WalkDir(projectDir, func(path string, d fs.DirEntry, werr error) error {
 		if werr != nil {
 			return werr
@@ -1168,6 +1232,11 @@ func warnIfStale(db *store.DB, projectDir string) {
 		}
 		return nil
 	})
+	return count, sample
+}
+
+func warnIfStale(db *store.DB, projectDir string) {
+	count, sample := countStaleFiles(db, projectDir)
 	if count == 0 {
 		return
 	}
@@ -1175,6 +1244,22 @@ func warnIfStale(db *store.DB, projectDir string) {
 		fmt.Fprintf(os.Stderr, "defn: 1 file modified since last ingest (%s) — results may be stale (run 'defn ingest .')\n", sample)
 	} else {
 		fmt.Fprintf(os.Stderr, "defn: %d files modified since last ingest — results may be stale (run 'defn ingest .')\n", count)
+	}
+}
+
+// announceStaleIngest prints a one-line notice of pending stale files
+// on entry to ingest/sync so the user sees staleness was detected and
+// is being resolved by the current operation — closing the loop that
+// `warnIfStale` opens on read paths.
+func announceStaleIngest(db *store.DB, projectDir string) {
+	count, sample := countStaleFiles(db, projectDir)
+	if count == 0 {
+		return
+	}
+	if count == 1 {
+		fmt.Fprintf(os.Stderr, "defn: 1 stale file detected (%s), ingesting...\n", sample)
+	} else {
+		fmt.Fprintf(os.Stderr, "defn: %d stale files detected, ingesting...\n", count)
 	}
 }
 
@@ -1375,7 +1460,19 @@ func cmdCheck() {
 }
 
 func cmdStatus() {
-	db, err := store.Open(getDBPath())
+	dbPath := getDBPath()
+
+	// Report the running serve first. Users running `defn status`
+	// specifically want to know who's holding the lock. If the flock
+	// is held by another process, we can't open embedded for DB
+	// stats; show what we know and exit cleanly.
+	locked := reportServeLock(dbPath)
+	if locked && !strings.Contains(dbPath, "@") {
+		fmt.Fprintln(os.Stderr, "\nSkipping DB stats (embedded DB is held by the running serve).")
+		return
+	}
+
+	db, err := store.Open(dbPath)
 	if err != nil {
 		fatal(err)
 	}
@@ -1385,42 +1482,22 @@ func cmdStatus() {
 	mods, _ := db.ListModules()
 	defs, _ := db.FindDefinitions("%")
 	fmt.Printf("On branch %s\n", branch)
-	fmt.Printf("Database: %s\n", getDBPath())
+	fmt.Printf("Database: %s\n", dbPath)
 	fmt.Printf("%d modules, %d definitions\n", len(mods), len(defs))
 
-	// Check freshness: compare newest .go file against DB modtime.
-	dbPath := getDBPath()
-	dbStat, err := os.Stat(filepath.Join(dbPath, ".dolt", "noms"))
-	if err != nil {
-		return
-	}
-	dbTime := dbStat.ModTime()
-
-	var newestFile string
-	var newestTime time.Time
-	filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
-			base := filepath.Base(path)
-			if base == ".defn" || base == ".defn-server" || base == ".git" || base == "vendor" || base == "node_modules" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if strings.HasSuffix(path, ".go") && info.ModTime().After(newestTime) {
-			newestTime = info.ModTime()
-			newestFile = path
-		}
-		return nil
-	})
-
-	if newestTime.IsZero() {
-		return
-	}
-	if newestTime.After(dbTime) {
-		fmt.Fprintf(os.Stderr, "\nDatabase may be stale: %s is newer than DB\n", newestFile)
-		fmt.Fprintf(os.Stderr, "  run: defn ingest .\n")
+	// Freshness via last_ingest meta — authoritative across serves and
+	// matches what `defn query` reports. Falls back to silence when the
+	// DB predates last_ingest.
+	count, sample := countStaleFiles(db, ".")
+	fmt.Fprintln(os.Stderr)
+	if count == 0 {
+		fmt.Fprintln(os.Stderr, "Database is up to date")
+	} else if count == 1 {
+		fmt.Fprintf(os.Stderr, "Database may be stale: %s modified since last ingest\n", sample)
+		fmt.Fprintln(os.Stderr, "  run: defn ingest .")
 	} else {
-		fmt.Fprintf(os.Stderr, "\nDatabase is up to date\n")
+		fmt.Fprintf(os.Stderr, "Database may be stale: %d files modified since last ingest (e.g. %s)\n", count, sample)
+		fmt.Fprintln(os.Stderr, "  run: defn ingest .")
 	}
 }
 

@@ -30,6 +30,12 @@ import (
 
 const maxSearchResults = 20 // keep responses compact to avoid context bloat
 
+// Version is the running defn build's semver string. Kept as a package
+// constant so the CLI can compare its own version against what a
+// running serve reports via the /version HTTP endpoint, surfacing
+// binary/serve skew in `defn status`.
+const Version = "0.14.0"
+
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
 	testTimeout  = envDuration("DEFN_TEST_TIMEOUT", 60*time.Second)
@@ -63,11 +69,8 @@ func Run(ctx context.Context, database *store.DB, projDir string) error {
 // Multiple clients can connect to the same server, sharing one defn process.
 func RunHTTP(ctx context.Context, database *store.DB, projDir, addr string) error {
 	_, mcpServer := newMCPServer(ctx, database, projDir)
-	handler := sdkmcp.NewSSEHandler(func(*http.Request) *sdkmcp.Server {
-		return mcpServer
-	}, nil)
 	fmt.Fprintf(os.Stderr, "defn: listening on %s\n", addr)
-	srv := &http.Server{Addr: addr, Handler: handler}
+	srv := &http.Server{Addr: addr, Handler: mcpHTTPMux(mcpServer)}
 	go func() {
 		<-ctx.Done()
 		srv.Close()
@@ -82,11 +85,8 @@ func RunShared(ctx context.Context, database *store.DB, projDir, addr string) er
 	_, mcpServer := newMCPServer(ctx, database, projDir)
 
 	// Start HTTP/SSE in background.
-	handler := sdkmcp.NewSSEHandler(func(*http.Request) *sdkmcp.Server {
-		return mcpServer
-	}, nil)
 	fmt.Fprintf(os.Stderr, "defn: shared server on %s\n", addr)
-	srv := &http.Server{Addr: addr, Handler: handler}
+	srv := &http.Server{Addr: addr, Handler: mcpHTTPMux(mcpServer)}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			fmt.Fprintf(os.Stderr, "defn: http server error: %v\n", err)
@@ -149,6 +149,27 @@ func RunProxy(ctx context.Context, sseEndpoint string) error {
 	return <-errc
 }
 
+// mcpHTTPMux returns the ServeMux used by RunHTTP and RunShared. MCP
+// clients connect to /sse; CLI tools hit /version to check for binary
+// skew (an older serve still running under an upgraded on-disk defn).
+func mcpHTTPMux(mcpServer *sdkmcp.Server) http.Handler {
+	sse := sdkmcp.NewSSEHandler(func(*http.Request) *sdkmcp.Server {
+		return mcpServer
+	}, nil)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Write([]byte(Version))
+	})
+	// /sse is the SSE entry point; subpaths (/sse/<id>) are per-session
+	// streams. Anything unmatched falls through to SSE for backward
+	// compatibility with clients hitting "/".
+	mux.Handle("/sse", sse)
+	mux.Handle("/sse/", sse)
+	mux.Handle("/", sse)
+	return mux
+}
+
 // newMCPServer creates the internal server state and MCP server instance.
 // Shared by both stdio and HTTP transports.
 func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*server, *sdkmcp.Server) {
@@ -175,7 +196,7 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 
 	mcpServer := sdkmcp.NewServer(&sdkmcp.Implementation{
 		Name:    "defn",
-		Version: "0.14.0",
+		Version: Version,
 	}, nil)
 
 	sdkmcp.AddTool(mcpServer, &sdkmcp.Tool{
