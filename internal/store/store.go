@@ -829,11 +829,27 @@ func (s *DB) GetImports(moduleID int64) ([]Import, error) {
 // when present (server mode) so this probe reflects the actual session
 // state, falling back to the pool otherwise. Useful for long-running
 // clients to detect that a Dolt sql-server has restarted.
+//
+// On GC invalidation (Dolt killed our conn when it ran DOLT_GC), Ping
+// transparently reacquires a fresh pinned conn and retries once, so
+// callers see a successful ping whenever the database is actually
+// reachable — they don't have to understand the invalidation sentinel.
 func (s *DB) Ping(ctx context.Context) error {
-	if c := s.pinnedConn(); c != nil {
-		return c.PingContext(ctx)
+	c := s.pinnedConn()
+	if c == nil {
+		return s.db.PingContext(ctx)
 	}
-	return s.db.PingContext(ctx)
+	err := c.PingContext(ctx)
+	if err != nil && isGCInvalidation(err) {
+		if reErr := s.reacquirePinnedConn(ctx); reErr != nil {
+			return reErr
+		}
+		if c2 := s.pinnedConn(); c2 != nil {
+			return c2.PingContext(ctx)
+		}
+		return s.db.PingContext(ctx)
+	}
+	return err
 }
 
 // GetMeta returns the value for a key, or "" if not set.

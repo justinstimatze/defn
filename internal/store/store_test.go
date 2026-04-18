@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	_ "embed"
 	"os"
 	"path/filepath"
@@ -71,6 +72,27 @@ func TestGCSurvivesConnInvalidation(t *testing.T) {
 		Body: "func Bar() {}",
 	}); err != nil {
 		t.Fatalf("write after GC: %v", err)
+	}
+}
+
+func TestPingSurvivesGCInvalidation(t *testing.T) {
+	// Ping must absorb the same GC-invalidation recovery that
+	// queryContext/queryRowContext do, so callers' retry loops don't
+	// need to understand the invalidation sentinel.
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+	db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true,
+		Body: "func Foo() {}",
+	})
+	if err := db.Commit("seed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GC(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Ping(context.Background()); err != nil {
+		t.Fatalf("Ping after GC: %v", err)
 	}
 }
 
