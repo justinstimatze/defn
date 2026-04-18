@@ -23,6 +23,37 @@ func testDB(t *testing.T) *store.DB {
 	return db
 }
 
+func TestEmitHandlesProjectRelativeSourceFile(t *testing.T) {
+	// Regression: before 2026-04-17, source_file was used verbatim as a
+	// byFile key and joined with pkgDir, yielding doubled paths like
+	// outDir/cmd/defn/cmd/defn/main.go. Ensure basename is used.
+	db := testDB(t)
+	root, _ := db.EnsureModule("example.com/test", "test", "")
+	sub, _ := db.EnsureModule("example.com/test/cmd/tool", "main", "")
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: root.ID, Name: "Foo", Kind: "function", Exported: true,
+		Body: "func Foo() {}", SourceFile: "test.go",
+	})
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: sub.ID, Name: "main", Kind: "function",
+		Body: "func main() {}", SourceFile: "cmd/tool/main.go",
+	})
+
+	outDir := t.TempDir()
+	if err := Emit(db, outDir); err != nil {
+		t.Fatal(err)
+	}
+
+	// Correct path.
+	if _, err := os.Stat(filepath.Join(outDir, "cmd/tool/main.go")); err != nil {
+		t.Fatalf("expected main.go at cmd/tool/, got: %v", err)
+	}
+	// Doubled path must not exist.
+	if _, err := os.Stat(filepath.Join(outDir, "cmd/tool/cmd/tool/main.go")); err == nil {
+		t.Fatal("emit produced doubled path cmd/tool/cmd/tool/main.go")
+	}
+}
+
 func TestEmitGeneratedHeader(t *testing.T) {
 	db := testDB(t)
 	// Use a two-level module path so detectModuleRoot can compute a prefix.

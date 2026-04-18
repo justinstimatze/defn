@@ -47,23 +47,25 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 type server struct {
 	db              *store.DB
 	projectDir      string
-	lastResolved    atomic.Int64 // UnixNano timestamp of last resolve (to debounce watcher)
-	ready           atomic.Bool  // true after startup ingest+resolve completes
-	autoCommitCount atomic.Int64 // counts auto-commits; triggers GC every 50
+	lastResolved    atomic.Int64  // UnixNano timestamp of last resolve (to debounce watcher)
+	ready           atomic.Bool   // true after startup ingest+resolve completes
+	autoCommitCount atomic.Int64  // counts auto-commits; triggers GC every 50
+	startupDone     chan struct{} // closed when startup ingest finishes
 }
 
 // Run starts the MCP server over stdio. projDir is the project root where
 // files should be emitted (for in-place sync with file-based tools).
 func Run(ctx context.Context, database *store.DB, projDir string) error {
 	s, mcpServer := newMCPServer(ctx, database, projDir)
-	_ = s
-	return mcpServer.Run(ctx, &sdkmcp.StdioTransport{})
+	err := mcpServer.Run(ctx, &sdkmcp.StdioTransport{})
+	<-s.startupDone // ensure startup ingest finishes before caller closes DB
+	return err
 }
 
 // RunHTTP starts the MCP server over HTTP/SSE on addr (e.g. ":9420").
 // Multiple clients can connect to the same server, sharing one defn process.
 func RunHTTP(ctx context.Context, database *store.DB, projDir, addr string) error {
-	_, mcpServer := newMCPServer(ctx, database, projDir)
+	s, mcpServer := newMCPServer(ctx, database, projDir)
 	handler := sdkmcp.NewSSEHandler(func(*http.Request) *sdkmcp.Server {
 		return mcpServer
 	}, nil)
@@ -73,14 +75,16 @@ func RunHTTP(ctx context.Context, database *store.DB, projDir, addr string) erro
 		<-ctx.Done()
 		srv.Close()
 	}()
-	return srv.ListenAndServe()
+	err := srv.ListenAndServe()
+	<-s.startupDone
+	return err
 }
 
 // RunShared starts an HTTP/SSE server on addr and simultaneously serves
 // this client over stdio. Used for auto-sharing: first session starts the
 // HTTP daemon; subsequent sessions proxy to it via RunProxy.
 func RunShared(ctx context.Context, database *store.DB, projDir, addr string) error {
-	_, mcpServer := newMCPServer(ctx, database, projDir)
+	s, mcpServer := newMCPServer(ctx, database, projDir)
 
 	// Start HTTP/SSE in background.
 	handler := sdkmcp.NewSSEHandler(func(*http.Request) *sdkmcp.Server {
@@ -99,7 +103,12 @@ func RunShared(ctx context.Context, database *store.DB, projDir, addr string) er
 	}()
 
 	// Serve this client over stdio (blocks until client disconnects).
-	return mcpServer.Run(ctx, &sdkmcp.StdioTransport{})
+	err := mcpServer.Run(ctx, &sdkmcp.StdioTransport{})
+	// Block db.Close() from racing the startup ingest goroutine: it uses
+	// the same pinned conn and would error with "connection is already
+	// closed" if the DB is torn down first.
+	<-s.startupDone
+	return err
 }
 
 // RunProxy bridges a stdio MCP client to an existing HTTP/SSE defn server.
@@ -153,7 +162,7 @@ func RunProxy(ctx context.Context, sseEndpoint string) error {
 // newMCPServer creates the internal server state and MCP server instance.
 // Shared by both stdio and HTTP transports.
 func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*server, *sdkmcp.Server) {
-	s := &server{db: database, projectDir: projDir}
+	s := &server{db: database, projectDir: projDir, startupDone: make(chan struct{})}
 
 	if projDir != "" {
 		// Reconcile changes made while defn was not running (file moves,
@@ -161,12 +170,15 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 		// the client's connection timeout. Queries before completion serve
 		// from whatever's in the DB; results include a staleness notice.
 		go func() {
+			defer close(s.startupDone)
 			if err := s.ingestAndResolve(); err != nil {
 				fmt.Fprintf(os.Stderr, "defn: startup ingest/resolve failed: %v\n", err)
 			}
 			s.ready.Store(true)
 		}()
 		go s.watchFiles(ctx)
+	} else {
+		close(s.startupDone) // no startup work
 	}
 
 	mcpServer := sdkmcp.NewServer(&sdkmcp.Implementation{
