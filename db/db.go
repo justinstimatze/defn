@@ -84,10 +84,17 @@ func (db *DB) GetMeta(key string) (string, error) {
 }
 
 // SetMeta stores value under key in defn_meta. Overwrites any previous
-// value. The key namespace is shared with defn itself — use a prefix
-// (e.g. "winze:last_cycle") to avoid collisions with defn-managed
-// keys like last_ingest.
+// value.
+//
+// External keys must contain a ":" namespace separator (e.g.
+// "winze:last_cycle") to prevent collisions with defn-managed keys
+// like last_ingest. Returns an error on unqualified keys rather than
+// silently shadowing internal state.
 func (db *DB) SetMeta(key, value string) error {
+	if !strings.Contains(key, ":") {
+		return fmt.Errorf("SetMeta: key %q must include a namespace prefix (e.g. %q) — "+
+			"unqualified keys are reserved for defn", key, "myapp:"+key)
+	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	return db.s.SetMeta(key, value)

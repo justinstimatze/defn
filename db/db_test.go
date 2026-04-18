@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -55,5 +56,31 @@ func TestMetaRoundTrip(t *testing.T) {
 	got, _ = d.GetMeta("winze:last_cycle")
 	if got != "2026-04-18T12:00:00Z" {
 		t.Errorf("overwrite produced %q", got)
+	}
+}
+
+func TestSetMetaRequiresNamespacePrefix(t *testing.T) {
+	// Unqualified keys would collide with defn-managed state like
+	// last_ingest. SetMeta must refuse them rather than silently
+	// clobbering internal metadata.
+	dir := t.TempDir()
+	d, err := Open(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	err = d.SetMeta("last_ingest", "1234567890")
+	if err == nil {
+		t.Fatal("SetMeta accepted 'last_ingest' without a namespace prefix")
+	}
+	if !strings.Contains(err.Error(), "namespace prefix") {
+		t.Errorf("error should mention namespace prefix, got: %v", err)
+	}
+
+	// Reads of defn-managed keys are unrestricted — external callers
+	// can still observe defn's own metadata.
+	if _, err := d.GetMeta("last_ingest"); err != nil {
+		t.Errorf("GetMeta on defn-managed key failed: %v", err)
 	}
 }

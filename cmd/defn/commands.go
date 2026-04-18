@@ -984,7 +984,7 @@ func reportServeLock(dbPath string) bool {
 	fmt.Println("Running serve:")
 	fmt.Printf("  pid:        %d\n", lock.PID)
 	if lock.HTTPAddr != "" {
-		fmt.Printf("  http:       http://%s/sse\n", lock.HTTPAddr)
+		fmt.Printf("  mcp:        http://%s/sse\n", lock.HTTPAddr)
 	}
 	if lock.Started > 0 {
 		uptime := time.Since(time.Unix(lock.Started, 0)).Round(time.Second)
@@ -1013,9 +1013,12 @@ func reportServeLock(dbPath string) bool {
 
 // fetchServerVersion GETs http://<addr>/version on the running MCP
 // serve. Returns "" on any error so callers can silently skip when the
-// running server predates the /version endpoint.
+// running server predates the /version endpoint. 2s timeout — long
+// enough that a serve under load (e.g. mid-ingest) still responds,
+// short enough that a wedged or dead socket doesn't stall `defn
+// status` for a human's attention window.
 func fetchServerVersion(addr string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("http://%s/version", addr), nil)
 	resp, err := http.DefaultClient.Do(req)
@@ -1189,13 +1192,13 @@ func cmdQuery(sql string) {
 	enc.Encode(results)
 }
 
-// warnIfStale prints a warning to stderr if any .go file under projectDir
-// is newer than the last recorded ingest timestamp. Silent if the
-// database has no last_ingest recorded (older DBs) or nothing is stale.
 // countStaleFiles reports how many .go files under projectDir have
 // been modified since the last ingest. Returns (0, "") when the DB
 // has no last_ingest meta (older DBs) or nothing is stale. sample is
 // the first stale path encountered, for user-facing messages.
+//
+// Walks projectDir skipping .defn/, .git/, vendor/, node_modules/,
+// and testdata/. Shared backend for warnIfStale and announceStaleIngest.
 func countStaleFiles(db *store.DB, projectDir string) (count int, sample string) {
 	lastIngestStr, err := db.GetMeta("last_ingest")
 	if err != nil || lastIngestStr == "" {
@@ -1235,6 +1238,10 @@ func countStaleFiles(db *store.DB, projectDir string) (count int, sample string)
 	return count, sample
 }
 
+// warnIfStale prints a stderr notice when the working tree has .go
+// files newer than the last ingest — signaling that read ops (query,
+// status) may return stale results. Silent when up to date or when
+// the DB predates last_ingest.
 func warnIfStale(db *store.DB, projectDir string) {
 	count, sample := countStaleFiles(db, projectDir)
 	if count == 0 {

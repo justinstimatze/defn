@@ -2,6 +2,9 @@ package mcp
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +15,44 @@ import (
 	"github.com/justinstimatze/defn/internal/store"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+func TestVersionEndpoint(t *testing.T) {
+	// Route /version through the real mux to cover the method guard
+	// and the Content-Type header contract that CLI status depends on.
+	mcpServer := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "defn", Version: Version}, nil)
+	srv := httptest.NewServer(mcpHTTPMux(mcpServer))
+	defer srv.Close()
+
+	// GET returns the version as text/plain.
+	resp, err := http.Get(srv.URL + "/version")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("GET /version status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Errorf("Content-Type = %q, want text/plain", ct)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if got := strings.TrimSpace(string(body)); got != Version {
+		t.Errorf("body = %q, want %q", got, Version)
+	}
+
+	// POST is rejected with 405 + Allow header.
+	resp, err = http.Post(srv.URL+"/version", "text/plain", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("POST /version status = %d, want 405", resp.StatusCode)
+	}
+	if allow := resp.Header.Get("Allow"); !strings.Contains(allow, "GET") {
+		t.Errorf("Allow = %q, should include GET", allow)
+	}
+}
 
 // --- Pure function tests ---
 
