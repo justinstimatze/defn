@@ -972,45 +972,6 @@ func embeddedLockStatus(dbPath string) (msg string, held bool) {
 	return sb.String(), true
 }
 
-// reportServeLock prints a "running serve" section to stdout if a serve
-// is holding the flock on dbPath. Includes PID, HTTP addr, uptime, and
-// a skew warning if the running server's /version differs from this
-// binary's Version. Returns whether a lock was found.
-func reportServeLock(dbPath string) bool {
-	lock := readServeLock(dbPath)
-	if lock == nil {
-		return false
-	}
-	fmt.Println("Running serve:")
-	fmt.Printf("  pid:        %d\n", lock.PID)
-	if lock.HTTPAddr != "" {
-		fmt.Printf("  mcp:        http://%s/sse\n", lock.HTTPAddr)
-	}
-	if lock.Started > 0 {
-		uptime := time.Since(time.Unix(lock.Started, 0)).Round(time.Second)
-		fmt.Printf("  started:    %s ago (%s)\n", uptime,
-			time.Unix(lock.Started, 0).Format(time.RFC3339))
-	}
-	// Version skew: ask the running serve what version it is. Silent
-	// if the endpoint isn't reachable (older serve predating /version,
-	// or transient network issue) — don't cry wolf.
-	if lock.HTTPAddr != "" {
-		if runningVer := fetchServerVersion(lock.HTTPAddr); runningVer != "" {
-			if runningVer != mcpserver.Version {
-				fmt.Printf("  version:    %s (on-disk defn: %s)\n", runningVer, mcpserver.Version)
-				fmt.Fprintf(os.Stderr,
-					"\nVersion skew: running serve is %s but $(which defn) is %s.\n"+
-						"  restart 'defn serve' to pick up the new binary.\n",
-					runningVer, mcpserver.Version)
-			} else {
-				fmt.Printf("  version:    %s\n", runningVer)
-			}
-		}
-	}
-	fmt.Println()
-	return true
-}
-
 // fetchServerVersion GETs http://<addr>/version on the running MCP
 // serve. Returns "" on any error so callers can silently skip when the
 // running server predates the /version endpoint. 2s timeout — long
@@ -1466,17 +1427,89 @@ func cmdCheck() {
 	}
 }
 
-func cmdStatus() {
-	dbPath := getDBPath()
+// statusReport is the structured form of `defn status`. JSON output
+// marshals this directly; human output renders it via formatters
+// below. Kept tight so scripts (polecat, slimemold) can depend on a
+// stable shape.
+type statusReport struct {
+	RunningServe *runningServeInfo `json:"running_serve,omitempty"`
+	VersionSkew  *versionSkewInfo  `json:"version_skew,omitempty"`
+	Database     *databaseInfo     `json:"database,omitempty"`
+	// Freshness is nil when we couldn't check (e.g. the embedded DB is
+	// locked by the running serve). Scripts should treat a missing
+	// field as "unknown", not "up to date".
+	Freshness *freshnessInfo `json:"freshness,omitempty"`
+}
 
-	// Report the running serve first. Users running `defn status`
-	// specifically want to know who's holding the lock. If the flock
-	// is held by another process, we can't open embedded for DB
-	// stats; show what we know and exit cleanly.
-	locked := reportServeLock(dbPath)
-	if locked && !strings.Contains(dbPath, "@") {
-		fmt.Fprintln(os.Stderr, "\nSkipping DB stats (embedded DB is held by the running serve).")
+type runningServeInfo struct {
+	PID           int    `json:"pid"`
+	HTTPAddr      string `json:"http_addr,omitempty"`
+	StartedUnix   int64  `json:"started_unix,omitempty"`
+	UptimeSeconds int64  `json:"uptime_seconds,omitempty"`
+	Version       string `json:"version,omitempty"`
+}
+
+type versionSkewInfo struct {
+	Running string `json:"running"`
+	OnDisk  string `json:"on_disk"`
+}
+
+type databaseInfo struct {
+	Path        string `json:"path"`
+	Branch      string `json:"branch"`
+	Modules     int    `json:"modules"`
+	Definitions int    `json:"definitions"`
+}
+
+type freshnessInfo struct {
+	UpToDate   bool   `json:"up_to_date"`
+	StaleCount int    `json:"stale_count"`
+	Sample     string `json:"sample,omitempty"`
+}
+
+func cmdStatus(jsonOut bool) {
+	r := collectStatus(getDBPath())
+	if jsonOut {
+		out, err := json.MarshalIndent(r, "", "  ")
+		if err != nil {
+			fatal(err)
+		}
+		fmt.Println(string(out))
 		return
+	}
+	printStatus(r)
+}
+
+// collectStatus gathers the full status report. Doesn't print; the
+// caller renders in either human or JSON form.
+func collectStatus(dbPath string) statusReport {
+	var r statusReport
+
+	if lock := readServeLock(dbPath); lock != nil {
+		info := &runningServeInfo{
+			PID:         lock.PID,
+			HTTPAddr:    lock.HTTPAddr,
+			StartedUnix: lock.Started,
+		}
+		if lock.Started > 0 {
+			info.UptimeSeconds = int64(time.Since(time.Unix(lock.Started, 0)).Seconds())
+		}
+		if lock.HTTPAddr != "" {
+			if v := fetchServerVersion(lock.HTTPAddr); v != "" {
+				info.Version = v
+				if v != mcpserver.Version {
+					r.VersionSkew = &versionSkewInfo{Running: v, OnDisk: mcpserver.Version}
+				}
+			}
+		}
+		r.RunningServe = info
+	}
+
+	// Skip DB stats when the flock is held on an embedded path — we
+	// can't open it without racing Dolt's own manifest lock.
+	embeddedAndLocked := r.RunningServe != nil && !strings.Contains(dbPath, "@")
+	if embeddedAndLocked {
+		return r
 	}
 
 	db, err := store.Open(dbPath)
@@ -1488,22 +1521,70 @@ func cmdStatus() {
 	branch, _ := db.GetCurrentBranch()
 	mods, _ := db.ListModules()
 	defs, _ := db.FindDefinitions("%")
-	fmt.Printf("On branch %s\n", branch)
-	fmt.Printf("Database: %s\n", dbPath)
-	fmt.Printf("%d modules, %d definitions\n", len(mods), len(defs))
+	r.Database = &databaseInfo{
+		Path: dbPath, Branch: branch,
+		Modules: len(mods), Definitions: len(defs),
+	}
 
-	// Freshness via last_ingest meta — authoritative across serves and
-	// matches what `defn query` reports. Falls back to silence when the
-	// DB predates last_ingest.
 	count, sample := countStaleFiles(db, ".")
+	r.Freshness = &freshnessInfo{
+		UpToDate:   count == 0,
+		StaleCount: count,
+		Sample:     sample,
+	}
+	return r
+}
+
+func printStatus(r statusReport) {
+	if s := r.RunningServe; s != nil {
+		fmt.Println("Running serve:")
+		fmt.Printf("  pid:        %d\n", s.PID)
+		if s.HTTPAddr != "" {
+			fmt.Printf("  mcp:        http://%s/sse\n", s.HTTPAddr)
+		}
+		if s.StartedUnix > 0 {
+			uptime := time.Duration(s.UptimeSeconds) * time.Second
+			fmt.Printf("  started:    %s ago (%s)\n", uptime,
+				time.Unix(s.StartedUnix, 0).Format(time.RFC3339))
+		}
+		if s.Version != "" {
+			if r.VersionSkew != nil {
+				fmt.Printf("  version:    %s (on-disk defn: %s)\n", s.Version, r.VersionSkew.OnDisk)
+			} else {
+				fmt.Printf("  version:    %s\n", s.Version)
+			}
+		}
+		fmt.Println()
+		if r.VersionSkew != nil {
+			fmt.Fprintf(os.Stderr,
+				"Version skew: running serve is %s but $(which defn) is %s.\n"+
+					"  restart 'defn serve' to pick up the new binary.\n\n",
+				r.VersionSkew.Running, r.VersionSkew.OnDisk)
+		}
+	}
+
+	if r.Database == nil {
+		fmt.Fprintln(os.Stderr, "Skipping DB stats (embedded DB is held by the running serve).")
+		return
+	}
+
+	fmt.Printf("On branch %s\n", r.Database.Branch)
+	fmt.Printf("Database: %s\n", r.Database.Path)
+	fmt.Printf("%d modules, %d definitions\n", r.Database.Modules, r.Database.Definitions)
 	fmt.Fprintln(os.Stderr)
-	if count == 0 {
+
+	if r.Freshness == nil {
+		return
+	}
+	switch {
+	case r.Freshness.StaleCount == 0:
 		fmt.Fprintln(os.Stderr, "Database is up to date")
-	} else if count == 1 {
-		fmt.Fprintf(os.Stderr, "Database may be stale: %s modified since last ingest\n", sample)
+	case r.Freshness.StaleCount == 1:
+		fmt.Fprintf(os.Stderr, "Database may be stale: %s modified since last ingest\n", r.Freshness.Sample)
 		fmt.Fprintln(os.Stderr, "  run: defn ingest .")
-	} else {
-		fmt.Fprintf(os.Stderr, "Database may be stale: %d files modified since last ingest (e.g. %s)\n", count, sample)
+	default:
+		fmt.Fprintf(os.Stderr, "Database may be stale: %d files modified since last ingest (e.g. %s)\n",
+			r.Freshness.StaleCount, r.Freshness.Sample)
 		fmt.Fprintln(os.Stderr, "  run: defn ingest .")
 	}
 }

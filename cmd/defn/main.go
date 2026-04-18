@@ -95,7 +95,13 @@ func main() {
 	case "lint":
 		cmdLint()
 	case "status":
-		cmdStatus()
+		jsonFlag := false
+		for _, a := range os.Args[2:] {
+			if a == "--json" {
+				jsonFlag = true
+			}
+		}
+		cmdStatus(jsonFlag)
 	case "check":
 		cmdCheck()
 	case "branch":
