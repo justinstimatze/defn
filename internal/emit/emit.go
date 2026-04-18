@@ -193,10 +193,7 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string) ([]D
 		return nil, err
 	}
 
-	// Group definitions by source file. Use the basename because
-	// source_file is stored as a project-relative path (e.g.
-	// "internal/mcp/tools_extra.go"); joining that with pkgDir doubles
-	// the directory prefix and writes land in a non-existent path.
+	// Group definitions by source file.
 	// If source_file is empty (old data), fall back to one file per package.
 	byFile := map[string][]store.Definition{}
 	for _, d := range defs {
@@ -207,8 +204,6 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string) ([]D
 			} else {
 				file = strings.ToLower(mod.Name) + ".go"
 			}
-		} else {
-			file = filepath.Base(file)
 		}
 		byFile[file] = append(byFile[file], d)
 	}

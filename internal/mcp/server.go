@@ -47,10 +47,9 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 type server struct {
 	db              *store.DB
 	projectDir      string
-	lastResolved    atomic.Int64  // UnixNano timestamp of last resolve (to debounce watcher)
-	ready           atomic.Bool   // true after startup ingest+resolve completes
-	autoCommitCount atomic.Int64  // counts auto-commits; triggers GC every 50
-	startupDone     chan struct{} // closed when startup ingest finishes
+	lastResolved    atomic.Int64 // UnixNano timestamp of last resolve (to debounce watcher)
+	ready           atomic.Bool  // true after startup ingest+resolve completes
+	autoCommitCount atomic.Int64 // counts auto-commits; triggers GC every 50
 }
 
 // Run starts the MCP server over stdio. projDir is the project root where
@@ -153,7 +152,7 @@ func RunProxy(ctx context.Context, sseEndpoint string) error {
 // newMCPServer creates the internal server state and MCP server instance.
 // Shared by both stdio and HTTP transports.
 func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*server, *sdkmcp.Server) {
-	s := &server{db: database, projectDir: projDir, startupDone: make(chan struct{})}
+	s := &server{db: database, projectDir: projDir}
 
 	if projDir != "" {
 		// Reconcile changes made while defn was not running (file moves,
@@ -161,7 +160,6 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 		// the client's connection timeout. Queries before completion serve
 		// from whatever's in the DB; results include a staleness notice.
 		go func() {
-			defer close(s.startupDone)
 			if err := s.ingestAndResolve(); err != nil {
 				// "connection is already closed" means the DB was torn
 				// down mid-ingest (stdin EOF → db.Close()). Not a real
@@ -173,8 +171,6 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 			s.ready.Store(true)
 		}()
 		go s.watchFiles(ctx)
-	} else {
-		close(s.startupDone) // no startup work
 	}
 
 	mcpServer := sdkmcp.NewServer(&sdkmcp.Implementation{
