@@ -56,16 +56,14 @@ type server struct {
 // Run starts the MCP server over stdio. projDir is the project root where
 // files should be emitted (for in-place sync with file-based tools).
 func Run(ctx context.Context, database *store.DB, projDir string) error {
-	s, mcpServer := newMCPServer(ctx, database, projDir)
-	err := mcpServer.Run(ctx, &sdkmcp.StdioTransport{})
-	<-s.startupDone // ensure startup ingest finishes before caller closes DB
-	return err
+	_, mcpServer := newMCPServer(ctx, database, projDir)
+	return mcpServer.Run(ctx, &sdkmcp.StdioTransport{})
 }
 
 // RunHTTP starts the MCP server over HTTP/SSE on addr (e.g. ":9420").
 // Multiple clients can connect to the same server, sharing one defn process.
 func RunHTTP(ctx context.Context, database *store.DB, projDir, addr string) error {
-	s, mcpServer := newMCPServer(ctx, database, projDir)
+	_, mcpServer := newMCPServer(ctx, database, projDir)
 	handler := sdkmcp.NewSSEHandler(func(*http.Request) *sdkmcp.Server {
 		return mcpServer
 	}, nil)
@@ -75,16 +73,14 @@ func RunHTTP(ctx context.Context, database *store.DB, projDir, addr string) erro
 		<-ctx.Done()
 		srv.Close()
 	}()
-	err := srv.ListenAndServe()
-	<-s.startupDone
-	return err
+	return srv.ListenAndServe()
 }
 
 // RunShared starts an HTTP/SSE server on addr and simultaneously serves
 // this client over stdio. Used for auto-sharing: first session starts the
 // HTTP daemon; subsequent sessions proxy to it via RunProxy.
 func RunShared(ctx context.Context, database *store.DB, projDir, addr string) error {
-	s, mcpServer := newMCPServer(ctx, database, projDir)
+	_, mcpServer := newMCPServer(ctx, database, projDir)
 
 	// Start HTTP/SSE in background.
 	handler := sdkmcp.NewSSEHandler(func(*http.Request) *sdkmcp.Server {
@@ -103,12 +99,7 @@ func RunShared(ctx context.Context, database *store.DB, projDir, addr string) er
 	}()
 
 	// Serve this client over stdio (blocks until client disconnects).
-	err := mcpServer.Run(ctx, &sdkmcp.StdioTransport{})
-	// Block db.Close() from racing the startup ingest goroutine: it uses
-	// the same pinned conn and would error with "connection is already
-	// closed" if the DB is torn down first.
-	<-s.startupDone
-	return err
+	return mcpServer.Run(ctx, &sdkmcp.StdioTransport{})
 }
 
 // RunProxy bridges a stdio MCP client to an existing HTTP/SSE defn server.
@@ -172,7 +163,12 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 		go func() {
 			defer close(s.startupDone)
 			if err := s.ingestAndResolve(); err != nil {
-				fmt.Fprintf(os.Stderr, "defn: startup ingest/resolve failed: %v\n", err)
+				// "connection is already closed" means the DB was torn
+				// down mid-ingest (stdin EOF → db.Close()). Not a real
+				// startup failure; stay quiet.
+				if !strings.Contains(err.Error(), "connection is already closed") {
+					fmt.Fprintf(os.Stderr, "defn: startup ingest/resolve failed: %v\n", err)
+				}
 			}
 			s.ready.Store(true)
 		}()
