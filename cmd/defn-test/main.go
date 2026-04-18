@@ -69,6 +69,19 @@ var projects = []project{
 }
 
 func main() {
+	// -selfhost: run only the selfhost round-trip (no external clones).
+	// Useful as a quick CI smoke test and from agent sessions that can't
+	// reach github.com.
+	if len(os.Args) > 1 && os.Args[1] == "-selfhost" {
+		result := runSelfhostTest()
+		if !result.passed {
+			fmt.Printf("FAIL: %s\n", result.message)
+			os.Exit(1)
+		}
+		fmt.Println("PASS")
+		return
+	}
+
 	passed := 0
 	failed := 0
 	skipped := 0
@@ -99,6 +112,18 @@ func main() {
 	// Run workflow tests (SWE-bench patterns).
 	fmt.Println()
 	runWorkflowTests()
+
+	// Selfhost round-trip. Runs against the defn repo itself, isolated
+	// from whatever .defn/ the user has open, so it works concurrently
+	// with a running MCP serve.
+	fmt.Println()
+	selfhost := runSelfhostTest()
+	if selfhost.passed {
+		fmt.Printf("  PASS\n")
+	} else {
+		fmt.Printf("  FAIL: %s\n", selfhost.message)
+		failed++
+	}
 
 	if failed > 0 {
 		os.Exit(1)
