@@ -6,15 +6,19 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/justinstimatze/defn/internal/emit"
@@ -616,6 +620,7 @@ func cmdIngest(modulePath string, serverMode bool) {
 		dbPath = dsn
 		fmt.Fprintf(os.Stderr, "using server: %s\n", dsn)
 	}
+	checkEmbeddedAvailable(dbPath)
 	db, err := store.Open(dbPath)
 	if err != nil {
 		if isCorruptDBError(err) && !strings.Contains(dbPath, "@") {
@@ -711,6 +716,7 @@ func cmdSync(file string) {
 		return
 	}
 	dbPath := getDBPath()
+	checkEmbeddedAvailable(dbPath)
 	db, err := store.Open(dbPath)
 	if err != nil {
 		if isCorruptDBError(err) && !strings.Contains(dbPath, "@") {
@@ -777,6 +783,7 @@ func cmdRepair(modulePath string) {
 	}
 	defnDir := filepath.Join(absModulePath, ".defn")
 
+	checkEmbeddedAvailable(defnDir)
 	if _, err := os.Stat(defnDir); os.IsNotExist(err) {
 		fmt.Fprintln(os.Stderr, "no .defn/ found — running a fresh ingest")
 	} else {
@@ -824,6 +831,157 @@ func cmdRepair(modulePath string) {
 		len(mods), len(defs), hash[:16])
 }
 
+// serveLock records a running defn serve process holding the embedded
+// .defn/ lock. Other CLI commands read this before opening embedded so
+// they can surface an actionable error instead of a bare "database is
+// read only" from Dolt.
+//
+// Liveness is enforced via syscall.Flock on the lockfile, not a PID
+// alive-check — the kernel releases the flock when the serve process
+// dies, so stale lockfiles from crashes become automatically reapable
+// and PID recycling can't produce false positives.
+type serveLock struct {
+	PID      int    `json:"pid"`
+	HTTPAddr string `json:"http_addr,omitempty"`
+	Started  int64  `json:"started"` // unix seconds
+}
+
+// writeServeLock records this process as the owner of the embedded DB
+// at dbPath, holding an exclusive flock on the lockfile for the
+// lifetime of the process. Returns a cleanup func that releases the
+// flock (by closing the fd) and removes the file. Idempotent via
+// sync.Once; safe to call from both a defer and a signal handler.
+//
+// If another defn serve already holds the flock, the process aborts
+// via fatal — two serves on the same embedded DB would corrupt noms.
+func writeServeLock(dbPath, httpAddr string) func() {
+	if strings.Contains(dbPath, "@") {
+		return func() {} // DSN-backed: no embedded lock to advertise
+	}
+	lockPath := filepath.Join(dbPath, "serve.pid")
+	// Open without O_TRUNC: a racing second serve must not empty the
+	// winning serve's content on its way to failing the flock. Truncate
+	// is delayed until after we've proven we're the flock holder.
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "defn: could not open serve lockfile %s: %v\n", lockPath, err)
+		return func() {}
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		fatal(fmt.Errorf("another defn serve is already holding %s (flock: %w)", lockPath, err))
+	}
+	// Safe to overwrite stale content now that we own the flock.
+	if err := f.Truncate(0); err != nil {
+		fmt.Fprintf(os.Stderr, "defn: truncate serve lockfile: %v\n", err)
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		fmt.Fprintf(os.Stderr, "defn: seek serve lockfile: %v\n", err)
+	}
+	data, _ := json.Marshal(serveLock{
+		PID:      os.Getpid(),
+		HTTPAddr: httpAddr,
+		Started:  time.Now().Unix(),
+	})
+	if _, err := f.Write(data); err != nil {
+		fmt.Fprintf(os.Stderr, "defn: could not write serve lockfile: %v\n", err)
+	}
+
+	var once sync.Once
+	stopCh := make(chan struct{})
+	cleanup := func() {
+		once.Do(func() {
+			close(stopCh)
+			f.Close() // releases the flock
+			os.Remove(lockPath)
+		})
+	}
+
+	// Signal handler: SIGINT/SIGTERM should also release the lock before
+	// the process exits. On normal return, cleanup runs from defer and
+	// closes stopCh so this goroutine exits instead of parking forever.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		select {
+		case <-sigs:
+			f.Close()
+			os.Remove(lockPath)
+			os.Exit(130)
+		case <-stopCh:
+			signal.Stop(sigs)
+		}
+	}()
+	return cleanup
+}
+
+// readServeLock returns the active serve lockfile for dbPath, or nil
+// if none exists, the file is malformed, or the recorded serve has
+// died (flock no longer held).
+//
+// When the flock is releasable, the lockfile is reaped as a side
+// effect so the next caller sees a clean slate. Doing this under the
+// shared-lock check window means concurrent readers agree on the
+// verdict without a dedicated coordinator.
+func readServeLock(dbPath string) *serveLock {
+	lockPath := filepath.Join(dbPath, "serve.pid")
+	f, err := os.Open(lockPath)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	// LOCK_SH|LOCK_NB: succeeds iff no one holds LOCK_EX. If the serve
+	// is alive, it holds LOCK_EX and we'll see EWOULDBLOCK.
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err == nil {
+		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		os.Remove(lockPath)
+		return nil
+	}
+	data, err := io.ReadAll(f)
+	if err != nil || len(data) == 0 {
+		return nil
+	}
+	var lock serveLock
+	if err := json.Unmarshal(data, &lock); err != nil {
+		return nil
+	}
+	return &lock
+}
+
+// embeddedLockStatus returns the error message a CLI should print and
+// whether to abort. Extracted from checkEmbeddedAvailable so the
+// decision is testable without os.Exit side effects.
+func embeddedLockStatus(dbPath string) (msg string, held bool) {
+	if strings.Contains(dbPath, "@") {
+		return "", false
+	}
+	lock := readServeLock(dbPath)
+	if lock == nil {
+		return "", false
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "defn: %s is held by a running defn serve (pid %d)\n", dbPath, lock.PID)
+	if lock.HTTPAddr != "" {
+		fmt.Fprintf(&sb, "  MCP endpoint: http://%s/sse\n", lock.HTTPAddr)
+	}
+	sb.WriteString("  to run this command concurrently, either:\n")
+	sb.WriteString("    - stop the server and retry\n")
+	sb.WriteString("    - run against an isolated worktree: defn worktree <branch> <path>\n")
+	sb.WriteString("    - set DEFN_DSN to a running dolt sql-server\n")
+	return sb.String(), true
+}
+
+// checkEmbeddedAvailable aborts with an actionable message if a defn
+// serve process is holding the embedded DB at dbPath. Called by CLI
+// commands that want to open embedded before they pay for a Dolt
+// manifest error.
+func checkEmbeddedAvailable(dbPath string) {
+	if msg, held := embeddedLockStatus(dbPath); held {
+		fmt.Fprint(os.Stderr, msg)
+		os.Exit(1)
+	}
+}
+
 func cmdServe(httpAddr string) {
 	// Cap Go heap so Dolt's embedded caches scale down (v1.86.2+ reads
 	// GOMEMLIMIT via its memlimit package). 1 GiB is plenty for the MCP
@@ -837,11 +995,13 @@ func cmdServe(httpAddr string) {
 
 	// Explicit --http mode: just start the HTTP server.
 	if httpAddr != "" {
-		db, err := store.Open(getDBPath())
+		dbPath := getDBPath()
+		db, err := store.Open(dbPath)
 		if err != nil {
 			fatal(err)
 		}
 		defer db.Close()
+		defer writeServeLock(dbPath, httpAddr)()
 		projDir := serveProjectDir()
 		if err := mcpserver.RunHTTP(ctx, db, projDir, httpAddr); err != nil {
 			fatal(err)
@@ -866,11 +1026,13 @@ func cmdServe(httpAddr string) {
 	}
 
 	// First session: start shared HTTP + serve this client over stdio.
-	db, err := store.Open(getDBPath())
+	dbPath := getDBPath()
+	db, err := store.Open(dbPath)
 	if err != nil {
 		fatal(err)
 	}
 	defer db.Close()
+	defer writeServeLock(dbPath, addr)()
 	projDir := serveProjectDir()
 	if err := mcpserver.RunShared(ctx, db, projDir, addr); err != nil {
 		fatal(err)
@@ -917,7 +1079,9 @@ func isDefnListening(addr string) bool {
 }
 
 func cmdEmit(outDir string) {
-	db, err := store.Open(getDBPath())
+	dbPath := getDBPath()
+	checkEmbeddedAvailable(dbPath)
+	db, err := store.Open(dbPath)
 	if err != nil {
 		fatal(err)
 	}
