@@ -825,6 +825,17 @@ func (s *DB) GetImports(moduleID int64) ([]Import, error) {
 	return imports, rows.Err()
 }
 
+// Ping verifies the database is reachable. Uses the pinned connection
+// when present (server mode) so this probe reflects the actual session
+// state, falling back to the pool otherwise. Useful for long-running
+// clients to detect that a Dolt sql-server has restarted.
+func (s *DB) Ping(ctx context.Context) error {
+	if c := s.pinnedConn(); c != nil {
+		return c.PingContext(ctx)
+	}
+	return s.db.PingContext(ctx)
+}
+
 // GetMeta returns the value for a key, or "" if not set.
 func (s *DB) GetMeta(key string) (string, error) {
 	ctx := s.Ctx()

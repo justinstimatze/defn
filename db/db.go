@@ -1,8 +1,10 @@
-// Package db provides read-only Go access to a defn database.
+// Package db provides Go access to a defn database.
 //
-// The database must already exist (created by defn init). This package
-// opens it directly using the embedded Dolt engine — no server or CLI
-// binary needed.
+// Reads (Definitions, Search, Refs, Traverse, ...) are the main surface;
+// SetMeta is a narrow exception for durable key/value metadata shared
+// with defn itself (see GetMeta). The database must already exist
+// (created by defn init). This package opens it directly using the
+// embedded Dolt engine — no server or CLI binary needed.
 //
 //	import defndb "github.com/justinstimatze/defn/db"
 //
@@ -14,6 +16,7 @@
 package db
 
 import (
+	"context"
 	"fmt"
 	"io/fs"
 	"path/filepath"
@@ -49,12 +52,45 @@ func (db *DB) Close() error {
 	return db.s.Close()
 }
 
+// Ping verifies the database is reachable. Intended for long-running
+// clients (e.g. MCP servers that hold a single Client across hour-plus
+// sessions) that want to notice a Dolt sql-server restart without
+// waiting for the next real query to fail. Returns the underlying
+// driver error on failure — callers can wrap their own retry loop
+// around it.
+func (db *DB) Ping(ctx context.Context) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.s.Ping(ctx)
+}
+
 // Query executes a read-only SQL query and returns rows as maps.
 // Only SELECT, SHOW, DESCRIBE, EXPLAIN, and WITH (CTE) queries are allowed.
 func (db *DB) Query(sql string) ([]map[string]any, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	return db.s.Query(sql)
+}
+
+// GetMeta returns the value stored under key in defn_meta, or "" if
+// the key has not been set. defn_meta is a single-row-per-key key/value
+// store defn uses for database-level metadata (last_ingest, etc.).
+// External callers can use it as a durable place for their own
+// timestamps or markers without inventing a new file or table.
+func (db *DB) GetMeta(key string) (string, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.s.GetMeta(key)
+}
+
+// SetMeta stores value under key in defn_meta. Overwrites any previous
+// value. The key namespace is shared with defn itself — use a prefix
+// (e.g. "winze:last_cycle") to avoid collisions with defn-managed
+// keys like last_ingest.
+func (db *DB) SetMeta(key, value string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.s.SetMeta(key, value)
 }
 
 // --- Definitions ---
