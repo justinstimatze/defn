@@ -1,10 +1,10 @@
 module github.com/justinstimatze/defn
 
-go 1.26
+go 1.26.2
 
 require (
-	github.com/dolthub/dolt/go v0.40.5-0.20260416223919-b2acc3421e62
-	github.com/dolthub/driver v1.84.2-0.20260415010027-81fe8bae47a0
+	github.com/dolthub/dolt/go v0.40.5-0.20260422221605-73fcb4a868c2
+	github.com/dolthub/driver v1.86.4
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/modelcontextprotocol/go-sdk v1.5.0
 	golang.org/x/tools v0.44.0
@@ -67,11 +67,11 @@ require (
 	github.com/dolthub/flatbuffers/v23 v23.3.3-dh.2 // indirect
 	github.com/dolthub/fslock v0.0.3 // indirect
 	github.com/dolthub/go-icu-regex v0.0.0-20260412212219-49724d547866 // indirect
-	github.com/dolthub/go-mysql-server v0.20.1-0.20260415223525-cbe3a4007b97 // indirect
+	github.com/dolthub/go-mysql-server v0.20.1-0.20260422200044-972069de98a8 // indirect
 	github.com/dolthub/gozstd v0.0.0-20240423170813-23a2903bca63 // indirect
 	github.com/dolthub/ishell v0.0.0-20260414231531-5f031e3e9037 // indirect
 	github.com/dolthub/jsonpath v0.0.2-0.20240227200619-19675ab05c71 // indirect
-	github.com/dolthub/vitess v0.0.0-20260309181228-a99af9c518ab // indirect
+	github.com/dolthub/vitess v0.0.0-20260422060906-f6f5b5573b7b // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/edsrzf/mmap-go v1.2.0 // indirect
 	github.com/envoyproxy/go-control-plane/envoy v1.37.0 // indirect
