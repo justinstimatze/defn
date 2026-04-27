@@ -740,6 +740,11 @@ func cmdSync(file string) {
 	if err != nil {
 		fatal(err)
 	}
+	// Re-resolve refs for the affected package. Without this, embed and
+	// implements refs drift away from source as files are edited.
+	if err := resolve.ResolveFile(db, modulePath, absFile); err != nil {
+		fatal(fmt.Errorf("resolve file: %w", err))
+	}
 	if err := db.Commit("sync " + file); err != nil {
 		fatal(err)
 	}

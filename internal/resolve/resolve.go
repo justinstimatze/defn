@@ -36,6 +36,45 @@ func ResolveModule(db *store.DB, projectDir, modulePath string) error {
 	return resolve(db, nil, projectDir, modulePath)
 }
 
+// ResolveFile loads only the package containing filePath (with its
+// dependency types) and rebuilds references for definitions in that
+// package. Much faster than a full Resolve (~50–500ms vs ~30s on medium
+// projects) and intended for use after IngestFile to keep the ref graph
+// fresh without paying the full-load cost.
+//
+// Cross-package refs FROM other packages TO this file's defs are not
+// re-resolved here — those still flow from the prior full Resolve. If a
+// caller renames or removes a def that other packages reference, a full
+// Resolve is still needed to clean up the stale outgoing edges.
+func ResolveFile(db *store.DB, projectDir, filePath string) error {
+	cfg := &packages.Config{
+		Mode: packages.NeedName |
+			packages.NeedFiles |
+			packages.NeedSyntax |
+			packages.NeedTypes |
+			packages.NeedTypesInfo |
+			packages.NeedImports |
+			packages.NeedDeps,
+		Dir:   projectDir,
+		Tests: true,
+	}
+	pkgs, err := packages.Load(cfg, "file="+filePath)
+	if err != nil {
+		return err
+	}
+	if len(pkgs) == 0 {
+		return nil
+	}
+	// Pick the pkg path of the loaded package(s); after FilterPackages we
+	// expect 1 (test variant) or 2 (file appears in both x and x_test).
+	// resolve() uses the modulePath filter to scope rewrites; passing the
+	// non-test package path covers both because ingest strips the _test
+	// suffix from external test packages too.
+	target := pkgs[0].PkgPath
+	target = strings.TrimSuffix(target, "_test")
+	return resolve(db, pkgs, projectDir, target)
+}
+
 func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule string) error {
 	var pkgs []*packages.Package
 	if preloaded != nil {
@@ -79,6 +118,15 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 			}
 		}
 	}
+
+	// Accumulators: each fromID gets one final SetReferences call after all
+	// passes have contributed. Avoids the REPLACE-style wipes we used to
+	// hit when multiple call sites wrote refs for the same fromID
+	// (var X SomeType = expr touching both the value and type expressions;
+	// pass 2 implements vs pass 3 TypeSpec embed/type_ref; multiple
+	// interfaces satisfied by one concrete type).
+	defRefs := map[int64][]store.Reference{}
+	defLitFields := map[int64][]store.LiteralField{}
 
 	// Second pass: interface satisfaction — build ifaceMethodToImpls map
 	// BEFORE extracting references, so collectRefs can resolve interface calls.
@@ -139,11 +187,12 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 				concreteID := lookupTypeDefID(db, pkgPath, concrete.Obj().Name())
 				ifaceID := lookupTypeDefID(db, pkgPath, iface.Obj().Name())
 
-				// Add "implements" edge: concrete type → interface.
+				// Stage "implements" edge: concrete type → interface. Apply
+				// at the end with all the other refs for concreteID so a
+				// later TypeSpec pass cannot wipe it (and so multiple
+				// interfaces don't overwrite each other within this loop).
 				if concreteID > 0 && ifaceID > 0 {
-					db.SetReferences(concreteID, []store.Reference{
-						{ToDef: ifaceID, Kind: "implements"},
-					})
+					defRefs[concreteID] = append(defRefs[concreteID], store.Reference{ToDef: ifaceID, Kind: "implements"})
 				}
 
 				// Map interface method objects → concrete method def IDs.
@@ -181,14 +230,10 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 					}
 					refs, litFields := collectRefs(d.Body, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls)
 					if len(refs) > 0 {
-						if err := db.SetReferences(fromID, refs); err != nil {
-							return err
-						}
+						defRefs[fromID] = append(defRefs[fromID], refs...)
 					}
 					if len(litFields) > 0 {
-						if err := db.SetLiteralFields(fromID, litFields); err != nil {
-							return err
-						}
+						defLitFields[fromID] = append(defLitFields[fromID], litFields...)
 					}
 
 				case *ast.GenDecl:
@@ -204,26 +249,25 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 								if fromID <= 0 {
 									continue
 								}
-								// Collect refs from the value expression.
+								// Collect refs from the value expression
+								// AND the type expression. Both contribute
+								// to the same fromID; accumulate and flush
+								// once at the end so the second iteration
+								// doesn't wipe the first.
 								var nodes []ast.Node
 								if i < len(s.Values) {
 									nodes = append(nodes, s.Values[i])
 								}
-								// Also collect refs from the type expression.
 								if s.Type != nil {
 									nodes = append(nodes, s.Type)
 								}
 								for _, node := range nodes {
 									refs, litFields := collectRefs(node, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls)
 									if len(refs) > 0 {
-										if err := db.SetReferences(fromID, refs); err != nil {
-											return err
-										}
+										defRefs[fromID] = append(defRefs[fromID], refs...)
 									}
 									if len(litFields) > 0 {
-										if err := db.SetLiteralFields(fromID, litFields); err != nil {
-											return err
-										}
+										defLitFields[fromID] = append(defLitFields[fromID], litFields...)
 									}
 								}
 							}
@@ -236,19 +280,27 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 							}
 							refs, litFields := collectRefs(s.Type, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls)
 							if len(refs) > 0 {
-								if err := db.SetReferences(fromID, refs); err != nil {
-									return err
-								}
+								defRefs[fromID] = append(defRefs[fromID], refs...)
 							}
 							if len(litFields) > 0 {
-								if err := db.SetLiteralFields(fromID, litFields); err != nil {
-									return err
-								}
+								defLitFields[fromID] = append(defLitFields[fromID], litFields...)
 							}
 						}
 					}
 				}
 			}
+		}
+	}
+
+	// Flush accumulated refs once per def. SetReferences de-dupes internally.
+	for fromID, refs := range defRefs {
+		if err := db.SetReferences(fromID, refs); err != nil {
+			return err
+		}
+	}
+	for fromID, fields := range defLitFields {
+		if err := db.SetLiteralFields(fromID, fields); err != nil {
+			return err
 		}
 	}
 

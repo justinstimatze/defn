@@ -870,7 +870,11 @@ func (s *server) autoResolve(modulePath string) {
 	} else {
 		resolve.Resolve(s.db, s.projectDir)
 	}
-	s.autoCommit()
+	// Best effort — log to stderr if commit fails so the operator notices
+	// without breaking the edit they just made.
+	if err := s.autoCommit(); err != nil {
+		fmt.Fprintf(os.Stderr, "defn: auto-commit failed (post-resolve): %v\n", err)
+	}
 	s.lastResolved.Store(time.Now().UnixNano())
 }
 
@@ -878,12 +882,17 @@ func (s *server) autoResolve(modulePath string) {
 // This keeps Dolt's working set small so chunk accumulation doesn't
 // cause storage bloat. No-op if nothing changed. Runs GC every 50
 // auto-commits to compact the noms store.
-func (s *server) autoCommit() {
-	s.db.Commit("auto-sync")
+//
+// Returns the commit error so callers can fail loudly when a write
+// can't be persisted (e.g. "database is read only" after GC). Earlier
+// versions swallowed this and left writes silently dropped.
+func (s *server) autoCommit() error {
+	err := s.db.Commit("auto-sync")
 	s.db.CleanTempFiles()
 	if n := s.autoCommitCount.Add(1); n%50 == 0 {
 		go s.db.GC() // background — GC can be slow on large databases
 	}
+	return err
 }
 
 // ingestAndResolve loads packages once and runs both ingest and resolve
@@ -899,7 +908,9 @@ func (s *server) ingestAndResolve() error {
 	if err := resolve.ResolvePackages(s.db, pkgs, s.projectDir); err != nil {
 		return fmt.Errorf("resolve: %w", err)
 	}
-	s.autoCommit()
+	if err := s.autoCommit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
 	s.lastResolved.Store(time.Now().UnixNano())
 	return nil
 }
@@ -1604,7 +1615,18 @@ func (s *server) handleSync(_ context.Context, _ *sdkmcp.CallToolRequest, args c
 		if err != nil {
 			return errResult(fmt.Errorf("ingest file: %w", err))
 		}
-		s.autoCommit()
+		// Re-resolve refs for the affected package so structural changes
+		// (added/removed embeds, signature changes, new defs) keep the
+		// ref graph consistent. Without this, embed/implements/call refs
+		// silently drift away from source over many sync calls.
+		if err := resolve.ResolveFile(s.db, s.projectDir, filePath); err != nil {
+			return errResult(fmt.Errorf("resolve file: %w", err))
+		}
+		// Surface commit failures (e.g. read-only after GC) instead of
+		// leaving the ref table half-updated and reporting success.
+		if err := s.autoCommit(); err != nil {
+			return errResult(fmt.Errorf("commit after sync: %w", err))
+		}
 		return textResult(fmt.Sprintf("Synced %s: updated %d definitions.", args.File, n)), nil, nil
 	}
 
