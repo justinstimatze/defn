@@ -70,7 +70,7 @@ func Run(ctx context.Context, database *store.DB, projDir string) error {
 func RunHTTP(ctx context.Context, database *store.DB, projDir, addr string) error {
 	_, mcpServer := newMCPServer(ctx, database, projDir)
 	fmt.Fprintf(os.Stderr, "defn: listening on %s\n", addr)
-	srv := &http.Server{Addr: addr, Handler: mcpHTTPMux(mcpServer)}
+	srv := &http.Server{Addr: addr, Handler: mcpHTTPMux(mcpServer, projDir)}
 	go func() {
 		<-ctx.Done()
 		srv.Close()
@@ -86,7 +86,7 @@ func RunShared(ctx context.Context, database *store.DB, projDir, addr string) er
 
 	// Start HTTP/SSE in background.
 	fmt.Fprintf(os.Stderr, "defn: shared server on %s\n", addr)
-	srv := &http.Server{Addr: addr, Handler: mcpHTTPMux(mcpServer)}
+	srv := &http.Server{Addr: addr, Handler: mcpHTTPMux(mcpServer, projDir)}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			fmt.Fprintf(os.Stderr, "defn: http server error: %v\n", err)
@@ -152,7 +152,7 @@ func RunProxy(ctx context.Context, sseEndpoint string) error {
 // mcpHTTPMux returns the ServeMux used by RunHTTP and RunShared. MCP
 // clients connect to /sse; CLI tools hit /version to check for binary
 // skew (an older serve still running under an upgraded on-disk defn).
-func mcpHTTPMux(mcpServer *sdkmcp.Server) http.Handler {
+func mcpHTTPMux(mcpServer *sdkmcp.Server, projDir string) http.Handler {
 	sse := sdkmcp.NewSSEHandler(func(*http.Request) *sdkmcp.Server {
 		return mcpServer
 	}, nil)
@@ -165,6 +165,19 @@ func mcpHTTPMux(mcpServer *sdkmcp.Server) http.Handler {
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Write([]byte(Version))
+	})
+	// /identity returns the absolute project directory this serve is
+	// pinned to. cmdServe's auto-sharing path uses this to detect FNV
+	// hash collisions (two distinct projects mapping to the same port)
+	// before silently proxying to the wrong DB.
+	mux.HandleFunc("/identity", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Write([]byte(projDir))
 	})
 	// /sse is the SSE entry point; subpaths (/sse/<id>) are per-session
 	// streams. Anything unmatched falls through to SSE for backward

@@ -10,6 +10,55 @@ import (
 	_ "github.com/dolthub/driver"
 )
 
+// TestSalvageZeroJournalIdx is the regression for SIGTERM leaving an
+// empty journal.idx that breaks the next Open with "invalid index
+// checksum". salvageZeroJournalIdx must rename the empty file aside so
+// Dolt rebuilds it from the journal.
+func TestSalvageZeroJournalIdx(t *testing.T) {
+	dir := t.TempDir()
+	dbName := "defn"
+	noms := filepath.Join(dir, dbName, ".dolt", "noms")
+	if err := os.MkdirAll(noms, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	idx := filepath.Join(noms, "journal.idx")
+	if err := os.WriteFile(idx, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := salvageZeroJournalIdx(dir, dbName); err != nil {
+		t.Fatalf("salvage: %v", err)
+	}
+
+	if _, err := os.Stat(idx); !os.IsNotExist(err) {
+		t.Errorf("expected journal.idx to be moved aside, still present: %v", err)
+	}
+	bak := idx + ".empty.bak"
+	if _, err := os.Stat(bak); err != nil {
+		t.Errorf("expected backup at %s, got: %v", bak, err)
+	}
+
+	// Non-empty journal.idx must be left alone.
+	if err := os.WriteFile(idx, []byte("not empty"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := salvageZeroJournalIdx(dir, dbName); err != nil {
+		t.Fatalf("salvage (non-empty): %v", err)
+	}
+	if data, err := os.ReadFile(idx); err != nil || string(data) != "not empty" {
+		t.Errorf("non-empty journal.idx was disturbed: data=%q err=%v", data, err)
+	}
+
+	// Missing journal.idx must be a no-op (fresh DB).
+	missing := filepath.Join(t.TempDir(), dbName, ".dolt", "noms")
+	if err := os.MkdirAll(missing, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := salvageZeroJournalIdx(filepath.Dir(filepath.Dir(filepath.Dir(missing))), dbName); err != nil {
+		t.Errorf("missing journal.idx should be no-op, got: %v", err)
+	}
+}
+
 func TestComputeRootHash(t *testing.T) {
 	db := testDB(t)
 	mod, _ := db.EnsureModule("example.com/test", "test", "")

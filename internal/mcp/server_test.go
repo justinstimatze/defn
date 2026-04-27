@@ -20,7 +20,7 @@ func TestVersionEndpoint(t *testing.T) {
 	// Route /version through the real mux to cover the method guard
 	// and the Content-Type header contract that CLI status depends on.
 	mcpServer := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "defn", Version: Version}, nil)
-	srv := httptest.NewServer(mcpHTTPMux(mcpServer))
+	srv := httptest.NewServer(mcpHTTPMux(mcpServer, "/tmp/test-project"))
 	defer srv.Close()
 
 	// GET returns the version as text/plain.
@@ -51,6 +51,29 @@ func TestVersionEndpoint(t *testing.T) {
 	}
 	if allow := resp.Header.Get("Allow"); !strings.Contains(allow, "GET") {
 		t.Errorf("Allow = %q, should include GET", allow)
+	}
+}
+
+func TestIdentityEndpoint(t *testing.T) {
+	// /identity must echo the projDir verbatim — cmdServe relies on
+	// exact-match comparison (after filepath.Abs) to detect FNV
+	// hash collisions between distinct projects.
+	mcpServer := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "defn", Version: Version}, nil)
+	wantDir := "/some/abs/project/path"
+	srv := httptest.NewServer(mcpHTTPMux(mcpServer, wantDir))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/identity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("GET /identity status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if got := strings.TrimSpace(string(body)); got != wantDir {
+		t.Errorf("body = %q, want %q", got, wantDir)
 	}
 }
 

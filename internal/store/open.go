@@ -192,6 +192,9 @@ func openEmbedded(path string) (*DB, error) {
 	if err := migrateFlatLayout(absPath, dbName); err != nil {
 		return nil, fmt.Errorf("migrate layout: %w", err)
 	}
+	if err := salvageZeroJournalIdx(absPath, dbName); err != nil {
+		return nil, fmt.Errorf("salvage journal.idx: %w", err)
+	}
 
 	dsn := fmt.Sprintf("file://%s?commitname=defn&commitemail=defn@localhost",
 		filepath.ToSlash(absPath))
@@ -225,6 +228,29 @@ func openEmbedded(path string) (*DB, error) {
 		fmt.Fprintf(os.Stderr, "defn: warning: could not enable dolt_allow_commit_conflicts: %v\n", err)
 	}
 	return &DB{db: db, conn: conn, path: absPath, dbName: dbName}, nil
+}
+
+// salvageZeroJournalIdx renames an empty journal.idx aside so Dolt
+// rebuilds it from the journal on the next open. SIGTERM doesn't always
+// flush the index file cleanly, leaving a 0-byte journal.idx that makes
+// the next open fail with "invalid index checksum (... != ...)". The
+// journal itself is intact, so renaming the bad index is non-destructive.
+func salvageZeroJournalIdx(absPath, dbName string) error {
+	idx := filepath.Join(absPath, dbName, ".dolt", "noms", "journal.idx")
+	info, err := os.Stat(idx)
+	if err != nil {
+		return nil // missing is fine; a fresh DB has no journal.idx yet
+	}
+	if info.Size() != 0 {
+		return nil
+	}
+	bak := idx + ".empty.bak"
+	_ = os.Remove(bak)
+	if err := os.Rename(idx, bak); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "defn: salvaged empty journal.idx (renamed to %s); Dolt will rebuild from journal\n", filepath.Base(bak))
+	return nil
 }
 
 // migrateFlatLayout rewrites a pre-April-2026 defn database from

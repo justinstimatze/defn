@@ -1041,33 +1041,64 @@ func cmdServe(httpAddr string) {
 	}
 
 	// Auto-sharing: derive a port from the database path. If another
-	// defn serve is already listening on that port, proxy to it (~5 MB).
-	// Otherwise, start both HTTP and stdio (first session pays full cost,
-	// subsequent sessions are lightweight proxies).
-	port := portForDB(getDBPath())
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	sseURL := fmt.Sprintf("http://%s/sse", addr)
-
-	if isDefnListening(addr) {
-		fmt.Fprintf(os.Stderr, "defn: proxying to shared server on %s\n", addr)
-		if err := mcpserver.RunProxy(ctx, sseURL); err != nil {
-			fatal(err)
-		}
-		return
-	}
-
-	// First session: start shared HTTP + serve this client over stdio.
+	// defn serve is already listening on that port FOR THIS PROJECT,
+	// proxy to it (~5 MB). Otherwise, start both HTTP and stdio (first
+	// session pays full cost, subsequent sessions are lightweight
+	// proxies).
+	//
+	// FNV hashing has a small collision probability (1/580 per pair).
+	// Without identity verification, a collision would silently route
+	// reads/writes to the wrong project's database. We probe the
+	// hash port and a linear sequence after it, checking each one's
+	// /identity endpoint until we find our own project's serve or
+	// a free slot.
 	dbPath := getDBPath()
-	db, err := store.Open(dbPath)
-	if err != nil {
-		fatal(err)
-	}
-	defer db.Close()
-	defer writeServeLock(dbPath, addr)()
 	projDir := serveProjectDir()
-	if err := mcpserver.RunShared(ctx, db, projDir, addr); err != nil {
-		fatal(err)
+	wantIdentity, _ := filepath.Abs(projDir)
+	primary := portForDB(dbPath)
+
+	const maxProbes = 16
+	for offset := 0; offset < maxProbes; offset++ {
+		port := primary + offset
+		if port > 9999 {
+			port = 9420 + (port-9420)%580
+		}
+		addr := fmt.Sprintf("127.0.0.1:%d", port)
+		sseURL := fmt.Sprintf("http://%s/sse", addr)
+
+		if !isDefnListening(addr) {
+			// Free — claim it as the shared backend for this project.
+			db, err := store.Open(dbPath)
+			if err != nil {
+				fatal(err)
+			}
+			defer db.Close()
+			defer writeServeLock(dbPath, addr)()
+			if offset > 0 {
+				fmt.Fprintf(os.Stderr, "defn: hash collision on %d, using %d\n",
+					primary, port)
+			}
+			if err := mcpserver.RunShared(ctx, db, projDir, addr); err != nil {
+				fatal(err)
+			}
+			return
+		}
+
+		// Something's there — is it our project?
+		gotIdentity := defnIdentityAt(addr)
+		if gotIdentity == wantIdentity {
+			fmt.Fprintf(os.Stderr, "defn: proxying to shared server on %s\n", addr)
+			if err := mcpserver.RunProxy(ctx, sseURL); err != nil {
+				fatal(err)
+			}
+			return
+		}
+		// Different project on this port (FNV collision or a serve
+		// started without /identity support). Try the next port.
+		fmt.Fprintf(os.Stderr, "defn: %s holds port %d (need %s) — probing next\n",
+			gotIdentity, port, wantIdentity)
 	}
+	fatal(fmt.Errorf("auto-sharing: no free port in %d-port window starting at %d", maxProbes, primary))
 }
 
 // serveProjectDir returns the project root from the DEFN_DB path.
@@ -1107,6 +1138,29 @@ func isDefnListening(addr string) bool {
 	}
 	resp.Body.Close()
 	return resp.Header.Get("Content-Type") == "text/event-stream"
+}
+
+// defnIdentityAt fetches /identity from a running defn HTTP server and
+// returns the absolute project directory it's pinned to. Returns "" if
+// the endpoint is unreachable or absent (older defn versions without
+// /identity — treated as "unknown identity, don't trust").
+func defnIdentityAt(addr string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("http://%s/identity", addr), nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(body))
 }
 
 func cmdEmit(outDir string) {
