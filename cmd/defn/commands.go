@@ -5,6 +5,7 @@ import (
 	cryptoRand "crypto/rand"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -1191,6 +1192,185 @@ func cmdGC() {
 		fatal(err)
 	}
 	fmt.Fprintln(os.Stderr, " done.")
+}
+
+// cmdRestart gracefully bounces one or all `defn serve` processes.
+//
+// With all=false, restarts only the current project's serve (read from
+// .defn/serve.pid in CWD). With all=true, walks $HOME for every
+// .defn/serve.pid whose PID is alive and bounces each.
+//
+// Each bounce: SIGTERM → wait 10s for clean exit → SIGKILL fallback →
+// re-spawn `defn serve --http <addr>` detached on the same address →
+// verify /identity matches the project dir.
+func cmdRestart(all bool) {
+	var locks []discoveredLock
+	if all {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			fatal(err)
+		}
+		locks = discoverServeLocks(home)
+	} else {
+		// Current project only.
+		dbPath := getDBPath()
+		l := readServeLock(dbPath)
+		if l == nil {
+			fatal(fmt.Errorf("no live serve found for %s (no serve.pid, or PID is dead)", dbPath))
+		}
+		locks = []discoveredLock{{path: dbPath, lock: *l}}
+	}
+
+	if len(locks) == 0 {
+		fmt.Fprintln(os.Stderr, "no defn serves found")
+		return
+	}
+
+	failures := 0
+	for _, dl := range locks {
+		if err := bounceOne(dl); err != nil {
+			fmt.Fprintf(os.Stderr, "  ✗ %s: %v\n", dl.path, err)
+			failures++
+		}
+	}
+	if failures > 0 {
+		os.Exit(1)
+	}
+}
+
+type discoveredLock struct {
+	path string // dbPath (the .defn directory)
+	lock serveLock
+}
+
+// discoverServeLocks walks home looking for `.defn/serve.pid` files
+// belonging to live defn serves. readServeLock returns nil for stale
+// lockfiles (flock released after a crash), so anything we keep is by
+// definition a running serve. Caps directory depth at 6 to avoid
+// pathological scans on deep monorepos.
+func discoverServeLocks(home string) []discoveredLock {
+	var found []discoveredLock
+	const maxDepth = 6
+	homeDepth := strings.Count(home, string(os.PathSeparator))
+
+	filepath.WalkDir(home, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil // skip unreadable subtrees silently (cross-user perms etc.)
+		}
+		depth := strings.Count(path, string(os.PathSeparator)) - homeDepth
+		if depth > maxDepth && d.IsDir() {
+			return filepath.SkipDir
+		}
+		if d.IsDir() || d.Name() != "serve.pid" {
+			return nil
+		}
+		if filepath.Base(filepath.Dir(path)) != ".defn" {
+			return nil
+		}
+		dbPath := filepath.Dir(path)
+		l := readServeLock(dbPath)
+		if l == nil {
+			return nil
+		}
+		found = append(found, discoveredLock{path: dbPath, lock: *l})
+		return nil
+	})
+	return found
+}
+
+// bounceOne stops a serve via SIGTERM (escalating to SIGKILL if it
+// doesn't exit in 10s), then restarts it with the same http_addr.
+func bounceOne(dl discoveredLock) error {
+	projDir := filepath.Dir(dl.path)
+	addr := dl.lock.HTTPAddr
+	pid := dl.lock.PID
+
+	fmt.Fprintf(os.Stderr, "Bouncing PID %d in %s on %s\n", pid, projDir, addr)
+
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return fmt.Errorf("find pid %d: %w", pid, err)
+	}
+	// SIGTERM, then poll for up to 10s.
+	if err := proc.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return fmt.Errorf("SIGTERM: %w", err)
+	}
+	exited := false
+	for i := 0; i < 20; i++ {
+		if err := proc.Signal(syscall.Signal(0)); err != nil {
+			exited = true
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if !exited {
+		fmt.Fprintln(os.Stderr, "  still running after 10s — escalating to SIGKILL")
+		_ = proc.Signal(syscall.SIGKILL)
+		time.Sleep(time.Second)
+	}
+
+	// Restart. Use the same binary that's currently running this
+	// command — guarantees the new serve picks up any version updates
+	// the user just installed.
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locate self: %w", err)
+	}
+	args := []string{"serve"}
+	if addr != "" {
+		args = append(args, "--http", addr)
+	}
+	cmd := exec.Command(exe, args...)
+	cmd.Dir = projDir
+	logPath := fmt.Sprintf("/tmp/defn-restart-%d.log", time.Now().Unix())
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("open log: %w", err)
+	}
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.SysProcAttr = detachedSysProcAttr()
+	if err := cmd.Start(); err != nil {
+		logFile.Close()
+		return fmt.Errorf("spawn: %w", err)
+	}
+	logFile.Close()
+	// Don't Wait — we want it to outlive us.
+	_ = cmd.Process.Release()
+
+	// Verify by polling /version (and identity if applicable).
+	if addr == "" {
+		fmt.Fprintf(os.Stderr, "  ✓ launched (auto-share, no --http to verify)\n")
+		return nil
+	}
+	for i := 0; i < 10; i++ {
+		time.Sleep(500 * time.Millisecond)
+		if !isDefnListening(addr) {
+			continue
+		}
+		identity := defnIdentityAt(addr)
+		wantIdentity, _ := filepath.Abs(projDir)
+		if identity != "" && identity != wantIdentity {
+			return fmt.Errorf("port %s came up but /identity=%q != %q", addr, identity, wantIdentity)
+		}
+		ver := fetchVersion(addr)
+		fmt.Fprintf(os.Stderr, "  ✓ back up on %s (version: %s)\n", addr, ver)
+		return nil
+	}
+	return fmt.Errorf("not responding on %s after 5s — see %s", addr, logPath)
+}
+
+func fetchVersion(addr string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("http://%s/version", addr), nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "?"
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64))
+	return strings.TrimSpace(string(body))
 }
 
 func cmdQuery(sql string) {

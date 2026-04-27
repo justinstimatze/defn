@@ -156,6 +156,14 @@ func main() {
 		cmdPull(os.Args[2], os.Args[3])
 	case "gc":
 		cmdGC()
+	case "restart":
+		all := false
+		for _, a := range os.Args[2:] {
+			if a == "--all" {
+				all = true
+			}
+		}
+		cmdRestart(all)
 	default:
 		usage()
 		os.Exit(1)
@@ -188,6 +196,7 @@ Usage:
   defn log                     Commit history
   defn query <sql>             Read-only SQL query
   defn gc                      Compact Dolt storage (garbage collection)
+  defn restart [--all]         Gracefully bounce this project's serve (or all)
   defn worktree <branch>       Clone DB on a branch (for multi-agent)
   defn push <remote> <branch>  Push branch to remote
   defn pull <remote> <branch>  Pull from remote`)
