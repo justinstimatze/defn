@@ -55,7 +55,7 @@ type server struct {
 	projectDir      string
 	lastResolved    atomic.Int64 // UnixNano timestamp of last resolve (to debounce watcher)
 	ready           atomic.Bool  // true after startup ingest+resolve completes
-	autoCommitCount atomic.Int64 // counts auto-commits; triggers GC every 50
+	autoCommitCount atomic.Int64 // counts auto-commits; triggers GC every 10
 }
 
 // Run starts the MCP server over stdio. projDir is the project root where
@@ -197,6 +197,7 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 			s.ready.Store(true)
 		}()
 		go s.watchFiles(ctx)
+		go s.startGCTicker(ctx)
 	}
 
 	mcpServer := sdkmcp.NewServer(&sdkmcp.Implementation{
@@ -208,7 +209,7 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 		Name: "code",
 		Description: `Go code database. One tool, many ops. Start with impact for blast radius — it returns callers, transitives, and test coverage in one call. Don't follow up with search/explain unless you need more.
 
-Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree)`,
+Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
 	}, s.handleCode)
 
 	return s, mcpServer
@@ -591,8 +592,10 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return wrapStale(s.handleDiffDefs(ctx, req, args))
 	case "emit":
 		return s.handleEmit(ctx, req, args)
+	case "gc":
+		return s.handleGC(ctx, req, args)
 	default:
-		return errResult(fmt.Errorf("unknown op %q — valid: read, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit", args.Op))
+		return errResult(fmt.Errorf("unknown op %q — valid: read, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc", args.Op))
 	}
 }
 
@@ -880,8 +883,9 @@ func (s *server) autoResolve(modulePath string) {
 
 // autoCommit commits the working set with an auto-generated message.
 // This keeps Dolt's working set small so chunk accumulation doesn't
-// cause storage bloat. No-op if nothing changed. Runs GC every 50
-// auto-commits to compact the noms store.
+// cause storage bloat. No-op if nothing changed. Runs GC every 10
+// auto-commits to compact the noms store. A separate time-based
+// ticker (see startGCTicker) covers serves that don't hit 10 commits.
 //
 // Returns the commit error so callers can fail loudly when a write
 // can't be persisted (e.g. "database is read only" after GC). Earlier
@@ -889,10 +893,30 @@ func (s *server) autoResolve(modulePath string) {
 func (s *server) autoCommit() error {
 	err := s.db.Commit("auto-sync")
 	s.db.CleanTempFiles()
-	if n := s.autoCommitCount.Add(1); n%50 == 0 {
+	if n := s.autoCommitCount.Add(1); n%10 == 0 {
 		go s.db.GC() // background — GC can be slow on large databases
 	}
 	return err
+}
+
+// startGCTicker fires a background GC every gcInterval. Counter-based
+// GC alone (every N auto-commits) misses serves that idle or restart
+// before reaching N — those let the journal grow unbounded. The ticker
+// guarantees compaction over wall-clock time regardless of activity.
+func (s *server) startGCTicker(ctx context.Context) {
+	const gcInterval = 15 * time.Minute
+	t := time.NewTicker(gcInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := s.db.GC(); err != nil {
+				fmt.Fprintf(os.Stderr, "defn: periodic GC failed: %v\n", err)
+			}
+		}
+	}
 }
 
 // ingestAndResolve loads packages once and runs both ingest and resolve
@@ -1661,6 +1685,53 @@ func (s *server) handleEmit(_ context.Context, _ *sdkmcp.CallToolRequest, args c
 		return errResult(fmt.Errorf("emit: %w", err))
 	}
 	return textResult(fmt.Sprintf("Emitted %d definitions to %s.", len(locs), out)), nil, nil
+}
+
+// handleGC runs Dolt GC to compact the noms store. Safe to invoke
+// while the serve is running — DOLT_GC kills the pinned conn but the
+// pool reconnects on the next query (see store.Ping).
+func (s *server) handleGC(_ context.Context, _ *sdkmcp.CallToolRequest, _ codeParam) (*sdkmcp.CallToolResult, any, error) {
+	noms := filepath.Join(s.projectDir, ".defn", "defn", ".dolt", "noms")
+	before := nomsSize(noms)
+	start := time.Now()
+	if err := s.db.GC(); err != nil {
+		return errResult(fmt.Errorf("gc: %w", err))
+	}
+	after := nomsSize(noms)
+	return textResult(fmt.Sprintf(
+		"GC complete in %s. noms size: %s → %s (saved %s).",
+		time.Since(start).Truncate(time.Millisecond),
+		humanSize(before), humanSize(after), humanSize(before-after),
+	)), nil, nil
+}
+
+// nomsSize returns the total size in bytes of the noms directory, or 0
+// on error. Used for reporting GC savings; not load-bearing.
+func nomsSize(dir string) int64 {
+	var total int64
+	filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+
+func humanSize(n int64) string {
+	const unit = 1024
+	if n < 0 {
+		return "-" + humanSize(-n)
+	}
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for n2 := n / unit; n2 >= unit; n2 /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 func (s *server) handleSimilar(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
