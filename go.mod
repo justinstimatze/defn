@@ -5,8 +5,8 @@ go 1.26.2
 require (
 	github.com/dolthub/dolt/go v0.40.5-0.20260422221605-73fcb4a868c2
 	github.com/dolthub/driver v1.86.4
-	github.com/go-sql-driver/mysql v1.9.3
-	github.com/modelcontextprotocol/go-sdk v1.5.0
+	github.com/go-sql-driver/mysql v1.10.0
+	github.com/modelcontextprotocol/go-sdk v1.6.0
 	golang.org/x/tools v0.44.0
 )
 
@@ -92,7 +92,7 @@ require (
 	github.com/google/btree v1.1.3 // indirect
 	github.com/google/go-github/v57 v57.0.0 // indirect
 	github.com/google/go-querystring v1.2.0 // indirect
-	github.com/google/jsonschema-go v0.4.2 // indirect
+	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/google/pprof v0.0.0-20260302011040-a15ffb7f9dcc // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 // indirect
