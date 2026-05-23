@@ -6,7 +6,7 @@ require (
 	github.com/dolthub/dolt/go v0.40.5-0.20260507221239-14b38e279fc6
 	github.com/dolthub/driver v1.88.1
 	github.com/go-sql-driver/mysql v1.10.0
-	github.com/modelcontextprotocol/go-sdk v1.6.0
+	github.com/modelcontextprotocol/go-sdk v1.6.1
 	golang.org/x/tools v0.45.0
 )
 
