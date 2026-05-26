@@ -587,7 +587,10 @@ func defnClaudeMDSection() string {
 	return `<!-- defn:begin -->
 ## Code Navigation and Editing
 
-This project is indexed in defn. Use the ` + "`code`" + ` MCP tool for **Go code**:
+**The database is authoritative. Files are an I/O projection.** This project
+is indexed in defn. For **Go code**, use the ` + "`code`" + ` MCP tool — **not**
+Read, Edit, Write, or Grep. Reserve those built-in tools for non-Go files
+(YAML, JSON, Markdown, shell, ` + "`go.mod`" + `).
 
 ` + "```" + `
 code(op: "read", name: "handleEdit")           -- full source by name
@@ -597,16 +600,20 @@ code(op: "edit", name: "Foo", new_body: "...") -- edit, auto-emit + build
 code(op: "search", pattern: "%Auth%")          -- name pattern (% wildcard)
 code(op: "search", pattern: "authentication")  -- body text search
 code(op: "test", name: "Render")               -- run affected tests only
-code(op: "sync")                               -- re-ingest after file edits
 ` + "```" + `
 
 All ops: read, search, impact, explain, untested, edit, create, delete, rename, move, test, apply, diff, history, find, sync, query, overview, patch.
 
-**Both editing paths work.** ` + "`code(op:\"edit\")`" + ` updates the database, emits files, and rebuilds references automatically. File tools (Read, Edit) work too — call ` + "`code(op:\"sync\")`" + ` after editing Go files.
+### Why defn for Go, not Read/Edit/Grep
 
-Prefer defn for Go code (fewer steps, auto-build verification). Use Read/Edit/Grep for non-Go files.
+- ` + "`code(op:\"read\")`" + ` returns a whole definition by name — no line-number guessing, no reading a file to find one function.
+- ` + "`code(op:\"edit\")`" + ` updates one definition, emits the file, and rebuilds the reference graph in one call. A raw file Edit leaves defn's graph stale until a ` + "`sync`" + `.
+- ` + "`code(op:\"rename\")`" + ` / ` + "`move`" + ` update every reference and import site across the repo in one call — many fragile Edits otherwise.
+- ` + "`code(op:\"impact\")`" + ` gives callers + transitive blast radius + test coverage before you touch anything.
 
-**Rule of thumb:** Always run impact before modifying an existing definition. Skip it for brand-new definitions.
+If you do edit a ` + "`.go`" + ` file with a built-in tool, call ` + "`code(op:\"sync\", file:\"path\")`" + ` afterward so the graph stays correct.
+
+**Rule of thumb:** run ` + "`impact`" + ` before modifying an existing definition; skip it for brand-new ones.
 <!-- defn:end -->
 `
 }
@@ -1024,10 +1031,24 @@ func cmdServe(httpAddr string) {
 	}
 
 	ctx := context.Background()
+	dbPath := getDBPath()
+
+	// Guard: a bare `defn serve` (no explicit DEFN_DB/DSN) defaults to the
+	// local ".defn". Starting in a directory with no Go files is never
+	// useful — store.Open would auto-create an empty .defn and the watcher
+	// would poll the filesystem forever. This is what happens when defn is
+	// registered as a GLOBAL MCP server and Claude spawns it in every
+	// project it opens, Go or not. Bail cleanly so no idle serve lingers.
+	// `defn init` sets DEFN_DB explicitly, so opted-in projects (dbPath
+	// != ".defn") are never blocked.
+	if dbPath == ".defn" && !hasGoFiles(".") {
+		fmt.Fprintln(os.Stderr, "defn: no Go files in this directory; not starting serve "+
+			"(run `defn init` in a Go project to enable defn here)")
+		return
+	}
 
 	// Explicit --http mode: just start the HTTP server.
 	if httpAddr != "" {
-		dbPath := getDBPath()
 		db, err := store.Open(dbPath)
 		if err != nil {
 			fatal(err)
@@ -1053,7 +1074,6 @@ func cmdServe(httpAddr string) {
 	// hash port and a linear sequence after it, checking each one's
 	// /identity endpoint until we find our own project's serve or
 	// a free slot.
-	dbPath := getDBPath()
 	projDir := serveProjectDir()
 	wantIdentity, _ := filepath.Abs(projDir)
 	primary := portForDB(dbPath)
@@ -1100,6 +1120,33 @@ func cmdServe(httpAddr string) {
 			gotIdentity, port, wantIdentity)
 	}
 	fatal(fmt.Errorf("auto-sharing: no free port in %d-port window starting at %d", maxProbes, primary))
+}
+
+// hasGoFiles reports whether dir contains any .go file in its tree,
+// skipping the usual non-source directories. Used to guard `defn serve`
+// against starting in a directory that isn't a Go project — the common
+// case when defn is registered as a global MCP server and Claude spawns
+// it in every project it opens, Go or not.
+func hasGoFiles(dir string) bool {
+	found := false
+	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			base := filepath.Base(path)
+			if base == ".defn" || base == ".defn-server" || base == ".git" || base == "vendor" || base == "node_modules" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(path) == ".go" {
+			found = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
 }
 
 // serveProjectDir returns the project root from the DEFN_DB path.

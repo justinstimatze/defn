@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -935,6 +936,18 @@ func (s *server) startGCTicker(ctx context.Context) {
 // ingestAndResolve loads packages once and runs both ingest and resolve
 // against the shared result, avoiding a redundant packages.Load (~1-2 GB).
 func (s *server) ingestAndResolve() error {
+	// packages.Load + go/types peaks far above the steady-state heap —
+	// ~2-3 GB type-checking a medium module. cmdServe pins a low GOMEMLIMIT
+	// (1 GiB) to keep Dolt's caches small at idle, but enforcing that
+	// ceiling during the load drives the GC into a back-to-back collection
+	// spiral that pegs every core (and starves MCP requests into timeouts).
+	// Lift the limit for the duration of the load, then restore it so idle
+	// memory stays bounded.
+	if prev := debug.SetMemoryLimit(-1); prev < 6<<30 {
+		debug.SetMemoryLimit(6 << 30)
+		defer debug.SetMemoryLimit(prev)
+	}
+
 	pkgs, err := goload.LoadAll(s.projectDir)
 	if err != nil {
 		return fmt.Errorf("load packages: %w", err)
@@ -956,12 +969,20 @@ func (s *server) ingestAndResolve() error {
 // This keeps the defn database in sync when files are edited outside defn
 // (e.g. via Edit/Write tools, vim, or other processes).
 func (s *server) watchFiles(ctx context.Context) {
+	// Poll responsively while edits are happening, but back off when idle so
+	// a forgotten serve doesn't walk the whole tree every few seconds
+	// forever. Snap back to minInterval the moment a change is seen.
+	const (
+		minInterval = 3 * time.Second
+		maxInterval = 60 * time.Second
+	)
+	interval := minInterval
 	var lastMod int64 // 0 means first poll — debounce window handles startup race
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(3 * time.Second):
+		case <-time.After(interval):
 		}
 
 		// Check directory modtimes instead of stat-ing every .go file.
@@ -981,16 +1002,24 @@ func (s *server) watchFiles(ctx context.Context) {
 			return nil
 		})
 
-		if newest > lastMod && lastMod > 0 {
-			// Skip if startup ingest or autoResolve ran recently.
-			if time.Now().UnixNano()-s.lastResolved.Load() < int64(10*time.Second) {
-				lastMod = newest
-				continue
+		changed := newest > lastMod && lastMod > 0
+		if changed {
+			// Skip the re-ingest if startup ingest or autoResolve ran
+			// recently, but still treat this as activity for backoff.
+			if time.Now().UnixNano()-s.lastResolved.Load() >= int64(10*time.Second) {
+				// Files changed externally — shared load for ingest+resolve.
+				s.ingestAndResolve()
 			}
-			// Files changed externally — shared load for ingest+resolve.
-			s.ingestAndResolve()
 		}
 		lastMod = newest
+
+		if changed {
+			interval = minInterval
+		} else if interval < maxInterval {
+			if interval *= 2; interval > maxInterval {
+				interval = maxInterval
+			}
+		}
 	}
 }
 
