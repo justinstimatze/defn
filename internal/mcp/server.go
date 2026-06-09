@@ -985,16 +985,23 @@ func (s *server) watchFiles(ctx context.Context) {
 		case <-time.After(interval):
 		}
 
-		// Check directory modtimes instead of stat-ing every .go file.
-		// When a file changes, its parent directory's modtime updates.
+		// Stat directories AND .go files. Dir mtime catches adds/renames/
+		// deletes (the directory entry list changes); .go file mtime catches
+		// in-place modifications (truncate+write, which doesn't bump parent
+		// dir mtime on ext4/xfs). Dir-only would silently miss every in-place
+		// edit from emit.Emit, code(op:"edit"), or editors using in-place save.
 		var newest int64
 		filepath.Walk(s.projectDir, func(path string, info os.FileInfo, err error) error {
-			if err != nil || !info.IsDir() {
+			if err != nil {
 				return nil
 			}
-			base := filepath.Base(path)
-			if base == ".defn" || base == ".defn-server" || base == ".git" || base == "vendor" || base == "node_modules" {
-				return filepath.SkipDir
+			if info.IsDir() {
+				base := filepath.Base(path)
+				if base == ".defn" || base == ".defn-server" || base == ".git" || base == "vendor" || base == "node_modules" {
+					return filepath.SkipDir
+				}
+			} else if !strings.HasSuffix(path, ".go") {
+				return nil
 			}
 			if mod := info.ModTime().UnixNano(); mod > newest {
 				newest = mod
@@ -1005,19 +1012,20 @@ func (s *server) watchFiles(ctx context.Context) {
 		changed := newest > lastMod && lastMod > 0
 		if changed {
 			// Skip the re-ingest if startup ingest or autoResolve ran
-			// recently, but still treat this as activity for backoff.
+			// recently — but DO NOT advance lastMod, so the next tick
+			// after the 10s window retries this change instead of
+			// silently dropping it.
 			if time.Now().UnixNano()-s.lastResolved.Load() >= int64(10*time.Second) {
-				// Files changed externally — shared load for ingest+resolve.
 				s.ingestAndResolve()
+				lastMod = newest
 			}
-		}
-		lastMod = newest
-
-		if changed {
 			interval = minInterval
-		} else if interval < maxInterval {
-			if interval *= 2; interval > maxInterval {
-				interval = maxInterval
+		} else {
+			lastMod = newest
+			if interval < maxInterval {
+				if interval *= 2; interval > maxInterval {
+					interval = maxInterval
+				}
 			}
 		}
 	}
