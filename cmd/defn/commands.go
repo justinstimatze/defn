@@ -619,6 +619,16 @@ If you do edit a ` + "`.go`" + ` file with a built-in tool, call ` + "`code(op:\
 }
 
 func cmdIngest(modulePath string, serverMode bool) {
+	// Normalize to absolute so downstream filepath.Rel calls (in ingest
+	// and resolve) compute module-relative source_file paths consistently
+	// regardless of where defn was invoked. With a relative ".", Rel
+	// errors out and IngestPackages falls back to basename — making
+	// IngestPackages and IngestFile disagree on source_file format,
+	// which breaks the incremental fast path's file_sources count
+	// comparison after the first incremental.
+	if abs, err := filepath.Abs(modulePath); err == nil {
+		modulePath = abs
+	}
 	dbPath := getDBPath()
 	if serverMode {
 		dsn := detectRunningServer(".defn")
@@ -1589,59 +1599,65 @@ const incrementalCounterMeta = "incremental_count"
 // acceptable for editor-save hook flows where a periodic full ingest
 // closes the gap.
 func tryIncrementalIngest(db *store.DB, projectDir, dbPath string, serverMode bool) bool {
-	if serverMode || strings.Contains(dbPath, "@") {
-		return false
-	}
-	since := lastIngestUnix(db)
-	if since == 0 {
-		return false // first ingest, or pre-meta DB — full path required
-	}
-	all, stale := walkGoFiles(projectDir, since)
-	if len(stale) > incrementalIngestThreshold {
-		return false
-	}
-	dbCount, err := countDBSourceFiles(db)
-	if err != nil {
-		return false
-	}
-	if dbCount > len(all) {
-		// Files were deleted on disk — full ingest is needed to prune
-		// orphan definitions. Detect this even when no files appear
-		// stale (a pure deletion with no other edits).
-		return false
-	}
-	if len(all) > dbCount {
-		// A .go file exists on disk that the DB has never seen — could
-		// be a new file with mtime ≤ last_ingest (cp -p, untar, git
-		// checkout, clock skew) so it didn't surface as stale. Full
-		// ingest is needed to pick up its definitions.
+	stale, ok := incrementalPreflight(db, projectDir, dbPath, serverMode)
+	if !ok {
 		return false
 	}
 	if len(stale) == 0 {
 		fmt.Fprintln(os.Stderr, "nothing to ingest (no .go files modified since last ingest)")
 		return true
 	}
+	return applyIncrementalIngest(db, projectDir, dbPath, stale)
+}
 
-	start := time.Now()
-	// Per-file IngestFile for every stale file; per-package ResolveFile
-	// (one representative file per directory) since ResolveFile rebuilds
-	// the whole containing package's refs.
-	uniqueDirs := make(map[string]string, len(stale))
-	fmt.Fprintf(os.Stderr, "incremental ingest: %d file(s)...\n", len(stale))
-	for _, f := range stale {
-		if _, err := ingest.IngestFile(db, projectDir, f); err != nil {
-			fmt.Fprintf(os.Stderr, "incremental ingest failed on %s: %v — falling back to full ingest\n", f, err)
-			return false
-		}
-		if _, ok := uniqueDirs[filepath.Dir(f)]; !ok {
-			uniqueDirs[filepath.Dir(f)] = f
-		}
+// incrementalPreflight decides whether the fast path applies. Returns
+// (stale, true) when the per-file path should run (stale may be empty
+// if the DB is already up to date); (nil, false) when the caller must
+// fall through to the full ingest path.
+//
+// Disqualifies the fast path on: server/DSN mode, no last_ingest meta
+// (first ingest), too many stale files, or any disk-vs-DB file count
+// mismatch (add or delete that needs the full path's prune-and-load).
+func incrementalPreflight(db *store.DB, projectDir, dbPath string, serverMode bool) ([]string, bool) {
+	if serverMode || strings.Contains(dbPath, "@") {
+		return nil, false
 	}
-	for _, rep := range uniqueDirs {
-		if err := resolve.ResolveFile(db, projectDir, rep); err != nil {
-			fmt.Fprintf(os.Stderr, "incremental resolve failed on %s: %v — falling back to full ingest\n", rep, err)
-			return false
-		}
+	since := lastIngestUnix(db)
+	if since == 0 {
+		return nil, false // first ingest, or pre-meta DB
+	}
+	all, stale := walkGoFiles(projectDir, since)
+	if len(stale) > incrementalIngestThreshold {
+		return nil, false
+	}
+	dbCount, err := countDBSourceFiles(db)
+	if err != nil {
+		return nil, false
+	}
+	if dbCount != len(all) {
+		// Disk vs DB file-count mismatch: either a deletion (dbCount >
+		// len(all)) needs the full path's prune, or a new file with
+		// mtime ≤ last_ingest (cp -p, untar, clock skew, len(all) >
+		// dbCount) needs the full path to pick up its defs.
+		return nil, false
+	}
+	return stale, true
+}
+
+// applyIncrementalIngest runs the per-file ingest + per-package resolve
+// against a non-empty stale list, then commits and updates meta. On any
+// error it logs and returns false so the caller falls through to full
+// ingest. Best-effort compaction runs every incrementalCompactInterval
+// invocations.
+func applyIncrementalIngest(db *store.DB, projectDir, dbPath string, stale []string) bool {
+	start := time.Now()
+	fmt.Fprintf(os.Stderr, "incremental ingest: %d file(s)...\n", len(stale))
+	uniqueDirs, ok := ingestStaleFiles(db, projectDir, stale)
+	if !ok {
+		return false
+	}
+	if !resolveUniqueDirs(db, projectDir, uniqueDirs) {
+		return false
 	}
 	if err := db.SetMeta("last_ingest", strconv.FormatInt(time.Now().Unix(), 10)); err != nil {
 		fmt.Fprintf(os.Stderr, "set last_ingest: %v — falling back to full ingest\n", err)
@@ -1653,7 +1669,38 @@ func tryIncrementalIngest(db *store.DB, projectDir, dbPath string, serverMode bo
 		return false
 	}
 	maybeCompactAfterIncremental(db, dbPath)
-	fmt.Fprintf(os.Stderr, "done in %s (%d file(s), %d package(s)).\n", time.Since(start).Round(time.Millisecond), len(stale), len(uniqueDirs))
+	fmt.Fprintf(os.Stderr, "done in %s (%d file(s), %d package(s)).\n",
+		time.Since(start).Round(time.Millisecond), len(stale), len(uniqueDirs))
+	return true
+}
+
+// ingestStaleFiles runs ingest.IngestFile on each stale file and
+// returns a directory→representative-file map for the resolve pass.
+// Returns ok=false on the first per-file error (caller falls through).
+func ingestStaleFiles(db *store.DB, projectDir string, stale []string) (map[string]string, bool) {
+	uniqueDirs := make(map[string]string, len(stale))
+	for _, f := range stale {
+		if _, err := ingest.IngestFile(db, projectDir, f); err != nil {
+			fmt.Fprintf(os.Stderr, "incremental ingest failed on %s: %v — falling back to full ingest\n", f, err)
+			return nil, false
+		}
+		if _, ok := uniqueDirs[filepath.Dir(f)]; !ok {
+			uniqueDirs[filepath.Dir(f)] = f
+		}
+	}
+	return uniqueDirs, true
+}
+
+// resolveUniqueDirs calls resolve.ResolveFile once per unique package
+// directory using the recorded representative file. Returns false on
+// the first error.
+func resolveUniqueDirs(db *store.DB, projectDir string, uniqueDirs map[string]string) bool {
+	for _, rep := range uniqueDirs {
+		if err := resolve.ResolveFile(db, projectDir, rep); err != nil {
+			fmt.Fprintf(os.Stderr, "incremental resolve failed on %s: %v — falling back to full ingest\n", rep, err)
+			return false
+		}
+	}
 	return true
 }
 
