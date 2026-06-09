@@ -1468,10 +1468,17 @@ func lastIngestUnix(db *store.DB) int64 {
 // list of absolute paths and the subset whose mtime exceeds `since`
 // (unix seconds; 0 disables the stale filter). Skips .defn/, .git/,
 // vendor/, node_modules/, and testdata/.
+//
+// Logs (rather than silently drops) files we can't stat — broken
+// symlinks, permission-denied entries, or transient IO errors. The
+// fast path's structural-change guard relies on len(all), so a
+// silently-dropped file could miscount and route work down the wrong
+// path. A noisy warning beats a silent miss.
 func walkGoFiles(projectDir string, since int64) (all []string, stale []string) {
 	_ = filepath.WalkDir(projectDir, func(path string, d fs.DirEntry, werr error) error {
 		if werr != nil {
-			return werr
+			fmt.Fprintf(os.Stderr, "defn: warning: walk error at %s: %v\n", path, werr)
+			return nil
 		}
 		if d.IsDir() {
 			name := d.Name()
@@ -1486,6 +1493,7 @@ func walkGoFiles(projectDir string, since int64) (all []string, stale []string) 
 		}
 		info, err := d.Info()
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "defn: warning: cannot stat %s: %v (skipping)\n", path, err)
 			return nil
 		}
 		abs, aerr := filepath.Abs(path)
@@ -1544,11 +1552,27 @@ func countDBSourceFiles(db *store.DB) (int, error) {
 }
 
 // incrementalIngestThreshold caps the per-file fast path. Above this
-// many stale files we fall through to a full packages.Load — the
-// per-file cost is ~10ms but each call still parses + runs resolve.ResolveFile
-// which loads the file's package; 50 keeps total fast-path time well under
-// a second while covering the common hook case (1 file edited).
+// many stale files we fall through to a full packages.Load. Per-file
+// cost is roughly: IngestFile ~10ms (go/parser only) + ResolveFile
+// 200ms–1s (packages.Load scoped to one package). We dedupe ResolveFile
+// by package directory, so N stale files in K packages cost ~K resolve
+// loads, not N. At the 50 cap the realistic worst case is ~25s
+// (50 files in 50 packages); the common hook case (1 file edited)
+// runs in 200ms–1s.
 const incrementalIngestThreshold = 50
+
+// incrementalCompactInterval triggers a Dolt journal compaction after
+// this many successful incremental ingests. The full path runs
+// compactEmbedded on every call (reclaims ~99% of journal chunks);
+// the fast path commits without compacting, so we periodically catch
+// up to keep .defn/ bounded for projects driven mostly by editor-save
+// hooks. Stored as a meta counter ("defn:incremental_count") so it
+// survives across CLI invocations.
+const incrementalCompactInterval = 50
+
+// incrementalCounterMeta is a defn-managed internal meta key (no
+// namespace prefix, matching last_ingest's convention).
+const incrementalCounterMeta = "incremental_count"
 
 // tryIncrementalIngest attempts the per-file fast path when only a small
 // number of files have changed since last_ingest and no .go files were
@@ -1558,11 +1582,12 @@ const incrementalIngestThreshold = 50
 //
 // The fast path skips packages.Load — the dominant cost in cmdIngest
 // (~3 min, 1.1 GB RSS on medium projects). It uses ingest.IngestFile
-// (go/parser only, no go/types) and resolve.ResolveFile (loads only
-// the affected package). Cross-package refs FROM other packages TO
-// renamed defs are not refreshed here; that's documented in
-// resolve.ResolveFile and acceptable for editor-save hook flows where
-// a periodic full ingest closes the gap.
+// (go/parser only, ~10ms/file) and resolve.ResolveFile (packages.Load
+// scoped to one package, ~200ms–1s/package; deduped by package dir).
+// Cross-package refs FROM other packages TO renamed defs are not
+// refreshed here; that's documented in resolve.ResolveFile and
+// acceptable for editor-save hook flows where a periodic full ingest
+// closes the gap.
 func tryIncrementalIngest(db *store.DB, projectDir, dbPath string, serverMode bool) bool {
 	if serverMode || strings.Contains(dbPath, "@") {
 		return false
@@ -1598,14 +1623,23 @@ func tryIncrementalIngest(db *store.DB, projectDir, dbPath string, serverMode bo
 	}
 
 	start := time.Now()
+	// Per-file IngestFile for every stale file; per-package ResolveFile
+	// (one representative file per directory) since ResolveFile rebuilds
+	// the whole containing package's refs.
+	uniqueDirs := make(map[string]string, len(stale))
 	fmt.Fprintf(os.Stderr, "incremental ingest: %d file(s)...\n", len(stale))
 	for _, f := range stale {
 		if _, err := ingest.IngestFile(db, projectDir, f); err != nil {
 			fmt.Fprintf(os.Stderr, "incremental ingest failed on %s: %v — falling back to full ingest\n", f, err)
 			return false
 		}
-		if err := resolve.ResolveFile(db, projectDir, f); err != nil {
-			fmt.Fprintf(os.Stderr, "incremental resolve failed on %s: %v — falling back to full ingest\n", f, err)
+		if _, ok := uniqueDirs[filepath.Dir(f)]; !ok {
+			uniqueDirs[filepath.Dir(f)] = f
+		}
+	}
+	for _, rep := range uniqueDirs {
+		if err := resolve.ResolveFile(db, projectDir, rep); err != nil {
+			fmt.Fprintf(os.Stderr, "incremental resolve failed on %s: %v — falling back to full ingest\n", rep, err)
 			return false
 		}
 	}
@@ -1613,12 +1647,45 @@ func tryIncrementalIngest(db *store.DB, projectDir, dbPath string, serverMode bo
 		fmt.Fprintf(os.Stderr, "set last_ingest: %v — falling back to full ingest\n", err)
 		return false
 	}
+	bumpIncrementalCounter(db)
 	if err := db.Commit("incremental ingest"); err != nil {
 		fmt.Fprintf(os.Stderr, "commit failed: %v — falling back to full ingest\n", err)
 		return false
 	}
-	fmt.Fprintf(os.Stderr, "done in %s.\n", time.Since(start).Round(time.Millisecond))
+	maybeCompactAfterIncremental(db, dbPath)
+	fmt.Fprintf(os.Stderr, "done in %s (%d file(s), %d package(s)).\n", time.Since(start).Round(time.Millisecond), len(stale), len(uniqueDirs))
 	return true
+}
+
+// bumpIncrementalCounter increments the incremental-ingest counter
+// stored in DB meta. Best-effort: a failure here just means we may
+// compact slightly later than scheduled, never silently corrupt.
+func bumpIncrementalCounter(db *store.DB) {
+	cur := 0
+	if s, err := db.GetMeta(incrementalCounterMeta); err == nil && s != "" {
+		if n, perr := strconv.Atoi(s); perr == nil {
+			cur = n
+		}
+	}
+	_ = db.SetMeta(incrementalCounterMeta, strconv.Itoa(cur+1))
+}
+
+// maybeCompactAfterIncremental runs compactEmbedded once the counter
+// reaches incrementalCompactInterval, then resets it. The full ingest
+// path compacts on every call; this catches up for projects driven
+// mostly by hook-fired incremental ingests.
+func maybeCompactAfterIncremental(db *store.DB, dbPath string) {
+	s, err := db.GetMeta(incrementalCounterMeta)
+	if err != nil || s == "" {
+		return
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < incrementalCompactInterval {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "compacting embedded store after %d incremental ingests...\n", n)
+	compactEmbedded(db, dbPath)
+	_ = db.SetMeta(incrementalCounterMeta, "0")
 }
 
 // warnIfStale prints a stderr notice when the working tree has .go
