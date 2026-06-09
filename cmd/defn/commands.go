@@ -1458,6 +1458,7 @@ func lastIngestUnix(db *store.DB) int64 {
 	}
 	t, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "defn: warning: corrupted last_ingest meta %q: %v (run 'defn ingest .' to repair)\n", s, err)
 		return 0
 	}
 	return t
@@ -1516,11 +1517,14 @@ func countStaleFiles(db *store.DB, projectDir string) (count int, sample string)
 	return len(stale), stale[0]
 }
 
-// countDBSourceFiles returns the number of distinct .go files referenced
-// by the definitions table. Used to detect structural changes (file
-// adds/deletes) by comparing against the on-disk .go file count.
+// countDBSourceFiles returns the number of distinct .go files ingested
+// into the database. Queries file_sources (the authoritative per-file
+// record written by ingest, including files with zero declarations like
+// package-only files) — querying definitions would undercount and miss
+// deletions of def-bearing files in projects that also contain
+// package-only files.
 func countDBSourceFiles(db *store.DB) (int, error) {
-	rows, err := db.Query("SELECT COUNT(DISTINCT source_file) AS n FROM definitions WHERE source_file != ''")
+	rows, err := db.Query("SELECT COUNT(DISTINCT source_file) AS n FROM file_sources")
 	if err != nil {
 		return 0, err
 	}
@@ -1579,6 +1583,13 @@ func tryIncrementalIngest(db *store.DB, projectDir, dbPath string, serverMode bo
 		// Files were deleted on disk — full ingest is needed to prune
 		// orphan definitions. Detect this even when no files appear
 		// stale (a pure deletion with no other edits).
+		return false
+	}
+	if len(all) > dbCount {
+		// A .go file exists on disk that the DB has never seen — could
+		// be a new file with mtime ≤ last_ingest (cp -p, untar, git
+		// checkout, clock skew) so it didn't surface as stale. Full
+		// ingest is needed to pick up its definitions.
 		return false
 	}
 	if len(stale) == 0 {
