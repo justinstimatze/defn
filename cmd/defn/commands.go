@@ -639,6 +639,16 @@ func cmdIngest(modulePath string, serverMode bool) {
 	}
 	defer db.Close()
 
+	// Fast path: when only a small number of files have changed and no
+	// files were added/deleted, skip packages.Load (~3 min, 1.1 GB peak
+	// on medium projects) and update just the changed files via
+	// ingest.IngestFile + resolve.ResolveFile (~10 ms per file). This
+	// is the common case for editor-save hooks that re-run `defn ingest .`
+	// on every .go change in projects without a live serve.
+	if tryIncrementalIngest(db, modulePath, dbPath, serverMode) {
+		return
+	}
+
 	announceStaleIngest(db, modulePath)
 	fmt.Fprintf(os.Stderr, "ingesting %s...\n", modulePath)
 	pkgs, err := goload.LoadAll(modulePath)
@@ -1439,22 +1449,25 @@ func cmdQuery(sql string) {
 	enc.Encode(results)
 }
 
-// countStaleFiles reports how many .go files under projectDir have
-// been modified since the last ingest. Returns (0, "") when the DB
-// has no last_ingest meta (older DBs) or nothing is stale. sample is
-// the first stale path encountered, for user-facing messages.
-//
-// Walks projectDir skipping .defn/, .git/, vendor/, node_modules/,
-// and testdata/. Shared backend for warnIfStale and announceStaleIngest.
-func countStaleFiles(db *store.DB, projectDir string) (count int, sample string) {
-	lastIngestStr, err := db.GetMeta("last_ingest")
-	if err != nil || lastIngestStr == "" {
-		return 0, ""
+// lastIngestUnix returns the recorded last-ingest timestamp, or 0 when
+// the DB predates the meta (very old DBs) or has never been ingested.
+func lastIngestUnix(db *store.DB) int64 {
+	s, err := db.GetMeta("last_ingest")
+	if err != nil || s == "" {
+		return 0
 	}
-	lastIngest, err := strconv.ParseInt(lastIngestStr, 10, 64)
+	t, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
-		return 0, ""
+		return 0
 	}
+	return t
+}
+
+// walkGoFiles enumerates .go files under projectDir, returning the full
+// list of absolute paths and the subset whose mtime exceeds `since`
+// (unix seconds; 0 disables the stale filter). Skips .defn/, .git/,
+// vendor/, node_modules/, and testdata/.
+func walkGoFiles(projectDir string, since int64) (all []string, stale []string) {
 	_ = filepath.WalkDir(projectDir, func(path string, d fs.DirEntry, werr error) error {
 		if werr != nil {
 			return werr
@@ -1474,15 +1487,127 @@ func countStaleFiles(db *store.DB, projectDir string) (count int, sample string)
 		if err != nil {
 			return nil
 		}
-		if info.ModTime().Unix() > lastIngest {
-			count++
-			if sample == "" {
-				sample = path
-			}
+		abs, aerr := filepath.Abs(path)
+		if aerr != nil {
+			abs = path
+		}
+		all = append(all, abs)
+		if since > 0 && info.ModTime().Unix() > since {
+			stale = append(stale, abs)
 		}
 		return nil
 	})
-	return count, sample
+	return all, stale
+}
+
+// countStaleFiles reports how many .go files under projectDir have
+// been modified since the last ingest. Returns (0, "") when the DB
+// has no last_ingest meta (older DBs) or nothing is stale. sample is
+// the first stale path encountered, for user-facing messages.
+func countStaleFiles(db *store.DB, projectDir string) (count int, sample string) {
+	since := lastIngestUnix(db)
+	if since == 0 {
+		return 0, ""
+	}
+	_, stale := walkGoFiles(projectDir, since)
+	if len(stale) == 0 {
+		return 0, ""
+	}
+	return len(stale), stale[0]
+}
+
+// countDBSourceFiles returns the number of distinct .go files referenced
+// by the definitions table. Used to detect structural changes (file
+// adds/deletes) by comparing against the on-disk .go file count.
+func countDBSourceFiles(db *store.DB) (int, error) {
+	rows, err := db.Query("SELECT COUNT(DISTINCT source_file) AS n FROM definitions WHERE source_file != ''")
+	if err != nil {
+		return 0, err
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	switch v := rows[0]["n"].(type) {
+	case int64:
+		return int(v), nil
+	case int:
+		return v, nil
+	case uint64:
+		return int(v), nil
+	default:
+		return 0, fmt.Errorf("unexpected count type %T", v)
+	}
+}
+
+// incrementalIngestThreshold caps the per-file fast path. Above this
+// many stale files we fall through to a full packages.Load — the
+// per-file cost is ~10ms but each call still parses + runs resolve.ResolveFile
+// which loads the file's package; 50 keeps total fast-path time well under
+// a second while covering the common hook case (1 file edited).
+const incrementalIngestThreshold = 50
+
+// tryIncrementalIngest attempts the per-file fast path when only a small
+// number of files have changed since last_ingest and no .go files were
+// added or deleted. Returns true on success (caller should return),
+// false when the fast path doesn't apply or fails (caller falls through
+// to full ingest).
+//
+// The fast path skips packages.Load — the dominant cost in cmdIngest
+// (~3 min, 1.1 GB RSS on medium projects). It uses ingest.IngestFile
+// (go/parser only, no go/types) and resolve.ResolveFile (loads only
+// the affected package). Cross-package refs FROM other packages TO
+// renamed defs are not refreshed here; that's documented in
+// resolve.ResolveFile and acceptable for editor-save hook flows where
+// a periodic full ingest closes the gap.
+func tryIncrementalIngest(db *store.DB, projectDir, dbPath string, serverMode bool) bool {
+	if serverMode || strings.Contains(dbPath, "@") {
+		return false
+	}
+	since := lastIngestUnix(db)
+	if since == 0 {
+		return false // first ingest, or pre-meta DB — full path required
+	}
+	all, stale := walkGoFiles(projectDir, since)
+	if len(stale) > incrementalIngestThreshold {
+		return false
+	}
+	dbCount, err := countDBSourceFiles(db)
+	if err != nil {
+		return false
+	}
+	if dbCount > len(all) {
+		// Files were deleted on disk — full ingest is needed to prune
+		// orphan definitions. Detect this even when no files appear
+		// stale (a pure deletion with no other edits).
+		return false
+	}
+	if len(stale) == 0 {
+		fmt.Fprintln(os.Stderr, "nothing to ingest (no .go files modified since last ingest)")
+		return true
+	}
+
+	start := time.Now()
+	fmt.Fprintf(os.Stderr, "incremental ingest: %d file(s)...\n", len(stale))
+	for _, f := range stale {
+		if _, err := ingest.IngestFile(db, projectDir, f); err != nil {
+			fmt.Fprintf(os.Stderr, "incremental ingest failed on %s: %v — falling back to full ingest\n", f, err)
+			return false
+		}
+		if err := resolve.ResolveFile(db, projectDir, f); err != nil {
+			fmt.Fprintf(os.Stderr, "incremental resolve failed on %s: %v — falling back to full ingest\n", f, err)
+			return false
+		}
+	}
+	if err := db.SetMeta("last_ingest", strconv.FormatInt(time.Now().Unix(), 10)); err != nil {
+		fmt.Fprintf(os.Stderr, "set last_ingest: %v — falling back to full ingest\n", err)
+		return false
+	}
+	if err := db.Commit("incremental ingest"); err != nil {
+		fmt.Fprintf(os.Stderr, "commit failed: %v — falling back to full ingest\n", err)
+		return false
+	}
+	fmt.Fprintf(os.Stderr, "done in %s.\n", time.Since(start).Round(time.Millisecond))
+	return true
 }
 
 // warnIfStale prints a stderr notice when the working tree has .go
