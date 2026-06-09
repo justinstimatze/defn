@@ -1019,6 +1019,50 @@ func (s *DB) Path() string {
 	return s.path
 }
 
+// PruneStaleFileSources removes file_sources rows for any (module_id,
+// source_file) NOT present in live. Modules absent from live (not
+// touched by this ingest) are left untouched to avoid wiping data
+// from unrelated modules in monorepo workflows where a single ingest
+// might cover only a subset.
+//
+// Used by IngestPackages to clean up after deletions and to clear
+// orphan basename entries left by pre-0.22.3 relative-modulePath
+// ingests (which agreed on the basename but not the module-relative
+// path with IngestFile).
+func (s *DB) PruneStaleFileSources(live map[int64]map[string]bool) (int, error) {
+	if len(live) == 0 {
+		return 0, nil
+	}
+	pruned := 0
+	for modID, liveSet := range live {
+		rows, err := s.queryContext(s.Ctx(),
+			"SELECT source_file FROM file_sources WHERE module_id = ?", modID)
+		if err != nil {
+			return pruned, fmt.Errorf("list file_sources for module %d: %w", modID, err)
+		}
+		var stale []string
+		for rows.Next() {
+			var sf string
+			if err := rows.Scan(&sf); err != nil {
+				rows.Close()
+				return pruned, fmt.Errorf("scan source_file: %w", err)
+			}
+			if !liveSet[sf] {
+				stale = append(stale, sf)
+			}
+		}
+		rows.Close()
+		for _, sf := range stale {
+			if _, err := s.execContext(s.Ctx(),
+				"DELETE FROM file_sources WHERE module_id = ? AND source_file = ?", modID, sf); err != nil {
+				return pruned, fmt.Errorf("delete file_sources (%d, %s): %w", modID, sf, err)
+			}
+			pruned++
+		}
+	}
+	return pruned, nil
+}
+
 // PruneStaleDefinitions removes definitions not in the given set of IDs.
 func (s *DB) PruneStaleDefinitions(liveIDs map[int64]bool) (int, error) {
 	if len(liveIDs) == 0 {

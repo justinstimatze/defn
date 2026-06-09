@@ -48,8 +48,9 @@ func IngestPackages(db *store.DB, pkgs []*packages.Package, modulePath string) e
 	}
 
 	state := &ingestState{
-		initCounter: make(map[int64]int),
-		liveDefIDs:  make(map[int64]bool),
+		initCounter:     make(map[int64]int),
+		liveDefIDs:      make(map[int64]bool),
+		liveFileSources: make(map[int64]map[string]bool),
 	}
 
 	// Store project-level files (go.mod, go.sum).
@@ -77,6 +78,19 @@ func IngestPackages(db *store.DB, pkgs []*packages.Package, modulePath string) e
 		return fmt.Errorf("prune stale: %w", err)
 	} else if pruned > 0 {
 		fmt.Fprintf(os.Stderr, "pruned %d stale definitions\n", pruned)
+	}
+
+	// Remove file_sources rows for files no longer touched by ingest —
+	// catches both genuine on-disk deletions and orphan basename rows
+	// left by pre-0.22.3 relative-modulePath ingests, whose presence
+	// otherwise breaks the incremental fast path's structural-change
+	// guard. Scoped per-module: pruning runs for each module that was
+	// (re)ingested in this pass; modules absent from this ingest (an
+	// unusual situation) keep their rows.
+	if pruned, err := db.PruneStaleFileSources(state.liveFileSources); err != nil {
+		return fmt.Errorf("prune stale file_sources: %w", err)
+	} else if pruned > 0 {
+		fmt.Fprintf(os.Stderr, "pruned %d stale file_sources rows\n", pruned)
 	}
 
 	// Record last ingest timestamp for staleness detection.
@@ -167,6 +181,10 @@ func ingestPackage(db *store.DB, pkg *packages.Package, modulePath string, state
 				if err := db.SetFileSource(mod.ID, sourceFile, string(raw)); err != nil {
 					return fmt.Errorf("set file source for %s: %w", sourceFile, err)
 				}
+				if state.liveFileSources[mod.ID] == nil {
+					state.liveFileSources[mod.ID] = make(map[string]bool)
+				}
+				state.liveFileSources[mod.ID][sourceFile] = true
 			}
 		}
 		if err := ingestFile(db, pkg, mod, file, isTest, sourceFile, state); err != nil {
@@ -384,6 +402,11 @@ func ingestComments(db *store.DB, fset *token.FileSet, file *ast.File, sourceFil
 type ingestState struct {
 	initCounter map[int64]int  // tracks init functions per module
 	liveDefIDs  map[int64]bool // tracks all definition IDs seen
+	// liveFileSources tracks the (module_id, source_file) pairs written
+	// during this ingest. Used to prune file_sources rows for files
+	// that no longer exist on disk (e.g., orphan basename entries
+	// from pre-0.22.3 relative-modulePath ingests).
+	liveFileSources map[int64]map[string]bool
 }
 
 func ingestFunc(db *store.DB, fset *token.FileSet, mod *store.Module, file *ast.File, fn *ast.FuncDecl, isTest bool, sourceFile string, state *ingestState) error {
