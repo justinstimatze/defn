@@ -542,6 +542,82 @@ func TestHandleCreate(t *testing.T) {
 	}
 }
 
+// Bug C: op:create with multi-decl body must reject instead of silently
+// dropping all but the first decl into a single Definition.
+func TestHandleCreateRejectsMultiDecl(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	body := `const Limit = 10
+
+func Helper() int { return Limit }
+
+func Other() int { return 0 }`
+
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{Body: body})
+	text := resultText(t, result)
+
+	if !strings.Contains(text, "top-level declarations") {
+		t.Errorf("expected multi-decl rejection error, got: %s", text)
+	}
+	// Confirm nothing was created.
+	if _, err := db.GetDefinitionByName("Helper", ""); err == nil {
+		t.Error("Helper should not have been created when body was rejected")
+	}
+	if _, err := db.GetDefinitionByName("Other", ""); err == nil {
+		t.Error("Other should not have been created when body was rejected")
+	}
+}
+
+// Bug C: op:create with file: param must route the new def into that file
+// (SourceFile populated on the stored Definition).
+func TestHandleCreateHonorsFileParam(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body: "func PlacedHere() int { return 1 }",
+		File: "main.go",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Created") {
+		t.Fatalf("expected 'Created', got: %s", text)
+	}
+	if !strings.Contains(text, "main.go") {
+		t.Errorf("expected file path in output, got: %s", text)
+	}
+
+	d, err := db.GetDefinitionByName("PlacedHere", "")
+	if err != nil {
+		t.Fatalf("def not found: %v", err)
+	}
+	if d.SourceFile != "main.go" {
+		t.Errorf("SourceFile = %q, want %q", d.SourceFile, "main.go")
+	}
+}
+
+// Bug C: when file: maps to no known module, return an error rather than
+// silently falling back to the first module.
+func TestHandleCreateRejectsUnknownFile(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body: "func Nope() int { return 0 }",
+		File: "no/such/package/file.go",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "does not map to any known module") {
+		t.Errorf("expected unknown-module error, got: %s", text)
+	}
+	if _, err := db.GetDefinitionByName("Nope", ""); err == nil {
+		t.Error("Nope should not have been created when file is unknown")
+	}
+}
+
 func TestHandleRename(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()

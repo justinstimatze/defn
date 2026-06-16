@@ -35,7 +35,7 @@ const maxSearchResults = 20 // keep responses compact to avoid context bloat
 // constant so the CLI can compare its own version against what a
 // running serve reports via the /version HTTP endpoint, surfacing
 // binary/serve skew in `defn status`.
-const Version = "0.23.0"
+const Version = "0.23.1"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -293,6 +293,7 @@ type applyOp struct {
 	Body        string `json:"body"`
 	NewBody     string `json:"new_body"`
 	Module      string `json:"module"`
+	File        string `json:"file"`
 	OldFragment string `json:"old_fragment"`
 	NewFragment string `json:"new_fragment"`
 	After       string `json:"after"`
@@ -310,6 +311,7 @@ type editParam struct {
 type createParam struct {
 	Body   string `json:"body"`
 	Module string `json:"module,omitempty"`
+	File   string `json:"file,omitempty"`
 }
 type applyParam struct {
 	Operations []applyOp `json:"operations"`
@@ -543,7 +545,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "insert":
 		return s.handleInsert(ctx, req, args)
 	case "create":
-		return s.handleCreate(ctx, req, createParam{Body: args.Body, Module: args.Module})
+		return s.handleCreate(ctx, req, createParam{Body: args.Body, Module: args.Module, File: args.File})
 	case "delete":
 		return s.handleDelete(ctx, req, nameParam{Name: args.Name})
 	case "rename":
@@ -1216,16 +1218,31 @@ func (s *server) handleInsert(_ context.Context, _ *sdkmcp.CallToolRequest, args
 }
 
 func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args createParam) (*sdkmcp.CallToolResult, any, error) {
+	// Reject multi-decl bodies: each definition is its own atomic unit. Batch
+	// via code(op:"apply") with multiple create operations instead.
+	if n := countTopLevelDecls(args.Body); n > 1 {
+		return errResult(fmt.Errorf("body contains %d top-level declarations — op:create accepts exactly one. Split into %d separate calls (or use op:apply with %d create operations)", n, n, n))
+	}
+
 	// Infer name, kind, and test flag from the body.
 	name, kind, receiver, isTest := s.inferFromBody(args.Body)
 	if name == "" {
 		return errResult(fmt.Errorf("couldn't infer definition name from body — make sure it starts with func/type/const/var"))
 	}
 
-	// Find module: use provided, or default to first.
+	// Find module: file: param wins (most specific), then module:, then first.
 	var mod *store.Module
-	if args.Module != "" {
+	if args.File != "" {
+		mod = s.findModuleByFile(args.File)
+		if mod == nil {
+			return errResult(fmt.Errorf("file %q does not map to any known module — run defn ingest first, or pass module: explicitly", args.File))
+		}
+	}
+	if mod == nil && args.Module != "" {
 		mod = s.findModule(args.Module)
+		if mod == nil {
+			return errResult(fmt.Errorf("module %q not found", args.Module))
+		}
 	}
 	if mod == nil {
 		mods, _ := s.db.ListModules() // best effort — nil is safe
@@ -1245,14 +1262,15 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 
 	exported := len(name) > 0 && name[0] >= 'A' && name[0] <= 'Z'
 	d := &store.Definition{
-		ModuleID:  mod.ID,
-		Name:      name,
-		Kind:      kind,
-		Exported:  exported,
-		Test:      isTest,
-		Receiver:  receiver,
-		Signature: extractSignature(args.Body),
-		Body:      args.Body,
+		ModuleID:   mod.ID,
+		Name:       name,
+		Kind:       kind,
+		Exported:   exported,
+		Test:       isTest,
+		Receiver:   receiver,
+		Signature:  extractSignature(args.Body),
+		Body:       args.Body,
+		SourceFile: args.File,
 	}
 	id, err := s.db.UpsertDefinition(d)
 	if err != nil {
@@ -1263,11 +1281,63 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	s.autoResolve(mod.Path)
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Created %s (id=%d, kind=%s) in %s\n", name, id, kind, mod.Path))
+	loc := mod.Path
+	if args.File != "" {
+		loc = args.File + " (" + mod.Path + ")"
+	}
+	sb.WriteString(fmt.Sprintf("Created %s (id=%d, kind=%s) in %s\n", name, id, kind, loc))
 	if buildResult != "" {
 		sb.WriteString("\n" + buildResult)
 	}
 	return textResult(sb.String()), nil, nil
+}
+
+// countTopLevelDecls returns the number of top-level declarations in a Go body
+// fragment. Returns 0 if unparseable (caller surfaces a clearer error).
+func countTopLevelDecls(body string) int {
+	src := "package x\n" + strings.TrimSpace(body)
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	if err != nil {
+		return 0
+	}
+	return len(f.Decls)
+}
+
+// findModuleByFile maps a source file path to its module by matching the
+// file's directory against module Paths (which are import paths like
+// "github.com/x/y/internal/code"). Accepts repo-relative or absolute paths;
+// matches by suffix on the directory component.
+func (s *server) findModuleByFile(file string) *store.Module {
+	mods, _ := s.db.ListModules() // best effort — nil is safe
+	if len(mods) == 0 {
+		return nil
+	}
+	dir := filepath.ToSlash(filepath.Dir(file))
+	dir = strings.TrimPrefix(dir, "./")
+	if dir == "" || dir == "." {
+		// File sits at repo root — pick the module whose Path has no
+		// internal segment beyond the module root (shortest path wins).
+		var best *store.Module
+		for i, m := range mods {
+			if best == nil || len(m.Path) < len(best.Path) {
+				best = &mods[i]
+			}
+		}
+		return best
+	}
+	// Prefer exact suffix match on the import path. Try longest dir component
+	// first so "internal/code/foo" doesn't accidentally match "internal/code".
+	var best *store.Module
+	for i, m := range mods {
+		mp := m.Path
+		if mp == dir || strings.HasSuffix(mp, "/"+dir) {
+			if best == nil || len(m.Path) > len(best.Path) {
+				best = &mods[i]
+			}
+		}
+	}
+	return best
 }
 
 // inferFromBody extracts definition name, kind, receiver, and test flag from Go source.
@@ -1331,6 +1401,10 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		for _, op := range args.Operations {
 			switch op.Op {
 			case "create":
+				if n := countTopLevelDecls(op.Body); n > 1 {
+					errors = append(errors, fmt.Sprintf("create: body has %d top-level decls — split into %d create ops", n, n))
+					continue
+				}
 				name, kind, _, _ := s.inferFromBody(op.Body)
 				if name == "" {
 					errors = append(errors, "create: couldn't infer name from body")
@@ -1381,14 +1455,29 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	for _, op := range args.Operations {
 		switch op.Op {
 		case "create":
+			if n := countTopLevelDecls(op.Body); n > 1 {
+				errors = append(errors, fmt.Sprintf("create: body has %d top-level decls — split into %d create ops", n, n))
+				continue
+			}
 			name, kind, receiver, isTest := s.inferFromBody(op.Body)
 			if name == "" {
 				errors = append(errors, "create: couldn't infer name from body")
 				continue
 			}
 			var mod *store.Module
-			if op.Module != "" {
+			if op.File != "" {
+				mod = s.findModuleByFile(op.File)
+				if mod == nil {
+					errors = append(errors, fmt.Sprintf("create %s: file %q does not map to any known module", name, op.File))
+					continue
+				}
+			}
+			if mod == nil && op.Module != "" {
 				mod = s.findModule(op.Module)
+				if mod == nil {
+					errors = append(errors, fmt.Sprintf("create %s: module %q not found", name, op.Module))
+					continue
+				}
 			}
 			if mod == nil {
 				mods, _ := s.db.ListModules() // best effort — nil is safe
@@ -1404,6 +1493,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			d := &store.Definition{
 				ModuleID: mod.ID, Name: name, Kind: kind, Exported: exported,
 				Test: isTest, Receiver: receiver, Signature: extractSignature(op.Body), Body: op.Body,
+				SourceFile: op.File,
 			}
 			id, err := s.db.UpsertDefinition(d)
 			if err != nil {
