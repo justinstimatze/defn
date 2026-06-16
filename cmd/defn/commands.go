@@ -147,14 +147,21 @@ func dsnHostDisplay(dsn string) string {
 }
 
 // detectRunningServer returns a DSN for a running dolt sql-server hosting
-// this project's database, or "" if none is reachable. Checks
-// .defn/server.port for a custom port, falling back to 3307.
+// this project's database, or "" if none is reachable. Resolves the port
+// from (in order) .defn/server.port (embedded mode), .defn-server.port
+// (--server mode), then falls back to 3307. Verifies ownership via a
+// `SELECT COUNT(*) FROM definitions` query before returning the DSN —
+// a stranger's mysql/dolt on the same port won't have that table.
 //
 // Uses a short TCP dial first to avoid driver-level timeouts when
 // nothing is listening.
 func detectRunningServer(dbPath string) string {
 	port := "3307"
 	if data, err := os.ReadFile(filepath.Join(dbPath, "server.port")); err == nil {
+		port = strings.TrimSpace(string(data))
+	} else if data, err := os.ReadFile(".defn-server.port"); err == nil {
+		// --server mode writes the chosen port next to the pidfile at
+		// the project root; embedded mode uses .defn/server.port.
 		port = strings.TrimSpace(string(data))
 	}
 	addr := "127.0.0.1:" + port
@@ -189,6 +196,24 @@ func detectRunningServer(dbPath string) string {
 	return ""
 }
 
+// findFreePort returns the first port at or above start that no listener
+// currently holds, by trying to bind 127.0.0.1:<port>. Returns start
+// unchanged after 20 attempts if all are taken — caller will get a clear
+// bind failure on spawn rather than mistakenly connect to a stranger's
+// server. Used by cmdInitServer to avoid 3307 collisions with other
+// dolt instances on the host.
+func findFreePort(start int) int {
+	for p := start; p < start+20; p++ {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+		if err != nil {
+			continue
+		}
+		ln.Close()
+		return p
+	}
+	return start
+}
+
 func cmdInitServer(modulePath string) {
 	// Check dolt is installed.
 	doltBin, err := exec.LookPath("dolt")
@@ -199,9 +224,15 @@ func cmdInitServer(modulePath string) {
 	absModulePath, _ := filepath.Abs(modulePath)
 	serverDir := filepath.Join(absModulePath, ".defn-server")
 	pidFile := filepath.Join(absModulePath, ".defn-server.pid")
+	portFile := filepath.Join(absModulePath, ".defn-server.port")
 	port := os.Getenv("DEFN_PORT")
 	if port == "" {
-		port = "3307" // avoid conflict with system MySQL on 3306
+		// Probe for a free port starting at 3307 so we don't conflict
+		// with another dolt sql-server on the host (e.g. another defn
+		// project, or an unrelated dolt instance). Without this, the
+		// dial-readiness loop below succeeds against whoever's on the
+		// port and init proceeds against a stranger's database.
+		port = strconv.Itoa(findFreePort(3307))
 	}
 	dbName := filepath.Base(absModulePath)
 
@@ -232,6 +263,12 @@ func cmdInitServer(modulePath string) {
 	dsn := fmt.Sprintf("root@tcp(127.0.0.1:%s)/%s", port, dbName)
 	ready := false
 	for range 30 {
+		// If our spawned dolt has already exited (e.g. couldn't bind
+		// because something else owned the port), fail fast — don't
+		// wait for the dial to succeed against the squatter.
+		if cmd.ProcessState != nil {
+			fatal(fmt.Errorf("dolt server exited during startup (port %s likely already in use)", port))
+		}
 		conn, err := net.DialTimeout("tcp", "127.0.0.1:"+port, time.Second)
 		if err == nil {
 			conn.Close()
@@ -245,8 +282,9 @@ func cmdInitServer(modulePath string) {
 		fatal(fmt.Errorf("dolt server failed to start on port %s after 15s", port))
 	}
 
-	// Write pidfile only after server is confirmed ready.
+	// Write pidfile + portfile only after server is confirmed ready.
 	os.WriteFile(pidFile, fmt.Appendf(nil, "%d", pid), 0644)
+	os.WriteFile(portFile, []byte(port), 0644)
 	fmt.Fprintf(os.Stderr, "dolt server ready\n")
 
 	// Create a defn user with a random password (don't use root/no-password).
@@ -301,9 +339,18 @@ func cmdServer(action string) {
 		if _, err := os.Stat(serverDir); os.IsNotExist(err) {
 			fatal(fmt.Errorf(".defn-server not found — run defn init --server first"))
 		}
+		portFile := filepath.Join(absPath, ".defn-server.port")
 		port := os.Getenv("DEFN_PORT")
 		if port == "" {
-			port = "3307"
+			// Reuse the port the original init picked so subsequent
+			// `defn ingest` / `defn query` invocations (which call
+			// detectRunningServer) keep finding the same server. If no
+			// portfile exists, probe-for-free starting at 3307.
+			if data, err := os.ReadFile(portFile); err == nil {
+				port = strings.TrimSpace(string(data))
+			} else {
+				port = strconv.Itoa(findFreePort(3307))
+			}
 		}
 		cmd := exec.Command(doltBin, "sql-server", "--host", "127.0.0.1", "--port", port)
 		cmd.Dir = serverDir
@@ -311,6 +358,7 @@ func cmdServer(action string) {
 			fatal(fmt.Errorf("start: %w", err))
 		}
 		os.WriteFile(pidFile, fmt.Appendf(nil, "%d", cmd.Process.Pid), 0644)
+		os.WriteFile(portFile, []byte(port), 0644)
 		fmt.Fprintf(os.Stderr, "started dolt server (pid %d) on 127.0.0.1:%s\n", cmd.Process.Pid, port)
 
 	case "stop":
@@ -420,7 +468,23 @@ func cmdClean() {
 }
 
 func cmdInit(modulePath string) {
+	// Operate from the target project dir so .defn/, .mcp.json, etc. all
+	// resolve against modulePath rather than the caller's cwd. Without
+	// this, `defn init /elsewhere` from inside another defn project opens
+	// the caller's .defn/ — which, if a serve holds the flock, fails with
+	// "manifest: read only"; if no serve holds it, silently corrupts the
+	// caller's DB.
+	absModulePath, err := filepath.Abs(modulePath)
+	if err != nil {
+		fatal(err)
+	}
+	if err := os.Chdir(absModulePath); err != nil {
+		fatal(err)
+	}
+	modulePath = absModulePath
+
 	dbPath := getDBPath()
+	checkEmbeddedAvailable(dbPath)
 	db, err := store.Open(dbPath)
 	if err != nil {
 		if isCorruptDBError(err) && !strings.Contains(dbPath, "@") {
@@ -466,7 +530,6 @@ func cmdInit(modulePath string) {
 
 	// Get absolute paths for the MCP config.
 	absDB, _ := filepath.Abs(dbPath)
-	absModulePath, _ := filepath.Abs(modulePath)
 	absBin, _ := os.Executable()
 	if absBin == "" {
 		if p, err := exec.LookPath("defn"); err == nil {
@@ -628,6 +691,11 @@ func cmdIngest(modulePath string, serverMode bool) {
 	// comparison after the first incremental.
 	if abs, err := filepath.Abs(modulePath); err == nil {
 		modulePath = abs
+	}
+	// chdir to the project so .defn/ resolves to modulePath/.defn,
+	// not the caller's cwd. See cmdInit for the same fix.
+	if err := os.Chdir(modulePath); err != nil {
+		fatal(err)
 	}
 	dbPath := getDBPath()
 	if serverMode {
