@@ -383,6 +383,84 @@ func TestEmitMergeFallsBackToRegenerateForNewDefs(t *testing.T) {
 	}
 }
 
+func TestEmitRegeneratePreservesFilePrefixAndDeclOrder(t *testing.T) {
+	// Regression for the silent-data-loss bug reported by calque: when
+	// the regenerate path runs (merge falls through because the DB has
+	// a def with no on-disk counterpart), it must still preserve the
+	// byte prefix before `package X` (build constraints, file-level
+	// doc comments not directly attached to package X, free-floating
+	// leading comments) and the original on-disk declaration order.
+	// Before the fix, this path emitted only mod.Doc — which is empty
+	// when ingest never captured the comment (file.Doc only catches
+	// comments IMMEDIATELY before `package X`) — and reordered decls
+	// alphabetically because GetModuleDefinitions sorts by name.
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+
+	// Seed file_sources with a comment NOT bound to `package X` (blank
+	// line between), plus decls in a non-alphabetical order.
+	seed := `//go:build linux
+
+// Package test demonstrates a free-floating file-level comment that
+// is separated from the package clause by a blank line and is
+// therefore not captured as file.Doc by ingest.
+
+package test
+
+// Zeta runs first in source order but sorts last alphabetically.
+func Zeta() {}
+
+// Alpha sorts first alphabetically but appears second in source.
+func Alpha() {}
+`
+	if err := db.SetFileSource(mod.ID, "test.go", seed); err != nil {
+		t.Fatal(err)
+	}
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Zeta", Kind: "function", Exported: true,
+		Body: "func Zeta() {}", SourceFile: "test.go",
+	})
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Alpha", Kind: "function", Exported: true,
+		Body: "func Alpha() {}", SourceFile: "test.go",
+	})
+	// Newly-created def with no on-disk counterpart — forces merge to
+	// fall through to regenerate.
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Gamma", Kind: "function", Exported: true,
+		Body: "func Gamma() int { return 7 }", SourceFile: "test.go",
+	})
+
+	outDir := t.TempDir()
+	if err := Emit(db, outDir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(outDir, "test.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+
+	if !strings.Contains(got, "//go:build linux") {
+		t.Fatalf("//go:build constraint was lost in regenerate:\n%s", got)
+	}
+	if !strings.Contains(got, "Package test demonstrates a free-floating") {
+		t.Fatalf("file-level doc comment (not bound to package X) was lost in regenerate:\n%s", got)
+	}
+	zetaIdx := strings.Index(got, "func Zeta")
+	alphaIdx := strings.Index(got, "func Alpha")
+	gammaIdx := strings.Index(got, "func Gamma")
+	if zetaIdx < 0 || alphaIdx < 0 || gammaIdx < 0 {
+		t.Fatalf("missing decl in regenerated output:\n%s", got)
+	}
+	if zetaIdx > alphaIdx {
+		t.Fatalf("on-disk decl order not preserved: Alpha should appear AFTER Zeta:\n%s", got)
+	}
+	if gammaIdx < zetaIdx || gammaIdx < alphaIdx {
+		t.Fatalf("new def Gamma should appear after the on-disk decls:\n%s", got)
+	}
+}
+
 func TestEmitMergePreservesGroupedDocComments(t *testing.T) {
 	// Regression: AST-surgery (replacing a spec node with one parsed from
 	// a foreign fset) orphans the original Doc CommentGroup, leaving the
@@ -456,7 +534,7 @@ func TestEmitMergePatchesIotaConstBlock(t *testing.T) {
 	mod, _ := db.EnsureModule("example.com/test", "test", "")
 	db.UpsertDefinition(&store.Definition{
 		ModuleID: mod.ID, Name: "Red", Kind: "const", Exported: true,
-		Body: "const (\n\tRed = iota + 1\n\tGreen\n\tBlue\n\tYellow\n)",
+		Body:       "const (\n\tRed = iota + 1\n\tGreen\n\tBlue\n\tYellow\n)",
 		SourceFile: "test.go",
 	})
 

@@ -343,8 +343,21 @@ func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import,
 	// eliminating manual line counting and grouped spec handling.
 	var src strings.Builder
 
-	// Package doc comment.
-	if pkgDoc != "" {
+	// Preserve the byte prefix before `package X` from existingSrc when
+	// available: build constraints, file-level doc comments (even when
+	// separated from `package X` by blank lines and thus NOT captured
+	// as file.Doc by ingest), and any other leading content the schema
+	// doesn't represent. Without this, the regenerate path silently
+	// drops file-level comments — the AST-merge path is byte-faithful
+	// here, but if we're falling through, we'd otherwise lose them.
+	prefixWritten := false
+	if len(existingSrc) > 0 {
+		if idx := packageDeclStart(existingSrc); idx > 0 {
+			src.Write(existingSrc[:idx])
+			prefixWritten = true
+		}
+	}
+	if !prefixWritten && pkgDoc != "" {
 		for line := range strings.SplitSeq(pkgDoc, "\n") {
 			src.WriteString("// " + line + "\n")
 		}
@@ -362,6 +375,33 @@ func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import,
 			}
 		}
 		src.WriteString(")\n\n")
+	}
+
+	// Preserve original on-disk declaration order. DB defs come back
+	// alphabetical (source_file, kind, name) — that's fine for grouped
+	// specs but reorders free-floating decls when there's no AST-merge
+	// base to anchor them. Sort by existingSrc byte offset where the
+	// def matches an on-disk decl; new defs without a match sort to
+	// the end while keeping their current relative order.
+	if len(existingSrc) > 0 {
+		order := declOrderInSource(existingSrc)
+		if len(order) > 0 {
+			sort.SliceStable(defs, func(i, j int) bool {
+				ki, kj := declKey(defs[i]), declKey(defs[j])
+				iPos, iOk := order[ki]
+				jPos, jOk := order[kj]
+				if iOk && jOk {
+					return iPos < jPos
+				}
+				if iOk {
+					return true
+				}
+				if jOk {
+					return false
+				}
+				return false
+			})
+		}
 	}
 
 	// Definitions. Grouped specs get reassembled into blocks.
@@ -818,3 +858,66 @@ func funcIdentity(name, receiver string) string {
 	return receiver + "." + name
 }
 
+// packageDeclStart returns the byte offset of the `package X` keyword
+// in src, or -1 if the source doesn't parse far enough. Callers use
+// this to extract the byte prefix before the package clause —
+// preserving build constraints, leading doc comments (whether bound
+// to `package X` or separated by blank lines), and any other content
+// the regenerate path would otherwise drop.
+func packageDeclStart(src []byte) int {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, parser.PackageClauseOnly)
+	if err != nil {
+		return -1
+	}
+	return fset.Position(f.Package).Offset
+}
+
+// declOrderInSource returns a key → byte-offset map for every
+// top-level declaration in src. Keys match declKey's output so the
+// regenerate path can sort DB defs into the on-disk order. Returns
+// an empty map when src doesn't parse — treat absence as "no order
+// info available, leave as-is".
+func declOrderInSource(src []byte) map[string]int {
+	order := make(map[string]int)
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, parser.SkipObjectResolution)
+	if err != nil {
+		return order
+	}
+	for _, decl := range f.Decls {
+		pos := fset.Position(decl.Pos()).Offset
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			recv := ""
+			if d.Recv != nil && len(d.Recv.List) > 0 {
+				recv = recvTypeName(d.Recv.List[0].Type)
+			}
+			order[funcIdentity(d.Name.Name, recv)] = pos
+		case *ast.GenDecl:
+			for _, spec := range d.Specs {
+				switch s := spec.(type) {
+				case *ast.TypeSpec:
+					order[s.Name.Name] = pos
+				case *ast.ValueSpec:
+					for _, n := range s.Names {
+						if n.Name != "_" {
+							order[n.Name] = pos
+						}
+					}
+				}
+			}
+		}
+	}
+	return order
+}
+
+// declKey returns the identifier for a Definition matching the keys
+// declOrderInSource produces. Funcs/methods use funcIdentity (which
+// encodes the receiver); everything else uses the bare name.
+func declKey(d store.Definition) string {
+	if d.Kind == "function" || d.Kind == "method" {
+		return funcIdentity(d.Name, d.Receiver)
+	}
+	return d.Name
+}
