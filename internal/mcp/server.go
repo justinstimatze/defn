@@ -252,21 +252,21 @@ Ops: impact (blast radius — START HERE; pass format:"json" for structured outp
 //	status: (no params)
 //	emit: out (directory path — absolute or relative to the project root)
 type codeParam struct {
-	Op         string           `json:"op"`
-	Name       string           `json:"name,omitempty"`
-	Pattern    string           `json:"pattern,omitempty"`
-	Body       string           `json:"body,omitempty"`
-	NewBody    string           `json:"new_body,omitempty"`
-	Module     string           `json:"module,omitempty"`
-	OldName    string           `json:"old_name,omitempty"`
-	NewName    string           `json:"new_name,omitempty"`
-	SQL        string           `json:"sql,omitempty"`
-	File       string           `json:"file,omitempty"`
-	Line       int              `json:"line,omitempty"`
-	Names      []string         `json:"names,omitempty"`
-	Mutations  []store.Mutation `json:"mutations,omitempty"`
-	Depth      int              `json:"depth,omitempty"`
-	Receiver   string           `json:"receiver,omitempty"`
+	Op          string           `json:"op"`
+	Name        string           `json:"name,omitempty"`
+	Pattern     string           `json:"pattern,omitempty"`
+	Body        string           `json:"body,omitempty"`
+	NewBody     string           `json:"new_body,omitempty"`
+	Module      string           `json:"module,omitempty"`
+	OldName     string           `json:"old_name,omitempty"`
+	NewName     string           `json:"new_name,omitempty"`
+	SQL         string           `json:"sql,omitempty"`
+	File        string           `json:"file,omitempty"`
+	Line        int              `json:"line,omitempty"`
+	Names       []string         `json:"names,omitempty"`
+	Mutations   []store.Mutation `json:"mutations,omitempty"`
+	Depth       int              `json:"depth,omitempty"`
+	Receiver    string           `json:"receiver,omitempty"`
 	OldFragment string           `json:"old_fragment,omitempty"`
 	NewFragment string           `json:"new_fragment,omitempty"`
 	After       string           `json:"after,omitempty"`
@@ -711,13 +711,13 @@ func (s *server) impactJSON(impact *store.Impact) (*sdkmcp.CallToolResult, any, 
 			SourceFile: impact.Definition.SourceFile,
 			StartLine:  impact.Definition.StartLine,
 		},
-		"module":                    impact.Module,
-		"direct_callers":            callers,
+		"module":                     impact.Module,
+		"direct_callers":             callers,
 		"interface_dispatch_callers": ifaceDispatch,
-		"transitive_count":          impact.TransitiveCount,
-		"tests":                     tests,
-		"uncovered_by":              impact.UncoveredBy,
-		"blast_radius":              blastRadius,
+		"transitive_count":           impact.TransitiveCount,
+		"tests":                      tests,
+		"uncovered_by":               impact.UncoveredBy,
+		"blast_radius":               blastRadius,
 	}
 	text, err := toJSON(result)
 	if err != nil {

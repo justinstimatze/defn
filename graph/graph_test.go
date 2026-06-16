@@ -99,7 +99,7 @@ func TestConstructors(t *testing.T) {
 		[]Ref{
 			{FromDef: 2, ToDef: 1, Kind: "constructor"}, // NewWidget constructs Widget
 			{FromDef: 3, ToDef: 1, Kind: "constructor"}, // CreateAll constructs Widget
-			{FromDef: 4, ToDef: 1, Kind: "call"},         // UseWidget calls Widget (not a constructor)
+			{FromDef: 4, ToDef: 1, Kind: "call"},        // UseWidget calls Widget (not a constructor)
 		},
 		map[string]int64{"pkg": 1},
 		map[int64]string{1: "pkg"},

@@ -108,20 +108,20 @@ func TestExtractSignature(t *testing.T) {
 
 func TestAstRename(t *testing.T) {
 	tests := []struct {
-		name        string
-		body        string
-		oldName     string
-		newName     string
-		wantSkipped int
-		wantContain string
+		name           string
+		body           string
+		oldName        string
+		newName        string
+		wantSkipped    int
+		wantContain    string
 		wantNotContain string
 	}{
 		{
-			name:        "rename function call",
-			body:        "func Foo() { Bar() }",
-			oldName:     "Bar",
-			newName:     "Baz",
-			wantContain: "Baz()",
+			name:           "rename function call",
+			body:           "func Foo() { Bar() }",
+			oldName:        "Bar",
+			newName:        "Baz",
+			wantContain:    "Baz()",
 			wantNotContain: "Bar()",
 		},
 		{
