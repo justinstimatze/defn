@@ -46,18 +46,18 @@ type Ref struct {
 // Graph is an in-memory reference graph loaded from a defn database.
 // All query methods are O(1) map lookups.
 type Graph struct {
-	defs      []*Def
-	refs      []Ref
-	byID      map[int64]*Def
-	byName    map[string][]*Def
-	byFile    map[fileKey][]*Def
-	byModule  map[int64][]*Def
+	defs          []*Def
+	refs          []Ref
+	byID          map[int64]*Def
+	byName        map[string][]*Def
+	byFile        map[fileKey][]*Def
+	byModule      map[int64][]*Def
 	callers       map[int64][]int64
 	callees       map[int64][]int64
 	constructorOf map[int64][]int64 // type def ID → constructor site IDs
-	byHash    map[string][]*Def
-	modByPath map[string][]int64 // path → IDs (multiple in merged graphs)
-	modByID   map[int64]string
+	byHash        map[string][]*Def
+	modByPath     map[string][]int64 // path → IDs (multiple in merged graphs)
+	modByID       map[int64]string
 }
 
 // Duplicates returns definitions that share the same body hash — identical

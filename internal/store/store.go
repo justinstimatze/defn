@@ -2048,7 +2048,7 @@ type Conflict struct {
 // DB is NOT safe for concurrent use from multiple goroutines.
 type DB struct {
 	db     *sql.DB
-	conn   *sql.Conn // pinned connection for branch-state consistency
+	conn   *sql.Conn  // pinned connection for branch-state consistency
 	connMu sync.Mutex // guards conn swap across GC-invalidation recovery
 	path   string     // filesystem path to database directory
 	dbName string     // database name (for USE db/branch)
