@@ -5,6 +5,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 )
 
 func main() {
@@ -63,33 +64,9 @@ func main() {
 		}
 		cmdSync(file)
 	case "search":
-		rank := false
-		jsonFlag := false
-		limit := 20
-		var pattern string
-		for i := 2; i < len(os.Args); i++ {
-			a := os.Args[i]
-			switch {
-			case a == "--rank":
-				rank = true
-			case a == "--json":
-				jsonFlag = true
-			case a == "--limit":
-				if i+1 >= len(os.Args) {
-					fmt.Fprintln(os.Stderr, "usage: defn search [--rank] [--json] [--limit N] <pattern>")
-					os.Exit(1)
-				}
-				if _, err := fmt.Sscanf(os.Args[i+1], "%d", &limit); err != nil || limit <= 0 {
-					fmt.Fprintln(os.Stderr, "--limit requires a positive integer")
-					os.Exit(1)
-				}
-				i++
-			default:
-				pattern = a
-			}
-		}
-		if pattern == "" {
-			fmt.Fprintln(os.Stderr, "usage: defn search [--rank] [--json] [--limit N] <pattern>")
+		pattern, rank, jsonFlag, limit, err := parseSearchArgs(os.Args[2:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 		cmdSearch(pattern, rank, jsonFlag, limit)
@@ -231,4 +208,42 @@ Usage:
   defn worktree <branch>       Clone DB on a branch (for multi-agent)
   defn push <remote> <branch>  Push branch to remote
   defn pull <remote> <branch>  Pull from remote`)
+}
+
+// parseSearchArgs parses the argv tail for `defn search`. Returned err
+// carries the usage line so the caller just prints and exits. Extracted
+// from the main switch so the flag handling is unit-testable.
+func parseSearchArgs(args []string) (pattern string, rank, jsonFlag bool, limit int, err error) {
+	const usage = "usage: defn search [--rank] [--json] [--limit N] <pattern>"
+	limit = 20
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--rank":
+			rank = true
+		case a == "--json":
+			jsonFlag = true
+		case a == "--limit":
+			if i+1 >= len(args) {
+				return "", false, false, 0, fmt.Errorf("%s", usage)
+			}
+			var n int
+			if _, scanErr := fmt.Sscanf(args[i+1], "%d", &n); scanErr != nil || n <= 0 {
+				return "", false, false, 0, fmt.Errorf("--limit requires a positive integer")
+			}
+			limit = n
+			i++
+		case strings.HasPrefix(a, "--"):
+			return "", false, false, 0, fmt.Errorf("unknown flag %q\n%s", a, usage)
+		default:
+			if pattern != "" {
+				return "", false, false, 0, fmt.Errorf("multiple positional args (%q, %q); pattern must be a single word\n%s", pattern, a, usage)
+			}
+			pattern = a
+		}
+	}
+	if pattern == "" {
+		return "", false, false, 0, fmt.Errorf("%s", usage)
+	}
+	return pattern, rank, jsonFlag, limit, nil
 }
