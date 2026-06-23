@@ -1278,6 +1278,88 @@ func (s *DB) ResolveConflict(defID int64, body string) error {
 	return nil
 }
 
+// CountDefinitions returns the total number of non-test definitions. Used
+// by the ranker to size sample-vs-exact IDF builds.
+func (s *DB) CountDefinitions() (int, error) {
+	var n int
+	if err := s.queryRowContext(s.Ctx(),
+		`SELECT COUNT(*) FROM definitions WHERE test = false`).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// SampleBodies returns up to n non-test definition bodies. Ordered by hash
+// so the sample is deterministic for a given corpus state — two ranker
+// calls without an intervening ingest see the same IDF table.
+func (s *DB) SampleBodies(n int) ([]string, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	rows, err := s.queryContext(s.Ctx(),
+		`SELECT b.body
+		 FROM definitions d
+		 JOIN bodies b ON b.def_id = d.id
+		 WHERE d.test = false
+		 ORDER BY d.hash
+		 LIMIT ?`, n)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]string, 0, n)
+	for rows.Next() {
+		var b string
+		if err := rows.Scan(&b); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// RefCountsByTarget returns non-test and test caller counts for each target
+// definition ID. Used by the ranker to populate CallerCount/TestCount on
+// search candidates without N round-trips. Targets not present in `refs`
+// are absent from the returned maps (caller treats absent as 0).
+func (s *DB) RefCountsByTarget(targetIDs []int64) (map[int64]int, map[int64]int, error) {
+	callers := make(map[int64]int, len(targetIDs))
+	tests := make(map[int64]int, len(targetIDs))
+	if len(targetIDs) == 0 {
+		return callers, tests, nil
+	}
+	placeholders := make([]string, len(targetIDs))
+	args := make([]any, len(targetIDs))
+	for i, id := range targetIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	q := `SELECT r.to_def, caller.test, COUNT(*)
+	      FROM refs r
+	      JOIN definitions caller ON caller.id = r.from_def
+	      WHERE r.to_def IN (` + strings.Join(placeholders, ",") + `)
+	      GROUP BY r.to_def, caller.test`
+	rows, err := s.queryContext(s.Ctx(), q, args...)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var toDef int64
+		var isTest bool
+		var count int
+		if err := rows.Scan(&toDef, &isTest, &count); err != nil {
+			return nil, nil, err
+		}
+		if isTest {
+			tests[toDef] = count
+		} else {
+			callers[toDef] = count
+		}
+	}
+	return callers, tests, rows.Err()
+}
+
 // SearchDefinitions performs full-text search on definition bodies and doc comments.
 // Returns definitions ranked by relevance.
 func (s *DB) SearchDefinitions(query string) ([]Definition, error) {

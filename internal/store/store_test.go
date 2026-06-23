@@ -239,6 +239,51 @@ func TestFindDefinitions(t *testing.T) {
 	}
 }
 
+func TestCountAndSampleBodies(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+
+	for i, body := range []string{"alpha body", "beta body", "gamma body"} {
+		name := []string{"Alpha", "Beta", "Gamma"}[i]
+		db.UpsertDefinition(&Definition{
+			ModuleID: mod.ID, Name: name, Kind: "function", Exported: true, Body: body,
+		})
+	}
+	// One test-flagged def — must be excluded from both count and sample.
+	db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "TestAlpha", Kind: "function", Exported: true, Test: true, Body: "test body",
+	})
+
+	n, err := db.CountDefinitions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Errorf("CountDefinitions = %d, want 3 (test def excluded)", n)
+	}
+
+	bodies, err := db.SampleBodies(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bodies) != 2 {
+		t.Errorf("SampleBodies(2) returned %d", len(bodies))
+	}
+	for _, b := range bodies {
+		if b == "test body" {
+			t.Errorf("SampleBodies leaked a test-flagged body")
+		}
+	}
+
+	all, err := db.SampleBodies(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 {
+		t.Errorf("SampleBodies(100) returned %d, want 3", len(all))
+	}
+}
+
 func TestDeleteFileAndDistinctSourceFiles(t *testing.T) {
 	db := testDB(t)
 	mod, _ := db.EnsureModule("example.com/test", "test", "")
@@ -325,6 +370,58 @@ func TestDeleteFileAndDistinctSourceFiles(t *testing.T) {
 	// Deleting a file that doesn't exist must be a no-op (not an error).
 	if err := db.DeleteFile("never_existed.go"); err != nil {
 		t.Errorf("DeleteFile of absent path should be no-op, got %v", err)
+	}
+}
+
+func TestRefCountsByTarget(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+
+	target, _ := db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "Target", Kind: "function", Exported: true, Body: "func Target() {}",
+	})
+	caller1, _ := db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "Caller1", Kind: "function", Exported: true, Body: "func Caller1() {}",
+	})
+	caller2, _ := db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "Caller2", Kind: "function", Exported: true, Body: "func Caller2() {}",
+	})
+	testCaller, _ := db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "TestTarget", Kind: "function", Exported: true, Test: true, Body: "func TestTarget() {}",
+	})
+	orphan, _ := db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "Orphan", Kind: "function", Exported: true, Body: "func Orphan() {}",
+	})
+
+	// Two non-test callers + one test caller all point at Target.
+	db.SetReferences(caller1, []Reference{{ToDef: target, Kind: "call"}})
+	db.SetReferences(caller2, []Reference{{ToDef: target, Kind: "call"}})
+	db.SetReferences(testCaller, []Reference{{ToDef: target, Kind: "call"}})
+
+	callers, tests, err := db.RefCountsByTarget([]int64{target, orphan})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if callers[target] != 2 {
+		t.Errorf("non-test callers of Target = %d, want 2", callers[target])
+	}
+	if tests[target] != 1 {
+		t.Errorf("test callers of Target = %d, want 1", tests[target])
+	}
+	if _, ok := callers[orphan]; ok {
+		t.Errorf("orphan should be absent from callers map, got %d", callers[orphan])
+	}
+	if _, ok := tests[orphan]; ok {
+		t.Errorf("orphan should be absent from tests map, got %d", tests[orphan])
+	}
+
+	// Empty input must not produce a SQL error.
+	c, te, err := db.RefCountsByTarget(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c) != 0 || len(te) != 0 {
+		t.Errorf("empty input should produce empty maps, got callers=%v tests=%v", c, te)
 	}
 }
 
