@@ -1689,49 +1689,105 @@ const incrementalCounterMeta = "incremental_count"
 // acceptable for editor-save hook flows where a periodic full ingest
 // closes the gap.
 func tryIncrementalIngest(db *store.DB, projectDir, dbPath string, serverMode bool) bool {
-	stale, ok := incrementalPreflight(db, projectDir, dbPath, serverMode)
+	stale, added, deleted, ok := incrementalPreflight(db, projectDir, dbPath, serverMode)
 	if !ok {
 		return false
 	}
-	if len(stale) == 0 {
+	if len(stale) == 0 && len(added) == 0 && len(deleted) == 0 {
 		fmt.Fprintln(os.Stderr, "nothing to ingest (no .go files modified since last ingest)")
 		return true
 	}
-	return applyIncrementalIngest(db, projectDir, dbPath, stale)
+	return applyIncrementalIngest(db, projectDir, dbPath, stale, added, deleted)
 }
 
 // incrementalPreflight decides whether the fast path applies. Returns
-// (stale, true) when the per-file path should run (stale may be empty
-// if the DB is already up to date); (nil, false) when the caller must
-// fall through to the full ingest path.
+// (stale, added, deleted, true) when the per-file path should run
+// (all three slices may be empty if the DB is already up to date);
+// (nil, nil, nil, false) when the caller must fall through to the
+// full ingest path.
+//
+// stale and added are absolute paths (ingest.IngestFile expects abs).
+// deleted is module-relative (matches the source_file format the DB
+// stores and that store.DeleteFile takes).
 //
 // Disqualifies the fast path on: server/DSN mode, no last_ingest meta
-// (first ingest), too many stale files, or any disk-vs-DB file count
-// mismatch (add or delete that needs the full path's prune-and-load).
-func incrementalPreflight(db *store.DB, projectDir, dbPath string, serverMode bool) ([]string, bool) {
+// (first ingest), or total churn (stale + added + deleted) above
+// incrementalIngestThreshold.
+func incrementalPreflight(db *store.DB, projectDir, dbPath string, serverMode bool) (stale, added []string, deleted []string, ok bool) {
 	if serverMode || strings.Contains(dbPath, "@") {
-		return nil, false
+		return nil, nil, nil, false
 	}
 	since := lastIngestUnix(db)
 	if since == 0 {
-		return nil, false // first ingest, or pre-meta DB
+		return nil, nil, nil, false // first ingest, or pre-meta DB
 	}
-	all, stale := walkGoFiles(projectDir, since)
-	if len(stale) > incrementalIngestThreshold {
-		return nil, false
-	}
-	dbCount, err := countDBSourceFiles(db)
+	all, staleAbs := walkGoFiles(projectDir, since)
+
+	dbFiles, err := db.DistinctSourceFiles()
 	if err != nil {
-		return nil, false
+		return nil, nil, nil, false
 	}
-	if dbCount != len(all) {
-		// Disk vs DB file-count mismatch: either a deletion (dbCount >
-		// len(all)) needs the full path's prune, or a new file with
-		// mtime ≤ last_ingest (cp -p, untar, clock skew, len(all) >
-		// dbCount) needs the full path to pick up its defs.
-		return nil, false
+	added, deleted = diffFileSets(projectDir, all, dbFiles)
+
+	// Drop any stale-by-mtime entries that are actually new (they'll be
+	// processed via `added` and double-counting inflates the threshold).
+	staleAbs = subtractAbsPaths(staleAbs, added)
+
+	if len(staleAbs)+len(added)+len(deleted) > incrementalIngestThreshold {
+		return nil, nil, nil, false
 	}
-	return stale, true
+	return staleAbs, added, deleted, true
+}
+
+// diffFileSets returns (added, deleted) by comparing absolute paths on
+// disk to module-relative source_file entries from the DB. Both return
+// values are in their respective canonical forms: added uses absolute
+// paths (for ingest.IngestFile), deleted uses module-relative paths
+// (for store.DeleteFile / matches the DB's source_file column).
+func diffFileSets(projectDir string, diskAbs []string, dbRel []string) (added []string, deleted []string) {
+	diskRelSet := make(map[string]string, len(diskAbs)) // rel → abs
+	for _, abs := range diskAbs {
+		rel, err := filepath.Rel(projectDir, abs)
+		if err != nil {
+			continue
+		}
+		diskRelSet[rel] = abs
+	}
+	dbSet := make(map[string]bool, len(dbRel))
+	for _, rel := range dbRel {
+		dbSet[rel] = true
+	}
+	for rel, abs := range diskRelSet {
+		if !dbSet[rel] {
+			added = append(added, abs)
+		}
+	}
+	for rel := range dbSet {
+		if _, ok := diskRelSet[rel]; !ok {
+			deleted = append(deleted, rel)
+		}
+	}
+	return added, deleted
+}
+
+// subtractAbsPaths returns `xs` with any element of `ys` removed.
+// Used to remove newly-added files (which appear in `added`) from the
+// stale-by-mtime list so we don't double-count toward the threshold.
+func subtractAbsPaths(xs, ys []string) []string {
+	if len(ys) == 0 {
+		return xs
+	}
+	skip := make(map[string]bool, len(ys))
+	for _, y := range ys {
+		skip[y] = true
+	}
+	out := xs[:0]
+	for _, x := range xs {
+		if !skip[x] {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 // applyIncrementalIngest runs the per-file ingest + per-package resolve
@@ -1739,13 +1795,49 @@ func incrementalPreflight(db *store.DB, projectDir, dbPath string, serverMode bo
 // error it logs and returns false so the caller falls through to full
 // ingest. Best-effort compaction runs every incrementalCompactInterval
 // invocations.
-func applyIncrementalIngest(db *store.DB, projectDir, dbPath string, stale []string) bool {
+func applyIncrementalIngest(db *store.DB, projectDir, dbPath string, stale, added, deleted []string) bool {
 	start := time.Now()
-	fmt.Fprintf(os.Stderr, "incremental ingest: %d file(s)...\n", len(stale))
-	uniqueDirs, ok := ingestStaleFiles(db, projectDir, stale)
+	fmt.Fprintf(os.Stderr, "incremental ingest: %d modified, %d added, %d removed...\n",
+		len(stale), len(added), len(deleted))
+
+	// Prune deleted files first. Their defs may be referenced by surviving
+	// files in the same package; the package resolve below rebuilds refs
+	// for survivors. If a deletion fails partway we fall through to full
+	// ingest, which will rebuild from a clean slate.
+	deletedDirs := make(map[string]string, len(deleted))
+	for _, rel := range deleted {
+		if err := db.DeleteFile(rel); err != nil {
+			fmt.Fprintf(os.Stderr, "incremental delete failed on %s: %v — falling back to full ingest\n", rel, err)
+			return false
+		}
+		// Track package dir for the post-delete resolve pass. Pick any
+		// surviving file in that dir as the representative; if none
+		// survives the dir is empty and resolve.ResolveFile would error,
+		// so we skip those.
+		absDir := filepath.Join(projectDir, filepath.Dir(rel))
+		deletedDirs[absDir] = ""
+	}
+
+	// Ingest stale + added files (both go through IngestFile).
+	work := append(append([]string{}, stale...), added...)
+	uniqueDirs, ok := ingestStaleFiles(db, projectDir, work)
 	if !ok {
 		return false
 	}
+
+	// For deleted files' directories, pick a surviving sibling as the
+	// resolve representative if we didn't already touch the dir via
+	// stale/added work. Skips dirs that are now empty.
+	for absDir := range deletedDirs {
+		if _, ok := uniqueDirs[absDir]; ok {
+			continue
+		}
+		rep, found := firstGoFileIn(absDir)
+		if found {
+			uniqueDirs[absDir] = rep
+		}
+	}
+
 	if !resolveUniqueDirs(db, projectDir, uniqueDirs) {
 		return false
 	}
@@ -1779,6 +1871,27 @@ func ingestStaleFiles(db *store.DB, projectDir string, stale []string) (map[stri
 		}
 	}
 	return uniqueDirs, true
+}
+
+// firstGoFileIn returns the first non-test .go file in dir, or
+// ("", false) if the directory has no .go files. Used to pick a
+// representative file for a package whose only change in this
+// incremental pass was a deletion.
+func firstGoFileIn(dir string) (string, bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", false
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasSuffix(name, ".go") {
+			return filepath.Join(dir, name), true
+		}
+	}
+	return "", false
 }
 
 // resolveUniqueDirs calls resolve.ResolveFile once per unique package

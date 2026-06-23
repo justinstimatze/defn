@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	_ "embed"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -235,6 +236,95 @@ func TestFindDefinitions(t *testing.T) {
 	}
 	if len(defs) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(defs))
+	}
+}
+
+func TestDeleteFileAndDistinctSourceFiles(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+
+	// Two files in module; one has two defs, the other has one.
+	defA1, _ := db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "Alpha", Kind: "function", Exported: true,
+		SourceFile: "a.go", Body: "func Alpha() {}",
+	})
+	defA2, _ := db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "Beta", Kind: "function", Exported: true,
+		SourceFile: "a.go", Body: "func Beta() {}",
+	})
+	defB, _ := db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "Gamma", Kind: "function", Exported: true,
+		SourceFile: "b.go", Body: "func Gamma() {}",
+	})
+	// Beta in a.go calls Gamma in b.go — ref must vanish when a.go is deleted.
+	db.SetReferences(defA2, []Reference{{ToDef: defB, Kind: "call"}})
+	db.SetFileSource(mod.ID, "a.go", "package x\nfunc Alpha(){}\nfunc Beta(){}\n")
+	db.SetFileSource(mod.ID, "b.go", "package x\nfunc Gamma(){}\n")
+
+	files, err := db.DistinctSourceFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, f := range files {
+		got[f] = true
+	}
+	if !got["a.go"] || !got["b.go"] || len(got) != 2 {
+		t.Errorf("DistinctSourceFiles = %v, want exactly [a.go b.go]", files)
+	}
+
+	if err := db.DeleteFile("a.go"); err != nil {
+		t.Fatal(err)
+	}
+
+	// a.go defs are gone; b.go def survives.
+	if _, err := db.GetDefinition(defA1); err == nil {
+		t.Error("Alpha should be deleted")
+	}
+	if _, err := db.GetDefinition(defA2); err == nil {
+		t.Error("Beta should be deleted")
+	}
+	if _, err := db.GetDefinition(defB); err != nil {
+		t.Errorf("Gamma should survive: %v", err)
+	}
+
+	// Refs from deleted defs are gone (queried directly so this test
+	// doesn't depend on RefCountsByTarget — it's part of a separate
+	// changeset).
+	rows, err := db.Query(fmt.Sprintf("SELECT COUNT(*) AS n FROM refs WHERE to_def = %d", defB))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) == 0 {
+		t.Fatal("no rows from refs count query")
+	}
+	var refsToGamma int64
+	switch v := rows[0]["n"].(type) {
+	case int64:
+		refsToGamma = v
+	case uint64:
+		refsToGamma = int64(v)
+	}
+	if refsToGamma != 0 {
+		t.Errorf("ref from deleted Beta to Gamma should be cleaned up, got %d", refsToGamma)
+	}
+
+	// file_sources row for a.go is gone, b.go remains.
+	files, _ = db.DistinctSourceFiles()
+	got = map[string]bool{}
+	for _, f := range files {
+		got[f] = true
+	}
+	if got["a.go"] {
+		t.Error("file_sources still contains a.go after DeleteFile")
+	}
+	if !got["b.go"] {
+		t.Error("file_sources missing b.go after DeleteFile a.go")
+	}
+
+	// Deleting a file that doesn't exist must be a no-op (not an error).
+	if err := db.DeleteFile("never_existed.go"); err != nil {
+		t.Errorf("DeleteFile of absent path should be no-op, got %v", err)
 	}
 }
 

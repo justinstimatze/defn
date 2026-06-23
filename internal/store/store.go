@@ -1297,6 +1297,67 @@ func (s *DB) SearchDefinitions(query string) ([]Definition, error) {
 	return scanDefinitions(rows)
 }
 
+// DistinctSourceFiles returns every distinct source_file recorded in
+// file_sources. Paths are module-relative (the format ingest writes).
+// Used by the incremental ingest path to detect file additions and
+// deletions vs. the on-disk tree.
+func (s *DB) DistinctSourceFiles() ([]string, error) {
+	rows, err := s.queryContext(s.Ctx(),
+		`SELECT DISTINCT source_file FROM file_sources`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var sf string
+		if err := rows.Scan(&sf); err != nil {
+			return nil, err
+		}
+		out = append(out, sf)
+	}
+	return out, rows.Err()
+}
+
+// DeleteFile removes all definitions, bodies, refs, comments, and the
+// file_sources row for a given module-relative source path. Used by the
+// incremental ingest path when a file has been removed from disk so we
+// don't have to fall back to a full packages.Load just to prune.
+func (s *DB) DeleteFile(sourceFile string) error {
+	ctx := s.Ctx()
+	rows, err := s.queryContext(ctx,
+		`SELECT id FROM definitions WHERE source_file = ?`, sourceFile)
+	if err != nil {
+		return fmt.Errorf("list defs in %s: %w", sourceFile, err)
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := s.DeleteDefinition(id); err != nil {
+			return err
+		}
+	}
+	if _, err := s.execContext(ctx,
+		"DELETE FROM comments WHERE source_file = ?", sourceFile); err != nil {
+		return fmt.Errorf("delete comments for %s: %w", sourceFile, err)
+	}
+	if _, err := s.execContext(ctx,
+		"DELETE FROM file_sources WHERE source_file = ?", sourceFile); err != nil {
+		return fmt.Errorf("delete file_sources for %s: %w", sourceFile, err)
+	}
+	return nil
+}
+
 // SetFileComments replaces all comments for a source file.
 func (s *DB) SetFileComments(sourceFile string, comments []Comment) error {
 	ctx := s.Ctx()
