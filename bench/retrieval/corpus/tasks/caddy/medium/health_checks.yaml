@@ -1,0 +1,15 @@
+id: caddy-medium-002
+repo: caddy
+tier: medium
+description: "How does caddy perform active and passive health checks on reverse proxy backends to determine if they are healthy?"
+source: manual
+ground_truth:
+  - Handler.activeHealthChecker
+  - Handler.doActiveHealthCheck
+  - ActiveHealthChecks
+  - ActiveHealthChecks.IsEnabled
+  - PassiveHealthChecks
+  - Upstream.Healthy
+  - Upstream.setHealthy
+tags: [reverseproxy, health-check, active, passive, cross-package]
+notes: "activeHealthChecker runs periodic checks per ActiveHealthChecks config; doActiveHealthCheck probes individual upstreams. PassiveHealthChecks tracks failures during normal proxying. Upstream.Healthy/setHealthy manage the state."

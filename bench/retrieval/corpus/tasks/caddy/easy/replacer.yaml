@@ -1,0 +1,13 @@
+id: caddy-easy-005
+repo: caddy
+tier: easy
+description: "How does caddy's placeholder replacement system work for substituting runtime values into configuration strings?"
+source: manual
+ground_truth:
+  - Replacer
+  - Replacer.ReplaceAll
+  - Replacer.ReplaceKnown
+  - Replacer.Map
+  - NewReplacer
+tags: [replacer, placeholders, single-package]
+notes: "Replacer type holds mapping functions registered via Map. ReplaceAll and ReplaceKnown substitute {placeholder} tokens with runtime values."

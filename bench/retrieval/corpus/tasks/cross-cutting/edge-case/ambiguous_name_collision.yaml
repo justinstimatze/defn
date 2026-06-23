@@ -1,0 +1,13 @@
+id: cross-cutting-edge-004
+repo: cargo
+tier: medium
+description: "The 'resolve' function is broken. How do I fix it?"
+source: synthetic
+ground_truth:
+  - resolve
+  - ResolverContext
+  - RegistryQueryer
+  - FeatureResolver.resolve
+  - EncodableResolve.into_resolve
+tags: [resolver, ambiguous-name, understanding, cross-package]
+notes: "Edge case: ambiguous symbol name. 'resolve' appears in multiple contexts in cargo (dependency resolution, feature resolution, lockfile encoding). Tests whether retrieval surfaces the primary resolution function AND its related variants, helping the developer disambiguate."

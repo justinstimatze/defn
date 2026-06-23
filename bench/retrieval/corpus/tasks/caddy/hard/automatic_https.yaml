@@ -1,0 +1,17 @@
+id: caddy-hard-001
+repo: caddy
+tier: hard
+description: "Trace the full automatic HTTPS pipeline: how does caddy detect which domains need certificates, create automation policies, set up HTTP-to-HTTPS redirects, and coordinate between the HTTP app and the TLS app?"
+source: manual
+ground_truth:
+  - App.automaticHTTPSPhase1
+  - App.automaticHTTPSPhase2
+  - App.createAutomationPolicies
+  - App.fillInACMEIssuer
+  - App.makeRedirRoute
+  - AutoHTTPSConfig
+  - TLS.Manage
+  - AutomationPolicy
+  - ACMEIssuer
+tags: [https, tls, automation, redirects, cross-package, lifecycle]
+notes: "Two-phase HTTPS setup: phase1 scans server blocks for domain names and creates TLS automation policies. phase2 adds HTTP-to-HTTPS redirect routes. createAutomationPolicies bridges HTTP and TLS apps. fillInACMEIssuer provides defaults. TLS.Manage actually triggers certificate acquisition."

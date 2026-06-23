@@ -1,0 +1,14 @@
+id: caddy-medium-004
+repo: caddy
+tier: medium
+description: "How does caddy automatically obtain and manage TLS certificates for configured domains?"
+source: manual
+ground_truth:
+  - TLS
+  - TLS.Manage
+  - AutomationPolicy
+  - AutomationPolicy.makeCertMagicConfig
+  - ACMEIssuer
+  - AutomationConfig
+tags: [tls, certificates, acme, automation, cross-package]
+notes: "TLS.Manage triggers certificate management. AutomationPolicy defines per-domain issuance rules, makeCertMagicConfig builds the CertMagic config. ACMEIssuer handles ACME protocol. AutomationConfig holds all policies."

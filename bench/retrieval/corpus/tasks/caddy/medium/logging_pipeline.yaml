@@ -1,0 +1,15 @@
+id: caddy-medium-006
+repo: caddy
+tier: medium
+description: "How does caddy configure per-site structured logging with custom log outputs and filtering?"
+source: manual
+ground_truth:
+  - Logging
+  - Logging.openLogs
+  - Logging.Logger
+  - CustomLog
+  - CustomLog.matchesModule
+  - BaseLog
+  - BaseLog.provisionCommon
+tags: [logging, structured, filtering, cross-package]
+notes: "Logging holds all log config. openLogs provisions writers. Logger routes log entries. CustomLog defines per-module log filtering via matchesModule. BaseLog.provisionCommon sets up the zap core."

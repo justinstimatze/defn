@@ -1,0 +1,15 @@
+id: caddy-medium-001
+repo: caddy
+tier: medium
+description: "How does caddy's reverse proxy select an upstream backend and proxy the request to it?"
+source: manual
+ground_truth:
+  - Handler
+  - Handler.ServeHTTP
+  - Handler.reverseProxy
+  - Upstream
+  - Upstream.Available
+  - Selector
+  - LoadBalancing
+tags: [reverseproxy, upstream, load-balancing, cross-package]
+notes: "Request flow: ServeHTTP selects upstream via Selector interface (load balancing policy), checks Upstream.Available, then reverseProxy executes the actual proxying."

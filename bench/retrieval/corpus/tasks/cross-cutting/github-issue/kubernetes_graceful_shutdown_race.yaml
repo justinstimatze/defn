@@ -1,0 +1,14 @@
+id: cross-cutting-issue-003
+repo: kubernetes
+tier: hard
+description: "Fix a race condition where the kubelet receives SIGTERM during pod termination, causing the graceful shutdown handler to conflict with the in-progress pod kill sequence"
+source: swe-bench
+ground_truth:
+  - Kubelet.killPod
+  - Kubelet.HandlePodRemoves
+  - Manager
+  - Config
+  - PodWorkers
+  - GracefulNodeShutdown
+tags: [kubelet, graceful-shutdown, race-condition, cross-package, bug-fix]
+notes: "Based on kubernetes/kubernetes#108594. The race involves the pod termination path (syncTerminatingPod, killPod, completeTerminating), the node shutdown manager (managerImpl, ShutdownStatus), pod worker updates (UpdatePod), and lifecycle handlers that may still be running."

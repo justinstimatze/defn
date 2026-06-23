@@ -1,0 +1,16 @@
+id: cross-cutting-edge-003
+repo: django
+tier: hard
+description: "I'm getting a 'Cannot force an update in save() with no primary key' error deep inside a model save. Trace how Django determines whether to INSERT or UPDATE and what triggers this code path"
+source: synthetic
+ground_truth:
+  - Model.save
+  - Model.save_base
+  - Model._save_table
+  - Model._do_insert
+  - Model._do_update
+  - SQLUpdateCompiler.execute_sql
+  - Model._get_pk_val
+  - Options.setup_pk
+tags: [orm, save, internals, error-tracing, cross-package, bug-fix]
+notes: "Edge case: error message as query. Tests whether retrieval can trace from a runtime error message to the internal decision tree (save -> save_base -> _save_table -> _do_insert/_do_update), the PK detection logic (_get_pk_val, Options.pk), and the SQL execution path."

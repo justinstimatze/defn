@@ -1,0 +1,18 @@
+id: caddy-hard-005
+repo: caddy
+tier: hard
+description: "Trace the complete reverse proxy request lifecycle: upstream selection, transport configuration, the actual proxy round-trip, response handling with retry logic, WebSocket upgrade handling, and response finalization."
+source: manual
+ground_truth:
+  - Handler.ServeHTTP
+  - Handler.proxyLoopIteration
+  - Handler.reverseProxy
+  - Handler.finalizeResponse
+  - Handler.handleUpgradeResponse
+  - HTTPTransport
+  - HTTPTransport.RoundTrip
+  - LoadBalancing.tryAgain
+  - Handler.addForwardedHeaders
+  - Handler.copyResponse
+tags: [reverseproxy, transport, websocket, retry, architecture]
+notes: "ServeHTTP enters the proxy loop. proxyLoopIteration selects upstream and calls reverseProxy. reverseProxy does the RoundTrip via HTTPTransport, then finalizeResponse copies the response back. handleUpgradeResponse handles WebSocket/HTTP upgrades. LoadBalancing.tryAgain decides retries. addForwardedHeaders sets X-Forwarded-* headers."

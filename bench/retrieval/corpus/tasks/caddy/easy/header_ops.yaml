@@ -1,0 +1,13 @@
+id: caddy-easy-003
+repo: caddy
+tier: easy
+description: "How does caddy add, set, and delete HTTP headers on requests and responses?"
+source: manual
+ground_truth:
+  - Handler
+  - Handler.ServeHTTP
+  - HeaderOps
+  - HeaderOps.ApplyTo
+  - HeaderOps.ApplyToRequest
+tags: [headers, middleware, single-package]
+notes: "Handler is the middleware; HeaderOps holds the add/set/delete operations; ApplyTo and ApplyToRequest execute them on response and request headers."

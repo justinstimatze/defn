@@ -1,0 +1,12 @@
+id: caddy-easy-006
+repo: caddy
+tier: easy
+description: "How does caddy compress HTTP responses using gzip or zstd encoding?"
+source: manual
+ground_truth:
+  - Encode
+  - Encode.ServeHTTP
+  - Encoding
+  - Encoder
+tags: [encode, compression, middleware, single-package]
+notes: "Encode is the middleware handler. Encoding and Encoder interfaces abstract the compression algorithm. ServeHTTP wraps the response writer to compress on the fly."

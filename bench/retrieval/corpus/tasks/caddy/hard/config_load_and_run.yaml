@@ -1,0 +1,18 @@
+id: caddy-hard-007
+repo: caddy
+tier: hard
+description: "Trace how caddy loads a new configuration and transitions from the old config to the new one: config adaptation, provisioning the module tree, starting apps, and gracefully stopping the old config."
+source: manual
+ground_truth:
+  - Run
+  - Load
+  - changeConfig
+  - Config
+  - Context
+  - Context.App
+  - NewContext
+  - Adapter
+  - App.Start
+  - App.Stop
+tags: [config, lifecycle, reload, provisioning, cross-package, architecture]
+notes: "Run is the initial entry point; Load handles reloads via the admin API. Both call changeConfig which adapts config (via Adapter if needed), creates a new Context, provisions all modules via Context.App, starts apps (App.Start), and stops the old config (App.Stop). NewContext initializes the module dependency tree."

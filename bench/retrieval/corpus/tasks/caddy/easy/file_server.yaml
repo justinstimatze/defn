@@ -1,0 +1,11 @@
+id: caddy-easy-001
+repo: caddy
+tier: easy
+description: "How does caddy's static file server handle HTTP requests and serve files from disk?"
+source: manual
+ground_truth:
+  - FileServer
+  - FileServer.ServeHTTP
+  - FileServer.openFile
+tags: [fileserver, static, single-package]
+notes: "Direct lookup: FileServer type and its ServeHTTP method handle incoming requests, openFile does the actual disk I/O."

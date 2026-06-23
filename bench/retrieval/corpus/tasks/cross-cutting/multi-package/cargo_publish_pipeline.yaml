@@ -1,0 +1,16 @@
+id: cross-cutting-multi-004
+repo: cargo
+tier: hard
+description: "Extend cargo publish to support pre-publish hooks that run clippy, verify the package, check documentation coverage, and gate on all checks passing before uploading to the registry"
+source: synthetic
+ground_truth:
+  - package
+  - PackageOpts
+  - publish
+  - PublishOpts
+  - RegistryData
+  - compile
+  - GlobalContext
+  - doc
+tags: [publish, registry, compiler, cross-package, cross-cutting, feature-addition]
+notes: "Pre-publish hooks span the package/publish pipeline (package, publish with their opts), registry interaction (RegistryData), compilation for running clippy (compile), config for hook definitions (GlobalContext), and documentation (doc). Tests multi-subsystem orchestration."

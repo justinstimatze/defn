@@ -1,0 +1,18 @@
+id: caddy-hard-004
+repo: caddy
+tier: hard
+description: "Trace how an incoming HTTP request flows through caddy's entire handling pipeline: from the server accepting the connection, through route matching, middleware chain compilation and execution, to the final response."
+source: manual
+ground_truth:
+  - Server.serveHTTP
+  - Route
+  - RouteList.Compile
+  - RouteList.ProvisionMatchers
+  - RouteList.ProvisionHandlers
+  - RequestMatcher
+  - MiddlewareHandler
+  - Middleware
+  - Handler
+  - wrapMiddleware
+tags: [http, routing, middleware, pipeline, architecture]
+notes: "Server.serveHTTP receives requests. RouteList.Compile pre-compiles routes into a handler chain. ProvisionMatchers/ProvisionHandlers set up route components. Each Route has RequestMatchers that gate entry and MiddlewareHandlers wrapped via wrapMiddleware into a chain. Handler interface is the final execution contract."

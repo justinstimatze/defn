@@ -1,0 +1,14 @@
+id: cross-cutting-multi-001
+repo: django
+tier: hard
+description: "Add automatic queryset caching that intercepts ORM queries, checks the cache framework, and invalidates on model save signals, spanning the ORM, cache, and signals packages"
+source: synthetic
+ground_truth:
+  - QuerySet._fetch_all
+  - BaseCache.get
+  - ModelSignal.connect
+  - Signal.connect
+  - SQLCompiler.execute_sql
+  - CacheHandler
+tags: [orm, cache, signals, cross-package, cross-cutting, feature-addition]
+notes: "This spans three Django subsystems: ORM internals (_fetch_all, SQLCompiler for intercepting queries), cache framework (BaseCache.get, cache proxy), and signals (post_save/post_delete for invalidation, Signal.connect for registration). Tests cross-package retrieval depth."

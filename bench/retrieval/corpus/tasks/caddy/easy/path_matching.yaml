@@ -1,0 +1,11 @@
+id: caddy-easy-004
+repo: caddy
+tier: easy
+description: "How does caddy match incoming requests by URL path pattern?"
+source: manual
+ground_truth:
+  - MatchPath
+  - MatchPath.matchPatternWithEscapeSequence
+  - RequestMatcher
+tags: [matching, path, routing, single-package]
+notes: "MatchPath implements RequestMatcher interface. matchPatternWithEscapeSequence does the actual glob-style pattern matching with escape handling."

@@ -1,0 +1,14 @@
+id: caddy-medium-007
+repo: caddy
+tier: medium
+description: "How does caddy's file server generate directory listing pages when browsing is enabled?"
+source: manual
+ground_truth:
+  - FileServer.serveBrowse
+  - FileServer.directoryListing
+  - FileServer.loadDirectoryContents
+  - FileServer.makeBrowseTemplate
+  - browseTemplateContext
+  - Browse
+tags: [fileserver, browse, directory, templates, cross-package]
+notes: "serveBrowse is the entry point. directoryListing builds the data model, loadDirectoryContents reads the filesystem. makeBrowseTemplate renders HTML. browseTemplateContext provides template helpers like Breadcrumbs."

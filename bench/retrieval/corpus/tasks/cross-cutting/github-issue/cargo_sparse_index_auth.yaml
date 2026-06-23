@@ -1,0 +1,14 @@
+id: cross-cutting-issue-004
+repo: cargo
+tier: medium
+description: "Fix authentication failing for sparse HTTP registries when credential helpers return tokens with special characters that are not URL-encoded properly"
+source: swe-bench
+ground_truth:
+  - HttpRegistry
+  - HttpRegistry<'gctx>.start_fetch
+  - auth_token
+  - RegistryConfig
+  - Retry
+  - Download
+tags: [registry, auth, http, sparse-index, cross-package, bug-fix]
+notes: "Based on cargo issue #11800. Sparse index auth involves the HttpRegistry fetch mechanism (start_fetch), credential resolution (auth_token, RegistryConfig), network retry logic, and the download pipeline where headers are constructed."

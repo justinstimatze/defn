@@ -1,0 +1,14 @@
+id: caddy-medium-005
+repo: caddy
+tier: medium
+description: "How does caddy parse a Caddyfile into tokens and then into structured configuration directives?"
+source: manual
+ground_truth:
+  - Adapter
+  - Adapter.Adapt
+  - Dispenser
+  - Dispenser.Next
+  - Dispenser.NextBlock
+  - ServerType
+tags: [caddyfile, parsing, config, cross-package]
+notes: "Adapter.Adapt converts Caddyfile bytes to JSON. Dispenser provides the token iteration API (Next, NextBlock for block-scoped tokens). ServerType interface defines how the parsed tokens get translated into app-specific config."

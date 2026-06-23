@@ -1,0 +1,12 @@
+id: cross-cutting-multi-002
+repo: kubernetes
+tier: hard
+description: "Trace how a NetworkPolicy object flows from API server admission through the network plugin interface to iptables rules on a node, spanning apiserver, controller, and kubelet packages"
+source: synthetic
+ground_truth:
+  - NewProxier
+  - CleanupLeftovers
+  - NewDualStackProxier
+  - AddToScheme
+tags: [networking, policy, cross-package, cross-cutting, understanding]
+notes: "NetworkPolicy enforcement spans the entire stack: API types, the network policy controller (syncNetworkPolicy), the kube-proxy iptables implementation (Proxier.syncProxyRules), API server storage, and the CNI plugin interface on the kubelet. Tests whole-system tracing."

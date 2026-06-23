@@ -1,0 +1,18 @@
+id: caddy-hard-003
+repo: caddy
+tier: hard
+description: "Trace how a Caddyfile gets adapted into a running caddy configuration: from parsing tokens, through the HTTP server type setup, to generating the final JSON config with server blocks, routes, matchers, and TLS settings."
+source: manual
+ground_truth:
+  - Adapter
+  - Adapter.Adapt
+  - ServerType
+  - ServerType.Setup
+  - ServerType.serversFromPairings
+  - ServerType.buildTLSApp
+  - ServerType.consolidateAddrMappings
+  - RegisterDirective
+  - Helper
+  - Adapter
+tags: [caddyfile, adaptation, config, cross-package, pipeline]
+notes: "Adapter.Adapt is the entry point. ServerType.Setup orchestrates the full pipeline: evaluateGlobalOptionsBlock, consolidateAddrMappings groups site blocks by listener address, serversFromPairings builds HTTP server JSON, buildTLSApp generates TLS config. RegisterDirective hooks in per-directive parsers. Helper provides the parsing context."

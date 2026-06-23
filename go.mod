@@ -8,6 +8,7 @@ require (
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/modelcontextprotocol/go-sdk v1.6.1
 	golang.org/x/tools v0.46.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

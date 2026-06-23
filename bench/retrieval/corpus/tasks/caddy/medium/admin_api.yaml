@@ -1,0 +1,15 @@
+id: caddy-medium-003
+repo: caddy
+tier: medium
+description: "How does caddy's admin API receive configuration changes and apply them to the running server?"
+source: manual
+ground_truth:
+  - AdminConfig
+  - adminHandler
+  - adminHandler.ServeHTTP
+  - AdminHandler
+  - AdminRoute
+  - changeConfig
+  - Load
+tags: [admin, api, config, cross-package]
+notes: "AdminConfig defines the listener; adminHandler dispatches to AdminHandler implementations via AdminRoute. changeConfig applies new JSON config. Load is the public entry point for config changes."

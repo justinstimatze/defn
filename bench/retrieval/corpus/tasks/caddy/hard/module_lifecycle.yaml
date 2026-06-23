@@ -1,0 +1,17 @@
+id: caddy-hard-002
+repo: caddy
+tier: hard
+description: "Trace the full lifecycle of a caddy module from registration through provisioning, validation, and cleanup: how does a module get registered, discovered, loaded from JSON config, provisioned with dependencies, validated, and eventually cleaned up?"
+source: manual
+ground_truth:
+  - RegisterModule
+  - GetModule
+  - Module
+  - ModuleInfo
+  - Context.LoadModule
+  - Context.LoadModuleByID
+  - Provisioner
+  - Validator
+  - Validate
+tags: [modules, lifecycle, provisioning, validation, architecture]
+notes: "RegisterModule stores ModuleInfo in global registry. GetModule retrieves by ID. Context.LoadModule unmarshals JSON into the module, calls Provisioner.Provision, then Validator.Validate. LoadModuleByID is the lower-level variant. Validate is the top-level validation runner."
