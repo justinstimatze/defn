@@ -11,6 +11,7 @@ import (
 func All() []benchtype.Adapter {
 	return []benchtype.Adapter{
 		NewDefn(),
+		NewDefnRanked(),
 		NewGrep(),
 	}
 }
@@ -25,7 +26,7 @@ func Available() []benchtype.Adapter {
 	out := make([]benchtype.Adapter, 0, 2)
 	for _, a := range All() {
 		switch a.Name() {
-		case "defn":
+		case "defn", "defn-ranked":
 			if hasCommand("defn") {
 				out = append(out, a)
 			}
