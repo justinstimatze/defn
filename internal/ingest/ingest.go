@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -67,11 +69,56 @@ func IngestPackages(db *store.DB, pkgs []*packages.Package, modulePath string) e
 		}
 	}
 
-	for _, pkg := range goload.FilterPackages(pkgs) {
+	// Each UpsertDefinition forces Dolt to materialize a noms chunk that
+	// sticks in the in-memory chunk cache until DOLT_GC runs — DOLT_COMMIT
+	// alone does NOT release it (verified empirically on chi: a mid-ingest
+	// COMMIT dropped heap_alloc from 473 MB → 471 MB; a mid-ingest GC
+	// dropped it to 30 MB). Without intervention, peak retention scales
+	// linearly with (rows × avg body size).
+	//
+	// Strategy: rely on the end-of-IngestPackages GC below for the common
+	// case (small/medium projects). Only trigger mid-loop GC when the heap
+	// is truly large (>1 GB) — DOLT_GC time grows with chunk count, so
+	// each mid-loop GC costs ~10-20s; doing one for every 200 MB of writes
+	// makes ingest slower than just running with high RSS to the end.
+	const midLoopGCThresholdBytes = 1 << 30 // 1 GB
+	filtered := goload.FilterPackages(pkgs)
+	var m runtime.MemStats
+	for i, pkg := range filtered {
 		if err := ingestPackage(db, pkg, modulePath, state); err != nil {
 			return fmt.Errorf("ingest %s: %w", pkg.PkgPath, err)
 		}
+		if i+1 >= len(filtered) {
+			continue
+		}
+		runtime.ReadMemStats(&m)
+		if m.HeapAlloc < midLoopGCThresholdBytes {
+			continue
+		}
+		if err := db.Commit("ingest-checkpoint"); err != nil {
+			return fmt.Errorf("checkpoint commit: %w", err)
+		}
+		if err := db.GC(); err != nil {
+			return fmt.Errorf("checkpoint gc: %w", err)
+		}
 	}
+
+	// Release Dolt's accumulated chunk cache before downstream work. Cheap
+	// on a fresh ingest's worth of chunks; would otherwise sit until the
+	// next DOLT_GC. cmdIngest's compactEmbedded covers the same ground for
+	// the CLI path but serve's per-edit re-ingest does NOT — adding the GC
+	// here means every ingest cycle releases, regardless of caller.
+	if err := db.Commit("ingest-checkpoint"); err != nil {
+		return fmt.Errorf("post-ingest commit: %w", err)
+	}
+	if err := db.GC(); err != nil {
+		return fmt.Errorf("post-ingest gc: %w", err)
+	}
+	// Return mmap'd heap reservation to the OS. Go's runtime keeps freed
+	// heap as mmap by default — fine for CLI processes that exit, but in
+	// long-lived `defn serve` it means VmRSS only grows. Each ingest
+	// cycle gets back to baseline RSS this way. Cost: ~ms.
+	debug.FreeOSMemory()
 
 	// Remove definitions that no longer exist in the source code.
 	if pruned, err := db.PruneStaleDefinitions(state.liveDefIDs); err != nil {

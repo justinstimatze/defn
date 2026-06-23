@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -681,6 +682,23 @@ If you do edit a ` + "`.go`" + ` file with a built-in tool, call ` + "`code(op:\
 `
 }
 
+// logMem prints heap stats at a labeled phase. Used for diagnosing peak
+// retention during ingest. No-op unless DEFN_LOG_MEM=1.
+func logMem(phase string) {
+	if os.Getenv("DEFN_LOG_MEM") != "1" {
+		return
+	}
+	runtime.GC()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	fmt.Fprintf(os.Stderr, "MEM %-25s heap_alloc=%4d MB  heap_inuse=%4d MB  sys=%4d MB  goroutines=%d\n",
+		phase,
+		m.HeapAlloc/(1<<20),
+		m.HeapInuse/(1<<20),
+		m.Sys/(1<<20),
+		runtime.NumGoroutine())
+}
+
 func cmdIngest(modulePath string, serverMode bool) {
 	// Normalize to absolute so downstream filepath.Rel calls (in ingest
 	// and resolve) compute module-relative source_file paths consistently
@@ -729,18 +747,22 @@ func cmdIngest(modulePath string, serverMode bool) {
 
 	announceStaleIngest(db, modulePath)
 	fmt.Fprintf(os.Stderr, "ingesting %s...\n", modulePath)
+	logMem("before packages.Load")
 	pkgs, err := goload.LoadAll(modulePath)
 	if err != nil {
 		fatal(err)
 	}
+	logMem("after packages.Load")
 	if err := ingest.IngestPackages(db, pkgs, modulePath); err != nil {
 		fatal(err)
 	}
+	logMem("after IngestPackages")
 
 	fmt.Fprintf(os.Stderr, "resolving references...\n")
 	if err := resolve.ResolvePackages(db, pkgs, modulePath); err != nil {
 		fatal(err)
 	}
+	logMem("after ResolvePackages")
 
 	hash, err := db.ComputeRootHash()
 	if err != nil {
