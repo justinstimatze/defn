@@ -4,10 +4,12 @@ package resolve
 
 import (
 	"bytes"
+	"fmt"
 	"go/ast"
 	"go/format"
 	"go/token"
 	"go/types"
+	"runtime/debug"
 	"strings"
 
 	"github.com/justinstimatze/defn/internal/goload"
@@ -302,6 +304,24 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 		if err := db.SetLiteralFields(fromID, fields); err != nil {
 			return err
 		}
+	}
+
+	// Release Dolt's accumulated chunk cache. Mirrors IngestPackages's
+	// end-GC: SetReferences/SetLiteralFields materialize noms chunks that
+	// stick in the in-memory chunk cache until DOLT_GC runs. Without this,
+	// a serve-mode resolve on a medium project adds ~335 MB heap_alloc
+	// that doesn't release until the next autoCommit GC tick. Skipped on
+	// partial-resolve paths (ResolveModule/ResolveFile) — those are the
+	// sub-second fast paths used after a single-def edit, and DOLT_GC
+	// costs seconds.
+	if onlyModule == "" {
+		if err := db.Commit("resolve-checkpoint"); err != nil {
+			return fmt.Errorf("post-resolve commit: %w", err)
+		}
+		if err := db.GC(); err != nil {
+			return fmt.Errorf("post-resolve gc: %w", err)
+		}
+		debug.FreeOSMemory()
 	}
 
 	return nil
