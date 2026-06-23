@@ -28,6 +28,7 @@ import (
 	"github.com/justinstimatze/defn/internal/ingest"
 	"github.com/justinstimatze/defn/internal/lint"
 	mcpserver "github.com/justinstimatze/defn/internal/mcp"
+	"github.com/justinstimatze/defn/internal/rank"
 	"github.com/justinstimatze/defn/internal/resolve"
 	"github.com/justinstimatze/defn/internal/store"
 
@@ -883,6 +884,147 @@ func findModuleRoot(filePath string) (string, error) {
 		dir = parent
 	}
 }
+
+// cmdSearch is the CLI surface for definition search. Mirrors the MCP
+// op:search behavior: SQL LIKE on names (or % wildcard pattern), with
+// fallback to body/doc full-text search when no name matches. With
+// --rank, the candidates are scored by the linear ranker (lexical
+// features only — caller/test counts aren't fetched in the CLI path
+// to keep the query single-shot; agents wanting graph signal should
+// use the MCP op:search with rank:true).
+//
+// Output formats:
+//   - default: one result per line, "<receiver>.<name> (<kind>)" or
+//     "<name> (<kind>)", suitable for shell pipelines.
+//   - --json: array of {name, kind, receiver, score?} objects.
+func cmdSearch(pattern string, rank bool, jsonOutput bool, limit int) {
+	if pattern == "" {
+		fatal(fmt.Errorf("usage: defn search [--rank] [--json] [--limit N] <pattern>"))
+	}
+	db, err := store.Open(getDBPath())
+	if err != nil {
+		fatal(err)
+	}
+	defer db.Close()
+
+	var defs []store.Definition
+	if strings.Contains(pattern, "%") {
+		defs, err = db.FindDefinitions(pattern)
+	} else {
+		defs, err = db.FindDefinitions("%" + pattern + "%")
+		if (err != nil || len(defs) == 0) && !rank {
+			// Body fallback is fine for the unranked path. For ranked,
+			// we want to score the name matches we got; falling through
+			// to body search would change the candidate semantics.
+			defs, err = db.SearchDefinitions(pattern)
+		}
+	}
+	if err != nil {
+		fatal(err)
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+
+	if rank {
+		searchRanked(pattern, defs, limit, jsonOutput)
+		return
+	}
+
+	if limit > len(defs) {
+		limit = len(defs)
+	}
+	defs = defs[:limit]
+	if jsonOutput {
+		out := make([]map[string]any, 0, len(defs))
+		for _, d := range defs {
+			row := map[string]any{"name": d.Name, "kind": d.Kind}
+			if d.Receiver != "" {
+				row["receiver"] = d.Receiver
+			}
+			out = append(out, row)
+		}
+		b, _ := json.MarshalIndent(out, "", "  ")
+		fmt.Println(string(b))
+		return
+	}
+	for _, d := range defs {
+		if d.Receiver != "" {
+			fmt.Printf("%s.%s (%s)\n", d.Receiver, d.Name, d.Kind)
+		} else {
+			fmt.Printf("%s (%s)\n", d.Name, d.Kind)
+		}
+	}
+}
+
+// searchRanked scores `defs` with the linear ranker and prints top N.
+// Caller and test counts are batch-fetched once for the candidate pool
+// so the graph-signal features actually fire; the lazy IDF is built
+// from a fresh body sample so the CLI doesn't need a running serve.
+func searchRanked(pattern string, defs []store.Definition, limit int, jsonOutput bool) {
+	db, err := store.Open(getDBPath())
+	if err != nil {
+		fatal(err)
+	}
+	defer db.Close()
+
+	ids := make([]int64, len(defs))
+	for i, d := range defs {
+		ids[i] = d.ID
+	}
+	callers, tests, err := db.RefCountsByTarget(ids)
+	if err != nil {
+		fatal(fmt.Errorf("ref counts: %w", err))
+	}
+	cands := make([]rank.Candidate, len(defs))
+	for i, d := range defs {
+		cands[i] = rank.Candidate{
+			Def:         d,
+			CallerCount: callers[d.ID],
+			TestCount:   tests[d.ID],
+		}
+	}
+	idf := rank.NewLazyIDF(cliBodySource{db: db})
+	scored := rank.Rank(pattern, cands, idf, rank.DefaultWeights)
+	if limit > len(scored) {
+		limit = len(scored)
+	}
+	scored = scored[:limit]
+
+	if jsonOutput {
+		out := make([]map[string]any, 0, len(scored))
+		for _, r := range scored {
+			row := map[string]any{
+				"name":  r.Def.Name,
+				"kind":  r.Def.Kind,
+				"score": r.Score,
+			}
+			if r.Def.Receiver != "" {
+				row["receiver"] = r.Def.Receiver
+			}
+			out = append(out, row)
+		}
+		b, _ := json.MarshalIndent(out, "", "  ")
+		fmt.Println(string(b))
+		return
+	}
+	for _, r := range scored {
+		if r.Def.Receiver != "" {
+			fmt.Printf("%.4f  %s.%s (%s)\n", r.Score, r.Def.Receiver, r.Def.Name, r.Def.Kind)
+		} else {
+			fmt.Printf("%.4f  %s (%s)\n", r.Score, r.Def.Name, r.Def.Kind)
+		}
+	}
+}
+
+// cliBodySource adapts *store.DB to rank.BodySource for the CLI's
+// one-shot search. Same shape as the MCP-side adapter in
+// internal/mcp/ranking.go; kept separate to avoid making cmd/defn
+// depend on internal/mcp just for the adapter.
+type cliBodySource struct{ db *store.DB }
+
+func (a cliBodySource) CountDefinitions() (int, error)      { return a.db.CountDefinitions() }
+func (a cliBodySource) SampleBodies(n int) ([]string, error) { return a.db.SampleBodies(n) }
 
 // cmdRepair deletes the embedded .defn/ database and re-ingests from
 // source. Useful when the Dolt journal or indexes get corrupted — since

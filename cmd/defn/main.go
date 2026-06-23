@@ -62,6 +62,37 @@ func main() {
 			file = os.Args[2]
 		}
 		cmdSync(file)
+	case "search":
+		rank := false
+		jsonFlag := false
+		limit := 20
+		var pattern string
+		for i := 2; i < len(os.Args); i++ {
+			a := os.Args[i]
+			switch {
+			case a == "--rank":
+				rank = true
+			case a == "--json":
+				jsonFlag = true
+			case a == "--limit":
+				if i+1 >= len(os.Args) {
+					fmt.Fprintln(os.Stderr, "usage: defn search [--rank] [--json] [--limit N] <pattern>")
+					os.Exit(1)
+				}
+				if _, err := fmt.Sscanf(os.Args[i+1], "%d", &limit); err != nil || limit <= 0 {
+					fmt.Fprintln(os.Stderr, "--limit requires a positive integer")
+					os.Exit(1)
+				}
+				i++
+			default:
+				pattern = a
+			}
+		}
+		if pattern == "" {
+			fmt.Fprintln(os.Stderr, "usage: defn search [--rank] [--json] [--limit N] <pattern>")
+			os.Exit(1)
+		}
+		cmdSearch(pattern, rank, jsonFlag, limit)
 	case "serve":
 		httpAddr := ""
 		if len(os.Args) >= 4 && os.Args[2] == "--http" {
