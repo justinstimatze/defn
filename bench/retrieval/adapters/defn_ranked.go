@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -41,6 +42,12 @@ func NewDefnRanked() *DefnRanked {
 
 func (a *DefnRanked) Name() string { return "defn-ranked" }
 
+// benchVerbose reports whether to log adapter-level diagnostics (query
+// errors, empty results, ingest details). Set BENCH_VERBOSE=1 in the
+// environment to enable. Defaults off so the harness's aggregate
+// output stays clean.
+func benchVerbose() bool { return os.Getenv("BENCH_VERBOSE") == "1" }
+
 // Index ensures the project is ingested and primes the IDF table for the
 // repo. The plain adapter's `defn query SELECT 1` is reused as the "is the
 // DB ready" probe.
@@ -61,6 +68,12 @@ func (a *DefnRanked) Index(repoPath string) (int64, error) {
 	if err := a.primeIDF(repoPath); err != nil {
 		return time.Since(start).Milliseconds(), fmt.Errorf("prime idf: %w", err)
 	}
+	if benchVerbose() {
+		if idf, ok := a.idf[repoPath]; ok && idf != nil {
+			fmt.Fprintf(os.Stderr, "[defn-ranked] %s indexed: IDF over %d sampled bodies, %d unique tokens, maxIDF=%.2f\n",
+				repoPath, idf.docs, len(idf.scores), idf.maxIDF)
+		}
+	}
 	return time.Since(start).Milliseconds(), nil
 }
 
@@ -76,7 +89,15 @@ func (a *DefnRanked) Retrieve(repoPath string, task benchtype.Task, tokenBudget 
 	for _, kw := range keywords {
 		rows, err := a.queryWithBody(repoPath, kw)
 		if err != nil {
+			if benchVerbose() {
+				fmt.Fprintf(os.Stderr, "[defn-ranked] task=%s keyword=%q query error: %v\n",
+					task.ID, kw, err)
+			}
 			continue
+		}
+		if benchVerbose() && len(rows) == 0 {
+			fmt.Fprintf(os.Stderr, "[defn-ranked] task=%s keyword=%q returned 0 rows\n",
+				task.ID, kw)
 		}
 		for _, r := range rows {
 			key := r.def.Receiver + "." + r.def.Name
@@ -84,6 +105,7 @@ func (a *DefnRanked) Retrieve(repoPath string, task benchtype.Task, tokenBudget 
 				seen[key] = rank.Candidate{
 					Def:         r.def,
 					CallerCount: r.callers,
+					TestCount:   r.tests,
 				}
 			}
 		}
@@ -137,15 +159,23 @@ func (a *DefnRanked) Reset(_ string) error                                      
 func (a *DefnRanked) queryWithBody(repoPath, keyword string) ([]struct {
 	def     store.Definition
 	callers int
+	tests   int
 }, error) {
 	kw := strings.ReplaceAll(keyword, "'", "")
+	// 200 cap (was 50) — the earlier limit was clipping the candidate
+	// pool before the ranker ever saw the relevant items, so high-recall
+	// ground truths were unreachable no matter what the weights did.
+	// Two correlated subqueries fill caller_count (non-test) and
+	// test_count (test) so the ranker's graph-signal features have data.
 	sql := fmt.Sprintf(
 		"SELECT d.name, IFNULL(d.receiver,'') AS receiver, d.`kind` AS kind, "+
 			"IFNULL(d.source_file,'') AS source_file, IFNULL(b.body,'') AS body, "+
 			"(SELECT COUNT(*) FROM refs r JOIN definitions c ON c.id = r.from_def "+
-			"WHERE c.test = FALSE AND r.to_def = d.id) AS caller_count "+
+			"WHERE c.test = FALSE AND r.to_def = d.id) AS caller_count, "+
+			"(SELECT COUNT(*) FROM refs r JOIN definitions c ON c.id = r.from_def "+
+			"WHERE c.test = TRUE AND r.to_def = d.id) AS test_count "+
 			"FROM definitions d LEFT JOIN bodies b ON b.def_id = d.id "+
-			"WHERE d.test = FALSE AND d.name LIKE '%%%s%%' LIMIT 50",
+			"WHERE d.test = FALSE AND d.name LIKE '%%%s%%' LIMIT 200",
 		kw,
 	)
 	cmd := exec.Command(a.bin, "query", sql)
@@ -161,11 +191,13 @@ func (a *DefnRanked) queryWithBody(repoPath, keyword string) ([]struct {
 	rows := make([]struct {
 		def     store.Definition
 		callers int
+		tests   int
 	}, 0, len(maps))
 	for _, m := range maps {
 		rows = append(rows, struct {
 			def     store.Definition
 			callers int
+			tests   int
 		}{
 			def: store.Definition{
 				Name:       asStr(m["name"]),
@@ -175,6 +207,7 @@ func (a *DefnRanked) queryWithBody(repoPath, keyword string) ([]struct {
 				Body:       asStr(m["body"]),
 			},
 			callers: asInt(m["caller_count"]),
+			tests:   asInt(m["test_count"]),
 		})
 	}
 	return rows, nil

@@ -113,6 +113,12 @@ func testCountScore(n int) float64 {
 // appear in the body. Doesn't penalize long bodies — a def with three
 // distinct query terms in its body is more relevant than one with one term,
 // even if the long-body def's term frequency is diluted.
+//
+// History: a sqrt(body length) length-normalization was tried 2026-06-23
+// and dropped — it demoted handler functions (the right answers on
+// caddy tasks) in favor of small mentions in vars/types. NDCG fell
+// 0.113→0.091 on test split. Length normalization stays out unless a
+// bigger corpus shows it helps.
 func bodyOverlap(qTokens []string, body string, idf IDF) float64 {
 	if body == "" || len(qTokens) == 0 {
 		return 0

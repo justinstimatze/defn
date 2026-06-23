@@ -234,9 +234,11 @@ func fetchCandidates(bin, repoPath, description string) ([]rank.Candidate, error
 			"SELECT d.name, IFNULL(d.receiver,'') AS receiver, d.`kind` AS kind, "+
 				"IFNULL(d.source_file,'') AS source_file, IFNULL(b.body,'') AS body, "+
 				"(SELECT COUNT(*) FROM refs r JOIN definitions c ON c.id = r.from_def "+
-				"WHERE c.test = FALSE AND r.to_def = d.id) AS caller_count "+
+				"WHERE c.test = FALSE AND r.to_def = d.id) AS caller_count, "+
+				"(SELECT COUNT(*) FROM refs r JOIN definitions c ON c.id = r.from_def "+
+				"WHERE c.test = TRUE AND r.to_def = d.id) AS test_count "+
 				"FROM definitions d LEFT JOIN bodies b ON b.def_id = d.id "+
-				"WHERE d.test = FALSE AND d.name LIKE '%%%s%%' LIMIT 50",
+				"WHERE d.test = FALSE AND d.name LIKE '%%%s%%' LIMIT 200",
 			kw,
 		)
 		cmd := exec.Command(bin, "query", sql)
@@ -264,6 +266,7 @@ func fetchCandidates(bin, repoPath, description string) ([]rank.Candidate, error
 			seen[key] = rank.Candidate{
 				Def:         d,
 				CallerCount: asInt(m["caller_count"]),
+				TestCount:   asInt(m["test_count"]),
 			}
 		}
 	}
