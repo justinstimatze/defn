@@ -382,6 +382,28 @@ func TestHandleImpact(t *testing.T) {
 	}
 }
 
+func TestHandleImpact_Rank(t *testing.T) {
+	// rank=true must not panic, must not lose callers, and must keep
+	// the formatted output coherent. Score ordering is exercised
+	// directly in internal/rank — here we just verify the wire-up.
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+	s.idf = newIDF(db)
+
+	result, _, err := s.handleImpact(context.Background(), nil, codeParam{Name: "Greet", Rank: true})
+	if err != nil {
+		t.Fatalf("rank=true impact: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Greet") {
+		t.Error("expected Greet in ranked impact output")
+	}
+	if !strings.Contains(text, "Farewell") {
+		t.Error("expected Farewell still present after ranking")
+	}
+}
+
 func TestHandleRead(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()

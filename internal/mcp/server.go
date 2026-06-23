@@ -24,6 +24,7 @@ import (
 	"github.com/justinstimatze/defn/internal/emit"
 	"github.com/justinstimatze/defn/internal/goload"
 	"github.com/justinstimatze/defn/internal/ingest"
+	"github.com/justinstimatze/defn/internal/rank"
 	"github.com/justinstimatze/defn/internal/resolve"
 	"github.com/justinstimatze/defn/internal/store"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -57,6 +58,7 @@ type server struct {
 	lastResolved    atomic.Int64 // UnixNano timestamp of last resolve (to debounce watcher)
 	ready           atomic.Bool  // true after startup ingest+resolve completes
 	autoCommitCount atomic.Int64 // counts auto-commits; triggers GC every 10
+	idf             *rank.LazyIDF
 }
 
 // Run starts the MCP server over stdio. projDir is the project root where
@@ -193,6 +195,7 @@ func mcpHTTPMux(mcpServer *sdkmcp.Server, projDir string) http.Handler {
 // Shared by both stdio and HTTP transports.
 func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*server, *sdkmcp.Server) {
 	s := &server{db: database, projectDir: projDir}
+	s.idf = newIDF(database)
 
 	if projDir != "" {
 		// Reconcile changes made while defn was not running (file moves,
@@ -284,6 +287,7 @@ type codeParam struct {
 	Pick        string           `json:"pick,omitempty"`
 	To          string           `json:"to,omitempty"`
 	Out         string           `json:"out,omitempty"`
+	Rank        bool             `json:"rank,omitempty"`
 }
 
 type applyOp struct {
@@ -627,6 +631,12 @@ func (s *server) handleImpact(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		return errResult(err)
 	}
 
+	if args.Rank && len(impact.DirectCallers) > 1 {
+		if err := s.rankDirectCallers(impact); err != nil {
+			return errResult(fmt.Errorf("rank callers: %w", err))
+		}
+	}
+
 	if args.Format == "json" {
 		return s.impactJSON(impact)
 	}
@@ -782,6 +792,10 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		limit = args.Limit
 	}
 
+	if args.Rank {
+		return s.rankedSearchResult(args.Pattern, defs, limit)
+	}
+
 	type summary struct {
 		Name     string `json:"name"`
 		Kind     string `json:"kind"`
@@ -806,6 +820,91 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	}
 	if truncated != "" {
 		text += truncated
+	}
+	return textResult(text), nil, nil
+}
+
+// rankDirectCallers reorders impact.DirectCallers by descending rank score.
+// The "query" is the impacted definition's name — callers with overlapping
+// surface area (lexical match, body terms, receiver alignment) sort first,
+// then graph weight (own caller count + test coverage) breaks ties. Mutates
+// impact in place so both the JSON and markdown formatters pick up the new
+// order without duplicating ranking logic on each path.
+func (s *server) rankDirectCallers(impact *store.Impact) error {
+	if s.idf == nil {
+		// Server constructed without idf (test fixture or partial init);
+		// skip ranking rather than panic on rank.Rank.
+		return nil
+	}
+	ids := make([]int64, len(impact.DirectCallers))
+	for i, c := range impact.DirectCallers {
+		ids[i] = c.ID
+	}
+	callers, tests, err := s.db.RefCountsByTarget(ids)
+	if err != nil {
+		return err
+	}
+	cands := make([]rank.Candidate, len(impact.DirectCallers))
+	for i, c := range impact.DirectCallers {
+		cands[i] = rank.Candidate{
+			Def:         c,
+			CallerCount: callers[c.ID],
+			TestCount:   tests[c.ID],
+		}
+	}
+	scored := rank.Rank(impact.Definition.Name, cands, s.idf, rank.DefaultWeights)
+	sorted := make([]store.Definition, len(scored))
+	for i, r := range scored {
+		sorted[i] = r.Def
+	}
+	impact.DirectCallers = sorted
+	return nil
+}
+
+// rankedSearchResult scores the candidate set and returns the top `limit`
+// by descending score. Caller/test counts are filled from a single batch
+// refs query so the graph-signal features actually fire.
+func (s *server) rankedSearchResult(query string, defs []store.Definition, limit int) (*sdkmcp.CallToolResult, any, error) {
+	ids := make([]int64, len(defs))
+	for i, d := range defs {
+		ids[i] = d.ID
+	}
+	callers, tests, err := s.db.RefCountsByTarget(ids)
+	if err != nil {
+		return errResult(fmt.Errorf("ref counts: %w", err))
+	}
+	cands := make([]rank.Candidate, len(defs))
+	for i, d := range defs {
+		cands[i] = rank.Candidate{
+			Def:         d,
+			CallerCount: callers[d.ID],
+			TestCount:   tests[d.ID],
+		}
+	}
+	scored := rank.Rank(query, cands, s.idf, rank.DefaultWeights)
+
+	type rankedSummary struct {
+		Name     string  `json:"name"`
+		Kind     string  `json:"kind"`
+		Receiver string  `json:"receiver,omitempty"`
+		Score    float64 `json:"score"`
+	}
+	out := make([]rankedSummary, 0, limit)
+	for i, r := range scored {
+		if i >= limit {
+			break
+		}
+		out = append(out, rankedSummary{
+			Name: r.Def.Name, Kind: r.Def.Kind, Receiver: r.Def.Receiver,
+			Score: r.Score,
+		})
+	}
+	text, err := toJSON(out)
+	if err != nil {
+		return errResult(err)
+	}
+	if len(scored) > limit {
+		text += fmt.Sprintf("\n(showing top %d of %d ranked — pass limit:<n> to see more)", limit, len(scored))
 	}
 	return textResult(text), nil, nil
 }
@@ -895,6 +994,9 @@ func (s *server) autoResolve(modulePath string) {
 		fmt.Fprintf(os.Stderr, "defn: auto-commit failed (post-resolve): %v\n", err)
 	}
 	s.lastResolved.Store(time.Now().UnixNano())
+	if s.idf != nil {
+		s.idf.Invalidate()
+	}
 }
 
 // autoCommit commits the working set with an auto-generated message.
@@ -964,6 +1066,9 @@ func (s *server) ingestAndResolve() error {
 		return fmt.Errorf("commit: %w", err)
 	}
 	s.lastResolved.Store(time.Now().UnixNano())
+	if s.idf != nil {
+		s.idf.Invalidate()
+	}
 	return nil
 }
 
