@@ -255,9 +255,16 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string) ([]D
 		byFile[file] = append(byFile[file], d)
 	}
 
-	var allLocs []DefLocation
-	var written []writtenFile
-	docWritten := false
+	// Deterministic file order. Map iteration order was the surface
+	// cause of the package-doc duplication bug: whichever file iterated
+	// first got mod.Doc auto-attached, even when another file in the
+	// package already carried it via prefix preservation. Sorting also
+	// makes emit output stable across runs.
+	fileNames := make([]string, 0, len(byFile))
+	for f := range byFile {
+		fileNames = append(fileNames, f)
+	}
+	sort.Strings(fileNames)
 
 	// Phase C: pre-fetch the raw sources for this module. When present,
 	// writeFile uses them as the authoritative merge base — that's the
@@ -265,35 +272,66 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string) ([]D
 	// be stale or never have existed, e.g. fresh `defn emit /tmp/out`).
 	rawMap, _ := db.ListFileSources(mod.ID)
 
-	for file, fileDefs := range byFile {
-		path := filepath.Join(pkgDir, file)
-		// Only include package doc on the first non-test file.
-		pkgDoc := ""
-		if !docWritten && !strings.HasSuffix(file, "_test.go") {
-			pkgDoc = mod.Doc
-			docWritten = true
-		}
-		// Find the raw source for this file. source_file in the DB is
-		// project-relative (e.g. "internal/mcp/tools_extra.go"), so look
-		// up by the source_file of any def in this bucket.
-		//
+	// Per-file rawFromDB lookup, cached once for reuse.
+	rawByFile := make(map[string][]byte, len(fileNames))
+	projectRelByFile := make(map[string]string, len(fileNames))
+	for _, file := range fileNames {
 		// Invariant: all defs in a byFile bucket share the same
 		// SourceFile. Buckets are keyed by basename, and within a
 		// single module (one package directory) each basename maps to
 		// exactly one project-relative path. So breaking at the first
 		// def with a non-empty SourceFile yields the canonical one.
-		var rawFromDB []byte
-		var projectRelSource string
-		for _, d := range fileDefs {
+		for _, d := range byFile[file] {
 			if d.SourceFile != "" {
-				projectRelSource = d.SourceFile
+				projectRelByFile[file] = d.SourceFile
 				if r, ok := rawMap[d.SourceFile]; ok {
-					rawFromDB = []byte(r)
+					rawByFile[file] = []byte(r)
 				}
 				break
 			}
 		}
-		locs, err := writeFile(path, mod.Name, mod.Path, pkgDoc, imports, fileDefs, rawFromDB)
+	}
+
+	// Detect whether mod.Doc is already carried by some file's
+	// existing source. If yes, suppress auto-attach for every file —
+	// writeFile's prefix preservation keeps the doc where it lives, so
+	// attaching elsewhere would duplicate. If no, attach to the
+	// alphabetically-first non-test file as a deterministic fallback
+	// (so a fresh emit to an empty directory doesn't silently drop it).
+	docAlreadyPresent := false
+	if mod.Doc != "" {
+		for _, file := range fileNames {
+			src := rawByFile[file]
+			if len(src) == 0 {
+				if data, err := os.ReadFile(filepath.Join(pkgDir, file)); err == nil {
+					src = data
+				}
+			}
+			if sourceHasPackageDoc(src, mod.Doc) {
+				docAlreadyPresent = true
+				break
+			}
+		}
+	}
+	docTarget := ""
+	if mod.Doc != "" && !docAlreadyPresent {
+		for _, file := range fileNames {
+			if !strings.HasSuffix(file, "_test.go") {
+				docTarget = file
+				break
+			}
+		}
+	}
+
+	var allLocs []DefLocation
+	var written []writtenFile
+	for _, file := range fileNames {
+		path := filepath.Join(pkgDir, file)
+		pkgDoc := ""
+		if file == docTarget {
+			pkgDoc = mod.Doc
+		}
+		locs, err := writeFile(path, mod.Name, mod.Path, pkgDoc, imports, byFile[file], rawByFile[file])
 		if err != nil {
 			return nil, nil, err
 		}
@@ -301,7 +339,7 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string) ([]D
 		written = append(written, writtenFile{
 			Path:       path,
 			ModuleID:   mod.ID,
-			SourceFile: projectRelSource,
+			SourceFile: projectRelByFile[file],
 		})
 	}
 
@@ -309,14 +347,23 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string) ([]D
 }
 
 func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import, defs []store.Definition, rawFromDB []byte) ([]DefLocation, error) {
-	// Phase C: file_sources.raw is the authoritative byte-faithful
-	// representation. Prefer it over whatever is on disk, which might
-	// be stale. Fall through to disk (Phase A) if the DB has nothing.
-	existingSrc := rawFromDB
-	if len(existingSrc) == 0 {
-		if data, err := os.ReadFile(path); err == nil {
+	// Pick the merge base. Prefer disk when it exists and parses: a
+	// user's built-in Edit lands on disk before file_sources knows about
+	// it (built-in tools bypass defn's sync), so disk is the post-Edit
+	// truth. Fall back to file_sources (Phase C) when disk is missing
+	// (fresh `defn emit /tmp/out`) or broken — file_sources is then
+	// the authoritative byte-faithful copy that survives an empty
+	// outDir. If neither parses, existingSrc stays empty and the
+	// regenerate path rebuilds from defs alone.
+	var existingSrc []byte
+	if data, err := os.ReadFile(path); err == nil {
+		fset := token.NewFileSet()
+		if _, perr := parser.ParseFile(fset, "", data, parser.SkipObjectResolution); perr == nil {
 			existingSrc = data
 		}
+	}
+	if len(existingSrc) == 0 {
+		existingSrc = rawFromDB
 	}
 
 	// AST-merge path: if we have a base file that parses, patch the
@@ -364,10 +411,35 @@ func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import,
 	}
 	src.WriteString(fmt.Sprintf("package %s\n\n", pkgName))
 
-	// Import block.
-	if len(imports) > 0 {
+	// Import block. Imports are stored per-module (every file in the
+	// package shares the union), but `_ "embed"` is meaningful only in
+	// files with a //go:embed directive — emitting it elsewhere
+	// injects spurious imports and goimports won't strip blank imports.
+	// Special-case embed (the only stdlib blank import tied 1:1 to a
+	// directive); other blank imports may genuinely be loaded for side
+	// effects in any file and are passed through.
+	hasEmbedDirective := false
+	for _, d := range defs {
+		if strings.Contains(d.Body, "//go:embed") {
+			hasEmbedDirective = true
+			break
+		}
+	}
+	if !hasEmbedDirective && len(existingSrc) > 0 {
+		if bytes.Contains(existingSrc, []byte("//go:embed")) {
+			hasEmbedDirective = true
+		}
+	}
+	filtered := make([]store.Import, 0, len(imports))
+	for _, imp := range imports {
+		if imp.Alias == "_" && imp.ImportedPath == "embed" && !hasEmbedDirective {
+			continue
+		}
+		filtered = append(filtered, imp)
+	}
+	if len(filtered) > 0 {
 		src.WriteString("import (\n")
-		for _, imp := range imports {
+		for _, imp := range filtered {
 			if imp.Alias != "" {
 				src.WriteString(fmt.Sprintf("\t%s %q\n", imp.Alias, imp.ImportedPath))
 			} else {
@@ -856,6 +928,28 @@ func funcIdentity(name, receiver string) string {
 		return name
 	}
 	return receiver + "." + name
+}
+
+// sourceHasPackageDoc reports whether src carries the given package
+// doc as the comment bound to its `package X` clause. Used by
+// emitModule to decide whether mod.Doc is already present in some
+// file in the package (preserved via merge or on-disk prefix) — if
+// so, auto-attach is suppressed to avoid duplicating across files.
+//
+// Authoritative: parses src and compares file.Doc.Text() to the
+// stored doc using the same primitive ingest used to populate
+// mod.Doc, so format quirks (spacing on `//` blank lines, trailing
+// whitespace) can't desync the check.
+func sourceHasPackageDoc(src []byte, doc string) bool {
+	if len(src) == 0 || doc == "" {
+		return false
+	}
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, parser.ImportsOnly|parser.ParseComments)
+	if err != nil || f.Doc == nil {
+		return false
+	}
+	return strings.TrimSpace(f.Doc.Text()) == strings.TrimSpace(doc)
 }
 
 // packageDeclStart returns the byte offset of the `package X` keyword

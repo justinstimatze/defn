@@ -768,7 +768,6 @@ func TestEmitImports(t *testing.T) {
 
 	db.SetImports(mod.ID, []store.Import{
 		{ModuleID: mod.ID, ImportedPath: "fmt"},
-		{ModuleID: mod.ID, ImportedPath: "embed", Alias: "_"},
 	})
 	// Use fmt so goimports doesn't strip it.
 	db.UpsertDefinition(&store.Definition{
@@ -788,9 +787,258 @@ func TestEmitImports(t *testing.T) {
 	if !strings.Contains(content, `"fmt"`) {
 		t.Fatalf("missing fmt import in:\n%s", content)
 	}
-	// Blank imports should survive goimports.
+}
+
+func TestEmitFiltersBlankEmbedWithoutDirective(t *testing.T) {
+	// Imports are stored per-module: every file in the package gets
+	// the union. `_ "embed"` is meaningful only in files with a
+	// //go:embed directive — emitting it elsewhere injects spurious
+	// imports that goimports won't strip (blank imports are kept on
+	// purpose for side-effect loaders). Filter it out for files with
+	// no //go:embed.
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test/pkg", "pkg", "")
+	db.EnsureModule("example.com/test/other", "other", "")
+
+	db.SetImports(mod.ID, []store.Import{
+		{ModuleID: mod.ID, ImportedPath: "fmt"},
+		{ModuleID: mod.ID, ImportedPath: "embed", Alias: "_"},
+	})
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true,
+		Body: "func Foo() { fmt.Println() }", SourceFile: "pkg.go",
+	})
+
+	outDir := t.TempDir()
+	if err := Emit(db, outDir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(outDir, "pkg", "pkg.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	if strings.Contains(content, `_ "embed"`) {
+		t.Fatalf("spurious `_ \"embed\"` survived emit in a file with no //go:embed directive:\n%s", content)
+	}
+}
+
+func TestEmitKeepsBlankEmbedWhenDefHasDirective(t *testing.T) {
+	// Counterpart to TestEmitFiltersBlankEmbedWithoutDirective: when
+	// a def body carries //go:embed, the blank embed import must
+	// survive in that file.
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test/pkg", "pkg", "")
+	db.EnsureModule("example.com/test/other", "other", "")
+
+	db.SetImports(mod.ID, []store.Import{
+		{ModuleID: mod.ID, ImportedPath: "embed", Alias: "_"},
+	})
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "data", Kind: "var", Exported: false,
+		Body: "//go:embed file.txt\nvar data string", SourceFile: "pkg.go",
+	})
+
+	outDir := t.TempDir()
+	if err := Emit(db, outDir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(outDir, "pkg", "pkg.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
 	if !strings.Contains(content, `_ "embed"`) {
-		t.Fatalf("missing blank import in:\n%s", content)
+		t.Fatalf("blank embed import was wrongly filtered from a file with //go:embed:\n%s", content)
+	}
+}
+
+func TestEmitPackageDocNotDuplicatedAcrossFiles(t *testing.T) {
+	// Regression: mod.Doc is stored at module level, and emit used to
+	// auto-attach it to the first non-test file iterated from a Go map
+	// (non-deterministic). If a different file in the package already
+	// carried the doc via prefix preservation, both ended up with it.
+	// Fix: scan all files first; if any already carries the doc, skip
+	// auto-attach everywhere.
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "Package test is the canonical doc.")
+
+	// File A already carries the package doc in its raw source.
+	rawA := `// Package test is the canonical doc.
+package test
+
+func A() {}
+`
+	if err := db.SetFileSource(mod.ID, "a.go", rawA); err != nil {
+		t.Fatal(err)
+	}
+	rawB := `package test
+
+func B() {}
+`
+	if err := db.SetFileSource(mod.ID, "b.go", rawB); err != nil {
+		t.Fatal(err)
+	}
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "A", Kind: "function", Exported: true,
+		Body: "func A() {}", SourceFile: "a.go",
+	})
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "B", Kind: "function", Exported: true,
+		Body: "func B() {}", SourceFile: "b.go",
+	})
+
+	outDir := t.TempDir()
+	if err := Emit(db, outDir); err != nil {
+		t.Fatal(err)
+	}
+
+	dataA, _ := os.ReadFile(filepath.Join(outDir, "a.go"))
+	dataB, _ := os.ReadFile(filepath.Join(outDir, "b.go"))
+	a, b := string(dataA), string(dataB)
+
+	if !strings.Contains(a, "Package test is the canonical doc.") {
+		t.Fatalf("a.go lost its package doc:\n%s", a)
+	}
+	if strings.Contains(b, "Package test is the canonical doc.") {
+		t.Fatalf("b.go was wrongly given a duplicate of the package doc:\n%s", b)
+	}
+}
+
+func TestEmitMultiLinePackageDocNotDuplicated(t *testing.T) {
+	// Stronger version of TestEmitPackageDocNotDuplicatedAcrossFiles:
+	// uses a multi-line package doc (the realistic case for real
+	// packages) and proves the parser-backed sourceHasPackageDoc check
+	// matches the full doc — not just its first line.
+	db := testDB(t)
+	doc := "Package multi is the canonical multi-line doc.\n\nIt spans paragraphs and includes blank // lines."
+	mod, _ := db.EnsureModule("example.com/multi", "multi", doc)
+
+	rawA := `// Package multi is the canonical multi-line doc.
+//
+// It spans paragraphs and includes blank // lines.
+package multi
+
+func A() {}
+`
+	if err := db.SetFileSource(mod.ID, "a.go", rawA); err != nil {
+		t.Fatal(err)
+	}
+	rawB := `package multi
+
+func B() {}
+`
+	if err := db.SetFileSource(mod.ID, "b.go", rawB); err != nil {
+		t.Fatal(err)
+	}
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "A", Kind: "function", Exported: true,
+		Body: "func A() {}", SourceFile: "a.go",
+	})
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "B", Kind: "function", Exported: true,
+		Body: "func B() {}", SourceFile: "b.go",
+	})
+
+	outDir := t.TempDir()
+	if err := Emit(db, outDir); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := os.ReadFile(filepath.Join(outDir, "a.go"))
+	b, _ := os.ReadFile(filepath.Join(outDir, "b.go"))
+	if !strings.Contains(string(a), "It spans paragraphs") {
+		t.Fatalf("a.go lost the multi-line package doc:\n%s", a)
+	}
+	if strings.Contains(string(b), "Package multi is the canonical") {
+		t.Fatalf("b.go was given a duplicate of the multi-line package doc:\n%s", b)
+	}
+}
+
+func TestEmitAttachesPackageDocWhenNoFileCarriesIt(t *testing.T) {
+	// Fresh emit to an empty dir with mod.Doc set: no file's existing
+	// source carries the doc, so emit attaches it to the alphabetically-
+	// first non-test file (deterministic fallback) rather than silently
+	// dropping it. b_test.go sorts before z.go but is excluded; z.go
+	// sorts after a.go alphabetically so a.go gets it.
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "Package test docs.")
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Alpha", Kind: "function", Exported: true,
+		Body: "func Alpha() {}", SourceFile: "a.go",
+	})
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Zeta", Kind: "function", Exported: true,
+		Body: "func Zeta() {}", SourceFile: "z.go",
+	})
+
+	outDir := t.TempDir()
+	if err := Emit(db, outDir); err != nil {
+		t.Fatal(err)
+	}
+	dataA, _ := os.ReadFile(filepath.Join(outDir, "a.go"))
+	dataZ, _ := os.ReadFile(filepath.Join(outDir, "z.go"))
+	a, z := string(dataA), string(dataZ)
+
+	if !strings.Contains(a, "Package test docs.") {
+		t.Fatalf("a.go should carry the package doc (alphabetically first):\n%s", a)
+	}
+	if strings.Contains(z, "Package test docs.") {
+		t.Fatalf("z.go should NOT carry the package doc (a.go has it):\n%s", z)
+	}
+}
+
+func TestEmitPrefersDiskWhenFileSourcesStale(t *testing.T) {
+	// Regression: a user's built-in Edit lands on disk before defn's
+	// file_sources knows about it (built-in tools bypass MCP sync).
+	// If file_sources is stale and emit preferred it over disk, the
+	// user's edit (e.g. a newly-added package header) would be erased
+	// the next time emit ran. Disk-first preserves the user's bytes.
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+
+	// file_sources represents the OLD state (no header).
+	rawStale := `package test
+
+func Foo() {}
+`
+	if err := db.SetFileSource(mod.ID, "test.go", rawStale); err != nil {
+		t.Fatal(err)
+	}
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true,
+		Body: "func Foo() {}", SourceFile: "test.go",
+	})
+
+	outDir := t.TempDir()
+	// Disk has the user's fresh edit: a file-level doc comment NOT
+	// bound to `package X` (blank line separates them), so it lives
+	// in the prefix and is not captured by file.Doc on ingest.
+	diskWithHeader := `//go:build linux
+
+// User-added header that file_sources doesn't know about yet.
+
+package test
+
+func Foo() {}
+`
+	if err := os.WriteFile(filepath.Join(outDir, "test.go"), []byte(diskWithHeader), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Emit(db, outDir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(outDir, "test.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+
+	if !strings.Contains(got, "//go:build linux") {
+		t.Fatalf("user's build tag was erased by stale file_sources:\n%s", got)
+	}
+	if !strings.Contains(got, "User-added header that file_sources doesn't know about yet") {
+		t.Fatalf("user's added header was erased by stale file_sources:\n%s", got)
 	}
 }
 
