@@ -298,6 +298,99 @@ func (s *DB) DiffDefinitionsBetween(from, to string) ([]DefDiff, error) {
 	return out, rows.Err()
 }
 
+// CoModEntry is a definition that historically changed in the same commit
+// as the queried definition, and how often.
+type CoModEntry struct {
+	Name  string `json:"name"`
+	Kind  string `json:"kind"`
+	Count int    `json:"count"`
+}
+
+// CoModification ranks definitions that changed in the same commit as name,
+// across the full commit history — the git co-modification signal, exposed
+// as a queryable primitive so callers (e.g. plancheck) don't need to shell
+// out to git or hand-roll a dolt_diff_definitions self-join themselves.
+func (s *DB) CoModification(name string, limit int) ([]CoModEntry, error) {
+	rows, err := s.queryContext(s.Ctx(), `
+		SELECT to_commit, COALESCE(to_name, from_name) AS name, COALESCE(to_kind, from_kind) AS kind
+		FROM dolt_diff_definitions
+		WHERE to_commit IS NOT NULL`)
+	if err != nil {
+		return nil, fmt.Errorf("comod: query dolt_diff_definitions: %w", err)
+	}
+	defer rows.Close()
+
+	type changedRow struct{ name, kind string }
+	byCommit := map[string][]changedRow{}
+	for rows.Next() {
+		var commit string
+		var r changedRow
+		if err := rows.Scan(&commit, &r.name, &r.kind); err != nil {
+			return nil, fmt.Errorf("comod: scan: %w", err)
+		}
+		byCommit[commit] = append(byCommit[commit], r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("comod: %w", err)
+	}
+
+	counts := map[string]int{}
+	kinds := map[string]string{}
+	for _, changed := range byCommit {
+		touchesTarget := false
+		for _, r := range changed {
+			if r.name == name {
+				touchesTarget = true
+				break
+			}
+		}
+		if !touchesTarget {
+			continue
+		}
+		for _, r := range changed {
+			if r.name == name {
+				continue
+			}
+			counts[r.name]++
+			kinds[r.name] = r.kind
+		}
+	}
+
+	entries := make([]CoModEntry, 0, len(counts))
+	for n, c := range counts {
+		entries = append(entries, CoModEntry{Name: n, Kind: kinds[n], Count: c})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Count != entries[j].Count {
+			return entries[i].Count > entries[j].Count
+		}
+		return entries[i].Name < entries[j].Name
+	})
+	if limit > 0 && len(entries) > limit {
+		entries = entries[:limit]
+	}
+	return entries, nil
+}
+
+// FindDefinitionsBySourceFile finds all definitions in an exact source file
+// (project-relative, same convention as definitions.source_file). Unlike
+// FindDefinitionsByFile, this doesn't need a module-path suffix to
+// disambiguate — useful for root-package files where there's no directory
+// component to key on.
+func (s *DB) FindDefinitionsBySourceFile(sourceFile string) ([]Definition, error) {
+	rows, err := s.queryContext(s.Ctx(),
+		`SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
+		        COALESCE(d.signature,''), '', COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
+		 FROM definitions d
+		 WHERE d.source_file = ?
+		 ORDER BY d.start_line`, sourceFile)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanDefinitions(rows)
+}
+
 // EnsureModule creates or returns an existing module.
 func (s *DB) EnsureModule(path, name, doc string) (*Module, error) {
 	var m Module
@@ -1550,6 +1643,162 @@ func (s *DB) SetLiteralFields(defID int64, fields []LiteralField) error {
 	return nil
 }
 
+// SetEffectSignals replaces all effect signals for a definition.
+func (s *DB) SetEffectSignals(defID int64, signals []EffectSignal) error {
+	ctx := s.Ctx()
+	if _, err := s.execContext(ctx, "DELETE FROM effect_signals WHERE def_id = ?", defID); err != nil {
+		return fmt.Errorf("clear effect_signals: %w", err)
+	}
+	for _, sig := range signals {
+		if _, err := s.execContext(ctx,
+			`INSERT INTO effect_signals (def_id, kind, value, line) VALUES (?, ?, ?, ?)`,
+			defID, sig.Kind, sig.Value, sig.Line,
+		); err != nil {
+			return fmt.Errorf("insert effect_signal: %w", err)
+		}
+	}
+	return nil
+}
+
+// GetEffectSignals returns all effect signals recorded for a definition.
+func (s *DB) GetEffectSignals(defID int64) ([]EffectSignal, error) {
+	rows, err := s.queryContext(s.Ctx(),
+		"SELECT id, kind, value, line FROM effect_signals WHERE def_id = ?", defID)
+	if err != nil {
+		return nil, fmt.Errorf("query effect_signals: %w", err)
+	}
+	defer rows.Close()
+	var signals []EffectSignal
+	for rows.Next() {
+		var sig EffectSignal
+		if err := rows.Scan(&sig.ID, &sig.Kind, &sig.Value, &sig.Line); err != nil {
+			return nil, fmt.Errorf("scan effect_signal: %w", err)
+		}
+		sig.DefID = defID
+		signals = append(signals, sig)
+	}
+	return signals, rows.Err()
+}
+
+// BehaviorFact is a fact observed about a definition during an actual test
+// run (as opposed to the static parse-time effect_signals). v1 records only
+// coverage-derived facts: "covered" and "error-branch-hit".
+type BehaviorFact struct {
+	ID     int64
+	DefID  int64
+	Kind   string // "covered" | "error-branch-hit"
+	RunRef string
+}
+
+// AddBehaviorFacts inserts one row per fact. Facts accumulate across runs
+// (not replaced like effect_signals/literal_fields) since each run_ref is a
+// distinct observation worth keeping — history is the point.
+func (s *DB) AddBehaviorFacts(facts []BehaviorFact) error {
+	ctx := s.Ctx()
+	for _, f := range facts {
+		if _, err := s.execContext(ctx,
+			"INSERT INTO behavior_facts (def_id, kind, run_ref) VALUES (?, ?, ?)",
+			f.DefID, f.Kind, f.RunRef,
+		); err != nil {
+			return fmt.Errorf("insert behavior_fact: %w", err)
+		}
+	}
+	return nil
+}
+
+// GetBehaviorFacts returns all recorded facts for a definition, most recent first.
+func (s *DB) GetBehaviorFacts(defID int64) ([]BehaviorFact, error) {
+	rows, err := s.queryContext(s.Ctx(),
+		"SELECT id, kind, run_ref FROM behavior_facts WHERE def_id = ? ORDER BY id DESC", defID)
+	if err != nil {
+		return nil, fmt.Errorf("query behavior_facts: %w", err)
+	}
+	defer rows.Close()
+	var facts []BehaviorFact
+	for rows.Next() {
+		var f BehaviorFact
+		if err := rows.Scan(&f.ID, &f.Kind, &f.RunRef); err != nil {
+			return nil, fmt.Errorf("scan behavior_fact: %w", err)
+		}
+		f.DefID = defID
+		facts = append(facts, f)
+	}
+	return facts, rows.Err()
+}
+
+// Role is a declared cardinality invariant: role Name (definitions matching
+// Pattern) should have Expected implementations. RoleMemberIDs holds the
+// frozen baseline — the set of definitions considered "known" as of the
+// last declare/check, which only ever shrinks (see ShrinkRoleBaseline).
+type Role struct {
+	ID       int64
+	Name     string
+	Pattern  string
+	Expected int
+}
+
+// GetRole fetches a declared role by name. Returns (nil, nil) if undeclared.
+func (s *DB) GetRole(name string) (*Role, error) {
+	row := s.queryRowContext(s.Ctx(), "SELECT id, name, pattern, expected FROM roles WHERE name = ?", name)
+	var r Role
+	if err := row.Scan(&r.ID, &r.Name, &r.Pattern, &r.Expected); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get role %q: %w", name, err)
+	}
+	return &r, nil
+}
+
+// DeclareRole creates a role and snapshots memberIDs as its frozen baseline.
+func (s *DB) DeclareRole(name, pattern string, expected int, memberIDs []int64) (*Role, error) {
+	ctx := s.Ctx()
+	res, err := s.execContext(ctx,
+		"INSERT INTO roles (name, pattern, expected) VALUES (?, ?, ?)", name, pattern, expected)
+	if err != nil {
+		return nil, fmt.Errorf("declare role %q: %w", name, err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, fmt.Errorf("declare role %q: %w", name, err)
+	}
+	for _, defID := range memberIDs {
+		if _, err := s.execContext(ctx,
+			"INSERT INTO role_members (role_id, def_id) VALUES (?, ?)", id, defID); err != nil {
+			return nil, fmt.Errorf("declare role %q member: %w", name, err)
+		}
+	}
+	return &Role{ID: id, Name: name, Pattern: pattern, Expected: expected}, nil
+}
+
+// RoleMemberIDs returns the frozen baseline definition IDs for a role.
+func (s *DB) RoleMemberIDs(roleID int64) (map[int64]bool, error) {
+	rows, err := s.queryContext(s.Ctx(), "SELECT def_id FROM role_members WHERE role_id = ?", roleID)
+	if err != nil {
+		return nil, fmt.Errorf("role members: %w", err)
+	}
+	defer rows.Close()
+	ids := map[int64]bool{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids[id] = true
+	}
+	return ids, rows.Err()
+}
+
+// ShrinkRoleBaseline removes a definition from a role's frozen baseline.
+// The baseline only ever ratchets toward the declared expected count —
+// members are removed here (when they no longer match live) but never
+// added outside of DeclareRole, so a new implementation always shows up
+// as a violation rather than silently widening the accepted set.
+func (s *DB) ShrinkRoleBaseline(roleID, defID int64) error {
+	_, err := s.execContext(s.Ctx(), "DELETE FROM role_members WHERE role_id = ? AND def_id = ?", roleID, defID)
+	return err
+}
+
 // SetMeta upserts a key/value pair into the defn_meta table.
 func (s *DB) SetMeta(key, value string) error {
 	ctx := s.Ctx()
@@ -2322,6 +2571,18 @@ type LiteralField struct {
 	FieldName  string
 	FieldValue string // source text of the value
 	Line       int
+}
+
+// EffectSignal is a calque-style behavior signal for a definition: what it
+// writes, what it says (emitted strings), or what shape it hands back
+// (returned keys). Used by the "similar" op to score behavioral overlap
+// independent of textual/signature similarity.
+type EffectSignal struct {
+	ID    int64
+	DefID int64
+	Kind  string // "write" | "string" | "retkey"
+	Value string
+	Line  int
 }
 
 // Module represents a Go package/module in the database.

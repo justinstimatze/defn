@@ -11,13 +11,17 @@ code(op: "impact", name: "Render")             -- blast radius + test coverage
 code(op: "edit", name: "Foo", new_body: "...") -- edit, auto-emit + build
 code(op: "search", pattern: "%Auth%")          -- name pattern (% wildcard)
 code(op: "search", pattern: "authentication")  -- body text search
+code(op: "similar", name: "handleAuth")        -- behavioral overlap: writes/strings/name-role/calls, not just signature
 code(op: "test", name: "Render")               -- run affected tests only
+code(op: "test", name: "Render", coverage: true) -- also records behavior_facts (advisory, coverage-derived)
+code(op: "cardinality", name: "replay-backend", pattern: "%Replay%", expected: 1) -- declare, then re-run to check for new/removed members
+code(op: "comod", name: "Render", limit: 10)   -- git co-modification frequency (which defs historically change together)
 code(op: "sync")                               -- re-ingest after file edits
 code(op: "sync", file: "pkg/foo.go")           -- fast single-file sync (~10ms)
 code(op: "emit", out: "/tmp/out")              -- emit the tree (works while serve holds the DB)
 ```
 
-All ops: read, search, impact, explain, untested, edit, create, delete, rename, move, test, apply, diff, history, find, sync, emit, query, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, traverse, literals, pragmas, file-defs, overview, patch.
+All ops: read, search, impact, explain, similar, untested, edit, insert, create, delete, rename, move, test, apply, diff, history, find, sync, emit, query, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, traverse, literals, pragmas, file-defs, overview, patch, test-coverage, batch-impact, simulate, cardinality, comod, validate-plan, gc.
 
 ### Why defn for Go, not Edit/Write
 
@@ -72,6 +76,9 @@ Database stored in `.defn/` directory. Key tables:
 - `refs` — which definitions call/reference which (edges in the call graph)
 - `imports` — per-module import paths
 - `project_files` — go.mod, go.sum, embedded files
+- `effect_signals` — calque-style behavior signals per definition (writes, emitted strings, returned keys), backing `similar`
+- `roles` / `role_members` — declared role-cardinality invariants and their frozen baseline, backing `cardinality`
+- `behavior_facts` — coverage-derived facts from `test`/`coverage:true` runs (advisory, not gating)
 
 **Writing queries:** Dolt uses MySQL's reserved-word list, so column names
 like `kind`, `order`, `key`, `group` will fail parsing unless backticked.

@@ -10,6 +10,7 @@ import (
 	"go/token"
 	"go/types"
 	"runtime/debug"
+	"strconv"
 	"strings"
 
 	"github.com/justinstimatze/defn/internal/goload"
@@ -129,6 +130,7 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 	// interfaces satisfied by one concrete type).
 	defRefs := map[int64][]store.Reference{}
 	defLitFields := map[int64][]store.LiteralField{}
+	defEffectSignals := map[int64][]store.EffectSignal{}
 
 	// Second pass: interface satisfaction — build ifaceMethodToImpls map
 	// BEFORE extracting references, so collectRefs can resolve interface calls.
@@ -230,12 +232,15 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 					if fromID <= 0 {
 						continue
 					}
-					refs, litFields := collectRefs(d.Body, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls)
+					refs, litFields, effSignals := collectRefs(d.Body, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls)
 					if len(refs) > 0 {
 						defRefs[fromID] = append(defRefs[fromID], refs...)
 					}
 					if len(litFields) > 0 {
 						defLitFields[fromID] = append(defLitFields[fromID], litFields...)
+					}
+					if len(effSignals) > 0 {
+						defEffectSignals[fromID] = append(defEffectSignals[fromID], effSignals...)
 					}
 
 				case *ast.GenDecl:
@@ -264,12 +269,15 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 									nodes = append(nodes, s.Type)
 								}
 								for _, node := range nodes {
-									refs, litFields := collectRefs(node, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls)
+									refs, litFields, effSignals := collectRefs(node, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls)
 									if len(refs) > 0 {
 										defRefs[fromID] = append(defRefs[fromID], refs...)
 									}
 									if len(litFields) > 0 {
 										defLitFields[fromID] = append(defLitFields[fromID], litFields...)
+									}
+									if len(effSignals) > 0 {
+										defEffectSignals[fromID] = append(defEffectSignals[fromID], effSignals...)
 									}
 								}
 							}
@@ -280,12 +288,15 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 							if fromID <= 0 {
 								continue
 							}
-							refs, litFields := collectRefs(s.Type, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls)
+							refs, litFields, effSignals := collectRefs(s.Type, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls)
 							if len(refs) > 0 {
 								defRefs[fromID] = append(defRefs[fromID], refs...)
 							}
 							if len(litFields) > 0 {
 								defLitFields[fromID] = append(defLitFields[fromID], litFields...)
+							}
+							if len(effSignals) > 0 {
+								defEffectSignals[fromID] = append(defEffectSignals[fromID], effSignals...)
 							}
 						}
 					}
@@ -302,6 +313,11 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 	}
 	for fromID, fields := range defLitFields {
 		if err := db.SetLiteralFields(fromID, fields); err != nil {
+			return err
+		}
+	}
+	for fromID, signals := range defEffectSignals {
+		if err := db.SetEffectSignals(fromID, signals); err != nil {
 			return err
 		}
 	}
@@ -358,10 +374,11 @@ func lookupVarDefID(db *store.DB, pkgPath, name string) int64 {
 	return d.ID
 }
 
-func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef map[types.Object]int64, ifaceMethodToImpls map[types.Object][]int64) ([]store.Reference, []store.LiteralField) {
+func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef map[types.Object]int64, ifaceMethodToImpls map[types.Object][]int64) ([]store.Reference, []store.LiteralField, []store.EffectSignal) {
 	seen := make(map[int64]string)
 	var refs []store.Reference
 	var litFields []store.LiteralField
+	var effSignals []store.EffectSignal
 
 	addRef := func(toID int64, kind string) {
 		if _, dup := seen[toID]; !dup {
@@ -445,6 +462,61 @@ func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef 
 				}
 			}
 			return true
+		case *ast.AssignStmt:
+			// Attribute write-targets: x.Field = ... / r.field = ...
+			// A calque-style effect signal — what this function mutates.
+			for _, lhs := range x.Lhs {
+				sel, ok := lhs.(*ast.SelectorExpr)
+				if !ok {
+					continue
+				}
+				effSignals = append(effSignals, store.EffectSignal{
+					Kind:  "write",
+					Value: sel.Sel.Name,
+					Line:  fset.Position(sel.Pos()).Line,
+				})
+			}
+			return true
+		case *ast.BasicLit:
+			// Emitted string literals — what this function "says".
+			// Skip 0-1 char strings as noise (mirrors calque's exclusion) and
+			// very long ones (help text, embedded templates) — a unique blob
+			// like that never jaccard-matches anything and only wastes space;
+			// it also exceeds the value column's width.
+			if x.Kind == token.STRING {
+				if s, err := strconv.Unquote(x.Value); err == nil && len(s) > 1 && len(s) <= 200 {
+					effSignals = append(effSignals, store.EffectSignal{
+						Kind:  "string",
+						Value: s,
+						Line:  fset.Position(x.Pos()).Line,
+					})
+				}
+			}
+			return true
+		case *ast.ReturnStmt:
+			// Returned dict/struct keys — the shape of what this function hands back.
+			for _, res := range x.Results {
+				lit, ok := res.(*ast.CompositeLit)
+				if !ok {
+					continue
+				}
+				for _, elt := range lit.Elts {
+					kv, ok := elt.(*ast.KeyValueExpr)
+					if !ok {
+						continue
+					}
+					ident, ok := kv.Key.(*ast.Ident)
+					if !ok {
+						continue
+					}
+					effSignals = append(effSignals, store.EffectSignal{
+						Kind:  "retkey",
+						Value: ident.Name,
+						Line:  fset.Position(kv.Pos()).Line,
+					})
+				}
+			}
+			return true
 		case *ast.Ident:
 			// Fall through to existing ident handling below.
 		default:
@@ -476,7 +548,7 @@ func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef 
 		}
 		return true
 	})
-	return refs, litFields
+	return refs, litFields, effSignals
 }
 
 // innerIdent unwraps *ast.StarExpr and *ast.SelectorExpr to find the
