@@ -25,6 +25,7 @@ import (
 	"github.com/justinstimatze/defn/internal/emit"
 	"github.com/justinstimatze/defn/internal/goload"
 	"github.com/justinstimatze/defn/internal/ingest"
+	"github.com/justinstimatze/defn/internal/projection"
 	"github.com/justinstimatze/defn/internal/rank"
 	"github.com/justinstimatze/defn/internal/resolve"
 	"github.com/justinstimatze/defn/internal/store"
@@ -227,7 +228,7 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 		Name: "code",
 		Description: `Go code database. One tool, many ops. Start with impact for blast radius — it returns callers, transitives, and test coverage in one call. Don't follow up with search/explain unless you need more.
 
-Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, outline (compact projection — sig + doc + caller/callee summary, no body; use when body isn't needed), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
+Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, outline (compact projection — sig + doc + caller/callee summary, no body; use when body isn't needed), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
 	}, s.handleCode)
 
 	return s, mcpServer
@@ -288,6 +289,16 @@ type codeParam struct {
 	Out         string           `json:"out,omitempty"`
 	Rank        bool             `json:"rank,omitempty"`
 	Slice       string           `json:"slice,omitempty"`
+	Condition   string           `json:"condition,omitempty"`
+	Ret         string           `json:"ret,omitempty"`
+	Index       int              `json:"index,omitempty"`
+	New         string           `json:"new,omitempty"`
+	ImportPath  string           `json:"import_path,omitempty"`
+	Alias       string           `json:"alias,omitempty"`
+	OldParam    string           `json:"old_param,omitempty"`
+	NewParam    string           `json:"new_param,omitempty"`
+	StmtIndex   int              `json:"stmt_index,omitempty"`
+	DeferBody   string           `json:"defer_body,omitempty"`
 }
 
 type applyOp struct {
@@ -534,6 +545,8 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return wrapStale(s.handleOutline(ctx, req, nameParam{Name: args.Name}))
 	case "slice":
 		return wrapStale(s.handleSlice(ctx, req, args))
+	case "insert-precondition":
+		return s.handleInsertPrecondition(ctx, req, args)
 	case "search":
 		if args.Pattern == "" {
 			args.Pattern = args.Name
@@ -623,7 +636,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "gc":
 		return s.handleGC(ctx, req, args)
 	default:
-		return errResult(fmt.Errorf("unknown op %q — valid: read, outline, slice, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc", args.Op))
+		return errResult(fmt.Errorf("unknown op %q — valid: read, outline, slice, insert-precondition, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc", args.Op))
 	}
 }
 
@@ -3099,4 +3112,30 @@ func pluralS(n int) string {
 		return ""
 	}
 	return "es"
+}
+
+// handleInsertPrecondition inserts an `if <condition> { <ret> }` block
+// at the start of the definition's body, immediately after the opening
+// brace. Byte-exact PUTGET against the input body — see
+// [[project_putget_edit_vocab_design]] and internal/projection for the
+// pure function and its fixture goldens.
+func (s *server) handleInsertPrecondition(ctx context.Context, req *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	if strings.TrimSpace(args.Name) == "" {
+		return errResult(fmt.Errorf("insert-precondition: name is required"))
+	}
+	if strings.TrimSpace(args.Condition) == "" {
+		return errResult(fmt.Errorf("insert-precondition: condition is required"))
+	}
+	if strings.TrimSpace(args.Ret) == "" {
+		return errResult(fmt.Errorf("insert-precondition: ret is required"))
+	}
+	d, err := s.db.GetDefinitionByName(args.Name, "")
+	if err != nil {
+		return errResult(fmt.Errorf("definition %q not found", args.Name))
+	}
+	newBody, err := projection.InsertPrecondition(d.Body, args.Condition, args.Ret)
+	if err != nil {
+		return errResult(err)
+	}
+	return s.handleEdit(ctx, req, editParam{Name: args.Name, NewBody: newBody})
 }
