@@ -169,10 +169,6 @@ func runMutationBench(defnBin string) {
 
 	fmt.Printf("scratch: %s\n", scratch)
 
-	// One shared scratch repo. Init git so we can reset between cases.
-	// The initial commit is empty — every case writes its fixture as the
-	// second commit so `git reset --hard first-commit` returns to a
-	// no-fixture state.
 	run := func(args ...string) error {
 		cmd := exec.Command(args[0], args[1:]...)
 		cmd.Dir = scratch
@@ -188,8 +184,6 @@ func runMutationBench(defnBin string) {
 	must("git", "init", "-q")
 	must("git", "config", "user.email", "bench@example.com")
 	must("git", "config", "user.name", "bench")
-	// Seed with a minimal go.mod + empty README so `defn ingest .` has
-	// something to chew on.
 	if err := os.WriteFile(filepath.Join(scratch, "go.mod"), []byte("module fixture\n\ngo 1.26\n"), 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "seed go.mod: %v\n", err)
 		os.Exit(1)
@@ -198,14 +192,22 @@ func runMutationBench(defnBin string) {
 		fmt.Fprintf(os.Stderr, "seed README: %v\n", err)
 		os.Exit(1)
 	}
-	must("git", "add", ".")
+	// Add ONLY the files we just wrote — not `git add .` / `-A` — so we
+	// never accidentally include something the scratch dir picked up
+	// between commands.
+	must("git", "add", "go.mod", "README.md")
 	must("git", "commit", "-q", "-m", "seed")
 
-	// Prime defn once.
 	if err := exec.Command(defnBin, "init", scratch).Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "defn init: %v\n", err)
 		os.Exit(1)
 	}
+	// Commit the artifacts defn init produced (.mcp.json + CLAUDE.md) so
+	// `git clean -fdq` in each case doesn't wipe them. The .defn/ dir is
+	// gitignored by defn init; the .codex dir is not something we need for
+	// this bench — leave it uncommitted, so it gets cleaned each case.
+	must("git", "add", ".mcp.json", "CLAUDE.md")
+	must("git", "commit", "-q", "-m", "post-defn-init")
 
 	fmt.Printf("\n=== Running %d mutation cases in both modes ===\n\n", len(mutations))
 
@@ -223,7 +225,6 @@ func runMutationBench(defnBin string) {
 		fmt.Println()
 	}
 
-	// Summary.
 	fmt.Println("=== Mutation summary ===")
 	fmt.Printf("%-24s %8s %8s %8s %8s %10s %10s\n", "Case", "F.calls", "D.calls", "F.time", "D.time", "F.correct", "D.correct")
 	fmt.Println(strings.Repeat("-", 90))
@@ -258,7 +259,8 @@ func runMutationBench(defnBin string) {
 }
 
 func runMutationCase(scratch, defnBin string, m mutation, mode string) mutationResult {
-	// Reset to seed state.
+	// Reset to seed state (which includes .mcp.json + CLAUDE.md committed
+	// during setup; see runMutationBench).
 	resetCmd := exec.Command("git", "reset", "--hard", "-q")
 	resetCmd.Dir = scratch
 	if err := resetCmd.Run(); err != nil {
@@ -268,7 +270,6 @@ func runMutationCase(scratch, defnBin string, m mutation, mode string) mutationR
 	cleanCmd.Dir = scratch
 	_ = cleanCmd.Run()
 
-	// Write the fixture file.
 	fixturePath := filepath.Join(scratch, m.fixtureFile)
 	if err := os.WriteFile(fixturePath, []byte(m.fixtureContents), 0644); err != nil {
 		return mutationResult{name: m.name, mode: mode, rawOutput: fmt.Sprintf("write fixture: %v", err)}
@@ -280,8 +281,6 @@ func runMutationCase(scratch, defnBin string, m mutation, mode string) mutationR
 	syncCmd.Dir = scratch
 	_ = syncCmd.Run()
 
-	// Prepare prompt. In defn mode, prepend an equivalent of CLAUDE.md so
-	// the agent knows the projection ops exist.
 	prompt := m.prompt
 	if mode == "defn" {
 		prompt = mutationDefnPreamble + "\n\n---\n\n" + m.prompt
@@ -290,8 +289,14 @@ func runMutationCase(scratch, defnBin string, m mutation, mode string) mutationR
 	}
 
 	start := time.Now()
-	cmd := exec.Command("claude", "-p", "--verbose", "--output-format", "stream-json")
+	// --mcp-config forces claude -p to load THIS repo's MCP config; in some
+	// environments cwd .mcp.json isn't picked up in headless mode.
+	// CLAUDE_ALLOW_GO_EDIT=1 tells the global enforce-defn-on-go-edits.sh
+	// hook to stay out of the way — otherwise the hook fires (because
+	// defn init created .defn/) and distorts BOTH modes' call counts.
+	cmd := exec.Command("claude", "-p", "--mcp-config", ".mcp.json", "--verbose", "--output-format", "stream-json")
 	cmd.Dir = scratch
+	cmd.Env = append(os.Environ(), "CLAUDE_ALLOW_GO_EDIT=1")
 	cmd.Stdin = strings.NewReader(prompt)
 	out, err := cmd.CombinedOutput()
 	dur := time.Since(start)
@@ -366,7 +371,11 @@ func checkPostCondition(final string, m mutation) bool {
 
 const mutationFilesPreamble = `You are editing a Go file in the current directory. Use the standard Read and Edit tools. Make the edit exactly as described — do not add any extra changes, do not run gofmt, do not touch other files.`
 
-const mutationDefnPreamble = `You are editing a Go file in the current directory. This project uses the defn MCP tool for Go edits — prefer it over Read/Edit for any Go source change. Key ops:
+const mutationDefnPreamble = `You are editing a Go file in the current directory. This project uses the defn MCP tool for Go edits — prefer it over Read/Edit for any Go source change.
+
+FIRST STEP: call ToolSearch with query "select:mcp__defn__code" to load the defn "code" tool schema before doing anything else. Deferred MCP tools are not available until their schema is fetched — skipping this makes the rest of the plan impossible.
+
+Then use one of these ops:
 
 - code(op:"insert-precondition", name:"F", condition:"x < 0", ret:"return err") — inserts if <cond> { <ret> } at the top of function F
 - code(op:"replace-slice", name:"F", slice:"return", index:1, new:"return nil") — replaces the Nth match of slice kind (return, error-branch, loop, signature, body, doc) verbatim
