@@ -837,3 +837,158 @@ func main() {}
 		}
 	}
 }
+
+func TestExtractSlices(t *testing.T) {
+	body := `// Chunky iterates, err-checks, and defers.
+func Chunky(items []string) (int, error) {
+	total := 0
+	for _, item := range items {
+		total++
+	}
+	if err := check(items); err != nil {
+		return 0, err
+	}
+	defer cleanup()
+	if dbErr := ping(); dbErr != nil {
+		return 0, dbErr
+	}
+	return total, nil
+}`
+
+	tests := []struct {
+		kind         string
+		wantMatches  int
+		wantContains []string // each element must appear in at least one slice's Source
+	}{
+		{
+			kind:         "signature",
+			wantMatches:  1,
+			wantContains: []string{"func Chunky(items []string) (int, error)"},
+		},
+		{
+			kind:         "doc",
+			wantMatches:  1,
+			wantContains: []string{"// Chunky iterates"},
+		},
+		{
+			kind:         "body",
+			wantMatches:  1,
+			wantContains: []string{"total := 0", "return total, nil"},
+		},
+		{
+			kind:         "error-branch",
+			wantMatches:  2, // if err != nil AND if dbErr != nil
+			wantContains: []string{"err != nil", "dbErr != nil"},
+		},
+		{
+			kind:         "return",
+			wantMatches:  3, // three return statements
+			wantContains: []string{"return 0, err", "return 0, dbErr", "return total, nil"},
+		},
+		{
+			kind:         "loop",
+			wantMatches:  1,
+			wantContains: []string{"range items"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.kind, func(t *testing.T) {
+			slices, err := extractSlices(body, tc.kind)
+			if err != nil {
+				t.Fatalf("extractSlices(%q): %v", tc.kind, err)
+			}
+			if len(slices) != tc.wantMatches {
+				sources := make([]string, len(slices))
+				for i, s := range slices {
+					sources[i] = s.Source
+				}
+				t.Fatalf("kind=%s: got %d matches, want %d. Sources: %#v",
+					tc.kind, len(slices), tc.wantMatches, sources)
+			}
+			for _, needle := range tc.wantContains {
+				found := false
+				for _, sl := range slices {
+					if strings.Contains(sl.Source, needle) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("kind=%s: no slice contains %q. Slices: %+v", tc.kind, needle, slices)
+				}
+			}
+			// Byte-exact invariant: every slice's Source must be a
+			// substring of the input body. This is the PUTGET
+			// foundation — if slice Source doesn't survive verbatim
+			// through extract, splicing it back can never be
+			// byte-exact.
+			for _, sl := range slices {
+				if !strings.Contains(body, sl.Source) {
+					t.Errorf("kind=%s: slice Source not a verbatim substring of body:\n---slice---\n%s\n---body---\n%s",
+						tc.kind, sl.Source, body)
+				}
+			}
+		})
+	}
+}
+
+func TestExtractSlices_UnknownKind(t *testing.T) {
+	_, err := extractSlices("func F() {}", "bogus")
+	if err == nil {
+		t.Fatal("expected error for unknown slice kind, got nil")
+	}
+	if !strings.Contains(err.Error(), "unknown slice kind") {
+		t.Errorf("expected 'unknown slice kind' error, got: %v", err)
+	}
+}
+
+func TestExtractSlices_NoMatches(t *testing.T) {
+	// Function with no error branches — should return empty slice, not error.
+	body := `func F() int { return 42 }`
+	slices, err := extractSlices(body, "error-branch")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(slices) != 0 {
+		t.Errorf("expected 0 matches for error-branch in trivial fn, got %d: %+v", len(slices), slices)
+	}
+}
+
+func TestHandleSlice_MissingArgs(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	// Missing name.
+	result, _, _ := s.handleSlice(context.Background(), nil, codeParam{Slice: "return"})
+	if !strings.Contains(resultText(t, result), "name is required") {
+		t.Errorf("expected 'name is required' error")
+	}
+
+	// Missing slice kind.
+	result, _, _ = s.handleSlice(context.Background(), nil, codeParam{Name: "Greet"})
+	if !strings.Contains(resultText(t, result), "kind is required") {
+		t.Errorf("expected 'kind is required' error")
+	}
+}
+
+func TestHandleSlice_ReturnStmt(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	// Greet has one return statement.
+	result, _, _ := s.handleSlice(context.Background(), nil, codeParam{Name: "Greet", Slice: "return"})
+	text := resultText(t, result)
+
+	if !strings.Contains(text, "return") {
+		t.Errorf("expected return keyword in slice output:\n%s", text)
+	}
+	if !strings.Contains(text, `"Hello, "`) {
+		t.Errorf("expected return expression content:\n%s", text)
+	}
+	if !strings.Contains(text, "slice: return, 1 match") {
+		t.Errorf("expected match count header:\n%s", text)
+	}
+}

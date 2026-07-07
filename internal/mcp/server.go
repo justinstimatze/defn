@@ -227,7 +227,7 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 		Name: "code",
 		Description: `Go code database. One tool, many ops. Start with impact for blast radius — it returns callers, transitives, and test coverage in one call. Don't follow up with search/explain unless you need more.
 
-Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, outline (compact projection — sig + doc + caller/callee summary, no body; use when body isn't needed), search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
+Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, outline (compact projection — sig + doc + caller/callee summary, no body; use when body isn't needed), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
 	}, s.handleCode)
 
 	return s, mcpServer
@@ -287,6 +287,7 @@ type codeParam struct {
 	To          string           `json:"to,omitempty"`
 	Out         string           `json:"out,omitempty"`
 	Rank        bool             `json:"rank,omitempty"`
+	Slice       string           `json:"slice,omitempty"`
 }
 
 type applyOp struct {
@@ -531,6 +532,8 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name}))
 	case "outline":
 		return wrapStale(s.handleOutline(ctx, req, nameParam{Name: args.Name}))
+	case "slice":
+		return wrapStale(s.handleSlice(ctx, req, args))
 	case "search":
 		if args.Pattern == "" {
 			args.Pattern = args.Name
@@ -620,7 +623,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "gc":
 		return s.handleGC(ctx, req, args)
 	default:
-		return errResult(fmt.Errorf("unknown op %q — valid: read, outline, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc", args.Op))
+		return errResult(fmt.Errorf("unknown op %q — valid: read, outline, slice, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc", args.Op))
 	}
 }
 
@@ -2852,4 +2855,248 @@ func (s *server) handleOutline(_ context.Context, req *sdkmcp.CallToolRequest, a
 	}
 
 	return textResult(sb.String()), nil, nil
+}
+
+// sliceKinds are the AST-role slice names handleSlice accepts.
+// Adding a new kind requires: (a) a case in extractSlices; (b) at
+// least one fixture in TestExtractSlices; (c) an update to the tool
+// description. See [[project_putget_edit_vocab_design]] for the phase
+// context — verbatim slices are the write-side foundation for the
+// future `replace-slice` edit primitive.
+var sliceKinds = map[string]bool{
+	"signature":    true, // just the func signature (no doc)
+	"doc":          true, // just the doc comment
+	"body":         true, // brace-delimited body block (statements only)
+	"error-branch": true, // every `if err != nil { ... }` block
+	"return":       true, // every top-level return statement
+	"loop":         true, // every for/range/select statement
+}
+
+// astSlice is one extracted verbatim slice of a definition's body,
+// identified by AST role and located by 1-based line offset from the
+// def's first line.
+type astSlice struct {
+	Kind   string
+	Line   int    // 1-based offset from def start
+	Source string // verbatim bytes
+}
+
+// extractSlices parses body and returns every AST subtree matching the
+// requested kind. Body is expected to be a function definition (signature
+// + brace-delimited block); non-function kinds return nil with an
+// explanatory error. Non-parseable bodies return the parse error verbatim.
+//
+// Position semantics: byte-exact against d.Body. The parser prefix
+// ("package p\n") is 10 bytes; slice Source is extracted from body
+// directly, not from the prefixed source, so callers can splice slices
+// back into the def without offset arithmetic.
+func extractSlices(body string, kind string) ([]astSlice, error) {
+	if !sliceKinds[kind] {
+		names := make([]string, 0, len(sliceKinds))
+		for k := range sliceKinds {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		return nil, fmt.Errorf("unknown slice kind %q — valid: %s", kind, strings.Join(names, ", "))
+	}
+	if body == "" {
+		return nil, nil
+	}
+	src := "package p\n" + body
+	prefixLen := len("package p\n")
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	if err != nil {
+		return nil, fmt.Errorf("parse body: %w", err)
+	}
+	if len(f.Decls) == 0 {
+		return nil, nil
+	}
+	fn, ok := f.Decls[0].(*ast.FuncDecl)
+	if !ok {
+		return nil, fmt.Errorf("slice: body is not a function declaration (kind=%s)", f.Decls[0].(*ast.GenDecl).Tok)
+	}
+
+	// signature: from FuncDecl.Pos to FuncType.End (excludes body block).
+	if kind == "signature" {
+		startOff := fset.Position(fn.Pos()).Offset - prefixLen
+		endOff := fset.Position(fn.Type.End()).Offset - prefixLen
+		return []astSlice{{
+			Kind:   "signature",
+			Line:   fset.Position(fn.Pos()).Line - 1,
+			Source: body[startOff:endOff],
+		}}, nil
+	}
+
+	// doc: from Doc.Pos to Doc.End. Empty if no doc.
+	if kind == "doc" {
+		if fn.Doc == nil {
+			return nil, nil
+		}
+		startOff := fset.Position(fn.Doc.Pos()).Offset - prefixLen
+		endOff := fset.Position(fn.Doc.End()).Offset - prefixLen
+		return []astSlice{{
+			Kind:   "doc",
+			Line:   fset.Position(fn.Doc.Pos()).Line - 1,
+			Source: body[startOff:endOff],
+		}}, nil
+	}
+
+	// Remaining kinds require a body block.
+	if fn.Body == nil {
+		return nil, nil
+	}
+
+	if kind == "body" {
+		// Body block including braces, verbatim.
+		startOff := fset.Position(fn.Body.Lbrace).Offset - prefixLen
+		endOff := fset.Position(fn.Body.Rbrace).Offset - prefixLen + 1
+		return []astSlice{{
+			Kind:   "body",
+			Line:   fset.Position(fn.Body.Lbrace).Line - 1,
+			Source: body[startOff:endOff],
+		}}, nil
+	}
+
+	defStartLine := fset.Position(fn.Pos()).Line
+	var out []astSlice
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		if n == nil {
+			return false
+		}
+		match := false
+		switch kind {
+		case "error-branch":
+			// if err != nil { ... } — any if whose condition is a
+			// binary "!= nil" against an identifier ending in "err"
+			// (case-insensitive). Matches `if err != nil`,
+			// `if dbErr != nil`, etc. Deliberately does NOT match
+			// `if err == nil` — that's success-branch, not error.
+			if ifStmt, ok := n.(*ast.IfStmt); ok && isErrNotNil(ifStmt.Cond) {
+				match = true
+				_ = ifStmt
+			}
+		case "return":
+			if _, ok := n.(*ast.ReturnStmt); ok {
+				match = true
+			}
+		case "loop":
+			switch n.(type) {
+			case *ast.ForStmt, *ast.RangeStmt, *ast.SelectStmt:
+				match = true
+			}
+		}
+		if match {
+			startOff := fset.Position(n.Pos()).Offset - prefixLen
+			endOff := fset.Position(n.End()).Offset - prefixLen
+			if startOff < 0 || endOff > len(body) {
+				return true // guard against pathological positions
+			}
+			out = append(out, astSlice{
+				Kind:   kind,
+				Line:   fset.Position(n.Pos()).Line - defStartLine + 1,
+				Source: body[startOff:endOff],
+			})
+			// Don't recurse into a matched node: return-inside-return
+			// is impossible; if-inside-if for error-branch would
+			// duplicate; loop-inside-loop is uncommon and would
+			// duplicate. If nested-match matters, revisit.
+			return false
+		}
+		return true
+	})
+	return out, nil
+}
+
+// isErrNotNil reports whether expr is a `<ident>err != nil` comparison
+// (case-insensitive on the identifier suffix). This is a syntactic
+// heuristic — it does not confirm the identifier's TYPE is error, only
+// its name shape. Good enough for the error-branch slice, which is
+// advisory in the same sense as `outline` — an agent uses it to locate
+// candidate slices, then reads verbatim source to confirm.
+func isErrNotNil(expr ast.Expr) bool {
+	bin, ok := expr.(*ast.BinaryExpr)
+	if !ok || bin.Op != token.NEQ {
+		return false
+	}
+	ident, ok := bin.X.(*ast.Ident)
+	if !ok {
+		return false
+	}
+	if !strings.HasSuffix(strings.ToLower(ident.Name), "err") {
+		return false
+	}
+	nilIdent, ok := bin.Y.(*ast.Ident)
+	if !ok || nilIdent.Name != "nil" {
+		return false
+	}
+	return true
+}
+
+// handleSlice returns verbatim source bytes for AST-role slices of a
+// definition (signature, doc, body, error-branch, return, loop). Each
+// slice is annotated with its line offset from the def's first line.
+// Multiple matches (e.g. multiple `if err != nil` blocks) are returned
+// as a numbered list.
+//
+// Phase B of the projection design: verbatim-slice queries are the
+// foundation for the future `replace-slice` edit primitive. Bytes
+// returned here should splice byte-exact back into the def via a
+// forthcoming write-side op. See [[project_putget_edit_vocab_design]].
+func (s *server) handleSlice(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	if strings.TrimSpace(args.Name) == "" {
+		return errResult(fmt.Errorf("slice: name is required"))
+	}
+	if strings.TrimSpace(args.Slice) == "" {
+		names := make([]string, 0, len(sliceKinds))
+		for k := range sliceKinds {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		return errResult(fmt.Errorf("slice: kind is required — valid: %s", strings.Join(names, ", ")))
+	}
+
+	d, err := s.db.GetDefinitionByName(args.Name, "")
+	if err != nil {
+		return errResult(fmt.Errorf("definition %q not found", args.Name))
+	}
+
+	slices, err := extractSlices(d.Body, args.Slice)
+	if err != nil {
+		return errResult(err)
+	}
+
+	var sb strings.Builder
+	recv := formatReceiver(d.Receiver)
+	sb.WriteString(fmt.Sprintf("## %s%s (slice: %s, %d match%s)\n",
+		recv, d.Name, args.Slice, len(slices), pluralS(len(slices))))
+	if d.SourceFile != "" && d.StartLine > 0 {
+		sb.WriteString(fmt.Sprintf("Location: %s:%d\n", d.SourceFile, d.StartLine))
+	}
+	sb.WriteString("\n")
+
+	if len(slices) == 0 {
+		sb.WriteString(fmt.Sprintf("(no %s slices in this definition)\n", args.Slice))
+		return textResult(sb.String()), nil, nil
+	}
+
+	for i, sl := range slices {
+		if len(slices) > 1 {
+			sb.WriteString(fmt.Sprintf("### match %d/%d — L%d\n", i+1, len(slices), sl.Line))
+		} else {
+			sb.WriteString(fmt.Sprintf("### L%d\n", sl.Line))
+		}
+		sb.WriteString("```go\n")
+		sb.WriteString(sl.Source)
+		sb.WriteString("\n```\n\n")
+	}
+
+	return textResult(sb.String()), nil, nil
+}
+
+func pluralS(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "es"
 }
