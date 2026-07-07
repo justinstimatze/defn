@@ -9,6 +9,11 @@ code(op: "read", name: "handleEdit")           -- full source by name
 code(op: "read", name: "server.go:272")        -- or by file:line
 code(op: "outline", name: "handleEdit")        -- compact projection: sig+doc+refs+flow, no body (v0.24.2)
 code(op: "slice", name: "handleEdit", slice: "error-branch") -- verbatim AST-role slice (v0.24.2)
+code(op: "insert-precondition", name: "F", condition: "x < 0", ret: "return err") -- byte-exact PUTGET (v0.25.0)
+code(op: "replace-slice", name: "F", slice: "return", index: 1, new: "return nil") -- byte-exact PUTGET (v0.25.0)
+code(op: "wrap-in-defer", name: "F", stmt_index: 1, defer_body: "cleanup()") -- byte-exact PUTGET (v0.25.0)
+code(op: "rename-param", name: "F", old_param: "x", new_param: "n") -- ≡_gofmt PUTGET (v0.25.0)
+code(op: "add-import", file: "pkg/f.go", import_path: "errors", alias: "") -- ≡_import_order PUTGET (v0.25.0)
 code(op: "impact", name: "Render")             -- blast radius + test coverage
 code(op: "edit", name: "Foo", new_body: "...") -- edit, auto-emit + build
 code(op: "search", pattern: "%Auth%")          -- name pattern (% wildcard)
@@ -19,7 +24,7 @@ code(op: "sync", file: "pkg/foo.go")           -- fast single-file sync (~10ms)
 code(op: "emit", out: "/tmp/out")              -- emit the tree (works while serve holds the DB)
 ```
 
-All ops: read, outline, slice, search, impact, explain, untested, edit, create, delete, rename, move, test, apply, diff, history, find, sync, emit, query, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, traverse, literals, pragmas, file-defs, overview, patch.
+All ops: read, outline, slice, insert-precondition, replace-slice, wrap-in-defer, rename-param, add-import, search, impact, explain, untested, edit, create, delete, rename, move, test, apply, diff, history, find, sync, emit, query, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, traverse, literals, pragmas, file-defs, overview, patch.
 
 ### Why defn for Go, not Edit/Write
 

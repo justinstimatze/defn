@@ -89,6 +89,11 @@ One MCP tool — `code` — with an `op` field. Your AI agent calls it naturally
 | `read` | Full source of a definition | `name` or `file:line` |
 | `outline` | Compact projection: signature + doc + caller/callee summary + top-level flow. Falls back to `read` for bodies under 300 bytes (v0.24.2). | `name` |
 | `slice` | Verbatim AST-role slice of a def: `signature`, `doc`, `body`, `error-branch`, `return`, `loop` (v0.24.2). Byte-exact against the source. | `name`, `slice` |
+| `insert-precondition` | Insert `if <condition> { <ret> }` at function entry. Byte-exact PUTGET (v0.25.0). | `name`, `condition`, `ret` |
+| `replace-slice` | Replace the Nth match of an AST-role slice with verbatim bytes. Byte-exact PUTGET (v0.25.0). | `name`, `slice`, `index`, `new` |
+| `wrap-in-defer` | Insert `defer <body>` before the Nth top-level statement. Byte-exact PUTGET (v0.25.0). | `name`, `stmt_index`, `defer_body` |
+| `rename-param` | Rename a value param or receiver via ast.Object scoping; shadowing is respected. ≡_gofmt PUTGET (v0.25.0). | `name`, `old_param`, `new_param` |
+| `add-import` | Add an import path (with optional alias) to a file's module. ≡_import_order PUTGET (v0.25.0). | `file`, `import_path`, `alias` |
 | `search` | Find by name pattern (%) or body text | `pattern` |
 | `impact` | Blast radius, callers, test coverage | `name` |
 | `explain` | Signature + callers + callees + tests | `name` |
