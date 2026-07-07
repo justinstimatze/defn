@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -30,7 +31,7 @@ import (
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const maxSearchResults = 20 // keep responses compact to avoid context bloat
+const maxSearchResults = 20
 
 // Version is the running defn build's semver string. Kept as a package
 // constant so the CLI can compare its own version against what a
@@ -226,13 +227,11 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 		Name: "code",
 		Description: `Go code database. One tool, many ops. Start with impact for blast radius — it returns callers, transitives, and test coverage in one call. Don't follow up with search/explain unless you need more.
 
-Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
+Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, outline (compact projection — sig + doc + caller/callee summary, no body; use when body isn't needed), search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
 	}, s.handleCode)
 
 	return s, mcpServer
 }
-
-// --- Params ---
 
 // codeParam is the unified parameter for the single "code" tool.
 // Required fields per op:
@@ -308,37 +307,43 @@ type applyOp struct {
 type nameParam struct {
 	Name string `json:"name"`
 }
+
 type editParam struct {
 	Name    string `json:"name"`
 	NewBody string `json:"new_body"`
 }
+
 type createParam struct {
 	Body   string `json:"body"`
 	Module string `json:"module,omitempty"`
 	File   string `json:"file,omitempty"`
 }
+
 type applyParam struct {
 	Operations []applyOp `json:"operations"`
 	DryRun     bool      `json:"dry_run,omitempty"`
 }
+
 type renameParam struct {
 	OldName string `json:"old_name"`
 	NewName string `json:"new_name"`
 }
+
 type sqlParam struct {
 	SQL string `json:"sql"`
 }
+
 type emptyParam struct{}
+
 type findParam struct {
 	File string `json:"file"`
 	Line int    `json:"line"`
 }
+
 type moveParam struct {
 	Name     string `json:"name"`
 	ToModule string `json:"to_module"`
 }
-
-// --- Helpers ---
 
 func textResult(text string) *sdkmcp.CallToolResult {
 	return &sdkmcp.CallToolResult{
@@ -388,8 +393,6 @@ func (s *server) modulePath(moduleID int64) string {
 	}
 	return ""
 }
-
-// --- Dispatch ---
 
 // handleCode is the single entry point for all operations.
 // It dispatches based on the "op" field to the appropriate handler.
@@ -526,6 +529,8 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	switch args.Op {
 	case "read":
 		return wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name}))
+	case "outline":
+		return wrapStale(s.handleOutline(ctx, req, nameParam{Name: args.Name}))
 	case "search":
 		if args.Pattern == "" {
 			args.Pattern = args.Name
@@ -615,11 +620,9 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "gc":
 		return s.handleGC(ctx, req, args)
 	default:
-		return errResult(fmt.Errorf("unknown op %q — valid: read, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc", args.Op))
+		return errResult(fmt.Errorf("unknown op %q — valid: read, outline, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc", args.Op))
 	}
 }
-
-// --- Handlers ---
 
 func (s *server) handleImpact(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
@@ -2679,4 +2682,82 @@ func (s *server) handleBatchImpact(_ context.Context, _ *sdkmcp.CallToolRequest,
 		return errResult(err)
 	}
 	return textResult(text), nil, nil
+}
+
+// handleOutline returns a compact projection of a definition: header +
+// signature + doc + caller/callee summary + body byte and line counts.
+// It deliberately does NOT include the body itself. Reserved for agents
+// that need to understand a definition's shape and relationships before
+// deciding whether to fetch the full body via read.
+//
+// Aider-lineage compact-read baseline. Measured token cost is signature
+// + doc + refs summary (~15-25% of body size on typical Go functions);
+// see [[project_putget_edit_vocab_design]] for the phase context.
+func (s *server) handleOutline(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
+	d, err := s.db.GetDefinitionByName(args.Name, "")
+	if err != nil {
+		return errResult(fmt.Errorf("definition %q not found", args.Name))
+	}
+
+	var modulePath string
+	mods, _ := s.db.ListModules()
+	for _, m := range mods {
+		if m.ID == d.ModuleID {
+			modulePath = m.Path
+			break
+		}
+	}
+
+	callers, _ := s.db.GetCallers(d.ID)
+	callees, _ := s.db.GetCallees(d.ID)
+
+	var prodCallers, testCallers int
+	for _, c := range callers {
+		if c.Test {
+			testCallers++
+		} else {
+			prodCallers++
+		}
+	}
+
+	bodyLines := strings.Count(d.Body, "\n") + 1
+	if d.Body == "" {
+		bodyLines = 0
+	}
+
+	var sb strings.Builder
+	recv := formatReceiver(d.Receiver)
+	sb.WriteString(fmt.Sprintf("## %s%s (%s)\n", recv, d.Name, d.Kind))
+	sb.WriteString(fmt.Sprintf("Module: %s\n", modulePath))
+	if d.SourceFile != "" && d.StartLine > 0 {
+		sb.WriteString(fmt.Sprintf("Location: %s:%d\n", d.SourceFile, d.StartLine))
+	}
+	sb.WriteString("\n")
+
+	// d.Signature already carries doc as `// ...` prefix lines when doc
+	// is present. Emit d.Signature only to avoid duplicating doc; fall
+	// back to d.Doc only if the sig is empty (unusual).
+	switch {
+	case d.Signature != "":
+		sb.WriteString("```go\n")
+		sb.WriteString(d.Signature)
+		sb.WriteString("\n```\n\n")
+	case d.Doc != "":
+		sb.WriteString(d.Doc + "\n\n")
+	}
+
+	sb.WriteString(fmt.Sprintf("Body: %d lines, %d bytes (fetch with op:\"read\")\n", bodyLines, len(d.Body)))
+	sb.WriteString(fmt.Sprintf("Callers: %d (%d production, %d test)\n", len(callers), prodCallers, testCallers))
+	if len(callees) > 0 {
+		names := make([]string, 0, len(callees))
+		for _, c := range callees {
+			names = append(names, formatReceiver(c.Receiver)+c.Name)
+		}
+		sort.Strings(names)
+		sb.WriteString(fmt.Sprintf("Callees (%d): %s\n", len(callees), strings.Join(names, ", ")))
+	} else {
+		sb.WriteString("Callees: 0\n")
+	}
+
+	return textResult(sb.String()), nil, nil
 }
