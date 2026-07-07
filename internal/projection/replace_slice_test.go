@@ -678,3 +678,131 @@ func TestSlices_ByteExactInvariant(t *testing.T) {
 		})
 	}
 }
+
+func TestReplaceSlice_RefuseInteriorComments(t *testing.T) {
+	cases := []struct {
+		name     string
+		body     string
+		kind     string
+		index    int
+		new      string
+		wantLost string
+	}{
+		{
+			name: "errbranch_line_comment",
+			body: `func F() error {
+	if err != nil {
+		// don't wrap; caller expects raw
+		return err
+	}
+	return nil
+}`,
+			kind: "error-branch", index: 1,
+			new: `if err != nil {
+		return fmt.Errorf("boom: %w", err)
+	}`,
+			wantLost: "don't wrap",
+		},
+		{
+			name: "errbranch_block_comment",
+			body: `func F() error {
+	if err != nil {
+		/* TODO(alice): fix this */
+		return err
+	}
+	return nil
+}`,
+			kind: "error-branch", index: 1,
+			new: `if err != nil {
+		return nil
+	}`,
+			wantLost: "TODO(alice)",
+		},
+		{
+			name: "loop_interior_comment",
+			body: `func F(xs []int) int {
+	total := 0
+	for _, x := range xs {
+		// accumulate
+		total += x
+	}
+	return total
+}`,
+			kind: "loop", index: 1,
+			new: `for i := 0; i < len(xs); i++ {
+		total += xs[i]
+	}`,
+			wantLost: "accumulate",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ReplaceSlice(tc.body, tc.kind, tc.index, tc.new)
+			if err == nil {
+				t.Fatalf("expected refuse error, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.wantLost) {
+				t.Errorf("error %q did not contain %q", err.Error(), tc.wantLost)
+			}
+			if !strings.Contains(err.Error(), "refusing to discard") {
+				t.Errorf("error %q missing refusal marker", err.Error())
+			}
+		})
+	}
+}
+
+func TestReplaceSliceForce_ByteExactAcrossComments(t *testing.T) {
+	body := `func F() error {
+	if err != nil {
+		// don't wrap; caller expects raw
+		return err
+	}
+	return nil
+}`
+	replacement := `if err != nil {
+		return fmt.Errorf("boom: %w", err)
+	}`
+	want := `func F() error {
+	if err != nil {
+		return fmt.Errorf("boom: %w", err)
+	}
+	return nil
+}`
+	got, err := ReplaceSliceForce(body, "error-branch", 1, replacement)
+	if err != nil {
+		t.Fatalf("ReplaceSliceForce: %v", err)
+	}
+	if got != want {
+		t.Errorf("byte-exact force splice mismatch\n--- want ---\n%s\n--- got ---\n%s", want, got)
+	}
+}
+
+func TestReplaceSlice_AllowWhenReplacementIncludesComment(t *testing.T) {
+	body := `func F() error {
+	if err != nil {
+		// don't wrap; caller expects raw
+		return err
+	}
+	return nil
+}`
+	replacement := `if err != nil {
+		// don't wrap; caller expects raw
+		log.Println(err)
+		return err
+	}`
+	want := `func F() error {
+	if err != nil {
+		// don't wrap; caller expects raw
+		log.Println(err)
+		return err
+	}
+	return nil
+}`
+	got, err := ReplaceSlice(body, "error-branch", 1, replacement)
+	if err != nil {
+		t.Fatalf("ReplaceSlice: unexpected error: %v", err)
+	}
+	if got != want {
+		t.Errorf("allow-when-comment-included mismatch\n--- want ---\n%s\n--- got ---\n%s", want, got)
+	}
+}
