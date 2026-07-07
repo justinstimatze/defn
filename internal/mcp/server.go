@@ -1214,12 +1214,22 @@ func (s *server) watchFiles(ctx context.Context) {
 // Set DEFN_LEGACY=1 to disable auto-emit (for projects where you want
 // to edit files directly and use defn as a read-only acceleration layer).
 func (s *server) autoEmitAndBuild() string {
+	return s.autoEmitAndBuildWithOpts(emit.Opts{})
+}
+
+// autoEmitAndBuildWithOpts is autoEmitAndBuild with caller-supplied
+// emit.Opts. Used by handleDelete to whitelist the deleted decl through
+// emit.safeWriteGoFile so the intentional removal isn't blocked by the
+// data-loss safety net. Without this, the delete lands in the DB but
+// never in the file — the watcher then re-ingests the "resurrected" def
+// on the next tick. See project_defn_watch_delete_race memory.
+func (s *server) autoEmitAndBuildWithOpts(opts emit.Opts) string {
 	if s.projectDir == "" || os.Getenv("DEFN_LEGACY") == "1" {
 		return "Saved to database."
 	}
 
 	// Emit to the actual project directory — keeps files in sync.
-	if err := emit.Emit(s.db, s.projectDir); err != nil {
+	if err := emit.EmitWithOpts(s.db, s.projectDir, opts); err != nil {
 		return fmt.Sprintf("emit error: %v", err)
 	}
 
@@ -1814,7 +1824,15 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		return errResult(err)
 	}
 
-	buildResult := s.autoEmitAndBuild()
+	// Whitelist the deleted decl through emit's safeWriteGoFile safety
+	// net. topLevelDeclNames formats methods as "<Recv>.Name" (pointer
+	// receivers unwrapped); match that. Without this, the file on disk
+	// would be left unchanged and watchFiles would resurrect the def.
+	qualified := d.Name
+	if d.Receiver != "" {
+		qualified = strings.TrimPrefix(d.Receiver, "*") + "." + d.Name
+	}
+	buildResult := s.autoEmitAndBuildWithOpts(emit.Opts{AllowedRemovals: []string{qualified}})
 	s.autoResolve("") // full resolve — deletion may affect other modules' references
 
 	var sb strings.Builder

@@ -31,16 +31,43 @@ type DefLocation struct {
 	EndLine   int    // 1-based line in emitted file where body ends
 }
 
+// Opts controls emit behavior beyond "write the DB to outDir."
+type Opts struct {
+	// AllowedRemovals whitelists top-level decl names that safeWriteGoFile
+	// is permitted to drop from disk. Used by handleDelete so an
+	// intentional code(op:"delete") isn't blocked by the safety net that
+	// exists to prevent *accidental* loss. Names are compared against
+	// topLevelDeclNames on the pre-emit file bytes.
+	AllowedRemovals []string
+}
+
 // Emit writes all definitions from the database as .go files into outDir.
 // Each module becomes a directory, and definitions are grouped into files by kind.
 func Emit(db *store.DB, outDir string) error {
-	_, err := EmitWithMap(db, outDir)
+	_, err := emitWithOpts(db, outDir, Opts{})
 	return err
 }
 
 // EmitWithMap is like Emit but also returns a source map: for each emitted
 // line, which definition it belongs to. This powers defn lint.
 func EmitWithMap(db *store.DB, outDir string) ([]DefLocation, error) {
+	return emitWithOpts(db, outDir, Opts{})
+}
+
+// EmitWithOpts is Emit with caller-supplied Opts (e.g. AllowedRemovals so
+// a code(op:"delete") can actually land on disk without safeWriteGoFile
+// blocking the write).
+func EmitWithOpts(db *store.DB, outDir string, opts Opts) error {
+	_, err := emitWithOpts(db, outDir, opts)
+	return err
+}
+
+// EmitWithMapAndOpts is EmitWithMap with caller-supplied Opts.
+func EmitWithMapAndOpts(db *store.DB, outDir string, opts Opts) ([]DefLocation, error) {
+	return emitWithOpts(db, outDir, opts)
+}
+
+func emitWithOpts(db *store.DB, outDir string, opts Opts) ([]DefLocation, error) {
 	var allLocs []DefLocation
 
 	// Write project-level files (go.mod, go.sum).
@@ -78,7 +105,7 @@ func EmitWithMap(db *store.DB, outDir string) ([]DefLocation, error) {
 
 	var writtenFiles []writtenFile
 	for _, mod := range modules {
-		locs, written, err := emitModule(db, &mod, outDir, moduleRoot)
+		locs, written, err := emitModule(db, &mod, outDir, moduleRoot, opts.AllowedRemovals)
 		if err != nil {
 			return nil, fmt.Errorf("emit %s: %w", mod.Path, err)
 		}
@@ -191,7 +218,7 @@ type writtenFile struct {
 	SourceFile string // project-relative; empty means don't refresh file_sources
 }
 
-func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string) ([]DefLocation, []writtenFile, error) {
+func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string, allowedRemovals []string) ([]DefLocation, []writtenFile, error) {
 	defs, err := db.GetModuleDefinitions(mod.ID)
 	if err != nil {
 		return nil, nil, err
@@ -331,7 +358,7 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string) ([]D
 		if file == docTarget {
 			pkgDoc = mod.Doc
 		}
-		locs, err := writeFile(path, mod.Name, mod.Path, pkgDoc, imports, byFile[file], rawByFile[file])
+		locs, err := writeFile(path, mod.Name, mod.Path, pkgDoc, imports, byFile[file], rawByFile[file], allowedRemovals)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -346,7 +373,7 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string) ([]D
 	return allLocs, written, nil
 }
 
-func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import, defs []store.Definition, rawFromDB []byte) ([]DefLocation, error) {
+func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import, defs []store.Definition, rawFromDB []byte, allowedRemovals []string) ([]DefLocation, error) {
 	// Pick the merge base. Prefer disk when it exists and parses: a
 	// user's built-in Edit lands on disk before file_sources knows about
 	// it (built-in tools bypass defn's sync), so disk is the post-Edit
@@ -371,8 +398,8 @@ func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import,
 	// everything defn's schema doesn't represent (package doc, build
 	// constraints, per-file imports, init() names, floating comments).
 	if len(existingSrc) > 0 {
-		if merged, ok := mergeDeclsIntoSource(existingSrc, defs); ok {
-			wrote, lost, err := safeWriteGoFile(path, merged)
+		if merged, ok := mergeDeclsIntoSource(existingSrc, defs, allowedRemovals); ok {
+			wrote, lost, err := safeWriteGoFile(path, merged, allowedRemovals)
 			if err != nil {
 				return nil, err
 			}
@@ -509,7 +536,7 @@ func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import,
 		// go build will catch syntax errors.
 		formatted = []byte(src.String())
 	}
-	wrote, lost, err := safeWriteGoFile(path, formatted)
+	wrote, lost, err := safeWriteGoFile(path, formatted, allowedRemovals)
 	if err != nil {
 		return nil, err
 	}
@@ -535,7 +562,12 @@ func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import,
 // This is a defense against the database's representation being lossier
 // than the on-disk source: a roundtrip edit/emit should never silently
 // delete user code.
-func safeWriteGoFile(path string, content []byte) (wrote bool, lost []string, err error) {
+//
+// allowedRemovals whitelists names the caller has explicitly acknowledged
+// losing (e.g. via code(op:"delete")). Names in this list are filtered
+// out of the "lost" set before the safety-net decision; a set containing
+// only allowed names is treated as no loss and the write proceeds.
+func safeWriteGoFile(path string, content []byte, allowedRemovals []string) (wrote bool, lost []string, err error) {
 	existing, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -560,10 +592,15 @@ func safeWriteGoFile(path string, content []byte) (wrote bool, lost []string, er
 	for _, n := range newDecls {
 		newSet[n] = true
 	}
+	allowed := make(map[string]bool, len(allowedRemovals))
+	for _, n := range allowedRemovals {
+		allowed[n] = true
+	}
 	for _, n := range oldDecls {
-		if !newSet[n] {
-			lost = append(lost, n)
+		if newSet[n] || allowed[n] {
+			continue
 		}
+		lost = append(lost, n)
 	}
 	if len(lost) > 0 {
 		return false, lost, nil
@@ -705,13 +742,21 @@ func groupKeyword(d store.Definition) string {
 // Ok=false means the caller should fall back to regenerating — the
 // source doesn't parse, the result after splicing doesn't parse, or
 // nothing in defs matched an on-disk decl.
-func mergeDeclsIntoSource(existing []byte, defs []store.Definition) ([]byte, bool) {
+func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemovals []string) ([]byte, bool) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "", existing, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
 		return nil, false
 	}
 
+	// remove holds names (pointer-unwrapped for methods, matching
+	// topLevelDeclNames) whose on-disk decl should be spliced out
+	// entirely. Used by handleDelete so an intentional deletion isn't
+	// preserved by the merge's normal "on-disk-only decls stay" rule.
+	remove := make(map[string]bool, len(allowedRemovals))
+	for _, n := range allowedRemovals {
+		remove[n] = true
+	}
 	wantFuncs := make(map[string]string)
 	wantTypes := make(map[string]string)
 	wantConsts := make(map[string]string)
@@ -774,6 +819,18 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition) ([]byte, boo
 			if d.Recv != nil && len(d.Recv.List) > 0 {
 				recv = recvTypeName(d.Recv.List[0].Type)
 			}
+			// Removal takes precedence over replacement. topLevelDeclNames
+			// keys methods as "Recv.Name" (pointer unwrapped by
+			// recvTypeName), matching what handleDelete passes in.
+			removeKey := d.Name.Name
+			if recv != "" {
+				removeKey = recv + "." + d.Name.Name
+			}
+			if remove[removeKey] {
+				s, e := declRange(d.Pos(), d.End(), d.Doc, true)
+				reps = append(reps, replacement{s, e, ""})
+				continue
+			}
 			body, ok := wantFuncs[funcIdentity(d.Name.Name, recv)]
 			if !ok {
 				continue
@@ -781,6 +838,16 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition) ([]byte, boo
 			s, e := declRange(d.Pos(), d.End(), d.Doc, true)
 			reps = append(reps, replacement{s, e, body})
 		case *ast.GenDecl:
+			// Whole-decl removal via allowedRemovals: matches on the
+			// first spec name (same key as whole-decl replacement).
+			// Only applies when the whole GenDecl represents a single
+			// removable unit (single-spec block or grouped block whose
+			// first-spec name is the one being deleted).
+			if name := firstSpecName(d); name != "" && remove[name] {
+				sp, ep := declRange(d.Pos(), d.End(), d.Doc, true)
+				reps = append(reps, replacement{sp, ep, ""})
+				continue
+			}
 			// Whole-decl replacement: ingest bundles iota const blocks
 			// (and any future whole-GenDecl case) under the first spec
 			// name. Match on that before falling through to per-spec
@@ -847,13 +914,23 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition) ([]byte, boo
 		return nil, false
 	}
 
+	// Count only body replacements (not removals) when checking that
+	// every DB def matched an on-disk decl; a removal doesn't contribute
+	// to that coverage.
+	nonRemovalReps := 0
+	for _, r := range reps {
+		if r.body != "" {
+			nonRemovalReps++
+		}
+	}
+
 	// If any DB def has no on-disk counterpart to patch, fall through
 	// to regeneration. Merge can only *replace* existing decls — it has
 	// no path to *add* missing ones. A newly-created DB def would be
 	// silently dropped if we kept merging here. Regeneration rebuilds
 	// from the full def set and safeWriteGoFile's check still prevents
 	// losing any on-disk decls that aren't tracked in the database.
-	if len(reps) < totalWants {
+	if nonRemovalReps < totalWants {
 		return nil, false
 	}
 

@@ -146,6 +146,98 @@ func Baz() string { return "hand-edited" }
 	}
 }
 
+func TestEmitOptsAllowedRemovalsUnblocksIntentionalDelete(t *testing.T) {
+	// Regression coverage for the watch-vs-delete race
+	// (project_defn_watch_delete_race memory): when a caller has
+	// intentionally deleted a def from the DB and passes its name in
+	// Opts.AllowedRemovals, safeWriteGoFile should stop guarding it and
+	// let the write land. Without this fix the delete silently persists
+	// in the DB but never reaches disk, and watchFiles resurrects it on
+	// the next tick.
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Keep", Kind: "function", Exported: true,
+		Body: "func Keep() {}", SourceFile: "test.go",
+	})
+	// Note: "Dropped" is intentionally NOT in the DB — that's the state
+	// after code(op:"delete") ran. Disk still has it, though.
+
+	outDir := t.TempDir()
+	existing := []byte(`package test
+
+func Keep() {}
+
+func Dropped() {}
+`)
+	if err := os.WriteFile(filepath.Join(outDir, "test.go"), existing, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EmitWithOpts(db, outDir, Opts{AllowedRemovals: []string{"Dropped"}}); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(outDir, "test.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(data)
+	if strings.Contains(s, "Dropped") {
+		t.Fatalf("Dropped was not removed from disk despite whitelist — safety-net still blocking:\n%s", s)
+	}
+	if !strings.Contains(s, "func Keep()") {
+		t.Fatalf("Keep was destroyed alongside Dropped — whitelist over-broad:\n%s", s)
+	}
+}
+
+func TestEmitOptsAllowedRemovalsDoesNotWhitelistOtherLosses(t *testing.T) {
+	// Complement to the previous test: whitelisting Dropped must NOT
+	// allow an unlisted decl (here: init(), which the schema can't
+	// round-trip) to be silently lost. Force the regenerate path by
+	// adding a DB def with no on-disk counterpart so mergeDeclsIntoSource
+	// bails; then safeWriteGoFile has to make the call. Its filtered-lost
+	// check must still fire on init because init is not whitelisted.
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Keep", Kind: "function", Exported: true,
+		Body: "func Keep() {}", SourceFile: "test.go",
+	})
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "NewInDB", Kind: "function", Exported: true,
+		Body: "func NewInDB() {}", SourceFile: "test.go",
+	})
+
+	outDir := t.TempDir()
+	existing := []byte(`package test
+
+func init() {}
+
+func Keep() {}
+
+func Dropped() {}
+`)
+	if err := os.WriteFile(filepath.Join(outDir, "test.go"), existing, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EmitWithOpts(db, outDir, Opts{AllowedRemovals: []string{"Dropped"}}); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(outDir, "test.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Regenerate path was taken. Safety net saw lost = [init, Dropped],
+	// filtered to [init] (Dropped is whitelisted), refused the write.
+	// File should be unchanged from "existing."
+	if string(data) != string(existing) {
+		t.Fatalf("safety net let a non-whitelisted decl (init) get dropped:\nwant:\n%s\ngot:\n%s", existing, data)
+	}
+}
+
 func TestEmitPrefersFileSourcesOverDisk(t *testing.T) {
 	// Phase C: file_sources.raw is authoritative. When it's populated,
 	// emit uses it as the merge base — even if the on-disk file is
