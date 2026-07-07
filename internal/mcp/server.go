@@ -37,7 +37,7 @@ const maxSearchResults = 20
 // constant so the CLI can compare its own version against what a
 // running serve reports via the /version HTTP endpoint, surfacing
 // binary/serve skew in `defn status`.
-const Version = "0.24.1"
+const Version = "0.24.2"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)

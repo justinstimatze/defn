@@ -87,6 +87,8 @@ One MCP tool — `code` — with an `op` field. Your AI agent calls it naturally
 | Op | What it does | Key params |
 |---|---|---|
 | `read` | Full source of a definition | `name` or `file:line` |
+| `outline` | Compact projection: signature + doc + caller/callee summary + top-level flow. Falls back to `read` for bodies under 300 bytes (v0.24.2). | `name` |
+| `slice` | Verbatim AST-role slice of a def: `signature`, `doc`, `body`, `error-branch`, `return`, `loop` (v0.24.2). Byte-exact against the source. | `name`, `slice` |
 | `search` | Find by name pattern (%) or body text | `pattern` |
 | `impact` | Blast radius, callers, test coverage | `name` |
 | `explain` | Signature + callers + callees + tests | `name` |
