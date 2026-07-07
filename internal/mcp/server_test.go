@@ -77,8 +77,6 @@ func TestIdentityEndpoint(t *testing.T) {
 	}
 }
 
-// --- Pure function tests ---
-
 func TestExtractSignature(t *testing.T) {
 	tests := []struct {
 		name string
@@ -221,8 +219,6 @@ func TestFormatReceiver(t *testing.T) {
 	}
 }
 
-// --- Dispatch validation tests ---
-
 func TestHandleCodeValidation(t *testing.T) {
 	s := &server{db: nil} // handlers will fail on DB access but validation runs first
 
@@ -260,8 +256,6 @@ func TestHandleCodeValidation(t *testing.T) {
 		})
 	}
 }
-
-// --- Integration tests with real DB ---
 
 func setupTestDB(t *testing.T) (*store.DB, string) {
 	t.Helper()
@@ -662,8 +656,6 @@ func TestHandleRename(t *testing.T) {
 	}
 }
 
-// --- helpers ---
-
 func resultText(t *testing.T, result *sdkmcp.CallToolResult) string {
 	t.Helper()
 	if result == nil || len(result.Content) == 0 {
@@ -837,12 +829,6 @@ func main() {}
 		}
 	}
 }
-
-// TestExtractSlices, TestExtractSlices_UnknownKind, TestExtractSlices_NoMatches
-// were removed as part of Phase C extract-slice consolidation — the pure
-// implementation lives in internal/projection, which has richer coverage
-// (30 replace-slice goldens + byte-exact invariant asserts). handleSlice
-// integration coverage remains via TestHandleSlice_* below.
 
 func TestHandleSlice_MissingArgs(t *testing.T) {
 	db, _ := setupTestDB(t)

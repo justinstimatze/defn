@@ -67,9 +67,6 @@ import (
 
 func F() { fmt.Println() }
 `,
-		// v1 note: astutil produces a flat block here (no blank-line
-		// group). Fixture asserts the ≡_import_order equivalent form
-		// after a canonicalization pass in the test harness.
 	},
 	{
 		name: "two_groups_add_stdlib",
@@ -155,7 +152,12 @@ func importSet(src string) []string {
 	return out
 }
 
-func TestAddImport_ImportOrderEquivPUTGET(t *testing.T) {
+// TestAddImport_ByteExactGoimportsGrouping asserts that AddImport
+// produces byte-exact goimports-canonical output: stdlib group first,
+// blank line, third-party group. The ≡_import_order quotient (per-line
+// set equivalence) is retained as a secondary assertion so a future
+// regression that flattens groups is caught at both levels.
+func TestAddImport_ByteExactGoimportsGrouping(t *testing.T) {
 	for _, tc := range addImportFixtures {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := AddImport(tc.src, tc.path, tc.alias)
@@ -164,10 +166,13 @@ func TestAddImport_ImportOrderEquivPUTGET(t *testing.T) {
 			}
 			gotFmt := gofmtSrc(t, got)
 			wantFmt := gofmtSrc(t, tc.after)
+			if gotFmt != wantFmt {
+				t.Errorf("byte-exact goimports-canonical output mismatch for %q\n--- want ---\n%s\n--- got ---\n%s", tc.name, wantFmt, gotFmt)
+			}
 			gotSet := importSet(gotFmt)
 			wantSet := importSet(wantFmt)
 			if strings.Join(gotSet, "\n") != strings.Join(wantSet, "\n") {
-				t.Errorf("≡_import_order PUTGET failed for %q\n--- want imports ---\n%s\n--- got imports ---\n%s\n--- got full source ---\n%s", tc.name, strings.Join(wantSet, "\n"), strings.Join(gotSet, "\n"), gotFmt)
+				t.Errorf("≡_import_order PUTGET secondary check failed for %q\nwant: %v\ngot:  %v", tc.name, wantSet, gotSet)
 			}
 		})
 	}

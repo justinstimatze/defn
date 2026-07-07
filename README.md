@@ -93,7 +93,7 @@ One MCP tool — `code` — with an `op` field. Your AI agent calls it naturally
 | `replace-slice` | Replace the Nth match of an AST-role slice with verbatim bytes. Byte-exact PUTGET (v0.25.0). | `name`, `slice`, `index`, `new` |
 | `wrap-in-defer` | Insert `defer <body>` before the Nth top-level statement. Byte-exact PUTGET (v0.25.0). | `name`, `stmt_index`, `defer_body` |
 | `rename-param` | Rename a value param or receiver via ast.Object scoping; shadowing is respected. ≡_gofmt PUTGET (v0.25.0). | `name`, `old_param`, `new_param` |
-| `add-import` | Add an import path (with optional alias) to a file's module. ≡_import_order PUTGET (v0.25.0). | `file`, `import_path`, `alias` |
+| `add-import` | Add an import path (with optional alias) to a file's module. Byte-exact goimports-canonical grouping (v0.25.0). | `file`, `import_path`, `alias` |
 | `search` | Find by name pattern (%) or body text | `pattern` |
 | `impact` | Blast radius, callers, test coverage | `name` |
 | `explain` | Signature + callers + callees + tests | `name` |

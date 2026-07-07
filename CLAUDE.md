@@ -13,7 +13,7 @@ code(op: "insert-precondition", name: "F", condition: "x < 0", ret: "return err"
 code(op: "replace-slice", name: "F", slice: "return", index: 1, new: "return nil") -- byte-exact PUTGET (v0.25.0)
 code(op: "wrap-in-defer", name: "F", stmt_index: 1, defer_body: "cleanup()") -- byte-exact PUTGET (v0.25.0)
 code(op: "rename-param", name: "F", old_param: "x", new_param: "n") -- ≡_gofmt PUTGET (v0.25.0)
-code(op: "add-import", file: "pkg/f.go", import_path: "errors", alias: "") -- ≡_import_order PUTGET (v0.25.0)
+code(op: "add-import", file: "pkg/f.go", import_path: "errors", alias: "") -- goimports-canonical grouping (v0.25.0)
 code(op: "impact", name: "Render")             -- blast radius + test coverage
 code(op: "edit", name: "Foo", new_body: "...") -- edit, auto-emit + build
 code(op: "search", pattern: "%Auth%")          -- name pattern (% wildcard)
