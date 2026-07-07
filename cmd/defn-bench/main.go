@@ -63,7 +63,42 @@ var questions = []question{
 }
 
 func main() {
-	// Setup project directories in a temp dir.
+	mutOnly := false
+	includeMut := false
+	for _, a := range os.Args[1:] {
+		switch a {
+		case "--mutations-only":
+			mutOnly = true
+		case "--mutations":
+			includeMut = true
+		case "-h", "--help":
+			fmt.Println("Usage: defn-bench [--mutations|--mutations-only]")
+			fmt.Println("  (no flags)         run read-side questions only (existing behavior)")
+			fmt.Println("  --mutations        also run write-side mutation cases")
+			fmt.Println("  --mutations-only   run ONLY the write-side mutation cases")
+			os.Exit(0)
+		}
+	}
+
+	if _, err := exec.LookPath("claude"); err != nil {
+		fmt.Fprintln(os.Stderr, "claude not found in PATH")
+		os.Exit(1)
+	}
+
+	defnBin, err := filepath.Abs("defn")
+	if err != nil || func() bool { _, e := os.Stat(defnBin); return e != nil }() {
+		defnBin, _ = exec.LookPath("defn")
+	}
+	if defnBin == "" {
+		fmt.Fprintln(os.Stderr, "defn binary not found")
+		os.Exit(1)
+	}
+
+	if mutOnly {
+		runMutationBench(defnBin)
+		return
+	}
+
 	benchDir, err := os.MkdirTemp("", "defn-bench-*")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create temp dir: %v\n", err)
@@ -73,7 +108,6 @@ func main() {
 
 	projects := map[string]string{}
 
-	// Clone any missing repos.
 	repos := map[string]string{
 		"chi":  "github.com/go-chi/chi",
 		"gin":  "github.com/gin-gonic/gin",
@@ -89,23 +123,6 @@ func main() {
 		}
 	}
 
-	// Check claude is available.
-	if _, err := exec.LookPath("claude"); err != nil {
-		fmt.Fprintln(os.Stderr, "claude not found in PATH")
-		os.Exit(1)
-	}
-
-	// Check defn is available.
-	defnBin, err := filepath.Abs("defn")
-	if err != nil || func() bool { _, e := os.Stat(defnBin); return e != nil }() {
-		defnBin, _ = exec.LookPath("defn")
-	}
-	if defnBin == "" {
-		fmt.Fprintln(os.Stderr, "defn binary not found")
-		os.Exit(1)
-	}
-
-	// Init defn databases for each project.
 	for name, dir := range projects {
 		defnDir := filepath.Join(dir, ".defn")
 		if _, err := os.Stat(defnDir); err != nil {
@@ -126,7 +143,6 @@ func main() {
 
 		fmt.Printf("[%d/%d] %s: %s\n", i+1, len(questions), q.project, truncate(q.query, 60))
 
-		// Run without defn (remove .mcp.json temporarily).
 		mcpPath := filepath.Join(dir, ".mcp.json")
 		claudeMDPath := filepath.Join(dir, "CLAUDE.md")
 		mcpBackup, _ := os.ReadFile(mcpPath)
@@ -138,7 +154,6 @@ func main() {
 		filesResults = append(filesResults, r1)
 		fmt.Printf("  files:  %d tool calls, %s, correct=%v\n", r1.toolCalls, r1.duration.Round(time.Second), r1.correct)
 
-		// Restore defn config.
 		if len(mcpBackup) > 0 {
 			os.WriteFile(mcpPath, mcpBackup, 0644)
 		}
@@ -152,7 +167,6 @@ func main() {
 		fmt.Println()
 	}
 
-	// Summary.
 	fmt.Println("=== Summary ===")
 	fmt.Printf("%-8s %-60s %6s %6s %6s %6s\n", "Project", "Question", "F.calls", "D.calls", "F.time", "D.time")
 	fmt.Println(strings.Repeat("-", 110))
@@ -188,6 +202,11 @@ func main() {
 	if totalFilesTime > 0 {
 		speedup := float64(totalFilesTime) / float64(totalDefnTime)
 		fmt.Printf("Speed improvement: %.1fx\n", speedup)
+	}
+
+	if includeMut {
+		fmt.Println()
+		runMutationBench(defnBin)
 	}
 }
 
