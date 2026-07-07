@@ -228,7 +228,7 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 		Name: "code",
 		Description: `Go code database. One tool, many ops. Start with impact for blast radius — it returns callers, transitives, and test coverage in one call. Don't follow up with search/explain unless you need more.
 
-Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, outline (compact projection — sig + doc + caller/callee summary, no body; use when body isn't needed), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; discards inline comments in v1), search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
+Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, outline (compact projection — sig + doc + caller/callee summary, no body; use when body isn't needed), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; discards inline comments in v1), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
 	}, s.handleCode)
 
 	return s, mcpServer
@@ -442,6 +442,13 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if r, o, e := need(args.New, "new"); r != nil {
 			return r, o, e
 		}
+	case "wrap-in-defer":
+		if r, o, e := need(args.Name, "name"); r != nil {
+			return r, o, e
+		}
+		if r, o, e := need(args.DeferBody, "defer_body"); r != nil {
+			return r, o, e
+		}
 	case "edit":
 		if r, o, e := need(args.Name, "name"); r != nil {
 			return r, o, e
@@ -569,6 +576,8 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return s.handleInsertPrecondition(ctx, req, args)
 	case "replace-slice":
 		return s.handleReplaceSlice(ctx, req, args)
+	case "wrap-in-defer":
+		return s.handleWrapInDefer(ctx, req, args)
 	case "search":
 		if args.Pattern == "" {
 			args.Pattern = args.Name
@@ -658,7 +667,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "gc":
 		return s.handleGC(ctx, req, args)
 	default:
-		return errResult(fmt.Errorf("unknown op %q — valid: read, outline, slice, insert-precondition, replace-slice, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc", args.Op))
+		return errResult(fmt.Errorf("unknown op %q — valid: read, outline, slice, insert-precondition, replace-slice, wrap-in-defer, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc", args.Op))
 	}
 }
 
@@ -3156,6 +3165,27 @@ func (s *server) handleInsertPrecondition(ctx context.Context, req *sdkmcp.CallT
 		return errResult(fmt.Errorf("definition %q not found", args.Name))
 	}
 	newBody, err := projection.InsertPrecondition(d.Body, args.Condition, args.Ret)
+	if err != nil {
+		return errResult(err)
+	}
+	return s.handleEdit(ctx, req, editParam{Name: args.Name, NewBody: newBody})
+}
+
+// handleWrapInDefer inserts a `defer <defer_body>` statement immediately
+// before the Nth (1-based) top-level statement in the definition's body.
+// Byte-exact PUTGET — see [[project_putget_edit_vocab_design]].
+func (s *server) handleWrapInDefer(ctx context.Context, req *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	if strings.TrimSpace(args.Name) == "" {
+		return errResult(fmt.Errorf("wrap-in-defer: name is required"))
+	}
+	if strings.TrimSpace(args.DeferBody) == "" {
+		return errResult(fmt.Errorf("wrap-in-defer: defer_body is required"))
+	}
+	d, err := s.db.GetDefinitionByName(args.Name, "")
+	if err != nil {
+		return errResult(fmt.Errorf("definition %q not found", args.Name))
+	}
+	newBody, err := projection.WrapInDefer(d.Body, args.StmtIndex, args.DeferBody)
 	if err != nil {
 		return errResult(err)
 	}
