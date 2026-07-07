@@ -228,4 +228,3 @@ func mean(ms []benchtype.MetricResult, f func(benchtype.MetricResult) float64) f
 	}
 	return s / float64(len(ms))
 }
-

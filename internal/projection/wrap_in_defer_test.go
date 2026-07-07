@@ -6,11 +6,11 @@ import (
 )
 
 type wrapInDeferFixture struct {
-	name       string
-	body       string
-	stmtIndex  int
-	deferBody  string
-	after      string
+	name      string
+	body      string
+	stmtIndex int
+	deferBody string
+	after     string
 }
 
 var wrapInDeferFixtures = []wrapInDeferFixture{

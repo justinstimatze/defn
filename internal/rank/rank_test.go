@@ -41,8 +41,8 @@ func TestNameMatchExactBeatsPrefix(t *testing.T) {
 
 func TestNameMatchShortVariantBeatsLongVariant(t *testing.T) {
 	q := tokenize("render")
-	short := nameMatch(q, "RenderHTML")    // 1 of 2 def tokens match
-	long := nameMatch(q, "preRenderHook")  // 1 of 3 def tokens match
+	short := nameMatch(q, "RenderHTML")   // 1 of 2 def tokens match
+	long := nameMatch(q, "preRenderHook") // 1 of 3 def tokens match
 	if short <= long {
 		t.Errorf("short variant (%.2f) should beat long variant (%.2f)", short, long)
 	}

@@ -1023,7 +1023,7 @@ func searchRanked(pattern string, defs []store.Definition, limit int, jsonOutput
 // depend on internal/mcp just for the adapter.
 type cliBodySource struct{ db *store.DB }
 
-func (a cliBodySource) CountDefinitions() (int, error)      { return a.db.CountDefinitions() }
+func (a cliBodySource) CountDefinitions() (int, error)       { return a.db.CountDefinitions() }
 func (a cliBodySource) SampleBodies(n int) ([]string, error) { return a.db.SampleBodies(n) }
 
 // cmdRepair deletes the embedded .defn/ database and re-ingests from

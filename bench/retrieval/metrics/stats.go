@@ -15,12 +15,12 @@ type PairwiseComparison struct {
 	Metric      string  `json:"metric"`
 	MeanA       float64 `json:"mean_a"`
 	MeanB       float64 `json:"mean_b"`
-	Difference  float64 `json:"difference"`   // MeanA - MeanB
-	WilcoxonP   float64 `json:"wilcoxon_p"`   // p-value from Wilcoxon signed-rank test
-	CohensD     float64 `json:"cohens_d"`     // effect size
-	CI95Lower   float64 `json:"ci_95_lower"`  // bootstrap 95% CI lower bound
-	CI95Upper   float64 `json:"ci_95_upper"`  // bootstrap 95% CI upper bound
-	Significant bool    `json:"significant"`  // p < 0.05
+	Difference  float64 `json:"difference"`  // MeanA - MeanB
+	WilcoxonP   float64 `json:"wilcoxon_p"`  // p-value from Wilcoxon signed-rank test
+	CohensD     float64 `json:"cohens_d"`    // effect size
+	CI95Lower   float64 `json:"ci_95_lower"` // bootstrap 95% CI lower bound
+	CI95Upper   float64 `json:"ci_95_upper"` // bootstrap 95% CI upper bound
+	Significant bool    `json:"significant"` // p < 0.05
 	TaskCount   int     `json:"task_count"`
 }
 

@@ -50,11 +50,11 @@ var PlaceholderIDF IDF = constIDF(1.0)
 // Weights controls the linear combiner. Tuned on the train split of the
 // retrieval benchmark; never against test. See cmd/defn-bench-tune (TBD).
 type Weights struct {
-	NameMatch      float64
-	CallerCount    float64
-	TestCount      float64
-	BodyOverlap    float64
-	ReceiverMatch  float64
+	NameMatch     float64
+	CallerCount   float64
+	TestCount     float64
+	BodyOverlap   float64
+	ReceiverMatch float64
 }
 
 // DefaultWeights are placeholders pending tune. Equal weight across features

@@ -274,9 +274,9 @@ func asInt(v any) int {
 // adapterIDF is a per-repo IDF source built once at Index time from a
 // body sample. Implements rank.IDF.
 type adapterIDF struct {
-	scores  map[string]float64
-	maxIDF  float64
-	docs    int
+	scores map[string]float64
+	maxIDF float64
+	docs   int
 }
 
 func (i *adapterIDF) Score(token string) float64 {
