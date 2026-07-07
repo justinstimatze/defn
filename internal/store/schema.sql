@@ -133,54 +133,6 @@ CREATE INDEX idx_litfield_def ON literal_fields(def_id);
 CREATE INDEX idx_litfield_type_field ON literal_fields(type_name, field_name);
 CREATE FULLTEXT INDEX idx_litfield_value_ft ON literal_fields(field_value);
 
--- Calque-style behavior signals extracted during resolve: what a definition
--- writes (assignment LHS targets), what it emits (string literals), and
--- what shape it returns (returned composite-literal keys). Used by the
--- "similar" op to score behavioral overlap independent of signature/text.
-CREATE TABLE IF NOT EXISTS effect_signals (
-    id      INT PRIMARY KEY AUTO_INCREMENT,
-    def_id  INT NOT NULL,
-    kind    VARCHAR(20) NOT NULL,   -- 'write' | 'string' | 'retkey'
-    value   VARCHAR(500) NOT NULL,
-    line    INT NOT NULL,
-    FOREIGN KEY (def_id) REFERENCES definitions(id) ON DELETE CASCADE
-);
-CREATE INDEX idx_effect_def ON effect_signals(def_id, kind);
-CREATE INDEX idx_effect_value ON effect_signals(kind, value);
-
--- Role-cardinality invariants (calque's "declare-and-gate" primitive):
--- a declared role should have `expected` implementations, matched by a
--- name/signature pattern. role_members is the frozen baseline set (one row
--- per member, not a JSON blob) so dolt_diff_role_members gives free,
--- per-row history of the ratchet toward the target count.
-CREATE TABLE IF NOT EXISTS roles (
-    id       INT PRIMARY KEY AUTO_INCREMENT,
-    name     VARCHAR(255) UNIQUE NOT NULL,
-    pattern  VARCHAR(500) NOT NULL,
-    expected INT NOT NULL DEFAULT 1
-);
-CREATE TABLE IF NOT EXISTS role_members (
-    role_id INT NOT NULL,
-    def_id  INT NOT NULL,
-    PRIMARY KEY (role_id, def_id),
-    FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE CASCADE,
-    FOREIGN KEY (def_id) REFERENCES definitions(id) ON DELETE CASCADE
-);
-
--- Dynamic behavior facts derived from actual `test` runs (v1: coverage-only —
--- 'covered' means at least one of the definition's lines was exercised by
--- the run; 'error-branch-hit' means a covered line fell inside an
--- "if err != nil" block in the definition's body). Advisory only — never
--- gates a strict check, surfaced like untested's coverage gaps.
-CREATE TABLE IF NOT EXISTS behavior_facts (
-    id      INT PRIMARY KEY AUTO_INCREMENT,
-    def_id  INT NOT NULL,
-    kind    VARCHAR(20) NOT NULL,   -- 'covered' | 'error-branch-hit'
-    run_ref VARCHAR(64) NOT NULL,   -- commit hash, or 'uncommitted'
-    FOREIGN KEY (def_id) REFERENCES definitions(id) ON DELETE CASCADE
-);
-CREATE INDEX idx_behavior_def ON behavior_facts(def_id, kind);
-
 -- Key/value metadata (last_ingest timestamp, schema version, etc.).
 CREATE TABLE IF NOT EXISTS defn_meta (
     `key`   VARCHAR(64) PRIMARY KEY,

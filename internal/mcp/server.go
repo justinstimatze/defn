@@ -17,7 +17,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
-	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -227,7 +226,7 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 		Name: "code",
 		Description: `Go code database. One tool, many ops. Start with impact for blast radius — it returns callers, transitives, and test coverage in one call. Don't follow up with search/explain unless you need more.
 
-Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, search, explain, similar (behavioral overlap — writes/emitted-strings/name-role/calls, not just signature), untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test (pass coverage:true to also record behavior_facts — advisory, coverage-derived), apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, cardinality (declare/check a role-cardinality invariant — pass name+pattern to declare a baseline, then again to check for new/removed members; expected sets the target count, default 1), comod (git co-modification frequency for name, ranked — pass limit to cap results), validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
+Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
 	}, s.handleCode)
 
 	return s, mcpServer
@@ -289,8 +288,6 @@ type codeParam struct {
 	To          string           `json:"to,omitempty"`
 	Out         string           `json:"out,omitempty"`
 	Rank        bool             `json:"rank,omitempty"`
-	Expected    int              `json:"expected,omitempty"`
-	Coverage    bool             `json:"coverage,omitempty"`
 }
 
 type applyOp struct {
@@ -461,17 +458,6 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if r, o, e := need(args.File, "file"); r != nil {
 			return r, o, e
 		}
-	case "cardinality":
-		if r, o, e := need(args.Name, "name"); r != nil {
-			return r, o, e
-		}
-		if r, o, e := need(args.Pattern, "pattern"); r != nil {
-			return r, o, e
-		}
-	case "comod":
-		if r, o, e := need(args.Name, "name"); r != nil {
-			return r, o, e
-		}
 	case "validate-plan":
 		if len(args.Mutations) == 0 {
 			return errResult(fmt.Errorf("validate-plan: mutations is required"))
@@ -571,7 +557,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "move":
 		return s.handleMove(ctx, req, moveParam{Name: args.Name, ToModule: args.Module})
 	case "test":
-		return s.handleTest(ctx, req, args)
+		return s.handleTest(ctx, req, nameParam{Name: args.Name})
 	case "similar":
 		return wrapStale(s.handleSimilar(ctx, req, nameParam{Name: args.Name}))
 	case "apply":
@@ -598,10 +584,6 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return s.handleSimulate(ctx, req, args)
 	case "file-defs":
 		return s.handleFileDefs(ctx, req, args)
-	case "cardinality":
-		return wrapStale(s.handleCardinality(ctx, req, args))
-	case "comod":
-		return wrapStale(s.handleCoModification(ctx, req, args))
 	case "validate-plan":
 		return wrapStale(s.handleValidatePlan(ctx, req, args))
 	case "pragmas":
@@ -633,7 +615,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "gc":
 		return s.handleGC(ctx, req, args)
 	default:
-		return errResult(fmt.Errorf("unknown op %q — valid: read, search, impact, explain, similar, untested, edit, insert, create, delete, rename, move, test, apply, diff, history, query, find, overview, patch, sync, test-coverage, batch-impact, simulate, file-defs, cardinality, comod, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc", args.Op))
+		return errResult(fmt.Errorf("unknown op %q — valid: read, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc", args.Op))
 	}
 }
 
@@ -1824,7 +1806,7 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	return textResult(sb.String()), nil, nil
 }
 
-func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", args.Name))
@@ -1857,43 +1839,19 @@ func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args c
 
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
-
-	goArgs := []string{"test", "-run", runPattern, "-count=1", "-v"}
-	var coverFile string
-	if args.Coverage {
-		f, err := os.CreateTemp("", "defn-cover-*.out")
-		if err != nil {
-			return errResult(fmt.Errorf("test: create coverprofile: %w", err))
-		}
-		coverFile = f.Name()
-		f.Close()
-		defer os.Remove(coverFile)
-		goArgs = append(goArgs, "-coverprofile="+coverFile)
-	}
-	goArgs = append(goArgs, "./...")
-
-	cmd := exec.CommandContext(ctx, "go", goArgs...)
+	cmd := exec.CommandContext(ctx, "go", "test", "-run", runPattern, "-count=1", "-v", "./...")
 	cmd.Dir = s.projectDir
-	out, runErr := cmd.CombinedOutput()
+	out, err := cmd.CombinedOutput()
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Running %d of %d tests (affected by %s):\n\n",
 		len(testNames), len(testNames), args.Name))
 	sb.WriteString(string(out))
 
-	if runErr != nil {
+	if err != nil {
 		sb.WriteString("\nSOME TESTS FAILED")
 	} else {
 		sb.WriteString("\nALL TESTS PASSED")
-	}
-
-	if args.Coverage {
-		n, covErr := recordCoverageFacts(s.db, s.projectDir, coverFile)
-		if covErr != nil {
-			sb.WriteString(fmt.Sprintf("\n\n[coverage: could not record behavior_facts: %s]", covErr))
-		} else {
-			sb.WriteString(fmt.Sprintf("\n\n[coverage: recorded %d behavior fact(s)]", n))
-		}
 	}
 
 	return textResult(sb.String()), nil, nil
@@ -2021,78 +1979,6 @@ func humanSize(n int64) string {
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
-// roleStemPrefixes are stripped from a definition's name before comparing
-// name-stems, so e.g. "handleAuth" and "resolveAuth" both stem to "auth".
-var roleStemPrefixes = []string{
-	"handle", "resolve", "get", "set", "new", "make", "build",
-	"create", "process", "run", "do",
-}
-
-// nameStem strips a leading role-prefix (case-insensitively) and lowercases
-// the remainder, so two definitions playing the same role but named after
-// different verbs still compare equal.
-func nameStem(name string) string {
-	lower := strings.ToLower(name)
-	for _, p := range roleStemPrefixes {
-		if strings.HasPrefix(lower, p) && len(lower) > len(p) {
-			return lower[len(p):]
-		}
-	}
-	return lower
-}
-
-// jaccard scores set overlap. The second return value is false when both
-// sets are empty — callers renormalize the overall score to skip signals
-// that simply have no data on either side, rather than counting them as 0.
-func jaccard(a, b map[string]bool) (score float64, available bool) {
-	if len(a) == 0 && len(b) == 0 {
-		return 0, false
-	}
-	inter, union := 0, len(a)
-	for v := range b {
-		if !a[v] {
-			union++
-		}
-	}
-	for v := range a {
-		if b[v] {
-			inter++
-		}
-	}
-	if union == 0 {
-		return 0, false
-	}
-	return float64(inter) / float64(union), true
-}
-
-// effectSignalSets loads a definition's write-target and emitted-string
-// signals (internal/resolve populates these during resolve) plus its
-// callee-name set (already available via refs) as jaccard-comparable sets.
-func effectSignalSets(db *store.DB, defID int64) (writes, strs, calls map[string]bool, err error) {
-	sigs, err := db.GetEffectSignals(defID)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	writes, strs = map[string]bool{}, map[string]bool{}
-	for _, sig := range sigs {
-		switch sig.Kind {
-		case "write":
-			writes[sig.Value] = true
-		case "string":
-			strs[sig.Value] = true
-		}
-	}
-	callees, err := db.GetCallees(defID)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	calls = map[string]bool{}
-	for _, c := range callees {
-		calls[c.Name] = true
-	}
-	return writes, strs, calls, nil
-}
-
 func (s *server) handleSimilar(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
@@ -2102,38 +1988,26 @@ func (s *server) handleSimilar(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 		return errResult(fmt.Errorf("definition %q has no signature", args.Name))
 	}
 
-	// Shortlist candidates by shared signature type-tokens — cheap, index-backed,
-	// and avoids an all-pairs scan across the module. Behavioral scoring below
-	// does the actual ranking.
+	// Find definitions with similar signatures by searching for shared type tokens.
+	// Extract type names from the signature (e.g., "func Foo(ctx context.Context, id int) error"
+	// → search for "context.Context" and "error").
 	sig := d.Signature
+	// Strip func keyword, receiver, and name to get just the params/returns.
 	if idx := strings.Index(sig, "("); idx >= 0 {
 		sig = sig[idx:]
 	}
+
+	// Find definitions with similar param/return signatures.
 	sigDefs, _ := s.db.FindDefinitions("%" + sig + "%")
 
-	dWrites, dStrings, dCalls, err := effectSignalSets(s.db, d.ID)
-	if err != nil {
-		return errResult(fmt.Errorf("similar: %w", err))
-	}
-	dStem := nameStem(d.Name)
-
-	type match struct {
-		Name      string             `json:"name"`
-		Kind      string             `json:"kind"`
-		Receiver  string             `json:"receiver,omitempty"`
-		Signature string             `json:"signature"`
-		Score     float64            `json:"score"`
-		Signals   map[string]float64 `json:"signals"`
-	}
-
-	const (
-		wStrings = 0.30
-		wWrites  = 0.30
-		wName    = 0.22
-		wCalls   = 0.18
-	)
-
+	// Deduplicate, exclude self.
 	seen := map[string]bool{d.Name: true}
+	type match struct {
+		Name      string `json:"name"`
+		Kind      string `json:"kind"`
+		Receiver  string `json:"receiver,omitempty"`
+		Signature string `json:"signature"`
+	}
 	var matches []match
 	for _, c := range sigDefs {
 		key := c.Name + c.Receiver
@@ -2141,202 +2015,23 @@ func (s *server) handleSimilar(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 			continue
 		}
 		seen[key] = true
-		// Exclude tiny functions — too little body for a reliable behavioral
-		// signal (mirrors calque's exclusion of <4-line functions).
-		if c.StartLine > 0 && c.EndLine > 0 && c.EndLine-c.StartLine+1 < 4 {
-			continue
-		}
-
-		cWrites, cStrings, cCalls, err := effectSignalSets(s.db, c.ID)
-		if err != nil {
-			continue
-		}
-
-		writeScore, writeOK := jaccard(dWrites, cWrites)
-		strScore, strOK := jaccard(dStrings, cStrings)
-		callScore, callOK := jaccard(dCalls, cCalls)
-		nameScore := 0.0
-		if dStem == nameStem(c.Name) {
-			nameScore = 1.0
-		}
-
-		// Real-anchor noise gate: don't surface a candidate on signature
-		// shortlisting alone — require at least one non-signature signal to
-		// actually overlap (or a name-stem match), same as calque's anchor
-		// requirement. Prevents generic-callee coincidences from flooding results.
-		if nameScore == 0 && writeScore == 0 && strScore == 0 && callScore == 0 {
-			continue
-		}
-
-		var weighted, weightTotal float64
-		signals := map[string]float64{"name": nameScore}
-		weighted += wName * nameScore
-		weightTotal += wName
-		if writeOK {
-			signals["writes"] = writeScore
-			weighted += wWrites * writeScore
-			weightTotal += wWrites
-		}
-		if strOK {
-			signals["strings"] = strScore
-			weighted += wStrings * strScore
-			weightTotal += wStrings
-		}
-		if callOK {
-			signals["calls"] = callScore
-			weighted += wCalls * callScore
-			weightTotal += wCalls
-		}
-		score := 0.0
-		if weightTotal > 0 {
-			score = weighted / weightTotal
-		}
-
 		matches = append(matches, match{
 			Name: c.Name, Kind: c.Kind, Receiver: c.Receiver, Signature: c.Signature,
-			Score: score, Signals: signals,
 		})
-	}
-
-	sort.Slice(matches, func(i, j int) bool { return matches[i].Score > matches[j].Score })
-	if len(matches) > 20 {
-		matches = matches[:20]
+		if len(matches) >= 20 {
+			break
+		}
 	}
 
 	if len(matches) == 0 {
-		return textResult(fmt.Sprintf("No behaviorally similar definitions found for %s", args.Name)), nil, nil
+		return textResult(fmt.Sprintf("No definitions with similar signatures to %s", args.Name)), nil, nil
 	}
 
 	text, err := toJSON(matches)
 	if err != nil {
 		return errResult(err)
 	}
-	return textResult(fmt.Sprintf("Definitions behaviorally similar to %s (ranked by shared writes/strings/name-role/calls):\n\n%s", args.Name, text)), nil, nil
-}
-
-type cardinalityResult struct {
-	Role       string   `json:"role"`
-	Pattern    string   `json:"pattern"`
-	Expected   int      `json:"expected"`
-	Declared   bool     `json:"declared"`
-	LiveCount  int      `json:"live_count"`
-	NewMembers []string `json:"new_members,omitempty"`
-	Removed    []string `json:"removed,omitempty"`
-	Violation  bool     `json:"violation"`
-	Vacuous    bool     `json:"vacuous"`
-}
-
-// handleCardinality implements the "declare-and-gate" role-cardinality
-// invariant: role Name (definitions matching Pattern) should have Expected
-// implementations. The first call for a given Name declares the role and
-// snapshots the current matches as a frozen baseline; every later call
-// checks the live match set against that baseline — any match not in the
-// baseline is a new/unexpected member (a violation even if the total count
-// is still at or under Expected, since renaming a banned implementation
-// shouldn't silently pass); baseline members no longer matching are removed
-// from the baseline (it only ever ratchets down, never grows implicitly).
-func (s *server) handleCardinality(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	pattern := args.Pattern
-	if !strings.Contains(pattern, "%") {
-		pattern = "%" + pattern + "%"
-	}
-	live, err := s.db.FindDefinitions(pattern)
-	if err != nil {
-		return errResult(fmt.Errorf("cardinality: %w", err))
-	}
-	liveByID := make(map[int64]store.Definition, len(live))
-	for _, d := range live {
-		liveByID[d.ID] = d
-	}
-
-	role, err := s.db.GetRole(args.Name)
-	if err != nil {
-		return errResult(fmt.Errorf("cardinality: %w", err))
-	}
-
-	expected := args.Expected
-	if expected <= 0 {
-		expected = 1
-	}
-	result := cardinalityResult{Role: args.Name, Pattern: pattern, Expected: expected, LiveCount: len(live)}
-
-	if role == nil {
-		ids := make([]int64, 0, len(live))
-		for _, d := range live {
-			ids = append(ids, d.ID)
-		}
-		if _, err := s.db.DeclareRole(args.Name, pattern, expected, ids); err != nil {
-			return errResult(fmt.Errorf("cardinality: %w", err))
-		}
-		result.Declared = true
-		text, _ := toJSON(result)
-		return textResult(fmt.Sprintf("Role %q declared with %d baseline member(s):\n\n%s", args.Name, len(live), text)), nil, nil
-	}
-
-	result.Expected = role.Expected
-	baseline, err := s.db.RoleMemberIDs(role.ID)
-	if err != nil {
-		return errResult(fmt.Errorf("cardinality: %w", err))
-	}
-
-	for id, d := range liveByID {
-		if !baseline[id] {
-			result.NewMembers = append(result.NewMembers, d.Name)
-		}
-	}
-	for id := range baseline {
-		if _, stillLive := liveByID[id]; stillLive {
-			continue
-		}
-		if err := s.db.ShrinkRoleBaseline(role.ID, id); err != nil {
-			return errResult(fmt.Errorf("cardinality: %w", err))
-		}
-		name := fmt.Sprintf("def#%d", id)
-		if d, derr := s.db.GetDefinition(id); derr == nil {
-			name = d.Name
-		}
-		result.Removed = append(result.Removed, name)
-	}
-
-	result.Vacuous = role.Expected >= 1 && len(live) == 0
-	result.Violation = len(result.NewMembers) > 0 || len(live) > role.Expected
-
-	text, err := toJSON(result)
-	if err != nil {
-		return errResult(err)
-	}
-	verdict := "OK"
-	switch {
-	case result.Violation:
-		verdict = "VIOLATION"
-	case result.Vacuous:
-		verdict = "VACUOUS"
-	}
-	return textResult(fmt.Sprintf("Role %q [%s]:\n\n%s", args.Name, verdict, text)), nil, nil
-}
-
-// handleCoModification exposes git co-modification frequency (which
-// definitions historically changed in the same commit as args.Name) as a
-// queryable primitive, so a consumer like plancheck can combine it with the
-// reference graph without shelling out to git or hand-rolling the
-// dolt_diff_definitions self-join itself.
-func (s *server) handleCoModification(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	limit := args.Limit
-	if limit <= 0 {
-		limit = 20
-	}
-	entries, err := s.db.CoModification(args.Name, limit)
-	if err != nil {
-		return errResult(fmt.Errorf("comod: %w", err))
-	}
-	if len(entries) == 0 {
-		return textResult(fmt.Sprintf("No co-modification history found for %s", args.Name)), nil, nil
-	}
-	text, err := toJSON(entries)
-	if err != nil {
-		return errResult(err)
-	}
-	return textResult(fmt.Sprintf("Definitions historically co-modified with %s:\n\n%s", args.Name, text)), nil, nil
+	return textResult(fmt.Sprintf("Definitions with similar signatures to %s:\n\n%s", args.Name, text)), nil, nil
 }
 
 func (s *server) handleOverview(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
