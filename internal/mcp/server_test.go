@@ -677,3 +677,163 @@ func resultText(t *testing.T, result *sdkmcp.CallToolResult) string {
 	t.Fatal("no text content in result")
 	return ""
 }
+
+func TestTopLevelFlow(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want []string
+	}{
+		{
+			name: "empty body",
+			body: "",
+			want: nil,
+		},
+		{
+			name: "not parseable",
+			body: "not go source",
+			want: nil,
+		},
+		{
+			name: "simple return",
+			body: "func F() int { return 42 }",
+			want: []string{"L0:return"},
+		},
+		{
+			name: "err check pattern",
+			body: `func F() error {
+	x, err := doThing()
+	if err != nil {
+		return err
+	}
+	return nil
+}`,
+			want: []string{"L1:assign", "L2:if", "L5:return"},
+		},
+		{
+			name: "loop + defer + go",
+			body: `func F() {
+	defer cleanup()
+	go bg()
+	for i := 0; i < 10; i++ {
+		process(i)
+	}
+	select {
+	case <-ch:
+	}
+}`,
+			want: []string{"L1:defer", "L2:go", "L3:for", "L6:select"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := topLevelFlow(tc.body)
+			if len(got) != len(tc.want) {
+				t.Fatalf("length: got %d %v, want %d %v", len(got), got, len(tc.want), tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("index %d: got %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestHandleOutline_SmallBodyFallsBackToRead(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	// Greet's body is well under outlineBodyThreshold (300 bytes) so
+	// the size-aware fallback should return the read view — which
+	// includes the full body inside a fenced code block.
+	result, _, _ := s.handleOutline(context.Background(), nil, nameParam{Name: "Greet"})
+	text := resultText(t, result)
+
+	if !strings.Contains(text, "Hello, ") {
+		t.Errorf("expected small body to fall back to read view (should include body content); got:\n%s", text)
+	}
+	if strings.Contains(text, "Body:") && strings.Contains(text, "fetch with") {
+		t.Errorf("expected fallback to read, but output looks like outline (has 'Body: ... fetch with'):\n%s", text)
+	}
+}
+
+func TestHandleOutline_LargeBodyReturnsOutline(t *testing.T) {
+	// Build a project with one large function that trips the outline
+	// threshold, to exercise the outline branch (not the small-body
+	// fallback). setupTestDB's Greet/Farewell are both too small.
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	// Overwrite main.go with a chunkier function that will comfortably
+	// exceed outlineBodyThreshold (300 bytes) and has a mix of stmts
+	// for the flow section to detect.
+	big := `package main
+
+// Chunky processes items with a mix of control-flow shapes so the
+// outline op's flow detection has something interesting to report.
+// Body is padded past outlineBodyThreshold via repeated statements.
+func Chunky(items []string) (int, error) {
+	total := 0
+	for _, item := range items {
+		if item == "" {
+			continue
+		}
+		total++
+	}
+	if total == 0 {
+		return 0, nil
+	}
+	defer func() {
+		total = 0
+	}()
+	go func() {
+		process(items)
+	}()
+	select {
+	case <-done:
+	}
+	return total, nil
+}
+
+func process(_ []string) {}
+
+var done = make(chan struct{})
+
+func main() {}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(big), 0644)
+	os.Remove(filepath.Join(projDir, "main_test.go"))
+
+	// Re-ingest.
+	if _, err := ingest.IngestFile(db, projDir, filepath.Join(projDir, "main.go")); err != nil {
+		t.Fatal("re-ingest:", err)
+	}
+
+	s := &server{db: db, projectDir: projDir}
+	result, _, _ := s.handleOutline(context.Background(), nil, nameParam{Name: "Chunky"})
+	text := resultText(t, result)
+
+	// Outline output must NOT contain the body statements — that would
+	// mean we fell through to read despite the body being large enough.
+	if strings.Contains(text, "continue") || strings.Contains(text, "total++") {
+		t.Errorf("expected outline (no body content); got read-shaped output:\n%s", text)
+	}
+	// Must contain the outline-specific lines.
+	for _, want := range []string{"Body:", "fetch with", "Callers:", "Callees"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("outline missing %q in:\n%s", want, text)
+		}
+	}
+	// Flow section must be present and list at least one recognized
+	// statement kind from the fixture.
+	if !strings.Contains(text, "Flow (") {
+		t.Errorf("outline missing Flow section:\n%s", text)
+	}
+	for _, kind := range []string{"range", "if", "defer", "go", "select", "return", "assign"} {
+		if !strings.Contains(text, kind) {
+			t.Errorf("flow section missing %q kind:\n%s", kind, text)
+		}
+	}
+}

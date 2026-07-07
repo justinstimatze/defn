@@ -2684,19 +2684,110 @@ func (s *server) handleBatchImpact(_ context.Context, _ *sdkmcp.CallToolRequest,
 	return textResult(text), nil, nil
 }
 
+// outlineBodyThreshold is the body-size below which outline returns
+// the full read view instead: for tiny bodies, the outline's fixed
+// overhead (header + refs summary + stats) exceeds the body's own
+// tokens, so returning the body is strictly cheaper. Threshold measured
+// on defn's own corpus — under ~300 chars, outline inflates the read.
+const outlineBodyThreshold = 300
+
+// topLevelFlow parses a function body and returns a compact sequence of
+// top-level statement kinds ("if", "for", "return", ...) with 1-based
+// line offsets from the body's first line. Non-parseable bodies (e.g.
+// non-function kinds, corrupted storage) return nil, "" — callers omit
+// the flow section entirely.
+func topLevelFlow(body string) []string {
+	if body == "" {
+		return nil
+	}
+	src := "package p\n" + body
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, 0)
+	if err != nil {
+		return nil
+	}
+	if len(f.Decls) == 0 {
+		return nil
+	}
+	fn, ok := f.Decls[0].(*ast.FuncDecl)
+	if !ok || fn.Body == nil {
+		return nil
+	}
+	bodyStart := fset.Position(fn.Body.Lbrace).Line
+	out := make([]string, 0, len(fn.Body.List))
+	for _, stmt := range fn.Body.List {
+		kind := stmtKind(stmt)
+		if kind == "" {
+			continue
+		}
+		line := fset.Position(stmt.Pos()).Line - bodyStart
+		out = append(out, fmt.Sprintf("L%d:%s", line, kind))
+	}
+	return out
+}
+
+// stmtKind returns a short label for a top-level statement, or "" for
+// kinds that don't carry useful flow information (empty stmts, labels).
+func stmtKind(s ast.Stmt) string {
+	switch x := s.(type) {
+	case *ast.IfStmt:
+		return "if"
+	case *ast.ForStmt:
+		return "for"
+	case *ast.RangeStmt:
+		return "range"
+	case *ast.SwitchStmt:
+		return "switch"
+	case *ast.TypeSwitchStmt:
+		return "typeswitch"
+	case *ast.SelectStmt:
+		return "select"
+	case *ast.ReturnStmt:
+		return "return"
+	case *ast.DeferStmt:
+		return "defer"
+	case *ast.GoStmt:
+		return "go"
+	case *ast.SendStmt:
+		return "send"
+	case *ast.AssignStmt:
+		return "assign"
+	case *ast.IncDecStmt:
+		return "incdec"
+	case *ast.ExprStmt:
+		return "call"
+	case *ast.DeclStmt:
+		return "decl"
+	case *ast.BlockStmt:
+		return "block"
+	case *ast.BranchStmt:
+		return strings.ToLower(x.Tok.String()) // break, continue, goto, fallthrough
+	}
+	return ""
+}
+
 // handleOutline returns a compact projection of a definition: header +
-// signature + doc + caller/callee summary + body byte and line counts.
-// It deliberately does NOT include the body itself. Reserved for agents
-// that need to understand a definition's shape and relationships before
-// deciding whether to fetch the full body via read.
+// signature (with doc prefix) + caller/callee summary + top-level flow
+// outline + body byte/line counts. Deliberately excludes body content.
 //
-// Aider-lineage compact-read baseline. Measured token cost is signature
-// + doc + refs summary (~15-25% of body size on typical Go functions);
-// see [[project_putget_edit_vocab_design]] for the phase context.
-func (s *server) handleOutline(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
+// Size-aware fallback: for bodies under outlineBodyThreshold, returns
+// the read view instead — outline's fixed overhead is larger than a
+// tiny body's own tokens, so the compression is negative.
+//
+// Aider-lineage compact-read baseline. Measured on defn's own 497
+// funcs/methods: 33% of read output on average (67% compression), 13%
+// on >2000-char bodies (87% compression). See
+// [[project_putget_edit_vocab_design]] for the phase context.
+func (s *server) handleOutline(_ context.Context, req *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", args.Name))
+	}
+
+	// Size-aware fallback: for tiny bodies, read is smaller than
+	// outline. Route to the read handler transparently.
+	if len(d.Body) < outlineBodyThreshold {
+		return s.handleGetDefinition(nil, req, args)
 	}
 
 	var modulePath string
@@ -2721,9 +2812,6 @@ func (s *server) handleOutline(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 	}
 
 	bodyLines := strings.Count(d.Body, "\n") + 1
-	if d.Body == "" {
-		bodyLines = 0
-	}
 
 	var sb strings.Builder
 	recv := formatReceiver(d.Receiver)
@@ -2757,6 +2845,10 @@ func (s *server) handleOutline(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 		sb.WriteString(fmt.Sprintf("Callees (%d): %s\n", len(callees), strings.Join(names, ", ")))
 	} else {
 		sb.WriteString("Callees: 0\n")
+	}
+
+	if flow := topLevelFlow(d.Body); len(flow) > 0 {
+		sb.WriteString(fmt.Sprintf("Flow (%d): %s\n", len(flow), strings.Join(flow, " → ")))
 	}
 
 	return textResult(sb.String()), nil, nil
