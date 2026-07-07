@@ -2922,181 +2922,10 @@ func (s *server) handleOutline(_ context.Context, req *sdkmcp.CallToolRequest, a
 	return textResult(sb.String()), nil, nil
 }
 
-// sliceKinds are the AST-role slice names handleSlice accepts.
-// Adding a new kind requires: (a) a case in extractSlices; (b) at
-// least one fixture in TestExtractSlices; (c) an update to the tool
-// description. See [[project_putget_edit_vocab_design]] for the phase
-// context — verbatim slices are the write-side foundation for the
-// future `replace-slice` edit primitive.
-var sliceKinds = map[string]bool{
-	"signature":    true, // just the func signature (no doc)
-	"doc":          true, // just the doc comment
-	"body":         true, // brace-delimited body block (statements only)
-	"error-branch": true, // every `if err != nil { ... }` block
-	"return":       true, // every top-level return statement
-	"loop":         true, // every for/range/select statement
-}
-
-// astSlice is one extracted verbatim slice of a definition's body,
-// identified by AST role and located by 1-based line offset from the
-// def's first line.
-type astSlice struct {
-	Kind   string
-	Line   int    // 1-based offset from def start
-	Source string // verbatim bytes
-}
-
-// extractSlices parses body and returns every AST subtree matching the
-// requested kind. Body is expected to be a function definition (signature
-// + brace-delimited block); non-function kinds return nil with an
-// explanatory error. Non-parseable bodies return the parse error verbatim.
-//
-// Position semantics: byte-exact against d.Body. The parser prefix
-// ("package p\n") is 10 bytes; slice Source is extracted from body
-// directly, not from the prefixed source, so callers can splice slices
-// back into the def without offset arithmetic.
-func extractSlices(body string, kind string) ([]astSlice, error) {
-	if !sliceKinds[kind] {
-		names := make([]string, 0, len(sliceKinds))
-		for k := range sliceKinds {
-			names = append(names, k)
-		}
-		sort.Strings(names)
-		return nil, fmt.Errorf("unknown slice kind %q — valid: %s", kind, strings.Join(names, ", "))
-	}
-	if body == "" {
-		return nil, nil
-	}
-	src := "package p\n" + body
-	prefixLen := len("package p\n")
-	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
-	if err != nil {
-		return nil, fmt.Errorf("parse body: %w", err)
-	}
-	if len(f.Decls) == 0 {
-		return nil, nil
-	}
-	fn, ok := f.Decls[0].(*ast.FuncDecl)
-	if !ok {
-		return nil, fmt.Errorf("slice: body is not a function declaration (kind=%s)", f.Decls[0].(*ast.GenDecl).Tok)
-	}
-
-	// signature: from FuncDecl.Pos to FuncType.End (excludes body block).
-	if kind == "signature" {
-		startOff := fset.Position(fn.Pos()).Offset - prefixLen
-		endOff := fset.Position(fn.Type.End()).Offset - prefixLen
-		return []astSlice{{
-			Kind:   "signature",
-			Line:   fset.Position(fn.Pos()).Line - 1,
-			Source: body[startOff:endOff],
-		}}, nil
-	}
-
-	// doc: from Doc.Pos to Doc.End. Empty if no doc.
-	if kind == "doc" {
-		if fn.Doc == nil {
-			return nil, nil
-		}
-		startOff := fset.Position(fn.Doc.Pos()).Offset - prefixLen
-		endOff := fset.Position(fn.Doc.End()).Offset - prefixLen
-		return []astSlice{{
-			Kind:   "doc",
-			Line:   fset.Position(fn.Doc.Pos()).Line - 1,
-			Source: body[startOff:endOff],
-		}}, nil
-	}
-
-	// Remaining kinds require a body block.
-	if fn.Body == nil {
-		return nil, nil
-	}
-
-	if kind == "body" {
-		// Body block including braces, verbatim.
-		startOff := fset.Position(fn.Body.Lbrace).Offset - prefixLen
-		endOff := fset.Position(fn.Body.Rbrace).Offset - prefixLen + 1
-		return []astSlice{{
-			Kind:   "body",
-			Line:   fset.Position(fn.Body.Lbrace).Line - 1,
-			Source: body[startOff:endOff],
-		}}, nil
-	}
-
-	defStartLine := fset.Position(fn.Pos()).Line
-	var out []astSlice
-	ast.Inspect(fn.Body, func(n ast.Node) bool {
-		if n == nil {
-			return false
-		}
-		match := false
-		switch kind {
-		case "error-branch":
-			// if err != nil { ... } — any if whose condition is a
-			// binary "!= nil" against an identifier ending in "err"
-			// (case-insensitive). Matches `if err != nil`,
-			// `if dbErr != nil`, etc. Deliberately does NOT match
-			// `if err == nil` — that's success-branch, not error.
-			if ifStmt, ok := n.(*ast.IfStmt); ok && isErrNotNil(ifStmt.Cond) {
-				match = true
-				_ = ifStmt
-			}
-		case "return":
-			if _, ok := n.(*ast.ReturnStmt); ok {
-				match = true
-			}
-		case "loop":
-			switch n.(type) {
-			case *ast.ForStmt, *ast.RangeStmt, *ast.SelectStmt:
-				match = true
-			}
-		}
-		if match {
-			startOff := fset.Position(n.Pos()).Offset - prefixLen
-			endOff := fset.Position(n.End()).Offset - prefixLen
-			if startOff < 0 || endOff > len(body) {
-				return true // guard against pathological positions
-			}
-			out = append(out, astSlice{
-				Kind:   kind,
-				Line:   fset.Position(n.Pos()).Line - defStartLine + 1,
-				Source: body[startOff:endOff],
-			})
-			// Don't recurse into a matched node: return-inside-return
-			// is impossible; if-inside-if for error-branch would
-			// duplicate; loop-inside-loop is uncommon and would
-			// duplicate. If nested-match matters, revisit.
-			return false
-		}
-		return true
-	})
-	return out, nil
-}
-
-// isErrNotNil reports whether expr is a `<ident>err != nil` comparison
-// (case-insensitive on the identifier suffix). This is a syntactic
-// heuristic — it does not confirm the identifier's TYPE is error, only
-// its name shape. Good enough for the error-branch slice, which is
-// advisory in the same sense as `outline` — an agent uses it to locate
-// candidate slices, then reads verbatim source to confirm.
-func isErrNotNil(expr ast.Expr) bool {
-	bin, ok := expr.(*ast.BinaryExpr)
-	if !ok || bin.Op != token.NEQ {
-		return false
-	}
-	ident, ok := bin.X.(*ast.Ident)
-	if !ok {
-		return false
-	}
-	if !strings.HasSuffix(strings.ToLower(ident.Name), "err") {
-		return false
-	}
-	nilIdent, ok := bin.Y.(*ast.Ident)
-	if !ok || nilIdent.Name != "nil" {
-		return false
-	}
-	return true
-}
+// Slice extraction is delegated to internal/projection.Slices (see the
+// pure implementation there). handleSlice reads via projection.Slices +
+// projection.SliceKindNames; the previous duplicate copy in this file
+// was removed as part of Phase C extract-slice consolidation.
 
 // handleSlice returns verbatim source bytes for AST-role slices of a
 // definition (signature, doc, body, error-branch, return, loop). Each
@@ -3105,20 +2934,15 @@ func isErrNotNil(expr ast.Expr) bool {
 // as a numbered list.
 //
 // Phase B of the projection design: verbatim-slice queries are the
-// foundation for the future `replace-slice` edit primitive. Bytes
-// returned here should splice byte-exact back into the def via a
-// forthcoming write-side op. See [[project_putget_edit_vocab_design]].
+// foundation for the `replace-slice` edit primitive. Bytes returned
+// here splice byte-exact back into the def via replace-slice. See
+// [[project_putget_edit_vocab_design]].
 func (s *server) handleSlice(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	if strings.TrimSpace(args.Name) == "" {
 		return errResult(fmt.Errorf("slice: name is required"))
 	}
 	if strings.TrimSpace(args.Slice) == "" {
-		names := make([]string, 0, len(sliceKinds))
-		for k := range sliceKinds {
-			names = append(names, k)
-		}
-		sort.Strings(names)
-		return errResult(fmt.Errorf("slice: kind is required — valid: %s", strings.Join(names, ", ")))
+		return errResult(fmt.Errorf("slice: kind is required — valid: %s", strings.Join(projection.SliceKindNames(), ", ")))
 	}
 
 	d, err := s.db.GetDefinitionByName(args.Name, "")
@@ -3126,7 +2950,7 @@ func (s *server) handleSlice(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		return errResult(fmt.Errorf("definition %q not found", args.Name))
 	}
 
-	slices, err := extractSlices(d.Body, args.Slice)
+	slices, err := projection.Slices(d.Body, args.Slice)
 	if err != nil {
 		return errResult(err)
 	}
