@@ -228,7 +228,7 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 		Name: "code",
 		Description: `Go code database. One tool, many ops. Start with impact for blast radius — it returns callers, transitives, and test coverage in one call. Don't follow up with search/explain unless you need more.
 
-Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, outline (compact projection — sig + doc + caller/callee summary, no body; use when body isn't needed), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass file+import_path+alias?), search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
+Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, outline (compact projection — sig + doc + caller/callee summary, no body; use when body isn't needed), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
 	}, s.handleCode)
 
 	return s, mcpServer
@@ -3036,14 +3036,38 @@ func (s *server) handleInsertPrecondition(ctx context.Context, req *sdkmcp.CallT
 // handles per-group placement.
 //
 // Idempotent: adding an already-present (path, alias) is a no-op.
+//
+// If args.File is empty, tries to infer the target: if the DB has exactly
+// one non-test .go file, uses it; otherwise errors with the candidate
+// list so the caller can retry with an explicit file.
 func (s *server) handleAddImport(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	if strings.TrimSpace(args.File) == "" {
-		return errResult(fmt.Errorf("add-import: file is required"))
-	}
 	if strings.TrimSpace(args.ImportPath) == "" {
 		return errResult(fmt.Errorf("add-import: import_path is required"))
 	}
-	file := args.File
+	file := strings.TrimSpace(args.File)
+	inferred := false
+	if file == "" {
+		all, err := s.db.DistinctSourceFiles()
+		if err != nil {
+			return errResult(fmt.Errorf("add-import: list files: %w", err))
+		}
+		var candidates []string
+		for _, f := range all {
+			if strings.HasSuffix(f, "_test.go") {
+				continue
+			}
+			candidates = append(candidates, f)
+		}
+		switch {
+		case len(candidates) == 1:
+			file = candidates[0]
+			inferred = true
+		case len(candidates) == 0:
+			return errResult(fmt.Errorf("add-import: file is required (DB has no non-test .go files to infer from)"))
+		default:
+			return errResult(fmt.Errorf("add-import: file is required; pick one of: %s", strings.Join(candidates, ", ")))
+		}
+	}
 	dir := file
 	if idx := strings.LastIndex(dir, "/"); idx >= 0 {
 		dir = dir[:idx]
@@ -3074,7 +3098,11 @@ func (s *server) handleAddImport(_ context.Context, _ *sdkmcp.CallToolRequest, a
 		return errResult(fmt.Errorf("add-import: set imports: %w", err))
 	}
 	msg := s.autoEmitAndBuild()
-	return textResult(fmt.Sprintf("added import %q (alias=%q) to module %d\n%s", args.ImportPath, args.Alias, moduleID, msg)), nil, nil
+	prefix := ""
+	if inferred {
+		prefix = fmt.Sprintf("(inferred file=%q from single-file corpus) ", file)
+	}
+	return textResult(fmt.Sprintf("%sadded import %q (alias=%q) to module %d\n%s", prefix, args.ImportPath, args.Alias, moduleID, msg)), nil, nil
 }
 
 // handleRenameParam renames a function parameter (or receiver) in the
