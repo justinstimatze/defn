@@ -146,15 +146,62 @@ func Show(x int) {
 			`fmt.Println(x)`,
 		},
 	},
+	{
+		name:            "big-add-import",
+		fixtureFile:     "big_importer.go",
+		fixtureContents: buildBigImporterFile(),
+		prompt:          `In the file big_importer.go, add the "hash/fnv" standard-library import. Do not modify any function. Do not add any other imports.`,
+		mustContain: []string{
+			`"hash/fnv"`,
+			`"context"`,
+			`"encoding/json"`,
+		},
+	},
+	{
+		name:            "big-rename-param",
+		fixtureFile:     "big_process.go",
+		fixtureContents: buildBigProcessFile(),
+		prompt:          `In the file big_process.go, rename the parameter "data" to "payload" in the Process function — throughout the signature and body. Do not rename "verbose" or "raw" or any other identifier. Do not change any other behavior.`,
+		mustContain: []string{
+			`payload []byte`,
+			`len(payload)`,
+			`bytes.TrimSpace(payload)`,
+			`json.Unmarshal(payload,`,
+		},
+		mustNotContain: []string{
+			`data []byte`,
+			`len(data)`,
+			`bytes.TrimSpace(data)`,
+			`json.Unmarshal(data,`,
+		},
+	},
+	{
+		name:            "big-replace-slice",
+		fixtureFile:     "big_classify.go",
+		fixtureContents: buildBigMultiReturnFile(),
+		prompt:          `In the file big_classify.go, replace the FINAL return statement of the Classify function (the "unknown" fallthrough one) with: return "other", nil. Leave every other return statement untouched.`,
+		mustContain: []string{
+			`return "other", nil`,
+			`return "url", nil`,
+			`return "email", nil`,
+			`return "int", nil`,
+		},
+		mustNotContain: []string{
+			`return "unknown", nil`,
+		},
+	},
 }
 
 type mutationResult struct {
-	name      string
-	mode      string
-	toolCalls int
-	duration  time.Duration
-	correct   bool
-	rawOutput string
+	name         string
+	mode         string
+	toolCalls    int
+	inputTokens  int
+	outputTokens int
+	cachedTokens int
+	duration     time.Duration
+	correct      bool
+	rawOutput    string
 }
 
 // runMutationBench runs every mutation case in both files-mode and defn-mode
@@ -192,9 +239,6 @@ func runMutationBench(defnBin string) {
 		fmt.Fprintf(os.Stderr, "seed README: %v\n", err)
 		os.Exit(1)
 	}
-	// Add ONLY the files we just wrote — not `git add .` / `-A` — so we
-	// never accidentally include something the scratch dir picked up
-	// between commands.
 	must("git", "add", "go.mod", "README.md")
 	must("git", "commit", "-q", "-m", "seed")
 
@@ -202,10 +246,6 @@ func runMutationBench(defnBin string) {
 		fmt.Fprintf(os.Stderr, "defn init: %v\n", err)
 		os.Exit(1)
 	}
-	// Commit the artifacts defn init produced (.mcp.json + CLAUDE.md) so
-	// `git clean -fdq` in each case doesn't wipe them. The .defn/ dir is
-	// gitignored by defn init; the .codex dir is not something we need for
-	// this bench — leave it uncommitted, so it gets cleaned each case.
 	must("git", "add", ".mcp.json", "CLAUDE.md")
 	must("git", "commit", "-q", "-m", "post-defn-init")
 
@@ -217,50 +257,62 @@ func runMutationBench(defnBin string) {
 
 		rFiles := runMutationCase(scratch, defnBin, m, "files")
 		filesResults = append(filesResults, rFiles)
-		fmt.Printf("  files:  %d tool calls, %s, correct=%v\n", rFiles.toolCalls, rFiles.duration.Round(time.Second), rFiles.correct)
+		fmt.Printf("  files:  %d calls, %s, in/out/cache=%d/%d/%d tok, correct=%v\n",
+			rFiles.toolCalls, rFiles.duration.Round(time.Second),
+			rFiles.inputTokens, rFiles.outputTokens, rFiles.cachedTokens, rFiles.correct)
 
 		rDefn := runMutationCase(scratch, defnBin, m, "defn")
 		defnResults = append(defnResults, rDefn)
-		fmt.Printf("  defn:   %d tool calls, %s, correct=%v\n", rDefn.toolCalls, rDefn.duration.Round(time.Second), rDefn.correct)
+		fmt.Printf("  defn:   %d calls, %s, in/out/cache=%d/%d/%d tok, correct=%v\n",
+			rDefn.toolCalls, rDefn.duration.Round(time.Second),
+			rDefn.inputTokens, rDefn.outputTokens, rDefn.cachedTokens, rDefn.correct)
 		fmt.Println()
 	}
 
 	fmt.Println("=== Mutation summary ===")
-	fmt.Printf("%-24s %8s %8s %8s %8s %10s %10s\n", "Case", "F.calls", "D.calls", "F.time", "D.time", "F.correct", "D.correct")
-	fmt.Println(strings.Repeat("-", 90))
+	fmt.Printf("%-24s %6s %6s %8s %8s %8s %8s %6s %6s\n",
+		"Case", "F.cls", "D.cls", "F.inTok", "D.inTok", "F.outTok", "D.outTok", "F.ok", "D.ok")
+	fmt.Println(strings.Repeat("-", 96))
 	var fCalls, dCalls int
-	var fTime, dTime time.Duration
+	var fIn, dIn, fOut, dOut int
 	var fCorrect, dCorrect int
 	for i := range mutations {
 		f, d := filesResults[i], defnResults[i]
 		fCalls += f.toolCalls
 		dCalls += d.toolCalls
-		fTime += f.duration
-		dTime += d.duration
+		fIn += f.inputTokens
+		dIn += d.inputTokens
+		fOut += f.outputTokens
+		dOut += d.outputTokens
 		if f.correct {
 			fCorrect++
 		}
 		if d.correct {
 			dCorrect++
 		}
-		fmt.Printf("%-24s %8d %8d %8s %8s %10v %10v\n",
+		fmt.Printf("%-24s %6d %6d %8d %8d %8d %8d %6v %6v\n",
 			mutations[i].name, f.toolCalls, d.toolCalls,
-			f.duration.Round(time.Second), d.duration.Round(time.Second),
+			f.inputTokens, d.inputTokens, f.outputTokens, d.outputTokens,
 			f.correct, d.correct)
 	}
-	fmt.Println(strings.Repeat("-", 90))
-	fmt.Printf("%-24s %8d %8d %8s %8s %10s %10s\n",
-		"TOTAL", fCalls, dCalls, fTime.Round(time.Second), dTime.Round(time.Second),
+	fmt.Println(strings.Repeat("-", 96))
+	fmt.Printf("%-24s %6d %6d %8d %8d %8d %8d %6s %6s\n",
+		"TOTAL", fCalls, dCalls, fIn, dIn, fOut, dOut,
 		fmt.Sprintf("%d/%d", fCorrect, len(mutations)),
 		fmt.Sprintf("%d/%d", dCorrect, len(mutations)))
+	fmt.Println()
 	if fCalls > 0 {
-		fmt.Printf("\nTool call reduction: %.0f%%\n", float64(fCalls-dCalls)/float64(fCalls)*100)
+		fmt.Printf("Tool call reduction: %.0f%%\n", float64(fCalls-dCalls)/float64(fCalls)*100)
+	}
+	if fIn > 0 {
+		fmt.Printf("Input token reduction:  %.0f%%\n", float64(fIn-dIn)/float64(fIn)*100)
+	}
+	if fOut > 0 {
+		fmt.Printf("Output token reduction: %.0f%%\n", float64(fOut-dOut)/float64(fOut)*100)
 	}
 }
 
 func runMutationCase(scratch, defnBin string, m mutation, mode string) mutationResult {
-	// Reset to seed state (which includes .mcp.json + CLAUDE.md committed
-	// during setup; see runMutationBench).
 	resetCmd := exec.Command("git", "reset", "--hard", "-q")
 	resetCmd.Dir = scratch
 	if err := resetCmd.Run(); err != nil {
@@ -275,8 +327,6 @@ func runMutationCase(scratch, defnBin string, m mutation, mode string) mutationR
 		return mutationResult{name: m.name, mode: mode, rawOutput: fmt.Sprintf("write fixture: %v", err)}
 	}
 
-	// Re-sync defn's DB so the fixture is queryable in defn mode. In files
-	// mode this is wasted work but keeps the two runs symmetrical.
 	syncCmd := exec.Command(defnBin, "ingest", ".")
 	syncCmd.Dir = scratch
 	_ = syncCmd.Run()
@@ -289,11 +339,6 @@ func runMutationCase(scratch, defnBin string, m mutation, mode string) mutationR
 	}
 
 	start := time.Now()
-	// --mcp-config forces claude -p to load THIS repo's MCP config; in some
-	// environments cwd .mcp.json isn't picked up in headless mode.
-	// CLAUDE_ALLOW_GO_EDIT=1 tells the global enforce-defn-on-go-edits.sh
-	// hook to stay out of the way — otherwise the hook fires (because
-	// defn init created .defn/) and distorts BOTH modes' call counts.
 	cmd := exec.Command("claude", "-p", "--mcp-config", ".mcp.json", "--verbose", "--output-format", "stream-json")
 	cmd.Dir = scratch
 	cmd.Env = append(os.Environ(), "CLAUDE_ALLOW_GO_EDIT=1")
@@ -306,7 +351,11 @@ func runMutationCase(scratch, defnBin string, m mutation, mode string) mutationR
 		return res
 	}
 
-	res.toolCalls = countToolCalls(out)
+	stats := parseStreamJSON(out)
+	res.toolCalls = stats.ToolCalls
+	res.inputTokens = stats.InputTokens
+	res.outputTokens = stats.OutputTokens
+	res.cachedTokens = stats.CachedTokens
 
 	finalBytes, ferr := os.ReadFile(fixturePath)
 	if ferr != nil {
@@ -316,8 +365,20 @@ func runMutationCase(scratch, defnBin string, m mutation, mode string) mutationR
 	return res
 }
 
-func countToolCalls(out []byte) int {
-	toolCalls := 0
+// streamStats captures both the tool-call count and the token accounting
+// for a single claude -p invocation's stream-json output.
+type streamStats struct {
+	ToolCalls    int
+	InputTokens  int
+	OutputTokens int
+	CachedTokens int
+}
+
+// parseStreamJSON walks a claude -p stream-json output, counting tool_use
+// blocks and summing per-turn token usage. Every assistant turn carries
+// its own `usage` object; totals are the sum across all assistant turns.
+func parseStreamJSON(out []byte) streamStats {
+	var s streamStats
 	for _, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || line[0] != '{' {
@@ -334,21 +395,42 @@ func countToolCalls(out []byte) int {
 		if !ok {
 			continue
 		}
-		content, ok := message["content"].([]any)
-		if !ok {
-			continue
+		if content, ok := message["content"].([]any); ok {
+			for _, c := range content {
+				cm, ok := c.(map[string]any)
+				if !ok {
+					continue
+				}
+				if cm["type"] == "tool_use" {
+					s.ToolCalls++
+				}
+			}
 		}
-		for _, c := range content {
-			cm, ok := c.(map[string]any)
-			if !ok {
-				continue
-			}
-			if cm["type"] == "tool_use" {
-				toolCalls++
-			}
+		if usage, ok := message["usage"].(map[string]any); ok {
+			s.InputTokens += intField(usage, "input_tokens")
+			s.OutputTokens += intField(usage, "output_tokens")
+			s.CachedTokens += intField(usage, "cache_read_input_tokens")
 		}
 	}
-	return toolCalls
+	return s
+}
+
+func countToolCalls(out []byte) int { return parseStreamJSON(out).ToolCalls }
+
+func intField(m map[string]any, key string) int {
+	v, ok := m[key]
+	if !ok {
+		return 0
+	}
+	switch x := v.(type) {
+	case float64:
+		return int(x)
+	case int:
+		return x
+	case int64:
+		return int(x)
+	}
+	return 0
 }
 
 func checkPostCondition(final string, m mutation) bool {
