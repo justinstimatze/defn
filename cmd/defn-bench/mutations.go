@@ -459,10 +459,13 @@ FIRST STEP: call ToolSearch with query "select:mcp__defn__code" to load the defn
 
 Then use one of these ops:
 
-- code(op:"insert-precondition", name:"F", condition:"x < 0", ret:"return err") — inserts if <cond> { <ret> } at the top of function F
-- code(op:"replace-slice", name:"F", slice:"return", index:1, new:"return nil") — replaces the Nth match of slice kind (return, error-branch, loop, signature, body, doc) verbatim
-- code(op:"wrap-in-defer", name:"F", stmt_index:1, defer_body:"cleanup()") — inserts defer <body> before the Nth top-level statement of F
-- code(op:"rename-param", name:"F", old_param:"x", new_param:"n") — renames a param via ast.Object binding; shadowing respected
-- code(op:"add-import", file:"pkg/f.go", import_path:"errors") — adds an import with goimports-canonical grouping
+- code(op:"insert-precondition", condition:"x < 0", ret:"return err") — inserts if <cond> { <ret> } at function entry (name inferred if only one non-test function)
+- code(op:"replace-slice", slice:"return", index:1, new:"return nil") — replaces the Nth match of a slice kind (return, error-branch, loop, signature, body, doc)
+- code(op:"wrap-in-defer", stmt_index:1, defer_body:"cleanup()") — inserts defer <body> before the Nth top-level statement
+- code(op:"rename-param", old_param:"x", new_param:"n") — renames a param via ast.Object binding; shadowing respected
+- code(op:"add-import", import_path:"errors") — adds an import with goimports-canonical grouping (file inferred if only one non-test .go file)
+
+Multi-edit? BATCH with apply:
+- code(op:"apply", operations:[{op:"rename-param", old_param:"x", new_param:"n"}, {op:"wrap-in-defer", defer_body:"cleanup()"}]) — atomic, one emit+build for the whole batch, rolls back on any error
 
 Make the edit exactly as described — do not add any extra changes, do not touch other files.`

@@ -228,7 +228,7 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 		Name: "code",
 		Description: `Go code database. One tool, many ops. Start with impact for blast radius — it returns callers, transitives, and test coverage in one call. Don't follow up with search/explain unless you need more.
 
-Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, outline (compact projection — sig + doc + caller/callee summary, no body; use when body isn't needed), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply, diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
+Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, outline (compact projection — sig + doc + caller/callee summary, no body; use when body isn't needed), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 5 projection ops insert-precondition/replace-slice/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
 	}, s.handleCode)
 
 	return s, mcpServer
@@ -313,6 +313,21 @@ type applyOp struct {
 	NewFragment string `json:"new_fragment"`
 	After       string `json:"after"`
 	ReplaceAll  bool   `json:"replace_all"`
+
+	// Projection-op fields. Not all ops use every field; the op tag
+	// picks which apply. See internal/projection for the pure functions.
+	Condition  string `json:"condition"`   // insert-precondition
+	Ret        string `json:"ret"`         // insert-precondition
+	Slice      string `json:"slice"`       // replace-slice
+	Index      int    `json:"index"`       // replace-slice
+	New        string `json:"new"`         // replace-slice
+	Force      bool   `json:"force"`       // replace-slice
+	DeferBody  string `json:"defer_body"`  // wrap-in-defer
+	StmtIndex  int    `json:"stmt_index"`  // wrap-in-defer
+	OldParam   string `json:"old_param"`   // rename-param
+	NewParam   string `json:"new_param"`   // rename-param
+	ImportPath string `json:"import_path"` // add-import
+	Alias      string `json:"alias"`       // add-import
 }
 
 // Legacy param types used by internal handlers.
@@ -1582,7 +1597,6 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	var sb strings.Builder
 	var errors []string
 
-	// Dry-run: validate all operations without executing.
 	if args.DryRun {
 		for _, op := range args.Operations {
 			switch op.Op {
@@ -1617,6 +1631,27 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				} else {
 					sb.WriteString(fmt.Sprintf("→ would rename %s → %s\n", op.Name, op.NewName))
 				}
+			case "insert-precondition", "replace-slice", "wrap-in-defer", "rename-param":
+				name := op.Name
+				if name == "" {
+					if inferred, err := s.inferSingleTargetName(); err != nil {
+						errors = append(errors, fmt.Sprintf("%s: %v", op.Op, err))
+						continue
+					} else {
+						name = inferred
+					}
+				}
+				if _, err := s.db.GetDefinitionByName(name, ""); err != nil {
+					errors = append(errors, fmt.Sprintf("%s %s: not found", op.Op, name))
+				} else {
+					sb.WriteString(fmt.Sprintf("~ would %s on %s\n", op.Op, name))
+				}
+			case "add-import":
+				if op.ImportPath == "" {
+					errors = append(errors, "add-import: import_path is required")
+				} else {
+					sb.WriteString(fmt.Sprintf("+ would add import %q\n", op.ImportPath))
+				}
 			default:
 				errors = append(errors, fmt.Sprintf("unknown op: %s", op.Op))
 			}
@@ -1631,12 +1666,42 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		return textResult(sb.String()), nil, nil
 	}
 
-	// Wrap in transaction for atomicity.
 	commit, rollback, txErr := s.db.Begin()
 	if txErr != nil {
 		return errResult(txErr)
 	}
-	defer rollback() // rollback if we don't commit
+	defer rollback()
+
+	// projEdit resolves the target name (with single-def inference), runs
+	// the pure projection function, validates the new body, and upserts.
+	projEdit := func(op applyOp, compute func(body string) (string, error)) (string, string) {
+		name := op.Name
+		if name == "" {
+			inferred, err := s.inferSingleTargetName()
+			if err != nil {
+				return "", fmt.Sprintf("%s: %v", op.Op, err)
+			}
+			name = inferred
+		}
+		d, err := s.db.GetDefinitionByName(name, "")
+		if err != nil {
+			return "", fmt.Sprintf("%s %s: not found", op.Op, name)
+		}
+		newBody, err := compute(d.Body)
+		if err != nil {
+			return "", fmt.Sprintf("%s %s: %v", op.Op, name, err)
+		}
+		validSrc := "package x\n" + newBody
+		if _, parseErr := parser.ParseFile(token.NewFileSet(), "", validSrc, parser.ParseComments); parseErr != nil {
+			return "", fmt.Sprintf("%s %s: produces invalid Go: %v", op.Op, name, parseErr)
+		}
+		d.Body = newBody
+		d.Signature = extractSignature(newBody)
+		if _, err := s.db.UpsertDefinition(d); err != nil {
+			return "", fmt.Sprintf("%s %s: %v", op.Op, name, err)
+		}
+		return fmt.Sprintf("~ %s on %s\n", op.Op, name), ""
+	}
 
 	for _, op := range args.Operations {
 		switch op.Op {
@@ -1666,7 +1731,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				}
 			}
 			if mod == nil {
-				mods, _ := s.db.ListModules() // best effort — nil is safe
+				mods, _ := s.db.ListModules()
 				if len(mods) > 0 {
 					mod = &mods[0]
 				}
@@ -1695,7 +1760,6 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				continue
 			}
 			if op.OldFragment != "" {
-				// Fragment mode.
 				count := strings.Count(d.Body, op.OldFragment)
 				if count == 0 {
 					errors = append(errors, fmt.Sprintf("edit %s: old_fragment not found", op.Name))
@@ -1717,7 +1781,6 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				}
 				d.Body = body
 			}
-			// Validate syntax before saving.
 			validSrc := "package x\n" + d.Body
 			if _, parseErr := parser.ParseFile(token.NewFileSet(), "", validSrc, parser.ParseComments); parseErr != nil {
 				errors = append(errors, fmt.Sprintf("edit %s: produces invalid Go: %v", op.Name, parseErr))
@@ -1760,8 +1823,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				errors = append(errors, fmt.Sprintf("rename %s: %v", op.Name, err))
 				continue
 			}
-			// Update callers (same as handleRename).
-			callers, _ := s.db.GetCallers(d.ID) // best effort
+			callers, _ := s.db.GetCallers(d.ID)
 			callerCount := 0
 			for _, caller := range callers {
 				if strings.Contains(caller.Body, op.Name) {
@@ -1776,21 +1838,117 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			}
 			sb.WriteString(fmt.Sprintf("→ renamed %s → %s (%d callers updated)\n", op.Name, op.NewName, callerCount))
 
+		case "insert-precondition":
+			line, errStr := projEdit(op, func(body string) (string, error) {
+				return projection.InsertPrecondition(body, op.Condition, op.Ret)
+			})
+			if errStr != "" {
+				errors = append(errors, errStr)
+			} else {
+				sb.WriteString(line)
+			}
+
+		case "replace-slice":
+			idx := op.Index
+			if idx == 0 {
+				idx = 1
+			}
+			line, errStr := projEdit(op, func(body string) (string, error) {
+				if op.Force {
+					return projection.ReplaceSliceForce(body, op.Slice, idx, op.New)
+				}
+				return projection.ReplaceSlice(body, op.Slice, idx, op.New)
+			})
+			if errStr != "" {
+				errors = append(errors, errStr)
+			} else {
+				sb.WriteString(line)
+			}
+
+		case "wrap-in-defer":
+			line, errStr := projEdit(op, func(body string) (string, error) {
+				return projection.WrapInDefer(body, op.StmtIndex, op.DeferBody)
+			})
+			if errStr != "" {
+				errors = append(errors, errStr)
+			} else {
+				sb.WriteString(line)
+			}
+
+		case "rename-param":
+			line, errStr := projEdit(op, func(body string) (string, error) {
+				return projection.RenameParam(body, op.OldParam, op.NewParam)
+			})
+			if errStr != "" {
+				errors = append(errors, errStr)
+			} else {
+				sb.WriteString(line)
+			}
+
+		case "add-import":
+			if op.ImportPath == "" {
+				errors = append(errors, "add-import: import_path is required")
+				continue
+			}
+			file := op.File
+			if file == "" {
+				all, err := s.db.DistinctSourceFiles()
+				if err != nil {
+					errors = append(errors, fmt.Sprintf("add-import: %v", err))
+					continue
+				}
+				var candidates []string
+				for _, f := range all {
+					if !strings.HasSuffix(f, "_test.go") {
+						candidates = append(candidates, f)
+					}
+				}
+				if len(candidates) == 1 {
+					file = candidates[0]
+				} else {
+					errors = append(errors, fmt.Sprintf("add-import: file is required (found %d non-test .go files)", len(candidates)))
+					continue
+				}
+			}
+			dir := file
+			if idx := strings.LastIndex(dir, "/"); idx >= 0 {
+				dir = dir[:idx]
+			}
+			defs, err := s.db.FindDefinitionsByFile(dir, file, 0)
+			if err != nil || len(defs) == 0 {
+				errors = append(errors, fmt.Sprintf("add-import: no defs in %q", file))
+				continue
+			}
+			moduleID := defs[0].ModuleID
+			existing, err := s.db.GetImports(moduleID)
+			if err != nil {
+				errors = append(errors, fmt.Sprintf("add-import: read imports: %v", err))
+				continue
+			}
+			alreadyPresent := false
+			for _, imp := range existing {
+				if imp.ImportedPath == op.ImportPath && imp.Alias == op.Alias {
+					alreadyPresent = true
+					break
+				}
+			}
+			if alreadyPresent {
+				sb.WriteString(fmt.Sprintf("= import %q already present\n", op.ImportPath))
+				continue
+			}
+			updated := append(existing, store.Import{ModuleID: moduleID, ImportedPath: op.ImportPath, Alias: op.Alias})
+			if err := s.db.SetImports(moduleID, updated); err != nil {
+				errors = append(errors, fmt.Sprintf("add-import %q: %v", op.ImportPath, err))
+			} else {
+				sb.WriteString(fmt.Sprintf("+ added import %q\n", op.ImportPath))
+			}
+
 		default:
 			errors = append(errors, fmt.Sprintf("unknown op: %s", op.Op))
 		}
 	}
 
 	if len(errors) > 0 {
-		sb.WriteString(fmt.Sprintf("\n%d errors:\n", len(errors)))
-		for _, e := range errors {
-			sb.WriteString("  " + e + "\n")
-		}
-	}
-
-	// Commit transaction if no errors.
-	if len(errors) > 0 {
-		// Rollback happens via defer. Don't commit partial state.
 		sb.WriteString("\nErrors (transaction rolled back):\n")
 		for _, e := range errors {
 			sb.WriteString("- " + e + "\n")
@@ -1801,9 +1959,8 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		return errResult(fmt.Errorf("commit: %w", err))
 	}
 
-	// One emit + build for all changes.
 	buildResult := s.autoEmitAndBuild()
-	s.autoResolve("") // full resolve — batch may touch multiple modules
+	s.autoResolve("")
 	if buildResult != "" {
 		sb.WriteString("\n" + buildResult)
 	}

@@ -22,7 +22,13 @@ code(op: "test", name: "Render")               -- run affected tests only
 code(op: "sync")                               -- re-ingest after file edits
 code(op: "sync", file: "pkg/foo.go")           -- fast single-file sync (~10ms)
 code(op: "emit", out: "/tmp/out")              -- emit the tree (works while serve holds the DB)
+code(op: "apply", operations: [                -- BATCH multiple ops in one call, atomic, one emit+build
+  {op: "rename-param", name: "F", old_param: "data", new_param: "payload"},
+  {op: "wrap-in-defer", name: "F", defer_body: "cleanup()"},
+  {op: "insert-precondition", name: "F", condition: "err != nil", ret: "return err"}])
 ```
+
+**Batch when you can.** `apply` accepts create/edit/delete/rename PLUS all 5 projection ops (insert-precondition, replace-slice, wrap-in-defer, rename-param, add-import). Prefer one `apply` over N sequential calls: same file gets emitted+built once instead of N times, and any error rolls back the whole batch atomically. Especially valuable for related edits to one def.
 
 All ops: read, outline, slice, insert-precondition, replace-slice, wrap-in-defer, rename-param, add-import, search, impact, explain, untested, edit, create, delete, rename, move, test, apply, diff, history, find, sync, emit, query, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, traverse, literals, pragmas, file-defs, overview, patch.
 
