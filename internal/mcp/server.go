@@ -3008,26 +3008,34 @@ func pluralS(n int) string {
 // brace. Byte-exact PUTGET against the input body — see
 // [[project_putget_edit_vocab_design]] and internal/projection for the
 // pure function and its fixture goldens.
+//
+// If args.Name is empty, tries to infer the target: if the DB has exactly
+// one non-test function, uses it; otherwise errors with the candidate list.
 func (s *server) handleInsertPrecondition(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	if strings.TrimSpace(args.Name) == "" {
-		return errResult(fmt.Errorf("insert-precondition: name is required"))
-	}
 	if strings.TrimSpace(args.Condition) == "" {
 		return errResult(fmt.Errorf("insert-precondition: condition is required"))
 	}
 	if strings.TrimSpace(args.Ret) == "" {
 		return errResult(fmt.Errorf("insert-precondition: ret is required"))
 	}
-	d, err := s.db.GetDefinitionByName(args.Name, "")
+	name := strings.TrimSpace(args.Name)
+	if name == "" {
+		inferred, err := s.inferSingleTargetName()
+		if err != nil {
+			return errResult(fmt.Errorf("insert-precondition: %w", err))
+		}
+		name = inferred
+	}
+	d, err := s.db.GetDefinitionByName(name, "")
 	if err != nil {
-		return errResult(fmt.Errorf("definition %q not found", args.Name))
+		return errResult(fmt.Errorf("definition %q not found", name))
 	}
 	newBody, err := projection.InsertPrecondition(d.Body, args.Condition, args.Ret)
 	if err != nil {
 		return errResult(err)
 	}
 	snippet := fmt.Sprintf("if %s {\n\t%s\n}", args.Condition, args.Ret)
-	return s.applyEditTerse(args.Name, "inserted precondition at entry", snippet, newBody)
+	return s.applyEditTerse(name, "inserted precondition at entry", snippet, newBody)
 }
 
 // handleAddImport adds a new import (with optional alias) to the module
@@ -3122,46 +3130,61 @@ func (s *server) handleAddImport(_ context.Context, _ *sdkmcp.CallToolRequest, a
 // definition's body via ast.Object scoping. Output is gofmt-normalized,
 // so the PUTGET contract is ≡_gofmt equivalence rather than byte-exact.
 // See [[project_putget_edit_vocab_design]].
+//
+// If args.Name is empty, tries to infer the target: if the DB has exactly
+// one non-test function, uses it; otherwise errors with the candidate list.
 func (s *server) handleRenameParam(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	if strings.TrimSpace(args.Name) == "" {
-		return errResult(fmt.Errorf("rename-param: name is required"))
-	}
 	if strings.TrimSpace(args.OldParam) == "" {
 		return errResult(fmt.Errorf("rename-param: old_param is required"))
 	}
 	if strings.TrimSpace(args.NewParam) == "" {
 		return errResult(fmt.Errorf("rename-param: new_param is required"))
 	}
-	d, err := s.db.GetDefinitionByName(args.Name, "")
+	name := strings.TrimSpace(args.Name)
+	if name == "" {
+		inferred, err := s.inferSingleTargetName()
+		if err != nil {
+			return errResult(fmt.Errorf("rename-param: %w", err))
+		}
+		name = inferred
+	}
+	d, err := s.db.GetDefinitionByName(name, "")
 	if err != nil {
-		return errResult(fmt.Errorf("definition %q not found", args.Name))
+		return errResult(fmt.Errorf("definition %q not found", name))
 	}
 	newBody, err := projection.RenameParam(d.Body, args.OldParam, args.NewParam)
 	if err != nil {
 		return errResult(err)
 	}
 	action := fmt.Sprintf("renamed param %q → %q", args.OldParam, args.NewParam)
-	// Show just the new signature line so the agent sees the rename landed.
 	snippet := newBody
 	if idx := strings.Index(newBody, "\n"); idx > 0 {
 		snippet = newBody[:idx]
 	}
-	return s.applyEditTerse(args.Name, action, snippet, newBody)
+	return s.applyEditTerse(name, action, snippet, newBody)
 }
 
 // handleWrapInDefer inserts a `defer <defer_body>` statement immediately
 // before the Nth (1-based) top-level statement in the definition's body.
 // Byte-exact PUTGET — see [[project_putget_edit_vocab_design]].
+//
+// If args.Name is empty, tries to infer the target: if the DB has exactly
+// one non-test function, uses it; otherwise errors with the candidate list.
 func (s *server) handleWrapInDefer(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	if strings.TrimSpace(args.Name) == "" {
-		return errResult(fmt.Errorf("wrap-in-defer: name is required"))
-	}
 	if strings.TrimSpace(args.DeferBody) == "" {
 		return errResult(fmt.Errorf("wrap-in-defer: defer_body is required"))
 	}
-	d, err := s.db.GetDefinitionByName(args.Name, "")
+	name := strings.TrimSpace(args.Name)
+	if name == "" {
+		inferred, err := s.inferSingleTargetName()
+		if err != nil {
+			return errResult(fmt.Errorf("wrap-in-defer: %w", err))
+		}
+		name = inferred
+	}
+	d, err := s.db.GetDefinitionByName(name, "")
 	if err != nil {
-		return errResult(fmt.Errorf("definition %q not found", args.Name))
+		return errResult(fmt.Errorf("definition %q not found", name))
 	}
 	newBody, err := projection.WrapInDefer(d.Body, args.StmtIndex, args.DeferBody)
 	if err != nil {
@@ -3173,7 +3196,7 @@ func (s *server) handleWrapInDefer(_ context.Context, _ *sdkmcp.CallToolRequest,
 	}
 	action := fmt.Sprintf("inserted defer before stmt #%d", stmtIdx)
 	snippet := fmt.Sprintf("defer %s", args.DeferBody)
-	return s.applyEditTerse(args.Name, action, snippet, newBody)
+	return s.applyEditTerse(name, action, snippet, newBody)
 }
 
 // handleReplaceSlice replaces the Nth (1-based) match of the given AST
@@ -3186,10 +3209,10 @@ func (s *server) handleWrapInDefer(_ context.Context, _ *sdkmcp.CallToolRequest,
 // comment not present in `new`. Pass `force:true` to discard interior
 // comments explicitly. See internal/projection.ReplaceSlice for the
 // contract.
+//
+// If args.Name is empty, tries to infer the target: if the DB has exactly
+// one non-test function, uses it; otherwise errors with the candidate list.
 func (s *server) handleReplaceSlice(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	if strings.TrimSpace(args.Name) == "" {
-		return errResult(fmt.Errorf("replace-slice: name is required"))
-	}
 	if strings.TrimSpace(args.Slice) == "" {
 		return errResult(fmt.Errorf("replace-slice: slice kind is required — valid: %s", strings.Join(projection.SliceKindNames(), ", ")))
 	}
@@ -3200,9 +3223,17 @@ func (s *server) handleReplaceSlice(_ context.Context, _ *sdkmcp.CallToolRequest
 	if index == 0 {
 		index = 1
 	}
-	d, err := s.db.GetDefinitionByName(args.Name, "")
+	name := strings.TrimSpace(args.Name)
+	if name == "" {
+		inferred, err := s.inferSingleTargetName()
+		if err != nil {
+			return errResult(fmt.Errorf("replace-slice: %w", err))
+		}
+		name = inferred
+	}
+	d, err := s.db.GetDefinitionByName(name, "")
 	if err != nil {
-		return errResult(fmt.Errorf("definition %q not found", args.Name))
+		return errResult(fmt.Errorf("definition %q not found", name))
 	}
 	var newBody string
 	if args.Force {
@@ -3214,7 +3245,7 @@ func (s *server) handleReplaceSlice(_ context.Context, _ *sdkmcp.CallToolRequest
 		return errResult(err)
 	}
 	action := fmt.Sprintf("replaced %s #%d", args.Slice, index)
-	return s.applyEditTerse(args.Name, action, args.New, newBody)
+	return s.applyEditTerse(name, action, args.New, newBody)
 }
 
 // applyEditTerse is the projection-op response path: takes a computed
@@ -3275,4 +3306,42 @@ func (s *server) applyEditTerse(name, action, snippet, newBody string) (*sdkmcp.
 		sb.WriteString("\n")
 	}
 	return textResult(sb.String()), nil, nil
+}
+
+// inferSingleTargetName returns the name of the only non-test function
+// or method in the corpus. Used by projection-op handlers to make `name`
+// optional in the single-def corpus case (e.g. bench fixtures) — mirrors
+// the file-inference pattern in handleAddImport. Errors when zero or
+// more than one candidate exists, listing the candidates so the caller
+// can retry with an explicit name.
+func (s *server) inferSingleTargetName() (string, error) {
+	defs, err := s.db.FilterDefinitions("", "", "", 0)
+	if err != nil {
+		return "", fmt.Errorf("infer name: list definitions: %w", err)
+	}
+	var candidates []string
+	for _, d := range defs {
+		if d.Test {
+			continue
+		}
+		if d.Kind != "function" && d.Kind != "method" {
+			continue
+		}
+		name := d.Name
+		if d.Receiver != "" {
+			name = strings.TrimPrefix(d.Receiver, "*") + "." + d.Name
+		}
+		candidates = append(candidates, name)
+	}
+	switch len(candidates) {
+	case 1:
+		return candidates[0], nil
+	case 0:
+		return "", fmt.Errorf("name is required (DB has no non-test functions to infer from)")
+	default:
+		if len(candidates) > 8 {
+			candidates = append(candidates[:8], "…")
+		}
+		return "", fmt.Errorf("name is required; %d candidates: %s", len(candidates), strings.Join(candidates, ", "))
+	}
 }

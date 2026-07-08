@@ -9,10 +9,10 @@ code(op: "read", name: "handleEdit")           -- full source by name
 code(op: "read", name: "server.go:272")        -- or by file:line
 code(op: "outline", name: "handleEdit")        -- compact projection: sig+doc+refs+flow, no body (v0.24.2)
 code(op: "slice", name: "handleEdit", slice: "error-branch") -- verbatim AST-role slice (v0.24.2)
-code(op: "insert-precondition", name: "F", condition: "x < 0", ret: "return err") -- byte-exact PUTGET (v0.25.0)
-code(op: "replace-slice", name: "F", slice: "return", index: 1, new: "return nil") -- byte-exact PUTGET (v0.25.0)
-code(op: "wrap-in-defer", name: "F", stmt_index: 1, defer_body: "cleanup()") -- byte-exact PUTGET (v0.25.0)
-code(op: "rename-param", name: "F", old_param: "x", new_param: "n") -- ≡_gofmt PUTGET (v0.25.0)
+code(op: "insert-precondition", name: "F", condition: "x < 0", ret: "return err") -- byte-exact PUTGET; name optional if the DB has one non-test function (v0.25.0)
+code(op: "replace-slice", name: "F", slice: "return", index: 1, new: "return nil") -- byte-exact PUTGET; name optional if the DB has one non-test function (v0.25.0)
+code(op: "wrap-in-defer", name: "F", stmt_index: 1, defer_body: "cleanup()") -- byte-exact PUTGET; name optional if the DB has one non-test function (v0.25.0)
+code(op: "rename-param", name: "F", old_param: "x", new_param: "n") -- ≡_gofmt PUTGET; name optional if the DB has one non-test function (v0.25.0)
 code(op: "add-import", import_path: "errors", file: "pkg/f.go", alias: "") -- goimports-canonical grouping; file optional if the DB has one non-test .go file (v0.25.0)
 code(op: "impact", name: "Render")             -- blast radius + test coverage
 code(op: "edit", name: "Foo", new_body: "...") -- edit, auto-emit + build
