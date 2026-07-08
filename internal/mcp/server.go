@@ -3008,7 +3008,7 @@ func pluralS(n int) string {
 // brace. Byte-exact PUTGET against the input body — see
 // [[project_putget_edit_vocab_design]] and internal/projection for the
 // pure function and its fixture goldens.
-func (s *server) handleInsertPrecondition(ctx context.Context, req *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) handleInsertPrecondition(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	if strings.TrimSpace(args.Name) == "" {
 		return errResult(fmt.Errorf("insert-precondition: name is required"))
 	}
@@ -3026,7 +3026,8 @@ func (s *server) handleInsertPrecondition(ctx context.Context, req *sdkmcp.CallT
 	if err != nil {
 		return errResult(err)
 	}
-	return s.handleEdit(ctx, req, editParam{Name: args.Name, NewBody: newBody})
+	snippet := fmt.Sprintf("if %s {\n\t%s\n}", args.Condition, args.Ret)
+	return s.applyEditTerse(args.Name, "inserted precondition at entry", snippet, newBody)
 }
 
 // handleAddImport adds a new import (with optional alias) to the module
@@ -3045,7 +3046,6 @@ func (s *server) handleAddImport(_ context.Context, _ *sdkmcp.CallToolRequest, a
 		return errResult(fmt.Errorf("add-import: import_path is required"))
 	}
 	file := strings.TrimSpace(args.File)
-	inferred := false
 	if file == "" {
 		all, err := s.db.DistinctSourceFiles()
 		if err != nil {
@@ -3061,7 +3061,6 @@ func (s *server) handleAddImport(_ context.Context, _ *sdkmcp.CallToolRequest, a
 		switch {
 		case len(candidates) == 1:
 			file = candidates[0]
-			inferred = true
 		case len(candidates) == 0:
 			return errResult(fmt.Errorf("add-import: file is required (DB has no non-test .go files to infer from)"))
 		default:
@@ -3086,7 +3085,7 @@ func (s *server) handleAddImport(_ context.Context, _ *sdkmcp.CallToolRequest, a
 	}
 	for _, imp := range existing {
 		if imp.ImportedPath == args.ImportPath && imp.Alias == args.Alias {
-			return textResult(fmt.Sprintf("import %q already present (no-op)", args.ImportPath)), nil, nil
+			return textResult(fmt.Sprintf("%s: import %q already present (no-op)\n", file, args.ImportPath)), nil, nil
 		}
 	}
 	updated := append(existing, store.Import{
@@ -3097,19 +3096,33 @@ func (s *server) handleAddImport(_ context.Context, _ *sdkmcp.CallToolRequest, a
 	if err := s.db.SetImports(moduleID, updated); err != nil {
 		return errResult(fmt.Errorf("add-import: set imports: %w", err))
 	}
-	msg := s.autoEmitAndBuild()
-	prefix := ""
-	if inferred {
-		prefix = fmt.Sprintf("(inferred file=%q from single-file corpus) ", file)
+	buildResult := s.autoEmitAndBuild()
+	snippet := fmt.Sprintf("import %q", args.ImportPath)
+	if args.Alias != "" {
+		snippet = fmt.Sprintf("import %s %q", args.Alias, args.ImportPath)
 	}
-	return textResult(fmt.Sprintf("%sadded import %q (alias=%q) to module %d\n%s", prefix, args.ImportPath, args.Alias, moduleID, msg)), nil, nil
+	var sb strings.Builder
+	sb.WriteString(file)
+	sb.WriteString(": added import\n    ")
+	sb.WriteString(snippet)
+	sb.WriteString("\n")
+	if buildResult != "" {
+		firstLine := buildResult
+		if idx := strings.Index(buildResult, "\n"); idx > 0 {
+			firstLine = buildResult[:idx]
+		}
+		sb.WriteString("build: ")
+		sb.WriteString(strings.ToLower(firstLine))
+		sb.WriteString("\n")
+	}
+	return textResult(sb.String()), nil, nil
 }
 
 // handleRenameParam renames a function parameter (or receiver) in the
 // definition's body via ast.Object scoping. Output is gofmt-normalized,
 // so the PUTGET contract is ≡_gofmt equivalence rather than byte-exact.
 // See [[project_putget_edit_vocab_design]].
-func (s *server) handleRenameParam(ctx context.Context, req *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) handleRenameParam(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	if strings.TrimSpace(args.Name) == "" {
 		return errResult(fmt.Errorf("rename-param: name is required"))
 	}
@@ -3127,13 +3140,19 @@ func (s *server) handleRenameParam(ctx context.Context, req *sdkmcp.CallToolRequ
 	if err != nil {
 		return errResult(err)
 	}
-	return s.handleEdit(ctx, req, editParam{Name: args.Name, NewBody: newBody})
+	action := fmt.Sprintf("renamed param %q → %q", args.OldParam, args.NewParam)
+	// Show just the new signature line so the agent sees the rename landed.
+	snippet := newBody
+	if idx := strings.Index(newBody, "\n"); idx > 0 {
+		snippet = newBody[:idx]
+	}
+	return s.applyEditTerse(args.Name, action, snippet, newBody)
 }
 
 // handleWrapInDefer inserts a `defer <defer_body>` statement immediately
 // before the Nth (1-based) top-level statement in the definition's body.
 // Byte-exact PUTGET — see [[project_putget_edit_vocab_design]].
-func (s *server) handleWrapInDefer(ctx context.Context, req *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) handleWrapInDefer(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	if strings.TrimSpace(args.Name) == "" {
 		return errResult(fmt.Errorf("wrap-in-defer: name is required"))
 	}
@@ -3148,7 +3167,13 @@ func (s *server) handleWrapInDefer(ctx context.Context, req *sdkmcp.CallToolRequ
 	if err != nil {
 		return errResult(err)
 	}
-	return s.handleEdit(ctx, req, editParam{Name: args.Name, NewBody: newBody})
+	stmtIdx := args.StmtIndex
+	if stmtIdx == 0 {
+		stmtIdx = 1
+	}
+	action := fmt.Sprintf("inserted defer before stmt #%d", stmtIdx)
+	snippet := fmt.Sprintf("defer %s", args.DeferBody)
+	return s.applyEditTerse(args.Name, action, snippet, newBody)
 }
 
 // handleReplaceSlice replaces the Nth (1-based) match of the given AST
@@ -3161,7 +3186,7 @@ func (s *server) handleWrapInDefer(ctx context.Context, req *sdkmcp.CallToolRequ
 // comment not present in `new`. Pass `force:true` to discard interior
 // comments explicitly. See internal/projection.ReplaceSlice for the
 // contract.
-func (s *server) handleReplaceSlice(ctx context.Context, req *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) handleReplaceSlice(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	if strings.TrimSpace(args.Name) == "" {
 		return errResult(fmt.Errorf("replace-slice: name is required"))
 	}
@@ -3188,5 +3213,66 @@ func (s *server) handleReplaceSlice(ctx context.Context, req *sdkmcp.CallToolReq
 	if err != nil {
 		return errResult(err)
 	}
-	return s.handleEdit(ctx, req, editParam{Name: args.Name, NewBody: newBody})
+	action := fmt.Sprintf("replaced %s #%d", args.Slice, index)
+	return s.applyEditTerse(args.Name, action, args.New, newBody)
+}
+
+// applyEditTerse is the projection-op response path: takes a computed
+// newBody + a compact human summary of what changed, does the same DB
+// write + build that handleEdit does, and returns a much tighter
+// response so the agent doesn't feel compelled to Read-verify.
+//
+// Format:
+//
+//	F: <action>
+//	    <snippet-line-1>
+//	    <snippet-line-2>
+//	build: ok
+//
+// Snippet is truncated to ~200 chars / ~6 lines. Skips the caller-count
+// FYI nudge that handleEdit prints (agents can ask for impact if they want).
+func (s *server) applyEditTerse(name, action, snippet, newBody string) (*sdkmcp.CallToolResult, any, error) {
+	d, err := s.db.GetDefinitionByName(name, "")
+	if err != nil {
+		return errResult(fmt.Errorf("definition %q not found", name))
+	}
+	src := "package x\n" + newBody
+	if _, parseErr := parser.ParseFile(token.NewFileSet(), "", src, parser.ParseComments); parseErr != nil {
+		return errResult(fmt.Errorf("new_body has syntax error: %v", parseErr))
+	}
+	d.Body = newBody
+	d.Signature = extractSignature(newBody)
+	if _, err := s.db.UpsertDefinition(d); err != nil {
+		return errResult(err)
+	}
+	buildResult := s.autoEmitAndBuild()
+	s.autoResolve(s.modulePath(d.ModuleID))
+
+	recv := formatReceiver(d.Receiver)
+	var sb strings.Builder
+	sb.WriteString(recv)
+	sb.WriteString(name)
+	sb.WriteString(": ")
+	sb.WriteString(action)
+	sb.WriteString("\n")
+	if snippet != "" {
+		if len(snippet) > 200 {
+			snippet = snippet[:200] + "…"
+		}
+		for _, line := range strings.Split(strings.TrimRight(snippet, "\n"), "\n") {
+			sb.WriteString("    ")
+			sb.WriteString(line)
+			sb.WriteString("\n")
+		}
+	}
+	if buildResult != "" {
+		firstLine := buildResult
+		if idx := strings.Index(buildResult, "\n"); idx > 0 {
+			firstLine = buildResult[:idx]
+		}
+		sb.WriteString("build: ")
+		sb.WriteString(strings.ToLower(firstLine))
+		sb.WriteString("\n")
+	}
+	return textResult(sb.String()), nil, nil
 }
