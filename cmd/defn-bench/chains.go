@@ -133,69 +133,36 @@ func RunB(x int) int {
 	},
 }
 
-// runChainBench runs every chain case in both files-mode and defn-mode
-// against a fresh scratch repo, git-resetting between runs. Mirrors
-// runMutationBench but writes multiple fixtures per case.
+// runChainBench runs every chain case in both files-mode and defn-mode.
+// Each case gets its own fresh scratch dir so DB state from prior cases
+// can't leak into later cases — the shared-scratch v1 shape leaked
+// state from case 1's projection-op edits into case 2's rename, making
+// the isolated fix look like it wasn't taking effect. Fresh scratch per
+// case costs ~500ms of setup (mktemp + git init + defn init) but is
+// worth it for correctness signal integrity.
 func runChainBench(defnBin string) {
-	scratch, err := os.MkdirTemp("", "defn-bench-chain-*")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "scratch dir: %v\n", err)
-		os.Exit(1)
-	}
-	defer os.RemoveAll(scratch)
-
-	fmt.Printf("scratch: %s\n", scratch)
-
-	run := func(args ...string) error {
-		cmd := exec.Command(args[0], args[1:]...)
-		cmd.Dir = scratch
-		cmd.Stderr = os.Stderr
-		return cmd.Run()
-	}
-	must := func(args ...string) {
-		if err := run(args...); err != nil {
-			fmt.Fprintf(os.Stderr, "setup %v: %v\n", args, err)
-			os.Exit(1)
-		}
-	}
-	must("git", "init", "-q")
-	must("git", "config", "user.email", "bench@example.com")
-	must("git", "config", "user.name", "bench")
-	if err := os.WriteFile(filepath.Join(scratch, "go.mod"), []byte("module fixture\n\ngo 1.26\n"), 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "seed go.mod: %v\n", err)
-		os.Exit(1)
-	}
-	if err := os.WriteFile(filepath.Join(scratch, "README.md"), []byte("bench fixture\n"), 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "seed README: %v\n", err)
-		os.Exit(1)
-	}
-	must("git", "add", "go.mod", "README.md")
-	must("git", "commit", "-q", "-m", "seed")
-
-	if err := exec.Command(defnBin, "init", scratch).Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "defn init: %v\n", err)
-		os.Exit(1)
-	}
-	must("git", "add", ".mcp.json", "CLAUDE.md")
-	must("git", "commit", "-q", "-m", "post-defn-init")
-
-	fmt.Printf("\n=== Running %d chain cases in both modes ===\n\n", len(chains))
+	fmt.Printf("\n=== Running %d chain cases in both modes (fresh scratch per case) ===\n\n", len(chains))
 
 	var filesResults, defnResults []mutationResult
 	for i, c := range chains {
 		fmt.Printf("[%d/%d] %s (%d fixture files)\n", i+1, len(chains), c.name, len(c.fixtures))
 
-		rFiles := runChainCase(scratch, defnBin, c, "files")
+		filesScratch := prepareChainScratch(defnBin)
+		rFiles := runChainCase(filesScratch, defnBin, c, "files")
 		filesResults = append(filesResults, rFiles)
 		fmt.Printf("  files:  %d calls, %s, in/out/cache=%d/%d/%d tok, correct=%v\n",
 			rFiles.toolCalls, rFiles.duration.Round(time.Second),
 			rFiles.inputTokens, rFiles.outputTokens, rFiles.cachedTokens, rFiles.correct)
+		os.RemoveAll(filesScratch)
 
-		rDefn := runChainCase(scratch, defnBin, c, "defn")
+		defnScratch := prepareChainScratch(defnBin)
+		rDefn := runChainCase(defnScratch, defnBin, c, "defn")
 		defnResults = append(defnResults, rDefn)
 		fmt.Printf("  defn:   %d calls, %s, in/out/cache=%d/%d/%d tok, correct=%v\n",
 			rDefn.toolCalls, rDefn.duration.Round(time.Second),
 			rDefn.inputTokens, rDefn.outputTokens, rDefn.cachedTokens, rDefn.correct)
+		os.RemoveAll(defnScratch)
+
 		fmt.Println()
 	}
 
@@ -240,6 +207,49 @@ func runChainBench(defnBin string) {
 	if fOut > 0 {
 		fmt.Printf("Output token reduction: %.0f%%\n", float64(fOut-dOut)/float64(fOut)*100)
 	}
+}
+
+// prepareChainScratch spins up a fresh scratch git+defn repo for a single
+// case run. Caller is responsible for os.RemoveAll(returned path) when done.
+func prepareChainScratch(defnBin string) string {
+	scratch, err := os.MkdirTemp("", "defn-bench-chain-*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "scratch dir: %v\n", err)
+		os.Exit(1)
+	}
+	run := func(args ...string) error {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = scratch
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
+	}
+	must := func(args ...string) {
+		if err := run(args...); err != nil {
+			fmt.Fprintf(os.Stderr, "setup %v: %v\n", args, err)
+			os.Exit(1)
+		}
+	}
+	must("git", "init", "-q")
+	must("git", "config", "user.email", "bench@example.com")
+	must("git", "config", "user.name", "bench")
+	if err := os.WriteFile(filepath.Join(scratch, "go.mod"), []byte("module fixture\n\ngo 1.26\n"), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "seed go.mod: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(filepath.Join(scratch, "README.md"), []byte("bench fixture\n"), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "seed README: %v\n", err)
+		os.Exit(1)
+	}
+	must("git", "add", "go.mod", "README.md")
+	must("git", "commit", "-q", "-m", "seed")
+
+	if err := exec.Command(defnBin, "init", scratch).Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "defn init: %v\n", err)
+		os.Exit(1)
+	}
+	must("git", "add", ".mcp.json", "CLAUDE.md")
+	must("git", "commit", "-q", "-m", "post-defn-init")
+	return scratch
 }
 
 func runChainCase(scratch, defnBin string, c chain, mode string) mutationResult {
@@ -289,9 +299,6 @@ func runChainCase(scratch, defnBin string, c chain, mode string) mutationResult 
 	res.cachedTokens = stats.CachedTokens
 	res.correct = checkChainPostCondition(scratch, c)
 
-	// On failure, preserve the raw stream-json AND the fixture files so the
-	// next debug run can diff intent vs reality. Cheap insurance; the file
-	// stays around until the user cleans /tmp.
 	if !res.correct {
 		if dumpDir, dumpErr := os.MkdirTemp("", "defn-bench-fail-"+c.name+"-"+mode+"-*"); dumpErr == nil {
 			_ = os.WriteFile(filepath.Join(dumpDir, "stream.jsonl"), out, 0644)
@@ -301,6 +308,19 @@ func runChainCase(scratch, defnBin string, c chain, mode string) mutationResult 
 					_ = os.WriteFile(filepath.Join(dumpDir, "final-"+strings.ReplaceAll(f.path, "/", "_")), finalBytes, 0644)
 				}
 			}
+			// Also snapshot the DB state via `defn query` so we can see whether
+			// the bug is in the DB (both defs present) or in the emit path
+			// (DB clean but disk dirty). Runs against the same scratch dir.
+			dbQ := exec.Command(defnBin, "query", "SELECT id, name, kind, source_file FROM definitions ORDER BY id")
+			dbQ.Dir = scratch
+			if dbOut, dbErr := dbQ.CombinedOutput(); dbErr == nil {
+				_ = os.WriteFile(filepath.Join(dumpDir, "db-post-run.txt"), dbOut, 0644)
+			}
+			// Preserve the .defn dir too so future debug can `defn query`
+			// against it later. Copy is cheaper than a symlink dance.
+			preservedDefn := filepath.Join(dumpDir, "defn-snapshot")
+			cp := exec.Command("cp", "-a", filepath.Join(scratch, ".defn"), preservedDefn)
+			_ = cp.Run()
 			fmt.Fprintf(os.Stderr, "    (failure dump: %s)\n", dumpDir)
 		}
 	}
