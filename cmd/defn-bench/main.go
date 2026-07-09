@@ -65,17 +65,21 @@ var questions = []question{
 func main() {
 	mutOnly := false
 	includeMut := false
+	chainsOnly := false
 	for _, a := range os.Args[1:] {
 		switch a {
 		case "--mutations-only":
 			mutOnly = true
 		case "--mutations":
 			includeMut = true
+		case "--chains-only":
+			chainsOnly = true
 		case "-h", "--help":
-			fmt.Println("Usage: defn-bench [--mutations|--mutations-only]")
+			fmt.Println("Usage: defn-bench [--mutations|--mutations-only|--chains-only]")
 			fmt.Println("  (no flags)         run read-side questions only (existing behavior)")
-			fmt.Println("  --mutations        also run write-side mutation cases")
-			fmt.Println("  --mutations-only   run ONLY the write-side mutation cases")
+			fmt.Println("  --mutations        also run write-side single-op mutation cases")
+			fmt.Println("  --mutations-only   run ONLY the write-side single-op mutation cases")
+			fmt.Println("  --chains-only      run ONLY the multi-op / cross-file chain cases")
 			os.Exit(0)
 		}
 	}
@@ -94,6 +98,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	if chainsOnly {
+		runChainBench(defnBin)
+		return
+	}
 	if mutOnly {
 		runMutationBench(defnBin)
 		return
