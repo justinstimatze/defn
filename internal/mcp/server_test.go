@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/justinstimatze/defn/internal/ingest"
 	"github.com/justinstimatze/defn/internal/resolve"
@@ -905,5 +906,232 @@ func TestHandleRename_EmitsOnlyNewName(t *testing.T) {
 	}
 	if strings.Contains(src, "Greet(name)") {
 		t.Errorf("emitted main.go still has old caller reference:\n%s", src)
+	}
+}
+
+// TestHandleRename_SurvivesReopen synthetic repro of the chain-bench
+// failure. Mirrors what the bench does step-for-step, but with NO MCP
+// goroutines (no watchFiles, no ingestAndResolve at startup) and NO
+// claude -p — just the store/emit/handler layer in a plain Go test.
+//
+// The bench fails: rename returns success, but a later `defn query`
+// (fresh connection) shows the OLD name still on the original id AND
+// a stray new id for the new name. This test isolates whether the bug
+// requires MCP-level concurrency or reproduces in pure code paths.
+//
+// Bisect logic: if this test FAILS, the bug is in store/emit —
+// something about Dolt session persistence, working-set commit, or
+// journal flush. If this test PASSES, the bug requires goroutine
+// concurrency (watchFiles polling, background ingestAndResolve, etc.).
+func TestHandleRename_SurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+
+	projDir := filepath.Join(dir, "testproj")
+	if err := os.MkdirAll(projDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeFixtureFile(t, projDir, "go.mod", "module fixture\n\ngo 1.26\n")
+	writeFixtureFile(t, projDir, "core.go", `package fixture
+
+// ProcessData is the core operation.
+func ProcessData(x int) int {
+	return x * 2
+}
+`)
+	writeFixtureFile(t, projDir, "caller_a.go", `package fixture
+
+func RunA(x int) int {
+	return ProcessData(x) + 1
+}
+`)
+	writeFixtureFile(t, projDir, "caller_b.go", `package fixture
+
+func RunB(x int) int {
+	total := 0
+	for i := 0; i < x; i++ {
+		total += ProcessData(i)
+	}
+	return total
+}
+`)
+
+	// --- FIRST SESSION: ingest, rename, close ---
+	db1, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open 1: %v", err)
+	}
+	if err := ingest.Ingest(db1, projDir); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if err := resolve.Resolve(db1, projDir); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if err := db1.Commit("initial ingest"); err != nil {
+		t.Fatalf("commit initial: %v", err)
+	}
+
+	s := &server{db: db1, projectDir: projDir}
+	s.ready.Store(true)
+	result, _, _ := s.handleRename(context.Background(), nil, renameParam{
+		OldName: "ProcessData",
+		NewName: "Handle",
+	})
+	if result == nil {
+		t.Fatal("nil result from handleRename")
+	}
+	if txt := resultText(t, result); !strings.Contains(txt, "Renamed") {
+		t.Fatalf("expected Renamed, got: %s", txt)
+	}
+	if err := db1.Close(); err != nil {
+		t.Logf("db1.Close error (non-fatal): %v", err)
+	}
+
+	// --- SECOND SESSION: reopen, query — does the rename survive? ---
+	db2, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open 2: %v", err)
+	}
+	defer db2.Close()
+
+	defs, err := db2.FilterDefinitions("", "function", "", 0)
+	if err != nil {
+		t.Fatalf("filter defs: %v", err)
+	}
+	names := make(map[string]int)
+	for _, d := range defs {
+		if d.Test {
+			continue
+		}
+		names[d.Name]++
+	}
+	if names["ProcessData"] > 0 {
+		t.Errorf("post-reopen DB still has ProcessData (should have been renamed to Handle): %v", names)
+	}
+	if names["Handle"] != 1 {
+		t.Errorf("post-reopen DB should have exactly one Handle def, got: %v", names)
+	}
+
+	// Also verify on-disk core.go doesn't have both.
+	if data, err := os.ReadFile(filepath.Join(projDir, "core.go")); err == nil {
+		src := string(data)
+		if strings.Contains(src, "func ProcessData(") {
+			t.Errorf("core.go still contains func ProcessData:\n%s", src)
+		}
+		if !strings.Contains(src, "func Handle(") {
+			t.Errorf("core.go missing func Handle:\n%s", src)
+		}
+	}
+}
+
+func writeFixtureFile(t *testing.T, dir, name, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0644); err != nil {
+		t.Fatalf("write %s: %v", name, err)
+	}
+}
+
+// TestHandleRename_SurvivesReopen_WithBackgroundIngest layers the MCP
+// startup pattern onto the synthetic repro: fires
+// `go s.ingestAndResolve()` right before handleRename, mirroring what
+// newMCPServer does. If the bench-level failure reproduces here, the
+// bug is the goroutine race (ingest writing to Dolt's session state
+// while handleRename is doing its work); if this ALSO passes, the bug
+// requires either watchFiles polling or the specific shutdown path
+// defn serve → RunShared → SIGTERM triggers.
+func TestHandleRename_SurvivesReopen_WithBackgroundIngest(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	projDir := filepath.Join(dir, "testproj")
+	if err := os.MkdirAll(projDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeFixtureFile(t, projDir, "go.mod", "module fixture\n\ngo 1.26\n")
+	writeFixtureFile(t, projDir, "core.go", `package fixture
+
+// ProcessData is the core operation.
+func ProcessData(x int) int {
+	return x * 2
+}
+`)
+	writeFixtureFile(t, projDir, "caller_a.go", `package fixture
+
+func RunA(x int) int {
+	return ProcessData(x) + 1
+}
+`)
+	writeFixtureFile(t, projDir, "caller_b.go", `package fixture
+
+func RunB(x int) int {
+	total := 0
+	for i := 0; i < x; i++ {
+		total += ProcessData(i)
+	}
+	return total
+}
+`)
+
+	db1, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open 1: %v", err)
+	}
+	// Seed the DB the way defn ingest CLI does (before serve starts).
+	if err := ingest.Ingest(db1, projDir); err != nil {
+		t.Fatalf("initial ingest: %v", err)
+	}
+	if err := resolve.Resolve(db1, projDir); err != nil {
+		t.Fatalf("initial resolve: %v", err)
+	}
+	if err := db1.Commit("initial ingest"); err != nil {
+		t.Fatalf("commit initial: %v", err)
+	}
+
+	// Now spin up a server the way newMCPServer does: fire the async
+	// startup ingest+resolve, then serve requests.
+	s := &server{db: db1, projectDir: projDir}
+	go func() {
+		if err := s.ingestAndResolve(); err != nil {
+			t.Logf("startup ingestAndResolve: %v", err)
+		}
+		s.ready.Store(true)
+	}()
+
+	result, _, _ := s.handleRename(context.Background(), nil, renameParam{
+		OldName: "ProcessData",
+		NewName: "Handle",
+	})
+	if result == nil {
+		t.Fatal("nil result from handleRename")
+	}
+
+	// Give any lingering goroutine time to potentially clobber state.
+	time.Sleep(200 * time.Millisecond)
+
+	if err := db1.Close(); err != nil {
+		t.Logf("db1.Close error (non-fatal): %v", err)
+	}
+
+	db2, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open 2: %v", err)
+	}
+	defer db2.Close()
+
+	defs, err := db2.FilterDefinitions("", "function", "", 0)
+	if err != nil {
+		t.Fatalf("filter defs: %v", err)
+	}
+	names := make(map[string]int)
+	for _, d := range defs {
+		if d.Test {
+			continue
+		}
+		names[d.Name]++
+	}
+	if names["ProcessData"] > 0 {
+		t.Errorf("post-reopen DB still has ProcessData (should have been renamed to Handle): %v", names)
+	}
+	if names["Handle"] != 1 {
+		t.Errorf("post-reopen DB should have exactly one Handle def, got: %v", names)
 	}
 }
