@@ -288,6 +288,22 @@ func runChainCase(scratch, defnBin string, c chain, mode string) mutationResult 
 	res.outputTokens = stats.OutputTokens
 	res.cachedTokens = stats.CachedTokens
 	res.correct = checkChainPostCondition(scratch, c)
+
+	// On failure, preserve the raw stream-json AND the fixture files so the
+	// next debug run can diff intent vs reality. Cheap insurance; the file
+	// stays around until the user cleans /tmp.
+	if !res.correct {
+		if dumpDir, dumpErr := os.MkdirTemp("", "defn-bench-fail-"+c.name+"-"+mode+"-*"); dumpErr == nil {
+			_ = os.WriteFile(filepath.Join(dumpDir, "stream.jsonl"), out, 0644)
+			for _, f := range c.fixtures {
+				finalBytes, ferr := os.ReadFile(filepath.Join(scratch, f.path))
+				if ferr == nil {
+					_ = os.WriteFile(filepath.Join(dumpDir, "final-"+strings.ReplaceAll(f.path, "/", "_")), finalBytes, 0644)
+				}
+			}
+			fmt.Fprintf(os.Stderr, "    (failure dump: %s)\n", dumpDir)
+		}
+	}
 	return res
 }
 

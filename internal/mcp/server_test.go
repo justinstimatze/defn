@@ -867,3 +867,41 @@ func TestHandleSlice_ReturnStmt(t *testing.T) {
 		t.Errorf("expected match count header:\n%s", text)
 	}
 }
+
+// TestHandleRename_EmitsOnlyNewName regression test for the chain-bench
+// failure surfaced on 2026-07-08: rename left the OLD def name in the
+// emitted file alongside the new one because the emit path treats the
+// old on-disk decl as untracked. Same shape as the delete-race fixed in
+// b274ccc; the rename fix (this file) passes the old qualified name
+// through emit.Opts.AllowedRemovals.
+func TestHandleRename_EmitsOnlyNewName(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db, projectDir: projDir}
+
+	result, _, _ := s.handleRename(context.Background(), nil, renameParam{
+		OldName: "Greet",
+		NewName: "SayHi",
+	})
+	if result == nil {
+		t.Fatal("nil result")
+	}
+
+	final, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	src := string(final)
+	if strings.Contains(src, "func Greet(") {
+		t.Errorf("emitted main.go still contains old def:\n%s", src)
+	}
+	if !strings.Contains(src, "func SayHi(") {
+		t.Errorf("emitted main.go missing new def:\n%s", src)
+	}
+	if !strings.Contains(src, "SayHi(name)") {
+		t.Errorf("emitted main.go missing updated caller (should call SayHi):\n%s", src)
+	}
+	if strings.Contains(src, "Greet(name)") {
+		t.Errorf("emitted main.go still has old caller reference:\n%s", src)
+	}
+}

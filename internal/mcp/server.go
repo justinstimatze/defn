@@ -2006,20 +2006,35 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		return errResult(fmt.Errorf("definition %q not found", args.OldName))
 	}
 
+	// Compose the qualified old-name the safety net compares against (methods
+	// use "<Recv>.Name", pointer receivers unwrapped). Reserve it BEFORE we
+	// mutate d so the emit path knows this decl-name is *intentionally*
+	// disappearing from the file — otherwise safeWriteGoFile refuses to drop
+	// it and the merge appends the new name alongside the old one (bug fixed
+	// for deletes in b274ccc; the same shape recurs for renames).
+	qualifiedOld := d.Name
+	if d.Receiver != "" {
+		qualifiedOld = strings.TrimPrefix(d.Receiver, "*") + "." + d.Name
+	}
+	originalID := d.ID
+
 	// Update the definition name in its own body using AST rename.
 	// Only renames identifiers — preserves comments and string literals.
 	totalSkipped := 0
-	d.Body, _ = astRename(d.Body, args.OldName, args.NewName)
-	d.Name = args.NewName
-	d.Signature = extractSignature(d.Body)
-	d.Exported = len(args.NewName) > 0 && args.NewName[0] >= 'A' && args.NewName[0] <= 'Z'
+	newBody, _ := astRename(d.Body, args.OldName, args.NewName)
+	newSig := extractSignature(newBody)
+	exported := len(args.NewName) > 0 && args.NewName[0] >= 'A' && args.NewName[0] <= 'Z'
 
-	if _, err := s.db.UpsertDefinition(d); err != nil {
+	// RenameDefinition updates BY ID so identity + refs edges are preserved.
+	// Do NOT use UpsertDefinition here: it looks up by (module,name,kind,recv,test)
+	// and would INSERT a new row for the new name, leaving the old row orphaned
+	// in the DB and both defs in the emitted file.
+	if err := s.db.RenameDefinition(originalID, args.NewName, newBody, newSig, exported); err != nil {
 		return errResult(err)
 	}
 
 	// Update all callers' bodies that reference the old name.
-	callers, err := s.db.GetCallers(d.ID)
+	callers, err := s.db.GetCallers(originalID)
 	if err != nil {
 		return errResult(fmt.Errorf("get callers for rename: %w", err))
 	}
@@ -2037,8 +2052,8 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		}
 	}
 
-	buildResult := s.autoEmitAndBuild()
-	s.autoResolve("") // full resolve — rename touches callers across modules
+	buildResult := s.autoEmitAndBuildWithOpts(emit.Opts{AllowedRemovals: []string{qualifiedOld}})
+	s.autoResolve("")
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Renamed %s → %s\n", args.OldName, args.NewName))

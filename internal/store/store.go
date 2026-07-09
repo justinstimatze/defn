@@ -2372,3 +2372,29 @@ type TraverseResult struct {
 
 //go:embed schema.sql
 var schemaSQL string
+
+// RenameDefinition atomically updates a definition's name, body, and
+// signature in-place, keyed by ID. Used by handleRename to avoid the
+// UpsertDefinition-by-name pitfall: Upsert looks up existing rows by
+// (module_id, name, kind, receiver, test), so setting d.Name to the new
+// name causes Upsert to INSERT a new row and orphan the old one — leaving
+// the DB with both defs. This method updates by ID so the identity
+// (and the ref-graph edges pointing at that ID) is preserved.
+func (s *DB) RenameDefinition(id int64, newName, newBody, newSignature string, exported bool) error {
+	hash := HashBody(newBody)
+	ctx := s.Ctx()
+	if _, err := s.execContext(ctx,
+		`UPDATE definitions
+		 SET name = ?, signature = ?, exported = ?, hash = ?
+		 WHERE id = ?`,
+		newName, newSignature, exported, hash, id,
+	); err != nil {
+		return fmt.Errorf("rename definition: %w", err)
+	}
+	if _, err := s.execContext(ctx,
+		`UPDATE bodies SET body = ? WHERE def_id = ?`, newBody, id,
+	); err != nil {
+		return fmt.Errorf("rename body: %w", err)
+	}
+	return nil
+}
