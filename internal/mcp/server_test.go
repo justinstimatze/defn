@@ -638,6 +638,7 @@ func TestHandleRename(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
 	s := &server{db: db}
+	s.ready.Store(true) // setupTestDB ingest+resolve is synchronous; skip the wait
 
 	result, _, _ := s.handleRename(context.Background(), nil, renameParam{
 		OldName: "Greet",
@@ -878,6 +879,7 @@ func TestHandleRename_EmitsOnlyNewName(t *testing.T) {
 	db, projDir := setupTestDB(t)
 	defer db.Close()
 	s := &server{db: db, projectDir: projDir}
+	s.ready.Store(true) // setupTestDB ingest+resolve is synchronous; skip the wait
 
 	result, _, _ := s.handleRename(context.Background(), nil, renameParam{
 		OldName: "Greet",

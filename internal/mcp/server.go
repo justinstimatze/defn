@@ -1059,6 +1059,30 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 // current after edits. If modulePath is non-empty, only resolves references
 // for that module (incremental — much faster). Falls back to full resolve
 // if modulePath is empty.
+// waitReady blocks until the startup ingestAndResolve goroutine has
+// completed (or a hard timeout hits). Write handlers must call this so
+// their SQL statements don't share the pinned *sql.Conn with the async
+// ingest — Go's database/sql doesn't synchronize concurrent Conn use,
+// and Dolt's session-level working set gets clobbered under the race
+// (rename UPDATE silently discarded, ingest re-inserts stale defs).
+//
+// Timeout guards against a stuck LoadAll on a huge repo taking the
+// serve down; 5 minutes is far above any legitimate startup and lets
+// the handler proceed rather than hang the client indefinitely.
+func (s *server) waitReady() {
+	if s.ready.Load() {
+		return
+	}
+	deadline := time.Now().Add(5 * time.Minute)
+	for !s.ready.Load() {
+		if time.Now().After(deadline) {
+			fmt.Fprintln(os.Stderr, "defn: waitReady timeout — startup ingest still running after 5m; proceeding anyway")
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // autoResolve updates the reference graph after a definition change.
 // When modulePath is set, only resolves that module (incremental).
 // Skips re-ingest — the DB was already updated by UpsertDefinition and
@@ -2001,6 +2025,19 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 }
 
 func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args renameParam) (*sdkmcp.CallToolResult, any, error) {
+	// Wait for startup ingest/resolve to finish before running a rename.
+	// newMCPServer launches ingestAndResolve() in a goroutine and marks
+	// s.ready=true after. Both goroutines call execContext on the same
+	// pinned sql.Conn (see internal/store.execContext); Go's database/sql
+	// does not synchronize concurrent use of *sql.Conn, and under the
+	// race Dolt's session-level working set is corrupted:
+	// RenameDefinition's UPDATE silently doesn't stick, then the tail of
+	// ingestAndResolve re-reads the emit'd file and INSERTs the new name
+	// as a fresh row. dolt_log ends up with the pre-rename baseline plus
+	// a stray row for the new name (bench chain-v4 dumped this on disk).
+	// Waiting for ready serializes them.
+	s.waitReady()
+
 	d, err := s.db.GetDefinitionByName(args.OldName, "")
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", args.OldName))

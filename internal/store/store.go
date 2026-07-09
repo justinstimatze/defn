@@ -2383,7 +2383,21 @@ var schemaSQL string
 func (s *DB) RenameDefinition(id int64, newName, newBody, newSignature string, exported bool) error {
 	hash := HashBody(newBody)
 	ctx := s.Ctx()
-	if _, err := s.execContext(ctx,
+
+	// Force UPDATE onto the pinned connection so the write lands in the
+	// same Dolt session as autoCommit. Without this, if execContext falls
+	// back to the pool (pinnedConn returned nil), the UPDATE lands on a
+	// throwaway session whose working set is never committed — bench
+	// chain-v6 reproduced this: DB shows id=3 STILL ProcessData at the
+	// autoCommit that ran right after RenameDefinition returned success.
+	conn := s.pinnedConn()
+	if conn == nil {
+		// Pool mode (MySQL DSN without pinning). Callers here are always
+		// embedded Dolt, but be defensive: reject rather than silently
+		// dropping the write on a throwaway session.
+		return fmt.Errorf("rename definition: no pinned connection — cannot guarantee atomicity")
+	}
+	if _, err := conn.ExecContext(ctx,
 		`UPDATE definitions
 		 SET name = ?, signature = ?, exported = ?, hash = ?
 		 WHERE id = ?`,
@@ -2391,10 +2405,23 @@ func (s *DB) RenameDefinition(id int64, newName, newBody, newSignature string, e
 	); err != nil {
 		return fmt.Errorf("rename definition: %w", err)
 	}
-	if _, err := s.execContext(ctx,
+	if _, err := conn.ExecContext(ctx,
 		`UPDATE bodies SET body = ? WHERE def_id = ?`, newBody, id,
 	); err != nil {
 		return fmt.Errorf("rename body: %w", err)
+	}
+	// Sanity check: confirm the UPDATE actually changed the name in the
+	// current session. If it didn't, the caller's autoCommit will commit a
+	// stale working set and both defs (old + new) will end up on disk.
+	// Better to surface here than to succeed loudly and be wrong quietly.
+	var seenName string
+	if err := conn.QueryRowContext(ctx,
+		`SELECT name FROM definitions WHERE id = ?`, id,
+	).Scan(&seenName); err != nil {
+		return fmt.Errorf("rename verify: %w", err)
+	}
+	if seenName != newName {
+		return fmt.Errorf("rename verify: session sees name=%q after UPDATE to %q — Dolt working set is inconsistent", seenName, newName)
 	}
 	return nil
 }
