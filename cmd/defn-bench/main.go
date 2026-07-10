@@ -66,7 +66,11 @@ func main() {
 	mutOnly := false
 	includeMut := false
 	chainsOnly := false
-	for _, a := range os.Args[1:] {
+	yourRepoDir := ""
+	yourRepoTask := ""
+	argv := os.Args[1:]
+	for i := 0; i < len(argv); i++ {
+		a := argv[i]
 		switch a {
 		case "--mutations-only":
 			mutOnly = true
@@ -74,12 +78,27 @@ func main() {
 			includeMut = true
 		case "--chains-only":
 			chainsOnly = true
+		case "--your-repo":
+			if i+1 >= len(argv) {
+				fmt.Fprintln(os.Stderr, "--your-repo requires a directory argument")
+				os.Exit(1)
+			}
+			yourRepoDir = argv[i+1]
+			i++
+		case "--task":
+			if i+1 >= len(argv) {
+				fmt.Fprintln(os.Stderr, "--task requires a string argument")
+				os.Exit(1)
+			}
+			yourRepoTask = argv[i+1]
+			i++
 		case "-h", "--help":
-			fmt.Println("Usage: defn-bench [--mutations|--mutations-only|--chains-only]")
-			fmt.Println("  (no flags)         run read-side questions only (existing behavior)")
-			fmt.Println("  --mutations        also run write-side single-op mutation cases")
-			fmt.Println("  --mutations-only   run ONLY the write-side single-op mutation cases")
-			fmt.Println("  --chains-only      run ONLY the multi-op / cross-file chain cases")
+			fmt.Println("Usage: defn-bench [--mutations|--mutations-only|--chains-only|--your-repo <dir> --task <str>]")
+			fmt.Println("  (no flags)                          run read-side questions only (existing behavior)")
+			fmt.Println("  --mutations                         also run write-side single-op mutation cases")
+			fmt.Println("  --mutations-only                    run ONLY the write-side single-op mutation cases")
+			fmt.Println("  --chains-only                       run ONLY the multi-op / cross-file chain cases")
+			fmt.Println("  --your-repo <dir> --task \"<str>\"    audit defn's read-tax win on YOUR own repo, read-only")
 			os.Exit(0)
 		}
 	}
@@ -133,6 +152,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "defn-bench: using %s (built %s)\n", defnBin, info.ModTime().Format("2006-01-02 15:04"))
 	}
 
+	if yourRepoDir != "" || yourRepoTask != "" {
+		runYourRepoBench(defnBin, yourRepoDir, yourRepoTask)
+		return
+	}
 	if chainsOnly {
 		runChainBench(defnBin)
 		return

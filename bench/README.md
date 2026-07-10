@@ -99,6 +99,9 @@ go run ./cmd/defn-bench --chains-only
 
 # Retrieval:
 go run ./bench/retrieval
+
+# Audit defn on YOUR OWN repo — read-side, no repo modification:
+go run ./cmd/defn-bench --your-repo /path/to/your/module --task "who calls X?"
 ```
 
 The bench harness now builds a fresh `./defn` at startup by default
