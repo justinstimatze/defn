@@ -18,3 +18,4 @@
 .claude/settings.local.json
 .codex/
 .plancheck-debug.json
+.venv-bench/

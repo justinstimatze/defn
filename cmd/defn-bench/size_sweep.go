@@ -75,12 +75,20 @@ func WithBudget(ctx context.Context) context.Context {
 // runSizeSweepBench runs the add-import mutation at every sweep size,
 // samples times per (size, mode), and writes the result table + a CSV
 // row-per-invocation to csvPath (or ./size-sweep.csv if empty).
-func runSizeSweepBench(defnBin string, samples int, csvPath string) {
+//
+// If sizesOverride is non-nil, it replaces sweepSizes for this run —
+// used by the diagnostic path to run a single case without re-slicing
+// the constant.
+func runSizeSweepBench(defnBin string, samples int, csvPath string, sizesOverride []int) {
 	if samples < 1 {
 		samples = 1
 	}
 	if csvPath == "" {
 		csvPath = "size-sweep.csv"
+	}
+	sizes := sweepSizes
+	if len(sizesOverride) > 0 {
+		sizes = sizesOverride
 	}
 	scratch, err := os.MkdirTemp("", "defn-bench-sweep-*")
 	if err != nil {
@@ -91,7 +99,7 @@ func runSizeSweepBench(defnBin string, samples int, csvPath string) {
 
 	fmt.Printf("scratch: %s\n", scratch)
 	fmt.Printf("samples per (size, mode): %d\n", samples)
-	fmt.Printf("sizes: %v\n\n", sweepSizes)
+	fmt.Printf("sizes: %v\n\n", sizes)
 
 	run := func(args ...string) error {
 		cmd := exec.Command(args[0], args[1:]...)
@@ -141,14 +149,14 @@ func runSizeSweepBench(defnBin string, samples int, csvPath string) {
 		"duration_ms", "correct",
 	})
 
-	total := len(sweepSizes) * samples * 2
+	total := len(sizes) * samples * 2
 	step := 0
 	type key struct {
 		size, sample int
 		mode         string
 	}
 	agg := map[key]mutationResult{}
-	for _, size := range sweepSizes {
+	for _, size := range sizes {
 		fixtureContents := buildSweepFile(size)
 		actualLOC := strings.Count(fixtureContents, "\n")
 		m := mutation{
@@ -170,6 +178,12 @@ func runSizeSweepBench(defnBin string, samples int, csvPath string) {
 				fmt.Printf("  %d calls, %s, in/out/cache=%d/%d/%d tok, correct=%v\n",
 					r.toolCalls, r.duration.Round(time.Second),
 					r.inputTokens, r.outputTokens, r.cachedTokens, r.correct)
+				// Persist the raw claude -p stream-json alongside the CSV
+				// so anomalies (e.g. runaway tool-call counts) are
+				// inspectable after the fact without a re-run.
+				rawPath := filepath.Join(filepath.Dir(csvPath),
+					fmt.Sprintf("raw-size-%d-s%d-%s.jsonl", size, sample, mode))
+				_ = os.WriteFile(rawPath, []byte(r.rawOutput), 0644)
 				_ = w.Write([]string{
 					m.name,
 					strconv.Itoa(size),
@@ -191,7 +205,7 @@ func runSizeSweepBench(defnBin string, samples int, csvPath string) {
 	fmt.Println("\n=== Size sweep — mean per (size, mode) ===")
 	fmt.Printf("%6s %6s %8s %8s %8s %6s\n", "size", "mode", "in.tok", "out.tok", "calls", "ok/n")
 	fmt.Println(strings.Repeat("-", 52))
-	for _, size := range sweepSizes {
+	for _, size := range sizes {
 		for _, mode := range []string{"files", "defn"} {
 			var inSum, outSum, callSum, okCount int
 			for sample := 0; sample < samples; sample++ {
@@ -210,6 +224,6 @@ func runSizeSweepBench(defnBin string, samples int, csvPath string) {
 		}
 	}
 	fmt.Println()
-	fmt.Printf("CSV written to %s (%d rows)\n", csvPath, len(sweepSizes)*samples*2)
+	fmt.Printf("CSV written to %s (%d rows)\n", csvPath, len(sizes)*samples*2)
 	fmt.Println("Plot column: input_tokens by (loc_actual, mode). Crossover = smallest loc_actual where mean(defn) < mean(files).")
 }

@@ -70,6 +70,7 @@ func main() {
 	sizeSweep := false
 	sizeSweepSamples := 2
 	sizeSweepCSV := ""
+	sizeSweepSizes := []int(nil)
 	yourRepoDir := ""
 	yourRepoTask := ""
 	argv := os.Args[1:]
@@ -102,6 +103,20 @@ func main() {
 				os.Exit(1)
 			}
 			sizeSweepCSV = argv[i+1]
+			i++
+		case "--sizes":
+			if i+1 >= len(argv) {
+				fmt.Fprintln(os.Stderr, "--sizes requires a comma-separated list argument (e.g. 10,50,100)")
+				os.Exit(1)
+			}
+			for _, part := range strings.Split(argv[i+1], ",") {
+				n, err := strconv.Atoi(strings.TrimSpace(part))
+				if err != nil || n < 1 {
+					fmt.Fprintf(os.Stderr, "--sizes: bad entry %q\n", part)
+					os.Exit(1)
+				}
+				sizeSweepSizes = append(sizeSweepSizes, n)
+			}
 			i++
 		case "--your-repo":
 			if i+1 >= len(argv) {
@@ -185,7 +200,7 @@ func main() {
 		return
 	}
 	if sizeSweep {
-		runSizeSweepBench(defnBin, sizeSweepSamples, sizeSweepCSV)
+		runSizeSweepBench(defnBin, sizeSweepSamples, sizeSweepCSV, sizeSweepSizes)
 		return
 	}
 	if chainsOnly {
