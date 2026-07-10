@@ -3349,9 +3349,14 @@ func (s *server) handleAddImport(_ context.Context, _ *sdkmcp.CallToolRequest, a
 			return errResult(fmt.Errorf("add-import: file is required; pick one of: %s", strings.Join(candidates, ", ")))
 		}
 	}
-	dir := file
-	if idx := strings.LastIndex(dir, "/"); idx >= 0 {
-		dir = dir[:idx]
+	// FindDefinitionsByFile matches the first arg against module.path
+	// (LIKE %fileSuffix%). We want the directory portion of the file
+	// for that; for a root-level file with no "/", the module can be
+	// anything, so pass "" (which LIKE '%%' — matches every module).
+	// The exact source_file filter still pins us to the right file.
+	dir := ""
+	if idx := strings.LastIndex(file, "/"); idx >= 0 {
+		dir = file[:idx]
 	}
 	defs, err := s.db.FindDefinitionsByFile(dir, file, 0)
 	if err != nil {

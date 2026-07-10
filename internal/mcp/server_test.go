@@ -428,6 +428,31 @@ func TestHandleRead(t *testing.T) {
 	}
 }
 
+// TestHandleAddImportRootFile regresses a bug where handleAddImport
+// treated a root-level file (no "/") as its own directory when
+// looking up its module, so FindDefinitionsByFile searched
+// m.path LIKE '%main.go%' — which never matched the module path
+// (e.g. "testproj"). The lookup returned zero defs and add-import
+// errored with "no definitions found in file X — cannot resolve
+// module", making callers thrash for many retries in benches.
+func TestHandleAddImportRootFile(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	result, _, _ := s.handleAddImport(context.Background(), nil, codeParam{
+		File:       "main.go",
+		ImportPath: "hash/fnv",
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "no definitions found") {
+		t.Fatalf("add-import failed on root-level file: %s", text)
+	}
+	if !strings.Contains(text, "added import") && !strings.Contains(text, "already present") {
+		t.Errorf("expected success indicator in output, got: %s", text)
+	}
+}
+
 func TestHandleEdit(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
