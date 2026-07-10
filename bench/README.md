@@ -100,6 +100,10 @@ go run ./cmd/defn-bench --chains-only
 # Retrieval:
 go run ./bench/retrieval
 
+# Fixture-size sweep — one mutation at 7 fixture sizes, writes CSV
+# for the crossover plot (real token spend; ~15 min at samples=2):
+go run ./cmd/defn-bench --size-sweep --samples 2 --size-sweep-csv sweep.csv
+
 # Audit defn on YOUR OWN repo — read-side, no repo modification:
 go run ./cmd/defn-bench --your-repo /path/to/your/module --task "who calls X?"
 ```

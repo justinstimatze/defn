@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -66,6 +67,9 @@ func main() {
 	mutOnly := false
 	includeMut := false
 	chainsOnly := false
+	sizeSweep := false
+	sizeSweepSamples := 2
+	sizeSweepCSV := ""
 	yourRepoDir := ""
 	yourRepoTask := ""
 	argv := os.Args[1:]
@@ -78,6 +82,27 @@ func main() {
 			includeMut = true
 		case "--chains-only":
 			chainsOnly = true
+		case "--size-sweep":
+			sizeSweep = true
+		case "--samples":
+			if i+1 >= len(argv) {
+				fmt.Fprintln(os.Stderr, "--samples requires an integer argument")
+				os.Exit(1)
+			}
+			n, err := strconv.Atoi(argv[i+1])
+			if err != nil || n < 1 {
+				fmt.Fprintf(os.Stderr, "--samples: not a positive integer: %q\n", argv[i+1])
+				os.Exit(1)
+			}
+			sizeSweepSamples = n
+			i++
+		case "--size-sweep-csv":
+			if i+1 >= len(argv) {
+				fmt.Fprintln(os.Stderr, "--size-sweep-csv requires a path argument")
+				os.Exit(1)
+			}
+			sizeSweepCSV = argv[i+1]
+			i++
 		case "--your-repo":
 			if i+1 >= len(argv) {
 				fmt.Fprintln(os.Stderr, "--your-repo requires a directory argument")
@@ -93,11 +118,14 @@ func main() {
 			yourRepoTask = argv[i+1]
 			i++
 		case "-h", "--help":
-			fmt.Println("Usage: defn-bench [--mutations|--mutations-only|--chains-only|--your-repo <dir> --task <str>]")
+			fmt.Println("Usage: defn-bench [--mutations|--mutations-only|--chains-only|--size-sweep|--your-repo <dir> --task <str>]")
 			fmt.Println("  (no flags)                          run read-side questions only (existing behavior)")
 			fmt.Println("  --mutations                         also run write-side single-op mutation cases")
 			fmt.Println("  --mutations-only                    run ONLY the write-side single-op mutation cases")
 			fmt.Println("  --chains-only                       run ONLY the multi-op / cross-file chain cases")
+			fmt.Println("  --size-sweep                        sweep add-import mutation across fixture sizes; writes CSV")
+			fmt.Println("  --samples N                         samples per (size, mode) in --size-sweep (default 2)")
+			fmt.Println("  --size-sweep-csv <path>             output CSV path (default ./size-sweep.csv)")
 			fmt.Println("  --your-repo <dir> --task \"<str>\"    audit defn's read-tax win on YOUR own repo, read-only")
 			os.Exit(0)
 		}
@@ -154,6 +182,10 @@ func main() {
 
 	if yourRepoDir != "" || yourRepoTask != "" {
 		runYourRepoBench(defnBin, yourRepoDir, yourRepoTask)
+		return
+	}
+	if sizeSweep {
+		runSizeSweepBench(defnBin, sizeSweepSamples, sizeSweepCSV)
 		return
 	}
 	if chainsOnly {
