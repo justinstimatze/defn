@@ -378,6 +378,60 @@ func textResult(text string) *sdkmcp.CallToolResult {
 	}
 }
 
+// usageStats is the structured meta-signal we attach to read-side op
+// responses so bench harnesses can measure per-op savings without
+// re-parsing text. Also drives the compact footer line on dramatic
+// wins. See task #59 / [[project_marketing_playbook]].
+type usageStats struct {
+	Op            string `json:"op"`
+	BytesReturned int    `json:"bytes_returned"`
+	BytesAltRead  int    `json:"bytes_alt_read,omitempty"`
+	SavingsPct    int    `json:"savings_pct,omitempty"`
+}
+
+// fileAltBytes is a proxy for "what a Read on the source file would
+// have returned in bytes." Uses the file_sources table (populated by
+// ingest); returns 0 when unavailable so the caller can skip the
+// comparison rather than log a bogus number.
+func (s *server) fileAltBytes(d *store.Definition) int {
+	if d == nil || d.SourceFile == "" {
+		return 0
+	}
+	raw, err := s.db.GetFileSource(d.ModuleID, d.SourceFile)
+	if err != nil {
+		return 0
+	}
+	return len(raw)
+}
+
+// withUsage attaches u to r.StructuredContent and, when the alt-Read
+// savings are both dramatic (≥50%) and non-trivial (alt ≥ 512 bytes),
+// appends a one-line footer to r's text content. No-op on nil / error
+// results.
+func withUsage(r *sdkmcp.CallToolResult, u usageStats) *sdkmcp.CallToolResult {
+	if r == nil || r.IsError {
+		return r
+	}
+	if u.BytesAltRead > 0 {
+		saved := u.BytesAltRead - u.BytesReturned
+		if saved < 0 {
+			saved = 0
+		}
+		u.SavingsPct = 100 * saved / u.BytesAltRead
+	}
+	r.StructuredContent = u
+	if u.BytesAltRead >= 512 && u.SavingsPct >= 50 {
+		footer := fmt.Sprintf("\n_— returned %dB vs ~%dB for full-file Read (-%d%%)_\n",
+			u.BytesReturned, u.BytesAltRead, u.SavingsPct)
+		for _, c := range r.Content {
+			if tc, ok := c.(*sdkmcp.TextContent); ok {
+				tc.Text += footer
+			}
+		}
+	}
+	return r
+}
+
 func errResult(err error) (*sdkmcp.CallToolResult, any, error) {
 	return &sdkmcp.CallToolResult{
 		Content: []sdkmcp.Content{&sdkmcp.TextContent{Text: err.Error()}},
@@ -851,7 +905,12 @@ func (s *server) handleGetDefinition(_ context.Context, _ *sdkmcp.CallToolReques
 	sb.WriteString(d.Body)
 	sb.WriteString("\n```\n")
 
-	return textResult(sb.String()), nil, nil
+	out := sb.String()
+	return withUsage(textResult(out), usageStats{
+		Op:            "read",
+		BytesReturned: len(out),
+		BytesAltRead:  s.fileAltBytes(d),
+	}), nil, nil
 }
 
 func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
@@ -3141,7 +3200,12 @@ func (s *server) handleOutline(_ context.Context, req *sdkmcp.CallToolRequest, a
 		sb.WriteString(fmt.Sprintf("Flow (%d): %s\n", len(flow), strings.Join(flow, " → ")))
 	}
 
-	return textResult(sb.String()), nil, nil
+	out := sb.String()
+	return withUsage(textResult(out), usageStats{
+		Op:            "outline",
+		BytesReturned: len(out),
+		BytesAltRead:  s.fileAltBytes(d),
+	}), nil, nil
 }
 
 // handleSlice returns verbatim source bytes for AST-role slices of a
@@ -3183,7 +3247,10 @@ func (s *server) handleSlice(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 
 	if len(slices) == 0 {
 		sb.WriteString(fmt.Sprintf("(no %s slices in this definition)\n", args.Slice))
-		return textResult(sb.String()), nil, nil
+		out := sb.String()
+		return withUsage(textResult(out), usageStats{
+			Op: "slice", BytesReturned: len(out), BytesAltRead: s.fileAltBytes(d),
+		}), nil, nil
 	}
 
 	for i, sl := range slices {
@@ -3197,7 +3264,10 @@ func (s *server) handleSlice(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		sb.WriteString("\n```\n\n")
 	}
 
-	return textResult(sb.String()), nil, nil
+	out := sb.String()
+	return withUsage(textResult(out), usageStats{
+		Op: "slice", BytesReturned: len(out), BytesAltRead: s.fileAltBytes(d),
+	}), nil, nil
 }
 
 func pluralS(n int) string {

@@ -410,6 +410,22 @@ func TestHandleRead(t *testing.T) {
 	if !strings.Contains(text, "Hello") {
 		t.Error("expected function body containing 'Hello'")
 	}
+
+	// Structured usage: op labeled, bytes non-zero, alt bytes populated
+	// from file_sources (ingest wrote main.go there).
+	u, ok := result.StructuredContent.(usageStats)
+	if !ok {
+		t.Fatalf("expected StructuredContent = usageStats, got %T", result.StructuredContent)
+	}
+	if u.Op != "read" {
+		t.Errorf("usage.Op = %q, want %q", u.Op, "read")
+	}
+	if u.BytesReturned == 0 {
+		t.Error("usage.BytesReturned should be > 0")
+	}
+	if u.BytesAltRead == 0 {
+		t.Error("usage.BytesAltRead should be > 0 (file_sources not populated?)")
+	}
 }
 
 func TestHandleEdit(t *testing.T) {
