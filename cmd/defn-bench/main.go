@@ -89,13 +89,48 @@ func main() {
 		os.Exit(1)
 	}
 
-	defnBin, err := filepath.Abs("defn")
-	if err != nil || func() bool { _, e := os.Stat(defnBin); return e != nil }() {
+	// Discover defn binary. Explicit DEFN_BIN wins; else "./defn" if
+	// present; else PATH. Whichever we pick, build a fresh copy into
+	// a tempdir first — stale binaries were the entire chain-bench
+	// rename bug for three sessions. See [[project_rename_bench_bug]].
+	//
+	// Skip the rebuild with DEFN_BENCH_NO_REBUILD=1 (for CI where the
+	// binary was built by an earlier step).
+	var defnBin string
+	if p := os.Getenv("DEFN_BIN"); p != "" {
+		defnBin = p
+	} else if abs, err := filepath.Abs("defn"); err == nil {
+		if _, statErr := os.Stat(abs); statErr == nil {
+			defnBin = abs
+		}
+	}
+	if defnBin == "" {
 		defnBin, _ = exec.LookPath("defn")
 	}
 	if defnBin == "" {
 		fmt.Fprintln(os.Stderr, "defn binary not found")
 		os.Exit(1)
+	}
+
+	if os.Getenv("DEFN_BENCH_NO_REBUILD") != "1" {
+		freshDir, err := os.MkdirTemp("", "defn-bench-defn-*")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "mktemp for defn build: %v\n", err)
+			os.Exit(1)
+		}
+		defer os.RemoveAll(freshDir)
+		fresh := filepath.Join(freshDir, "defn")
+		build := exec.Command("go", "build", "-o", fresh, "./cmd/defn")
+		build.Stderr = os.Stderr
+		if err := build.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "go build ./cmd/defn: %v (using pre-built %s)\n", err, defnBin)
+		} else {
+			defnBin = fresh
+			fmt.Fprintf(os.Stderr, "defn-bench: using fresh build at %s\n", defnBin)
+		}
+	} else {
+		info, _ := os.Stat(defnBin)
+		fmt.Fprintf(os.Stderr, "defn-bench: using %s (built %s)\n", defnBin, info.ModTime().Format("2006-01-02 15:04"))
 	}
 
 	if chainsOnly {

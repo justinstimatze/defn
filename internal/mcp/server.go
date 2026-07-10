@@ -2028,14 +2028,9 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// Wait for startup ingest/resolve to finish before running a rename.
 	// newMCPServer launches ingestAndResolve() in a goroutine and marks
 	// s.ready=true after. Both goroutines call execContext on the same
-	// pinned sql.Conn (see internal/store.execContext); Go's database/sql
-	// does not synchronize concurrent use of *sql.Conn, and under the
-	// race Dolt's session-level working set is corrupted:
-	// RenameDefinition's UPDATE silently doesn't stick, then the tail of
-	// ingestAndResolve re-reads the emit'd file and INSERTs the new name
-	// as a fresh row. dolt_log ends up with the pre-rename baseline plus
-	// a stray row for the new name (bench chain-v4 dumped this on disk).
-	// Waiting for ready serializes them.
+	// pinned sql.Conn; Go's database/sql does not synchronize concurrent
+	// use of *sql.Conn, and under the race Dolt's session-level working
+	// set is corrupted. Waiting for ready serializes them.
 	s.waitReady()
 
 	d, err := s.db.GetDefinitionByName(args.OldName, "")
