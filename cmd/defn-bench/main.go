@@ -7,6 +7,7 @@
 package main
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -26,13 +27,16 @@ type question struct {
 }
 
 type result struct {
-	question  string
-	mode      string // "files" or "defn"
-	toolCalls int
-	duration  time.Duration
-	answerLen int
-	correct   bool // did the answer contain expected strings?
-	rawOutput string
+	question     string
+	mode         string // "files" or "defn"
+	toolCalls    int
+	inputTokens  int
+	outputTokens int
+	cachedTokens int
+	duration     time.Duration
+	answerLen    int
+	correct      bool // did the answer contain expected strings?
+	rawOutput    string
 }
 
 var questions = []question{
@@ -72,6 +76,7 @@ func main() {
 	sizeSweepCSV := ""
 	sizeSweepSizes := []int(nil)
 	sizeSweepMutation := "rename-param"
+	readSideCSV := ""
 	yourRepoDir := ""
 	yourRepoTask := ""
 	argv := os.Args[1:]
@@ -104,6 +109,13 @@ func main() {
 				os.Exit(1)
 			}
 			sizeSweepCSV = argv[i+1]
+			i++
+		case "--read-side-csv":
+			if i+1 >= len(argv) {
+				fmt.Fprintln(os.Stderr, "--read-side-csv requires a path argument")
+				os.Exit(1)
+			}
+			readSideCSV = argv[i+1]
 			i++
 		case "--sweep-mutation":
 			if i+1 >= len(argv) {
@@ -151,6 +163,7 @@ func main() {
 			fmt.Println("  --sizes 10,50,100,...               override the default sweep sizes")
 			fmt.Println("  --samples N                         samples per (size, mode) in --size-sweep (default 2)")
 			fmt.Println("  --size-sweep-csv <path>             output CSV path (default ./size-sweep.csv)")
+			fmt.Println("  --read-side-csv <path>              write per-invocation CSV for the read-side questions run")
 			fmt.Println("  --your-repo <dir> --task \"<str>\"    audit defn's read-tax win on YOUR own repo, read-only")
 			os.Exit(0)
 		}
@@ -259,6 +272,41 @@ func main() {
 
 	fmt.Printf("\n=== Running %d questions in both modes ===\n\n", len(questions))
 
+	var csvWriter *csv.Writer
+	var csvFile *os.File
+	if readSideCSV != "" {
+		f, err := os.Create(readSideCSV)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "create --read-side-csv %s: %v\n", readSideCSV, err)
+			os.Exit(1)
+		}
+		csvFile = f
+		defer csvFile.Close()
+		csvWriter = csv.NewWriter(csvFile)
+		defer csvWriter.Flush()
+		_ = csvWriter.Write([]string{
+			"project", "question", "mode",
+			"tool_calls", "input_tokens", "output_tokens", "cached_tokens",
+			"duration_ms", "correct",
+		})
+	}
+
+	writeRow := func(q question, r result) {
+		if csvWriter == nil {
+			return
+		}
+		_ = csvWriter.Write([]string{
+			q.project, q.query, r.mode,
+			strconv.Itoa(r.toolCalls),
+			strconv.Itoa(r.inputTokens),
+			strconv.Itoa(r.outputTokens),
+			strconv.Itoa(r.cachedTokens),
+			strconv.FormatInt(r.duration.Milliseconds(), 10),
+			strconv.FormatBool(r.correct),
+		})
+		csvWriter.Flush()
+	}
+
 	var filesResults, defnResults []result
 
 	for i, q := range questions {
@@ -275,7 +323,10 @@ func main() {
 
 		r1 := runClaude(dir, q, "files")
 		filesResults = append(filesResults, r1)
-		fmt.Printf("  files:  %d tool calls, %s, correct=%v\n", r1.toolCalls, r1.duration.Round(time.Second), r1.correct)
+		writeRow(q, r1)
+		fmt.Printf("  files:  %d calls, %s, in/out/cache=%d/%d/%d tok, correct=%v\n",
+			r1.toolCalls, r1.duration.Round(time.Second),
+			r1.inputTokens, r1.outputTokens, r1.cachedTokens, r1.correct)
 
 		if len(mcpBackup) > 0 {
 			os.WriteFile(mcpPath, mcpBackup, 0644)
@@ -286,41 +337,74 @@ func main() {
 
 		r2 := runClaude(dir, q, "defn")
 		defnResults = append(defnResults, r2)
-		fmt.Printf("  defn:   %d tool calls, %s, correct=%v\n", r2.toolCalls, r2.duration.Round(time.Second), r2.correct)
+		writeRow(q, r2)
+		fmt.Printf("  defn:   %d calls, %s, in/out/cache=%d/%d/%d tok, correct=%v\n",
+			r2.toolCalls, r2.duration.Round(time.Second),
+			r2.inputTokens, r2.outputTokens, r2.cachedTokens, r2.correct)
 		fmt.Println()
 	}
 
 	fmt.Println("=== Summary ===")
-	fmt.Printf("%-8s %-60s %6s %6s %6s %6s\n", "Project", "Question", "F.calls", "D.calls", "F.time", "D.time")
-	fmt.Println(strings.Repeat("-", 110))
+	fmt.Printf("%-6s %-46s %5s %5s %8s %8s %6s %6s\n",
+		"Proj", "Question", "F.cls", "D.cls", "F.inTok", "D.inTok", "F.ok", "D.ok")
+	fmt.Println(strings.Repeat("-", 100))
 
 	totalFilesCalls := 0
 	totalDefnCalls := 0
+	totalFilesIn := 0
+	totalDefnIn := 0
+	totalFilesOut := 0
+	totalDefnOut := 0
 	totalFilesTime := time.Duration(0)
 	totalDefnTime := time.Duration(0)
+	filesCorrect := 0
+	defnCorrect := 0
 
 	for i := range questions {
 		f := filesResults[i]
 		d := defnResults[i]
 		totalFilesCalls += f.toolCalls
 		totalDefnCalls += d.toolCalls
+		totalFilesIn += f.inputTokens
+		totalDefnIn += d.inputTokens
+		totalFilesOut += f.outputTokens
+		totalDefnOut += d.outputTokens
 		totalFilesTime += f.duration
 		totalDefnTime += d.duration
-		fmt.Printf("%-8s %-60s %6d %6d %6s %6s\n",
+		if f.correct {
+			filesCorrect++
+		}
+		if d.correct {
+			defnCorrect++
+		}
+		fmt.Printf("%-6s %-46s %5d %5d %8d %8d %6v %6v\n",
 			questions[i].project,
-			truncate(questions[i].query, 60),
+			truncate(questions[i].query, 46),
 			f.toolCalls, d.toolCalls,
-			f.duration.Round(time.Second), d.duration.Round(time.Second))
+			f.inputTokens, d.inputTokens,
+			f.correct, d.correct)
 	}
 
-	fmt.Println(strings.Repeat("-", 110))
-	fmt.Printf("%-69s %6d %6d %6s %6s\n", "TOTAL",
+	fmt.Println(strings.Repeat("-", 100))
+	fmt.Printf("%-53s %5d %5d %8d %8d %6s %6s\n", "TOTAL",
 		totalFilesCalls, totalDefnCalls,
+		totalFilesIn, totalDefnIn,
+		fmt.Sprintf("%d/%d", filesCorrect, len(questions)),
+		fmt.Sprintf("%d/%d", defnCorrect, len(questions)))
+	fmt.Printf("Wall time: files=%s, defn=%s\n",
 		totalFilesTime.Round(time.Second), totalDefnTime.Round(time.Second))
 
 	if totalFilesCalls > 0 {
 		reduction := float64(totalFilesCalls-totalDefnCalls) / float64(totalFilesCalls) * 100
-		fmt.Printf("\nTool call reduction: %.0f%%\n", reduction)
+		fmt.Printf("Tool call reduction: %.0f%%\n", reduction)
+	}
+	if totalFilesIn > 0 {
+		reduction := float64(totalFilesIn-totalDefnIn) / float64(totalFilesIn) * 100
+		fmt.Printf("Input token reduction: %.1f%%\n", reduction)
+	}
+	if totalFilesOut > 0 {
+		reduction := float64(totalFilesOut-totalDefnOut) / float64(totalFilesOut) * 100
+		fmt.Printf("Output token reduction: %.1f%%\n", reduction)
 	}
 	if totalFilesTime > 0 {
 		speedup := float64(totalFilesTime) / float64(totalDefnTime)
@@ -357,10 +441,11 @@ func runClaude(dir string, q question, mode string) result {
 		return result{question: q.query, mode: mode, duration: dur, rawOutput: string(out)}
 	}
 
-	// Parse stream-json to count tool calls and extract answer.
-	toolCalls := 0
+	// Tool calls + per-turn usage totals come from parseStreamJSON
+	// (see mutations.go). Extracting the final answer text still needs
+	// a separate walk since it looks at the result envelope.
+	stats := parseStreamJSON(out)
 	var answer string
-
 	for line := range strings.SplitSeq(string(out), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || line[0] != '{' {
@@ -370,27 +455,7 @@ func runClaude(dir string, q question, mode string) result {
 		if err := json.Unmarshal([]byte(line), &msg); err != nil {
 			continue
 		}
-
-		msgType, _ := msg["type"].(string)
-
-		// Count tool uses from assistant messages.
-		// Format: {"type":"assistant","message":{"content":[{"type":"tool_use",...}]}}
-		if msgType == "assistant" {
-			if message, ok := msg["message"].(map[string]any); ok {
-				if content, ok := message["content"].([]any); ok {
-					for _, c := range content {
-						if cm, ok := c.(map[string]any); ok {
-							if cm["type"] == "tool_use" {
-								toolCalls++
-							}
-						}
-					}
-				}
-			}
-		}
-
-		// Extract final result text.
-		if msgType == "result" {
+		if msg["type"] == "result" {
 			if text, ok := msg["result"].(string); ok {
 				answer = text
 			}
@@ -408,13 +473,16 @@ func runClaude(dir string, q question, mode string) result {
 	}
 
 	return result{
-		question:  q.query,
-		mode:      mode,
-		toolCalls: toolCalls,
-		duration:  dur,
-		answerLen: len(answer),
-		correct:   correct,
-		rawOutput: string(out),
+		question:     q.query,
+		mode:         mode,
+		toolCalls:    stats.ToolCalls,
+		inputTokens:  stats.InputTokens,
+		outputTokens: stats.OutputTokens,
+		cachedTokens: stats.CachedTokens,
+		duration:     dur,
+		answerLen:    len(answer),
+		correct:      correct,
+		rawOutput:    string(out),
 	}
 }
 
