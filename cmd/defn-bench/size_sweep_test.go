@@ -9,31 +9,52 @@ import (
 )
 
 // TestBuildSweepFileBuilds verifies every sweep-size fixture actually
-// compiles. If a size fails to build, the mutation bench at that size
-// is unusable — defn's autoEmitAndBuild would reject the state before
-// the mutation even runs, or files-mode would edit a broken file.
+// compiles for every mutation family. If a size fails to build, the
+// bench at that size is unusable — defn's autoEmitAndBuild would
+// reject the state before the mutation even runs, or files-mode
+// would edit a broken file.
 func TestBuildSweepFileBuilds(t *testing.T) {
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("go not in PATH")
 	}
+	builders := map[string]func(int) string{
+		"add-import":   buildSweepFile,
+		"rename-param": buildSweepRenameParamFile,
+	}
+	for family, build := range builders {
+		for _, size := range sweepSizes {
+			src := build(size)
+			lines := strings.Count(src, "\n")
+			if lines < 8 {
+				t.Errorf("%s size=%d: only %d lines, expected at least ~10", family, size, lines)
+				continue
+			}
+			tmp := t.TempDir()
+			if err := os.WriteFile(filepath.Join(tmp, "go.mod"), []byte("module fixture\n\ngo 1.26\n"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(tmp, "s.go"), []byte(src), 0644); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("go", "build", "./...")
+			cmd.Dir = tmp
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Errorf("%s size=%d (actual %d lines) failed to build: %v\n%s", family, size, lines, err, out)
+			}
+		}
+	}
+}
+
+// TestBuildRenameParamFileHasScatteredData confirms the rename-param
+// fixture has enough `data` uses in Process for the mutation to have
+// non-trivial scope — otherwise files-mode's read-tax wouldn't
+// actually scale with LOC.
+func TestBuildRenameParamFileHasScatteredData(t *testing.T) {
 	for _, size := range sweepSizes {
-		src := buildSweepFile(size)
-		lines := strings.Count(src, "\n")
-		if lines < 8 {
-			t.Errorf("size=%d: only %d lines, expected at least ~10", size, lines)
-			continue
-		}
-		tmp := t.TempDir()
-		if err := os.WriteFile(filepath.Join(tmp, "go.mod"), []byte("module fixture\n\ngo 1.26\n"), 0644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(tmp, "s.go"), []byte(src), 0644); err != nil {
-			t.Fatal(err)
-		}
-		cmd := exec.Command("go", "build", "./...")
-		cmd.Dir = tmp
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Errorf("size=%d (actual %d lines) failed to build: %v\n%s", size, lines, err, out)
+		src := buildSweepRenameParamFile(size)
+		count := strings.Count(src, "data")
+		if count < 10 {
+			t.Errorf("size=%d: only %d uses of `data`, expected ≥10 for scatter-cost", size, count)
 		}
 	}
 }

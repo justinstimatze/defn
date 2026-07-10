@@ -29,6 +29,7 @@ not a win.
 
 | Run | Date | Workload | Fixture size | Correct (defn) | Input Δ | Notes |
 |---|---|---|---|---|---|---|
+| [rename-sweep](./mutations/2026-07-10-rename-sweep.md) | 2026-07-10 | rename-param, 7 sizes × 2 samples | 10 – 800 LOC | **14/14** | ~0% (noise) | **null result** — no crossover found; kills the crossover-curve marketing move |
 | [chains-v9](./mutations/2026-07-10-chains-v9.md) | 2026-07-10 | multi-op chain | 3-file / ~25 LOC | **2/2** | −28% | first clean chain run — stale-binary bug fixed in bench harness |
 | [chains-v4](./mutations/2026-07-08-chains-v4.md) | 2026-07-08 | multi-op chain | 3-file / ~25 LOC | 1/2 | — | **superseded** — see erratum on the doc; numbers invalid |
 | [chains-v1](./mutations/2026-07-08-chains-v1.md) | 2026-07-08 | multi-op chain | 3-file / ~25 LOC | — | — | first cut — shared scratch dir, superseded |
@@ -72,9 +73,16 @@ Three things every citation of a number here should carry:
 3. **Ship the audit workflow as a tool.** `defn bench --your-repo`
    should let users verify our claim on their own code. Not built
    yet; tracked as marketing artifact #3.
-4. **Show crossover, not peak.** A file-size × input-token-delta plot
-   showing small-fixture losses, crossover, growing win at scale.
-   Not built yet; tracked as marketing artifact #2.
+4. ~~**Show crossover, not peak.**~~ **RETIRED 2026-07-10 after a
+   null-finding sweep.** See
+   [`mutations/2026-07-10-rename-sweep.md`](./mutations/2026-07-10-rename-sweep.md):
+   no input-token crossover exists on single-op mutations at
+   LOC ≤ 800; the ~25k `claude -p` headless floor dominates any
+   fixture-size effect. The workload class was wrong — defn's
+   token wins live in multi-op multi-file chains and codebase-wide
+   read-side retrieval, not single-op edits. Replacement work:
+   scale the chain-bench and instrument the retrieval bench for
+   input-token measurement.
 5. **Compute-constrained enterprise angle.** Cost-per-refactor for
    teams running many agents against big codebases. That's the
    buyer conversation.

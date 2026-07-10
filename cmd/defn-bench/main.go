@@ -71,6 +71,7 @@ func main() {
 	sizeSweepSamples := 2
 	sizeSweepCSV := ""
 	sizeSweepSizes := []int(nil)
+	sizeSweepMutation := "rename-param"
 	yourRepoDir := ""
 	yourRepoTask := ""
 	argv := os.Args[1:]
@@ -103,6 +104,13 @@ func main() {
 				os.Exit(1)
 			}
 			sizeSweepCSV = argv[i+1]
+			i++
+		case "--sweep-mutation":
+			if i+1 >= len(argv) {
+				fmt.Fprintln(os.Stderr, "--sweep-mutation requires an argument (rename-param|add-import)")
+				os.Exit(1)
+			}
+			sizeSweepMutation = argv[i+1]
 			i++
 		case "--sizes":
 			if i+1 >= len(argv) {
@@ -138,7 +146,9 @@ func main() {
 			fmt.Println("  --mutations                         also run write-side single-op mutation cases")
 			fmt.Println("  --mutations-only                    run ONLY the write-side single-op mutation cases")
 			fmt.Println("  --chains-only                       run ONLY the multi-op / cross-file chain cases")
-			fmt.Println("  --size-sweep                        sweep add-import mutation across fixture sizes; writes CSV")
+			fmt.Println("  --size-sweep                        sweep a fixed mutation across fixture sizes; writes CSV")
+			fmt.Println("  --sweep-mutation <name>             mutation family: rename-param (default) | add-import")
+			fmt.Println("  --sizes 10,50,100,...               override the default sweep sizes")
 			fmt.Println("  --samples N                         samples per (size, mode) in --size-sweep (default 2)")
 			fmt.Println("  --size-sweep-csv <path>             output CSV path (default ./size-sweep.csv)")
 			fmt.Println("  --your-repo <dir> --task \"<str>\"    audit defn's read-tax win on YOUR own repo, read-only")
@@ -200,7 +210,7 @@ func main() {
 		return
 	}
 	if sizeSweep {
-		runSizeSweepBench(defnBin, sizeSweepSamples, sizeSweepCSV, sizeSweepSizes)
+		runSizeSweepBench(defnBin, sizeSweepSamples, sizeSweepCSV, sizeSweepSizes, sizeSweepMutation)
 		return
 	}
 	if chainsOnly {

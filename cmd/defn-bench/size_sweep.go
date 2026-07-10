@@ -72,6 +72,96 @@ func WithBudget(ctx context.Context) context.Context {
 	return b.String()
 }
 
+// buildSweepRenameParamFile emits a fixture whose Process function
+// takes a param named `data` and uses it ~15 times scattered through
+// the body. The surrounding padding functions don't reference `data`
+// — but the agent doesn't know that a priori, so files-mode still
+// has to read the whole file to find every use. That's where the
+// read-tax vs loc scaling should show up.
+//
+// The Process function's signature is at a fixed line (~13) so the
+// rename target sits at a stable location as loc grows.
+func buildSweepRenameParamFile(loc int) string {
+	var b strings.Builder
+	b.WriteString(`package fixture
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+)
+
+var ErrEmpty = errors.New("empty")
+
+// Process consumes data, normalizes it, and returns the count.
+func Process(data []byte, verbose bool) (int, error) {
+	if len(data) == 0 {
+		return 0, fmt.Errorf("process: empty data")
+	}
+	if verbose {
+		fmt.Printf("process: %d bytes\n", len(data))
+	}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return 0, ErrEmpty
+	}
+	var raw any
+	if err := json.Unmarshal(data, &raw); err == nil {
+		if verbose {
+			fmt.Printf("process: decoded %d bytes as JSON\n", len(data))
+		}
+		if arr, ok := raw.([]any); ok {
+			return len(arr), nil
+		}
+	}
+	if bytes.HasPrefix(data, []byte("\xff")) {
+		return -1, fmt.Errorf("process: unsupported header in data")
+	}
+	count := 0
+	inRun := false
+	for _, ch := range data {
+		if ch == ' ' || ch == '\t' || ch == '\n' {
+			inRun = false
+			continue
+		}
+		if !inRun {
+			count++
+			inRun = true
+		}
+	}
+	if verbose {
+		fmt.Printf("process: fell back to run-counting, got %d runs from %d bytes\n", count, len(data))
+	}
+	return count, nil
+}
+
+`)
+	// Header + Process function = ~45 lines fixed. Each padding
+	// function below is exactly 11 lines. Choose n so total lands
+	// near loc.
+	n := (loc - 45) / 11
+	if n < 1 {
+		n = 1
+	}
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&b, "// Op%d performs step %d in the pipeline.\n", i, i)
+		fmt.Fprintf(&b, "func Op%d(ctx context.Context, in []byte) ([]byte, error) {\n", i)
+		b.WriteString("\tif len(in) == 0 {\n\t\treturn nil, ErrEmpty\n\t}\n")
+		fmt.Fprintf(&b, "\tbuf := bytes.NewBuffer(nil)\n\tbuf.WriteString(fmt.Sprintf(%q, %d))\n", "op-%d:", i)
+		b.WriteString("\tbuf.Write(in)\n")
+		b.WriteString("\treturn buf.Bytes(), nil\n}\n\n")
+	}
+	// context is referenced by every Op; ensure it's still needed
+	// even if n==0 by keeping a small helper.
+	b.WriteString(`func WithBudget(ctx context.Context) context.Context {
+	return ctx
+}
+`)
+	return b.String()
+}
+
 // runSizeSweepBench runs the add-import mutation at every sweep size,
 // samples times per (size, mode), and writes the result table + a CSV
 // row-per-invocation to csvPath (or ./size-sweep.csv if empty).
@@ -79,7 +169,16 @@ func WithBudget(ctx context.Context) context.Context {
 // If sizesOverride is non-nil, it replaces sweepSizes for this run —
 // used by the diagnostic path to run a single case without re-slicing
 // the constant.
-func runSizeSweepBench(defnBin string, samples int, csvPath string, sizesOverride []int) {
+//
+// mutationFamily selects the mutation being swept: "rename-param"
+// (default; scattered-use param whose read-cost scales with LOC) or
+// "add-import" (retained for legacy; note goimports strips unused
+// imports on emit so the post-condition can only succeed if the
+// added import is also used by prompt).
+func runSizeSweepBench(defnBin string, samples int, csvPath string, sizesOverride []int, mutationFamily string) {
+	if mutationFamily == "" {
+		mutationFamily = "rename-param"
+	}
 	if samples < 1 {
 		samples = 1
 	}
@@ -157,18 +256,45 @@ func runSizeSweepBench(defnBin string, samples int, csvPath string, sizesOverrid
 	}
 	agg := map[key]mutationResult{}
 	for _, size := range sizes {
-		fixtureContents := buildSweepFile(size)
-		actualLOC := strings.Count(fixtureContents, "\n")
-		m := mutation{
-			name:            fmt.Sprintf("add-import-loc-%d", size),
-			fixtureFile:     fmt.Sprintf("sweep_%d.go", size),
-			fixtureContents: fixtureContents,
-			prompt:          fmt.Sprintf(`In the file sweep_%d.go, add the "hash/fnv" standard-library import. Do not modify any function. Do not add any other imports.`, size),
-			mustContain: []string{
-				`"hash/fnv"`,
-				`"fmt"`,
-			},
+		var m mutation
+		switch mutationFamily {
+		case "rename-param":
+			fixtureContents := buildSweepRenameParamFile(size)
+			m = mutation{
+				name:            fmt.Sprintf("rename-param-loc-%d", size),
+				fixtureFile:     fmt.Sprintf("sweep_%d.go", size),
+				fixtureContents: fixtureContents,
+				prompt: fmt.Sprintf(`In the file sweep_%d.go, rename the parameter "data" to "payload" in the Process function — throughout the signature and body. Do not rename "verbose" or any other identifier. Do not touch any other function. Do not change any behavior.`, size),
+				mustContain: []string{
+					`payload []byte`,
+					`len(payload)`,
+					`bytes.TrimSpace(payload)`,
+					`json.Unmarshal(payload,`,
+				},
+				mustNotContain: []string{
+					`data []byte`,
+					`len(data)`,
+					`bytes.TrimSpace(data)`,
+					`json.Unmarshal(data,`,
+				},
+			}
+		case "add-import":
+			fixtureContents := buildSweepFile(size)
+			m = mutation{
+				name:            fmt.Sprintf("add-import-loc-%d", size),
+				fixtureFile:     fmt.Sprintf("sweep_%d.go", size),
+				fixtureContents: fixtureContents,
+				prompt:          fmt.Sprintf(`In the file sweep_%d.go, add the "hash/fnv" standard-library import. Do not modify any function. Do not add any other imports.`, size),
+				mustContain: []string{
+					`"hash/fnv"`,
+					`"fmt"`,
+				},
+			}
+		default:
+			fmt.Fprintf(os.Stderr, "unknown mutation family %q — use rename-param or add-import\n", mutationFamily)
+			os.Exit(1)
 		}
+		actualLOC := strings.Count(m.fixtureContents, "\n")
 		for sample := 0; sample < samples; sample++ {
 			for _, mode := range []string{"files", "defn"} {
 				step++
