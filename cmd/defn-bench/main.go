@@ -122,6 +122,7 @@ func main() {
 	sizeSweepSizes := []int(nil)
 	sizeSweepMutation := "rename-param"
 	readSideCSV := ""
+	projectFilter := map[string]bool{}
 	yourRepoDir := ""
 	yourRepoTask := ""
 	argv := os.Args[1:]
@@ -154,6 +155,18 @@ func main() {
 				os.Exit(1)
 			}
 			sizeSweepCSV = argv[i+1]
+			i++
+		case "--project":
+			if i+1 >= len(argv) {
+				fmt.Fprintln(os.Stderr, "--project requires a comma-separated list (chi,gin,mux,toml)")
+				os.Exit(1)
+			}
+			for _, name := range strings.Split(argv[i+1], ",") {
+				name = strings.TrimSpace(name)
+				if name != "" {
+					projectFilter[name] = true
+				}
+			}
 			i++
 		case "--read-side-csv":
 			if i+1 >= len(argv) {
@@ -208,6 +221,7 @@ func main() {
 			fmt.Println("  --sizes 10,50,100,...               override the default sweep sizes")
 			fmt.Println("  --samples N                         samples per (size, mode) in --size-sweep (default 2)")
 			fmt.Println("  --size-sweep-csv <path>             output CSV path (default ./size-sweep.csv)")
+			fmt.Println("  --project chi[,gin,...]             restrict read-side questions to listed projects (RAM-safe batching)")
 			fmt.Println("  --read-side-csv <path>              write per-invocation CSV for the read-side questions run")
 			fmt.Println("  --your-repo <dir> --task \"<str>\"    audit defn's read-tax win on YOUR own repo, read-only")
 			os.Exit(0)
@@ -315,25 +329,57 @@ func main() {
 		}
 	}
 
+	if len(projectFilter) > 0 {
+		var filtered []question
+		for _, q := range questions {
+			if projectFilter[q.project] {
+				filtered = append(filtered, q)
+			}
+		}
+		questions = filtered
+		if len(questions) == 0 {
+			fmt.Fprintln(os.Stderr, "--project filter matched zero questions")
+			os.Exit(1)
+		}
+	}
+
+	// CSV append vs create: batching by --project would clobber prior
+	// batches if we always created. Append when the file exists AND
+	// a filter is in effect (the append-mode signal for batched runs).
+	appendCSV := len(projectFilter) > 0 && readSideCSV != ""
+	if appendCSV {
+		if _, err := os.Stat(readSideCSV); err != nil {
+			appendCSV = false
+		}
+	}
+
 	fmt.Printf("\n=== Running %d questions in both modes ===\n\n", len(questions))
 
 	var csvWriter *csv.Writer
 	var csvFile *os.File
 	if readSideCSV != "" {
-		f, err := os.Create(readSideCSV)
+		var f *os.File
+		var err error
+		if appendCSV {
+			f, err = os.OpenFile(readSideCSV, os.O_APPEND|os.O_WRONLY, 0644)
+		} else {
+			f, err = os.Create(readSideCSV)
+		}
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "create --read-side-csv %s: %v\n", readSideCSV, err)
+			fmt.Fprintf(os.Stderr, "open --read-side-csv %s: %v\n", readSideCSV, err)
 			os.Exit(1)
 		}
 		csvFile = f
 		defer csvFile.Close()
 		csvWriter = csv.NewWriter(csvFile)
 		defer csvWriter.Flush()
-		_ = csvWriter.Write([]string{
-			"project", "kind", "question", "mode",
-			"tool_calls", "input_tokens", "output_tokens", "cached_tokens",
-			"duration_ms", "correct",
-		})
+		if !appendCSV {
+			_ = csvWriter.Write([]string{
+				"project", "kind", "question", "mode",
+				"tool_calls", "input_tokens", "output_tokens", "cached_tokens",
+				"duration_ms", "correct",
+			})
+		}
 	}
 
 	writeRow := func(q question, r result) {
