@@ -19,9 +19,10 @@ import (
 )
 
 type question struct {
-	project string // project short name
-	repoDir string // path to cloned repo
-	query   string // the question to ask
+	project string       // project short name
+	kind    questionKind // graph vs lookup — for per-bucket splits in the summary
+	repoDir string       // path to cloned repo
+	query   string       // the question to ask
 	// Expected: what a correct answer should contain
 	expectContains []string
 }
@@ -39,32 +40,76 @@ type result struct {
 	rawOutput    string
 }
 
+// Question corpus for the read-side bench. Every entry carries a
+// `kind` so we can split totals into "graph" (callers, blast radius,
+// transitive impact — where defn's ref graph should win over Read+
+// grep) vs "lookup" (single-file "what does X do" — where files-
+// mode should be at least at parity). n=25, roughly balanced.
+type questionKind string
+
+const (
+	kindGraph  questionKind = "graph"  // ref-graph traversal
+	kindLookup questionKind = "lookup" // single-definition read
+)
+
 var questions = []question{
-	// Chi
-	{project: "chi", query: "What does the NewMux function do? Be concise.",
-		expectContains: []string{"Mux", "pool", "sync"}},
-	{project: "chi", query: "Who calls NewMux?",
+	// ── chi ────────────────────────────────────────────────────
+	{project: "chi", kind: kindLookup, query: "What does the NewMux function do? Be concise.",
+		expectContains: []string{"Mux"}},
+	{project: "chi", kind: kindLookup, query: "What does the Mux.ServeHTTP method do? Be concise.",
+		expectContains: []string{"request"}},
+	{project: "chi", kind: kindLookup, query: "What does the Router.Route method do? Be concise.",
+		expectContains: []string{"route"}},
+	{project: "chi", kind: kindGraph, query: "Who calls NewMux?",
 		expectContains: []string{"NewRouter"}},
-	{project: "chi", query: "What's the blast radius of changing InsertRoute? How many functions call it directly or transitively?",
+	{project: "chi", kind: kindGraph, query: "What's the blast radius of changing InsertRoute? How many functions call it directly or transitively?",
 		expectContains: []string{"handle"}},
+	{project: "chi", kind: kindGraph, query: "List every function that calls Mux.Handle directly.",
+		expectContains: []string{"Handle"}},
+	{project: "chi", kind: kindGraph, query: "Who calls the routeContext method?",
+		expectContains: []string{"chi"}},
 
-	// Gin
-	{project: "gin", query: "What does the Render method on Context do? Be concise.",
-		expectContains: []string{"response", "write", "status"}},
-	{project: "gin", query: "List all the methods on Context that call Render.",
-		expectContains: []string{"JSON", "XML", "HTML"}},
-	{project: "gin", query: "What's the blast radius of changing the Render method on Context?",
-		expectContains: []string{"caller", "16", "15"}},
+	// ── gin ────────────────────────────────────────────────────
+	{project: "gin", kind: kindLookup, query: "What does the Render method on Context do? Be concise.",
+		expectContains: []string{"response"}},
+	{project: "gin", kind: kindLookup, query: "What does the Engine.Run method do? Be concise.",
+		expectContains: []string{"http"}},
+	{project: "gin", kind: kindLookup, query: "What does the Context.JSON method do? Be concise.",
+		expectContains: []string{"json"}},
+	{project: "gin", kind: kindGraph, query: "List all the methods on Context that call Render.",
+		expectContains: []string{"JSON"}},
+	{project: "gin", kind: kindGraph, query: "What's the blast radius of changing the Render method on Context?",
+		expectContains: []string{"caller"}},
+	{project: "gin", kind: kindGraph, query: "Who calls Engine.handleHTTPRequest?",
+		expectContains: []string{"ServeHTTP"}},
+	{project: "gin", kind: kindGraph, query: "List every function that calls Context.Next directly.",
+		expectContains: []string{"Next"}},
 
-	// Mux
-	{project: "mux", query: "What does NewRouter do?",
+	// ── mux ────────────────────────────────────────────────────
+	{project: "mux", kind: kindLookup, query: "What does NewRouter do? Be concise.",
 		expectContains: []string{"Router"}},
-	{project: "mux", query: "Who calls HandleFunc on Router?",
+	{project: "mux", kind: kindLookup, query: "What does the Router.HandleFunc method do? Be concise.",
+		expectContains: []string{"handler"}},
+	{project: "mux", kind: kindLookup, query: "What does the Route.PathPrefix method do? Be concise.",
+		expectContains: []string{"prefix"}},
+	{project: "mux", kind: kindGraph, query: "Who calls HandleFunc on Router?",
 		expectContains: []string{"Test"}},
+	{project: "mux", kind: kindGraph, query: "Who calls the setMatch function?",
+		expectContains: []string{"match"}},
+	{project: "mux", kind: kindGraph, query: "List every function that calls Router.NewRoute directly.",
+		expectContains: []string{"Route"}},
 
-	// Toml
-	{project: "toml", query: "What does the Decode function do? Be concise.",
-		expectContains: []string{"TOML", "decode", "unmarshal"}},
+	// ── toml ───────────────────────────────────────────────────
+	{project: "toml", kind: kindLookup, query: "What does the Decode function do? Be concise.",
+		expectContains: []string{"TOML"}},
+	{project: "toml", kind: kindLookup, query: "What does the Encoder.Encode method do? Be concise.",
+		expectContains: []string{"toml"}},
+	{project: "toml", kind: kindLookup, query: "What does the DecodeFile function do? Be concise.",
+		expectContains: []string{"file"}},
+	{project: "toml", kind: kindGraph, query: "Who calls the Decode function?",
+		expectContains: []string{"toml"}},
+	{project: "toml", kind: kindGraph, query: "List every function that calls unify directly.",
+		expectContains: []string{"unify"}},
 }
 
 func main() {
@@ -285,7 +330,7 @@ func main() {
 		csvWriter = csv.NewWriter(csvFile)
 		defer csvWriter.Flush()
 		_ = csvWriter.Write([]string{
-			"project", "question", "mode",
+			"project", "kind", "question", "mode",
 			"tool_calls", "input_tokens", "output_tokens", "cached_tokens",
 			"duration_ms", "correct",
 		})
@@ -296,7 +341,7 @@ func main() {
 			return
 		}
 		_ = csvWriter.Write([]string{
-			q.project, q.query, r.mode,
+			q.project, string(q.kind), q.query, r.mode,
 			strconv.Itoa(r.toolCalls),
 			strconv.Itoa(r.inputTokens),
 			strconv.Itoa(r.outputTokens),
@@ -409,6 +454,45 @@ func main() {
 	if totalFilesTime > 0 {
 		speedup := float64(totalFilesTime) / float64(totalDefnTime)
 		fmt.Printf("Speed improvement: %.1fx\n", speedup)
+	}
+
+	// Per-kind split — the honest read of "where does defn win"
+	// requires bucketing by question type. graph = callers/blast/
+	// transitive-impact (ref-graph traversal); lookup = single-def
+	// read. The aggregate reduction number lies if the bucket sizes
+	// are lopsided.
+	fmt.Println()
+	fmt.Println("=== By question kind ===")
+	fmt.Printf("%-8s %5s %10s %10s %8s %6s %6s\n",
+		"kind", "n", "F.inTok", "D.inTok", "Δ.in", "F.ok", "D.ok")
+	fmt.Println(strings.Repeat("-", 60))
+	for _, kind := range []questionKind{kindGraph, kindLookup} {
+		var fIn, dIn, fOk, dOk, n int
+		for i, q := range questions {
+			if q.kind != kind {
+				continue
+			}
+			n++
+			fIn += filesResults[i].inputTokens
+			dIn += defnResults[i].inputTokens
+			if filesResults[i].correct {
+				fOk++
+			}
+			if defnResults[i].correct {
+				dOk++
+			}
+		}
+		if n == 0 {
+			continue
+		}
+		delta := ""
+		if fIn > 0 {
+			delta = fmt.Sprintf("%+.1f%%", -float64(fIn-dIn)/float64(fIn)*100)
+		}
+		fmt.Printf("%-8s %5d %10d %10d %8s %6s %6s\n",
+			kind, n, fIn, dIn, delta,
+			fmt.Sprintf("%d/%d", fOk, n),
+			fmt.Sprintf("%d/%d", dOk, n))
 	}
 
 	if includeMut {
