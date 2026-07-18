@@ -1680,13 +1680,31 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 // countTopLevelDecls returns the number of top-level declarations in a Go body
 // fragment. Returns 0 if unparseable (caller surfaces a clearer error).
 func countTopLevelDecls(body string) int {
-	src := "package x\n" + strings.TrimSpace(body)
+	src := "package x\n" + stripLeadingPackageDecl(strings.TrimSpace(body))
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
 	if err != nil {
 		return 0
 	}
 	return len(f.Decls)
+}
+
+// stripLeadingPackageDecl removes a leading `package X` declaration from a
+// body fragment if present. The model naturally writes whole-file bodies
+// beginning with `package foo` when asked to author a new file; without
+// this the "package x\n" prefix we add for parsing produces two package
+// decls and a parse error. The package name is redundant with the target
+// file path anyway (defn derives package from module ingest).
+func stripLeadingPackageDecl(body string) string {
+	trimmed := strings.TrimLeft(body, " \t\n")
+	if !strings.HasPrefix(trimmed, "package ") {
+		return body
+	}
+	nl := strings.IndexByte(trimmed, '\n')
+	if nl == -1 {
+		return "" // whole body is just `package X`
+	}
+	return trimmed[nl+1:]
 }
 
 // slicedDecl is one top-level decl carved out of a multi-decl body.
@@ -1703,7 +1721,7 @@ type slicedDecl struct {
 // metadata). Returns an error on unparseable input, no decls, or a decl
 // whose name cannot be inferred (e.g. imports, blank var groups).
 func sliceDecls(body string) ([]slicedDecl, error) {
-	trimmed := strings.TrimSpace(body)
+	trimmed := stripLeadingPackageDecl(strings.TrimSpace(body))
 	src := "package x\n" + trimmed
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
@@ -1804,13 +1822,24 @@ func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult
 	}
 
 	mod := s.findModuleByFile(args.File)
+	if mod == nil && args.Module != "" {
+		mod = s.findModule(args.Module)
+	}
 	if mod == nil {
-		if args.Module != "" {
-			mod = s.findModule(args.Module)
+		// New-package case: file: points at a directory not yet ingested.
+		// Fall back to the shortest-path module (matches single-decl create's
+		// fallback), which for a repo-rooted layout is the module root. Emit
+		// will place the file at args.File; the new package appears on next
+		// ingest.
+		mods, _ := s.db.ListModules()
+		for i := range mods {
+			if mod == nil || len(mods[i].Path) < len(mod.Path) {
+				mod = &mods[i]
+			}
 		}
 	}
 	if mod == nil {
-		return errResult(fmt.Errorf("file %q does not map to any known module — run defn ingest first, or pass module: explicitly", args.File))
+		return errResult(fmt.Errorf("no modules found — run defn ingest first, or pass module: explicitly"))
 	}
 
 	// Pre-check: no name collides with an existing def in the target module.
@@ -1906,7 +1935,7 @@ func (s *server) findModuleByFile(file string) *store.Module {
 // inferFromBody extracts definition name, kind, receiver, and test flag from Go source.
 func (s *server) inferFromBody(body string) (name, kind, receiver string, isTest bool) {
 	// Parse the body as a Go source file to extract definition metadata.
-	src := "package x\n" + strings.TrimSpace(body)
+	src := "package x\n" + stripLeadingPackageDecl(strings.TrimSpace(body))
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
 	if err != nil || len(f.Decls) == 0 {

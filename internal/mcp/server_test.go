@@ -1011,6 +1011,41 @@ func Existing() int { return 3 }`
 	}
 }
 
+// The model naturally writes whole-file bodies beginning with `package
+// foo` when asked to author a new file. Multi-decl create must strip
+// the leading package decl instead of choking on the resulting duplicate
+// package clause. Regression from the 2026-07-17 probe.
+func TestHandleCreateMultiDeclStripsLeadingPackage(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	body := `package multitest
+
+// Alpha runs.
+func Alpha() int { return 1 }
+
+// Beta runs.
+func Beta() int { return 2 }
+
+// Gamma runs.
+func Gamma() int { return 3 }`
+
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body: body,
+		File: "main.go",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Created 3 defs") {
+		t.Fatalf("expected 'Created 3 defs' (with leading package stripped), got: %s", text)
+	}
+	for _, name := range []string{"Alpha", "Beta", "Gamma"} {
+		if _, err := db.GetDefinitionByName(name, ""); err != nil {
+			t.Errorf("%s not created: %v", name, err)
+		}
+	}
+}
+
 // Bug C: op:create with file: param must route the new def into that file
 // (SourceFile populated on the stored Definition).
 func TestHandleCreateHonorsFileParam(t *testing.T) {
