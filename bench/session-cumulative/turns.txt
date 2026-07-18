@@ -1,0 +1,10 @@
+Look at how middleware.Timeout is implemented in this chi repo and briefly explain the middleware pattern used here.
+Now add a new middleware called RateLimit(rate int, burst int) using a token bucket. Put it in middleware/ratelimit.go. Follow the same style as other middleware in this directory. rate is tokens per second; burst is max bucket size. If a request comes in without a token available, respond with 429 Too Many Requests.
+Write tests for it in middleware/ratelimit_test.go. Follow the pattern of existing middleware tests you can see in the directory. Cover: allowed request, rate-limited request, and burst behavior.
+Run `go build ./...` from the repo root and fix any errors.
+Run `go test ./middleware/` and make sure everything passes.
+Which other functions in this codebase call chi.Middlewares? Which ones would be affected if I changed the Middlewares type?
+Refactor RateLimit to accept a context.Context in the token-acquisition path — if the request context is canceled while waiting for a token, respond with 503 Service Unavailable and stop waiting immediately.
+Update the tests to cover the context-cancel behavior — add one that cancels the request context mid-wait and asserts the response is 503.
+Run `go test ./middleware/ -v -run RateLimit` to confirm the RateLimit tests still pass.
+Finally, add a top-level doc comment on the RateLimit function explaining rate, burst, and the ctx-cancel behavior. Then confirm `go build ./...` still passes.

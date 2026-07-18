@@ -1,0 +1,10 @@
+Explain how chi.Mux handles routing. What's the flow when ServeHTTP is called? Focus on the top-level dispatch, not the trie internals.
+Which functions in chi call routeHTTP directly, and under what conditions? Include test callers if any.
+What's the relationship between chi.Mux and chi.Router? Is Router an interface Mux implements, or something else?
+If I wanted to change the signature of Mux.Handle, which production callers would break? Which tests would need updates?
+Explain chi.Middlewares. Where is it used, and what pattern does it enforce for users?
+Show me how chi.Chain is constructed and what it returns. Include any type conversions in the chain.
+Walk through the code path for a request matching a nested sub-router. What files does it touch, from ServeHTTP to the handler being invoked?
+Which middleware in the middleware/ directory uses context values? List each with the key type it stores.
+In chi.Mux.Route, how does the sub-router get its middleware inherited from the parent? Show the exact mechanism.
+Summarize the extension points chi exposes to users — where can external packages plug in?
