@@ -1,0 +1,25 @@
+# Curated well-known chi symbols for the delta-from-prior measurement.
+# Format: Name,Receiver,Kind
+# Receiver may include leading * (e.g. *Mux); comparison strips it.
+# Chosen to match the surface an agent would touch when writing chi
+# middleware or extending a chi router — exactly the D-favorable case.
+NewRouter,,function
+NewMux,,function
+URLParam,,function
+URLParamFromCtx,,function
+RouteContext,,function
+Chain,,function
+ServeHTTP,*Mux,method
+Handle,*Mux,method
+Mount,*Mux,method
+Route,*Mux,method
+Use,*Mux,method
+With,*Mux,method
+Get,*Mux,method
+Post,*Mux,method
+Put,*Mux,method
+Delete,*Mux,method
+Patch,*Mux,method
+NotFound,*Mux,method
+MethodNotAllowed,*Mux,method
+Routes,*Mux,method

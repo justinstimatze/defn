@@ -1,0 +1,25 @@
+# Curated well-known gin symbols for delta-from-prior measurement.
+# Chosen to mirror the surface an agent hits when writing gin middleware
+# or extending a gin app.
+New,,function
+Default,,function
+ServeHTTP,*Engine,method
+Run,*Engine,method
+Use,*Engine,method
+Handle,*Engine,method
+GET,*Engine,method
+POST,*Engine,method
+Group,*RouterGroup,method
+JSON,*Context,method
+Bind,*Context,method
+BindJSON,*Context,method
+ShouldBind,*Context,method
+Param,*Context,method
+Query,*Context,method
+GetHeader,*Context,method
+Set,*Context,method
+Get,*Context,method
+Next,*Context,method
+Abort,*Context,method
+AbortWithStatus,*Context,method
+Value,*Context,method
