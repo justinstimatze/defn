@@ -594,6 +594,30 @@ func TestHandleReadFile_MissingFile(t *testing.T) {
 	}
 }
 
+// TestHandleFileDefs_RootLevelFile is the regression for the bug that
+// let handleFileDefs miss defs when the file is at the module root and
+// the module path did not contain the file stem (e.g. module "testproj"
+// + file "main.go" — the old code stripped .go and searched for a "main"
+// dir substring, which never matches "testproj"). Fixed by mirroring
+// handleReadFile's dir="" pattern for bare filenames.
+func TestHandleFileDefs_RootLevelFile(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	result, _, err := s.handleFileDefs(context.Background(), nil, codeParam{File: "main.go"})
+	if err != nil {
+		t.Fatalf("file-defs: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Greet") {
+		t.Errorf("expected Greet in file-defs output, got: %s", text)
+	}
+	if !strings.Contains(text, "Farewell") {
+		t.Errorf("expected Farewell in file-defs output, got: %s", text)
+	}
+}
+
 // TestHandleAddImportRootFile regresses a bug where handleAddImport
 // treated a root-level file (no "/") as its own directory when
 // looking up its module, so FindDefinitionsByFile searched

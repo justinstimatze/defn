@@ -2802,13 +2802,12 @@ func (s *server) handleFileDefs(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 	if strings.TrimSpace(file) == "" {
 		return errResult(fmt.Errorf("file-defs: file is required"))
 	}
-	// Strip filename to get package directory.
-	dir := file
-	if idx := strings.LastIndex(dir, "/"); idx >= 0 {
-		dir = dir[:idx]
-	} else {
-		dir = strings.TrimSuffix(dir, "_test.go")
-		dir = strings.TrimSuffix(dir, ".go")
+	// For subpath files use the dirname; for root-level files leave dir empty
+	// so the module-path LIKE-match is permissive and the source_file exact
+	// match narrows to the right file. Mirrors handleReadFile.
+	dir := ""
+	if idx := strings.LastIndex(file, "/"); idx >= 0 {
+		dir = file[:idx]
 	}
 	defs, err := s.db.FindDefinitionsByFile(dir, file, 0)
 	if err != nil {
