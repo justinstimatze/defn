@@ -160,6 +160,29 @@ Result: 13 pairs, 6 clusters. Adjudicated: **0 drift**, 5 contracted-twin-ok,
     empty-dir (correct — permissive LIKE + exact source_file filter narrows).
     Followup: fix handleFileDefs to match handleReadFile's dir="" pattern.
 
+## Added 2026-07-17 (delta-from-prior read op)
+
+- cluster: internal/mcp/server.go::server.handleGetDefinition | internal/mcp/server.go::server.renderUpstreamMatch | internal/mcp/server.go::server.renderDivergedFromUpstream
+  - verdict: contracted-twin-ok
+  - reviewed: 2026-07-17
+  - note: three renderers for the same read op, split by upstream-fingerprint state.
+    `renderUpstreamMatch` fires when local structural hash equals a known upstream
+    row → compact provenance form (sig + doc + version, no body).
+    `renderDivergedFromUpstream` fires when the def name exists upstream but no
+    version's hash matches → full body + divergence note.
+    `handleGetDefinition` tail fires otherwise (module unknown to corpus, or
+    caller passed `full: true`) → the original body-in-fence form.
+    Contract: all three must set `usageStats{Op: "read", ...}` and route through
+    `withUsage(textResult(...), ...)` so structured output stays uniform.
+
+- pair: internal/store/hash.go::HashBodyStructural | internal/store/hash.go::HashBody
+  - verdict: contracted-twin-ok
+  - reviewed: 2026-07-17
+  - note: raw SHA256 vs AST-structural SHA256 of a body string. Twins by design —
+    `HashBody` is used for exact-match cache keys (ingest freshness); `HashBodyStructural`
+    is whitespace/comment-invariant, used to detect that local dep body matches a
+    tagged upstream release even when comments/formatting drifted.
+
 ## Follow-up refactors (deferred, not drift)
 
 None of these are gate-worthy — mild ergonomics wins surfaced by the scan:

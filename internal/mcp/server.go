@@ -299,6 +299,7 @@ type codeParam struct {
 	NewParam    string           `json:"new_param,omitempty"`
 	StmtIndex   int              `json:"stmt_index,omitempty"`
 	DeferBody   string           `json:"defer_body,omitempty"`
+	Full        bool             `json:"full,omitempty"`
 }
 
 type applyOp struct {
@@ -333,6 +334,10 @@ type applyOp struct {
 // Legacy param types used by internal handlers.
 type nameParam struct {
 	Name string `json:"name"`
+	// Full forces the read op to return the body even when the def
+	// matches a known upstream fingerprint. Default (false) yields the
+	// compact provenance form for library-symbol reads.
+	Full bool `json:"full,omitempty"`
 }
 
 type editParam struct {
@@ -658,7 +663,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 
 	switch args.Op {
 	case "read":
-		return wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name}))
+		return wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name, Full: args.Full}))
 	case "outline":
 		return wrapStale(s.handleOutline(ctx, req, nameParam{Name: args.Name}))
 	case "slice":
@@ -901,10 +906,101 @@ func (s *server) handleGetDefinition(_ context.Context, _ *sdkmcp.CallToolReques
 		}
 	}
 
+	// Delta-from-prior: if this def belongs to a module we have upstream
+	// fingerprints for AND the caller hasn't asked for the full body,
+	// try the compact provenance form. See project_d_delta_from_prior.
+	if !args.Full && modulePath != "" {
+		upstreamName := upstreamDefName(d)
+		hash := store.HashBodyStructural(d.Body)
+		if match, _ := s.db.FindUpstreamMatch(modulePath, upstreamName, d.Kind, d.Receiver, hash); match != nil {
+			return s.renderUpstreamMatch(d, match, modulePath)
+		}
+		// Miss: check whether any version of this def is known upstream.
+		// If yes, it means the local copy has diverged — annotate the
+		// body so the reader knows they're looking at patched code.
+		if versions, _ := s.db.FindUpstreamVersions(modulePath, upstreamName, d.Kind, d.Receiver); len(versions) > 0 {
+			return s.renderDivergedFromUpstream(d, versions, modulePath)
+		}
+	}
+
 	var sb strings.Builder
 	recv := formatReceiver(d.Receiver)
 	sb.WriteString(fmt.Sprintf("## %s%s (%s)\n", recv, d.Name, d.Kind))
 	sb.WriteString(fmt.Sprintf("Module: %s\n\n", modulePath))
+	if d.Doc != "" {
+		sb.WriteString(d.Doc + "\n\n")
+	}
+	sb.WriteString("```go\n")
+	sb.WriteString(d.Body)
+	sb.WriteString("\n```\n")
+
+	out := sb.String()
+	return withUsage(textResult(out), usageStats{
+		Op:            "read",
+		BytesReturned: len(out),
+		BytesAltRead:  s.fileAltBytes(d),
+	}), nil, nil
+}
+
+// upstreamDefName returns the fully-qualified name used in the
+// upstream_fingerprints table for a local definition. Plain functions
+// use their unqualified name; methods use "ReceiverBase.Method" (with
+// any leading "*" stripped from the receiver).
+func upstreamDefName(d *store.Definition) string {
+	if d.Receiver == "" {
+		return d.Name
+	}
+	return strings.TrimPrefix(d.Receiver, "*") + "." + d.Name
+}
+
+// renderUpstreamMatch produces the compact provenance form — signature
+// + doc + provenance tag, no body. Substantial byte savings for
+// well-known library defs the reader can look up from memory or docs.
+func (s *server) renderUpstreamMatch(d *store.Definition, match *store.UpstreamFingerprint, modulePath string) (*sdkmcp.CallToolResult, any, error) {
+	var sb strings.Builder
+	recv := formatReceiver(d.Receiver)
+	sb.WriteString(fmt.Sprintf("## %s%s (%s) — %s @ %s unchanged from upstream\n",
+		recv, d.Name, d.Kind, modulePath, match.Version))
+	sb.WriteString(fmt.Sprintf("Module: %s\n\n", modulePath))
+	doc := match.Doc
+	if doc == "" {
+		doc = d.Doc
+	}
+	if doc != "" {
+		sb.WriteString(doc + "\n\n")
+	}
+	sig := match.Signature
+	if sig == "" {
+		sig = d.Signature
+	}
+	if sig != "" {
+		sb.WriteString("```go\n")
+		sb.WriteString(sig)
+		sb.WriteString("\n```\n\n")
+	}
+	sb.WriteString("(body identical to upstream — pass `full: true` to see it)\n")
+
+	out := sb.String()
+	return withUsage(textResult(out), usageStats{
+		Op:            "read",
+		BytesReturned: len(out),
+		BytesAltRead:  s.fileAltBytes(d),
+	}), nil, nil
+}
+
+// renderDivergedFromUpstream returns the body but annotates that the
+// local copy differs from every known upstream version — a signal the
+// reader should not fall back to their prior about the library code.
+func (s *server) renderDivergedFromUpstream(d *store.Definition, versions []store.UpstreamFingerprint, modulePath string) (*sdkmcp.CallToolResult, any, error) {
+	var sb strings.Builder
+	recv := formatReceiver(d.Receiver)
+	sb.WriteString(fmt.Sprintf("## %s%s (%s)\n", recv, d.Name, d.Kind))
+	sb.WriteString(fmt.Sprintf("Module: %s\n\n", modulePath))
+	vs := make([]string, 0, len(versions))
+	for _, v := range versions {
+		vs = append(vs, v.Version)
+	}
+	sb.WriteString(fmt.Sprintf("**Note:** local copy diverges from all known upstream versions (%s).\n\n", strings.Join(vs, ", ")))
 	if d.Doc != "" {
 		sb.WriteString(d.Doc + "\n\n")
 	}

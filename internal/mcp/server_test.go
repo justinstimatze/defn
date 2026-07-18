@@ -429,6 +429,116 @@ func TestHandleRead(t *testing.T) {
 	}
 }
 
+// TestHandleRead_UpstreamMatch seeds an upstream fingerprint whose hash
+// matches the local Greet body exactly, then verifies the read op
+// returns the compact provenance form (no body, tagged with version).
+func TestHandleRead_UpstreamMatch(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	// Pull the local Greet so we can hash its exact body.
+	d, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := store.HashBodyStructural(d.Body)
+
+	if err := db.InsertUpstreamFingerprint(store.UpstreamFingerprint{
+		ModulePath:  "testproj",
+		Version:     "v1.2.3",
+		DefName:     "Greet",
+		Kind:        "function",
+		Receiver:    "",
+		Fingerprint: hash,
+		Signature:   "func Greet(name string) string",
+		Doc:         "Greet returns a greeting.",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Greet"})
+	text := resultText(t, result)
+
+	if !strings.Contains(text, "v1.2.3") {
+		t.Errorf("expected upstream version tag, got: %s", text)
+	}
+	if !strings.Contains(text, "unchanged from upstream") {
+		t.Errorf("expected provenance tag, got: %s", text)
+	}
+	if strings.Contains(text, "\"Hello, \"") {
+		t.Errorf("expected body to be elided in compact form, got: %s", text)
+	}
+	if !strings.Contains(text, "full: true") {
+		t.Errorf("expected hint about full:true, got: %s", text)
+	}
+
+	// full:true should bypass the compact form and return the body.
+	fullResult, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Greet", Full: true})
+	fullText := resultText(t, fullResult)
+	if !strings.Contains(fullText, "\"Hello, \"") {
+		t.Errorf("full:true should include body, got: %s", fullText)
+	}
+}
+
+// TestHandleRead_UpstreamDivergence seeds an upstream row whose hash
+// does NOT match the local body — the read op should return the full
+// body with a divergence note (helpful when the user has patched a
+// dep locally).
+func TestHandleRead_UpstreamDivergence(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	if err := db.InsertUpstreamFingerprint(store.UpstreamFingerprint{
+		ModulePath:  "testproj",
+		Version:     "v1.2.3",
+		DefName:     "Greet",
+		Kind:        "function",
+		Receiver:    "",
+		Fingerprint: "different-hash-does-not-match",
+		Signature:   "func Greet(name string) string",
+		Doc:         "Greet returns a greeting.",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Greet"})
+	text := resultText(t, result)
+
+	if !strings.Contains(text, "diverges from all known upstream versions") {
+		t.Errorf("expected divergence note, got: %s", text)
+	}
+	if !strings.Contains(text, "v1.2.3") {
+		t.Errorf("expected known version listed, got: %s", text)
+	}
+	if !strings.Contains(text, "\"Hello, \"") {
+		t.Errorf("divergence path should include full body, got: %s", text)
+	}
+}
+
+// TestHandleRead_UnknownModule verifies that a def whose module has
+// no upstream_fingerprints rows falls through to the current body-in-fence
+// behavior unchanged.
+func TestHandleRead_UnknownModule(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Greet"})
+	text := resultText(t, result)
+
+	if !strings.Contains(text, "\"Hello, \"") {
+		t.Errorf("expected full body in output for unknown module, got: %s", text)
+	}
+	if strings.Contains(text, "unchanged from upstream") {
+		t.Errorf("no upstream rows exist — should not be tagged as unchanged, got: %s", text)
+	}
+	if strings.Contains(text, "diverges from") {
+		t.Errorf("no upstream rows exist — should not be tagged as divergent, got: %s", text)
+	}
+}
+
 func TestHandleReadFile(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()

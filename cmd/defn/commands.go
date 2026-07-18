@@ -660,6 +660,7 @@ Read, Edit, Write, or Grep. Reserve those built-in tools for non-Go files
 ` + "```" + `
 code(op: "read", name: "handleEdit")           -- full source by name
 code(op: "read", name: "server.go:272")        -- or by file:line
+code(op: "read", name: "chi.Mux.ServeHTTP", full: true) -- force body when def is upstream-tagged
 code(op: "impact", name: "Render")             -- blast radius + test coverage
 code(op: "edit", name: "Foo", new_body: "...") -- edit, auto-emit + build
 code(op: "search", pattern: "%Auth%")          -- name pattern (% wildcard)
@@ -675,6 +676,7 @@ All ops: read, search, impact, explain, untested, edit, create, delete, rename, 
 - ` + "`code(op:\"edit\")`" + ` updates one definition, emits the file, and rebuilds the reference graph in one call. A raw file Edit leaves defn's graph stale until a ` + "`sync`" + `.
 - ` + "`code(op:\"rename\")`" + ` / ` + "`move`" + ` update every reference and import site across the repo in one call — many fragile Edits otherwise.
 - ` + "`code(op:\"impact\")`" + ` gives callers + transitive blast radius + test coverage before you touch anything.
+- ` + "`code(op:\"read\")`" + ` on a symbol from a well-known library (chi, gin, etc.) returns a compact provenance tag instead of the body when the local copy matches a tagged upstream release — signature + doc + version, no body. Pass ` + "`full: true`" + ` to see the body.
 
 If you do edit a ` + "`.go`" + ` file with a built-in tool, call ` + "`code(op:\"sync\", file:\"path\")`" + ` afterward so the graph stays correct.
 
