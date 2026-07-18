@@ -11,7 +11,7 @@ code(op: "outline", name: "handleEdit")        -- compact projection: sig+doc+re
 code(op: "slice", name: "handleEdit", slice: "error-branch") -- verbatim AST-role slice (v0.24.2)
 code(op: "insert-precondition", name: "F", condition: "x < 0", ret: "return err") -- byte-exact PUTGET; name optional if the DB has one non-test function (v0.25.0)
 code(op: "replace-slice", name: "F", slice: "return", index: 1, new: "return nil") -- byte-exact PUTGET; name optional if the DB has one non-test function (v0.25.0)
-code(op: "replace-hunk", name: "F", old: "x := 1\n", new: "x := 42\n", index: 0) -- byte-exact PUTGET; content-addressed hunk inside a def body; index required only when `old` occurs >1x; empty `new` deletes the hunk. Best for 6-40 line hunks; for 1-2 line edits use edit(new_body=) (v0.26.0)
+code(op: "replace-hunk", name: "F", old: "x := 1\n", new: "x := 42\n", index: 0) -- byte-exact PUTGET; content-addressed hunk inside a def body; index required only when `old` occurs >1x; empty `new` deletes the hunk. Send zero anchor context when the hunk is def-unique — name does the file-level disambiguation (v0.26.0)
 code(op: "wrap-in-defer", name: "F", stmt_index: 1, defer_body: "cleanup()") -- byte-exact PUTGET; name optional if the DB has one non-test function (v0.25.0)
 code(op: "rename-param", name: "F", old_param: "x", new_param: "n") -- ≡_gofmt PUTGET; name optional if the DB has one non-test function (v0.25.0)
 code(op: "add-import", import_path: "errors", file: "pkg/f.go", alias: "") -- goimports-canonical grouping; file optional if the DB has one non-test .go file (v0.25.0)
