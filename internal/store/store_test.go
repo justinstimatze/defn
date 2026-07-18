@@ -543,6 +543,86 @@ func TestGetImpact(t *testing.T) {
 	}
 }
 
+// TestGetImpact_InterfaceDispatchPrecision is the regression test for the
+// pre-2026-07-17 bug in getInterfaceDispatchCallers. That heuristic added
+// every caller of the interface TYPE (via any ref kind) to every concrete
+// method's DirectCallers — regardless of whether the concrete method
+// matched an interface method or not. Result on chi: unexported routeHTTP
+// showed 26 phantom callers when only 2 real callers exist.
+//
+// The fix: rely solely on refs.kind='interface_dispatch' edges emitted by
+// resolve.go for calls through interface values. This test wires such an
+// edge and verifies it's picked up, and verifies that a sibling method
+// NOT called via the interface gets zero interface_dispatch callers.
+func TestGetImpact_InterfaceDispatchPrecision(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+
+	// Reader interface, File concrete type that implements it.
+	reader, _ := db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "Reader", Kind: "interface", Exported: true,
+		Body: "type Reader interface { Read() }",
+	})
+	file, _ := db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "File", Kind: "type", Exported: true,
+		Body: "type File struct{}",
+	})
+	fileRead, _ := db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "Read", Kind: "method", Exported: true, Receiver: "*File",
+		Body: "func (f *File) Read() {}",
+	})
+	fileOpen, _ := db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "Open", Kind: "method", Exported: true, Receiver: "*File",
+		Body: "func (f *File) Open() {}",
+	})
+	useIface, _ := db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "UseReader", Kind: "function", Exported: true,
+		Body: "func UseReader(r Reader) { r.Read() }",
+	})
+	useConcrete, _ := db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "UseFile", Kind: "function", Exported: true,
+		Body: "func UseFile(f *File) { f.Open() }",
+	})
+
+	// File implements Reader.
+	db.SetReferences(file, []Reference{{ToDef: reader, Kind: "implements"}})
+	// UseReader calls Reader.Read (which is an interface method not stored as
+	// a def) — resolve.go emits interface_dispatch edge to the concrete impl.
+	db.SetReferences(useIface, []Reference{
+		{ToDef: reader, Kind: "type_ref"},
+		{ToDef: fileRead, Kind: "interface_dispatch"},
+	})
+	// UseFile calls File.Open directly.
+	db.SetReferences(useConcrete, []Reference{{ToDef: fileOpen, Kind: "call"}})
+
+	// File.Read: interface_dispatch edge from UseReader should show up.
+	impactR, err := db.GetImpact(fileRead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(impactR.DirectCallers) != 1 || impactR.DirectCallers[0].Name != "UseReader" {
+		t.Fatalf("File.Read direct callers: expected [UseReader], got %v", impactR.DirectCallers)
+	}
+	if len(impactR.InterfaceDispatchCallers) != 1 || impactR.InterfaceDispatchCallers[0].Name != "UseReader" {
+		t.Fatalf("File.Read interface_dispatch callers: expected [UseReader], got %v",
+			impactR.InterfaceDispatchCallers)
+	}
+
+	// File.Open: NOT an interface method. Old bug added UseReader here too
+	// because UseReader has a type_ref edge to Reader. Fix must NOT include it.
+	impactO, err := db.GetImpact(fileOpen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(impactO.DirectCallers) != 1 || impactO.DirectCallers[0].Name != "UseFile" {
+		t.Fatalf("File.Open direct callers: expected [UseFile], got %v", impactO.DirectCallers)
+	}
+	if len(impactO.InterfaceDispatchCallers) != 0 {
+		t.Fatalf("File.Open interface_dispatch callers: expected 0, got %d: %v",
+			len(impactO.InterfaceDispatchCallers), impactO.InterfaceDispatchCallers)
+	}
+}
+
 func TestImports(t *testing.T) {
 	db := testDB(t)
 	mod, _ := db.EnsureModule("example.com/test", "test", "")

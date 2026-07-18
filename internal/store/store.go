@@ -475,6 +475,25 @@ func (s *DB) GetCallers(defID int64) ([]Definition, error) {
 	return scanDefinitions(rows)
 }
 
+// getCallersOfKind returns callers restricted to a specific refs.kind
+// (e.g., "call" or "interface_dispatch"). Used by GetImpact to label the
+// interface-dispatch subset without a second table scan by the caller.
+func (s *DB) getCallersOfKind(defID int64, kind string) ([]Definition, error) {
+	rows, err := s.queryContext(s.Ctx(),
+		`SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
+		        COALESCE(d.signature,''), COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
+		 FROM definitions d
+		 LEFT JOIN bodies b ON b.def_id = d.id
+		 JOIN refs r ON r.from_def = d.id
+		 WHERE r.to_def = ? AND r.kind = ?
+		 ORDER BY d.name`, defID, kind)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanDefinitions(rows)
+}
+
 // GetCommentsByPragma returns all comments with the given pragma key.
 // pragmaKey supports SQL LIKE patterns (e.g. "go:%").
 func (s *DB) GetCommentsByPragma(pragmaKey string) ([]Comment, error) {
@@ -720,28 +739,16 @@ func (s *DB) GetImpact(defID int64) (*Impact, error) {
 		return nil, fmt.Errorf("get module path for def %d: %w", defID, err)
 	}
 
+	// Direct callers include both call edges and interface_dispatch edges
+	// (added by resolve.go when a call site targets an interface method that
+	// this concrete method satisfies). No additional heuristic needed.
 	directCallers, err := s.GetCallers(defID)
 	if err != nil {
 		return nil, err
 	}
-
-	// If this is a method on a concrete type, also include callers of
-	// any interface method it satisfies (interface dispatch).
-	var ifaceDispatchCallers []Definition
-	if d.Receiver != "" {
-		ifaceDispatchCallers = s.getInterfaceDispatchCallers(d)
-		for _, c := range ifaceDispatchCallers {
-			found := false
-			for _, existing := range directCallers {
-				if existing.ID == c.ID {
-					found = true
-					break
-				}
-			}
-			if !found {
-				directCallers = append(directCallers, c)
-			}
-		}
+	ifaceDispatchCallers, err := s.getCallersOfKind(defID, "interface_dispatch")
+	if err != nil {
+		return nil, err
 	}
 
 	// Transitive callers via BFS.
@@ -2102,52 +2109,6 @@ func (s *DB) fuzzyReceiverLookup(name, modulePath, bareRecv, prefix string) (*De
 		return nil, err
 	}
 	return d, nil
-}
-
-// GetUntested returns definitions that have no test in their direct callers.
-// getInterfaceDispatchCallers finds callers of interface methods that this
-// concrete method satisfies. E.g., if *responseWriter satisfies ResponseWriter,
-// callers of ResponseWriter.WriteHeader are also callers of responseWriter.WriteHeader.
-func (s *DB) getInterfaceDispatchCallers(d *Definition) []Definition {
-	// Find the concrete type (strip * from receiver).
-	concreteType := strings.TrimPrefix(d.Receiver, "*")
-
-	// Find interfaces this type implements (via "implements" edges).
-	rows, err := s.queryContext(s.Ctx(),
-		`SELECT d2.name FROM definitions d1
-		 JOIN refs r ON r.from_def = d1.id
-		 JOIN definitions d2 ON d2.id = r.to_def
-		 WHERE d1.name = ? AND r.kind = 'implements'`,
-		concreteType)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-
-	var ifaces []string
-	for rows.Next() {
-		var name string
-		rows.Scan(&name)
-		ifaces = append(ifaces, name)
-	}
-
-	// For each interface, find the same-named method and get its callers.
-	var allCallers []Definition
-	for _, iface := range ifaces {
-		// Interface methods don't exist as separate definitions in defn.
-		// But callers reference the interface type. Find callers that
-		// use this method name via the interface.
-		ifaceDef, err := s.GetDefinitionByName(iface, "")
-		if err != nil {
-			continue
-		}
-		callers, err := s.GetCallers(ifaceDef.ID)
-		if err != nil {
-			continue
-		}
-		allCallers = append(allCallers, callers...)
-	}
-	return allCallers
 }
 
 // queryContext runs QueryContext on the pinned connection (embedded) or pool (MySQL).
