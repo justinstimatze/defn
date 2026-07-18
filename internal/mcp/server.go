@@ -1718,8 +1718,9 @@ type slicedDecl struct {
 
 // sliceDecls parses a multi-decl body and returns each top-level decl as
 // its own slicedDecl (verbatim text including doc comments, name/kind
-// metadata). Returns an error on unparseable input, no decls, or a decl
-// whose name cannot be inferred (e.g. imports, blank var groups).
+// metadata). Import blocks are silently skipped — goimports re-adds them
+// at emit time from usage. Returns an error on unparseable input, no
+// remaining decls after filtering, or a decl whose name cannot be inferred.
 func sliceDecls(body string) ([]slicedDecl, error) {
 	trimmed := stripLeadingPackageDecl(strings.TrimSpace(body))
 	src := "package x\n" + trimmed
@@ -1733,6 +1734,9 @@ func sliceDecls(body string) ([]slicedDecl, error) {
 	}
 	out := make([]slicedDecl, 0, len(f.Decls))
 	for i, decl := range f.Decls {
+		if gd, ok := decl.(*ast.GenDecl); ok && gd.Tok == token.IMPORT {
+			continue
+		}
 		startPos := decl.Pos()
 		switch d := decl.(type) {
 		case *ast.FuncDecl:
@@ -1760,6 +1764,9 @@ func sliceDecls(body string) ([]slicedDecl, error) {
 			Receiver: receiver,
 			IsTest:   isTest,
 		})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no top-level declarations found (imports are ignored; goimports re-adds them at emit)")
 	}
 	return out, nil
 }

@@ -1046,6 +1046,74 @@ func Gamma() int { return 3 }`
 	}
 }
 
+// Regression: model naturally writes bodies that start with `package X`
+// followed by `import (...)` — that import block was tripping sliceDecls
+// with "could not infer name (kind=*ast.GenDecl)". Fix skips import
+// GenDecls silently; goimports re-adds them at emit from usage.
+func TestHandleCreateMultiDeclSkipsImportBlock(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	body := `package middleware
+
+import (
+	"net/http"
+	"sync"
+	"time"
+)
+
+// RateLimiter guards.
+type RateLimiter struct {
+	mu       sync.Mutex
+	requests map[string]time.Time
+}
+
+// Allow reports whether the request may proceed.
+func (r *RateLimiter) Allow(req *http.Request) bool {
+	return true
+}`
+
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body: body,
+		File: "middleware/ratelimit.go",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Created 2 defs") {
+		t.Fatalf("expected 'Created 2 defs' (import block skipped), got: %s", text)
+	}
+	for _, name := range []string{"RateLimiter", "Allow"} {
+		if _, err := db.GetDefinitionByName(name, ""); err != nil {
+			t.Errorf("%s not created: %v", name, err)
+		}
+	}
+}
+
+// If the body contains ONLY an import block (no code decls), sliceDecls
+// must error out with a helpful message rather than silently succeeding.
+func TestHandleCreateMultiDeclImportsOnlyFails(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	body := `package middleware
+
+import (
+	"net/http"
+	"sync"
+)`
+
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body: body,
+		File: "middleware/ratelimit.go",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "no top-level declarations found") &&
+		!strings.Contains(text, "couldn't infer definition name") {
+		t.Fatalf("expected error about no decls, got: %s", text)
+	}
+}
+
 // Bug C: op:create with file: param must route the new def into that file
 // (SourceFile populated on the stored Definition).
 func TestHandleCreateHonorsFileParam(t *testing.T) {
