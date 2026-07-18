@@ -240,6 +240,7 @@ func TestHandleCodeValidation(t *testing.T) {
 		{"insert missing body", codeParam{Op: "insert", Name: "X", After: "anchor"}, "body is required"},
 		{"unknown op", codeParam{Op: "nonexistent"}, "unknown op"},
 		{"whitespace name", codeParam{Op: "read", Name: "  "}, "name is required"},
+		{"read-file missing file", codeParam{Op: "read-file"}, "file is required"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -425,6 +426,61 @@ func TestHandleRead(t *testing.T) {
 	}
 	if u.BytesAltRead == 0 {
 		t.Error("usage.BytesAltRead should be > 0 (file_sources not populated?)")
+	}
+}
+
+func TestHandleReadFile(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	result, _, err := s.handleReadFile(context.Background(), nil, codeParam{File: "main.go"})
+	if err != nil {
+		t.Fatalf("read-file: %v", err)
+	}
+	text := resultText(t, result)
+
+	// Both defs from main.go should appear, bodies included.
+	if !strings.Contains(text, "Greet") {
+		t.Error("expected Greet in output")
+	}
+	if !strings.Contains(text, "Farewell") {
+		t.Error("expected Farewell in output")
+	}
+	if !strings.Contains(text, "Hello, ") {
+		t.Error("expected Greet body ('Hello, ') in output")
+	}
+	if !strings.Contains(text, "goodbye") {
+		t.Error("expected Farewell body ('goodbye') in output")
+	}
+	// Source-order: Greet (line 4) before Farewell (line 9).
+	gi := strings.Index(text, "Greet")
+	fi := strings.Index(text, "Farewell")
+	if gi < 0 || fi < 0 || gi > fi {
+		t.Errorf("expected Greet before Farewell in source order, got Greet@%d Farewell@%d", gi, fi)
+	}
+
+	u, ok := result.StructuredContent.(usageStats)
+	if !ok {
+		t.Fatalf("expected StructuredContent = usageStats, got %T", result.StructuredContent)
+	}
+	if u.Op != "read-file" {
+		t.Errorf("usage.Op = %q, want %q", u.Op, "read-file")
+	}
+	if u.BytesReturned == 0 {
+		t.Error("usage.BytesReturned should be > 0")
+	}
+}
+
+func TestHandleReadFile_MissingFile(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	result, _, _ := s.handleReadFile(context.Background(), nil, codeParam{File: "does-not-exist.go"})
+	text := resultText(t, result)
+	if !strings.Contains(text, "no definitions found") {
+		t.Errorf("expected 'no definitions found' error, got: %s", text)
 	}
 }
 

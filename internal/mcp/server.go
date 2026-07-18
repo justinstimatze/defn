@@ -228,7 +228,7 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 		Name: "code",
 		Description: `Go code database. One tool, many ops. Start with impact for blast radius — it returns callers, transitives, and test coverage in one call. Don't follow up with search/explain unless you need more.
 
-Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, outline (compact projection — sig + doc + caller/callee summary, no body; use when body isn't needed), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 5 projection ops insert-precondition/replace-slice/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
+Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, read-file (all defs' bodies in one file — pass file:"path"; whole-file counterpart to read; prefer over N sequential read calls when scanning), outline (compact projection — sig + doc + caller/callee summary, no body; use when body isn't needed), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 5 projection ops insert-precondition/replace-slice/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
 	}, s.handleCode)
 
 	return s, mcpServer
@@ -586,6 +586,11 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if r, o, e := need(args.File, "file"); r != nil {
 			return r, o, e
 		}
+	case "read-file":
+		// Accept file: or name: (users may pass a path in either).
+		if strings.TrimSpace(args.File) == "" && strings.TrimSpace(args.Name) == "" {
+			return errResult(fmt.Errorf("read-file: file is required (pass file:\"path/to/x.go\")"))
+		}
 	case "validate-plan":
 		if len(args.Mutations) == 0 {
 			return errResult(fmt.Errorf("validate-plan: mutations is required"))
@@ -726,6 +731,8 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return s.handleSimulate(ctx, req, args)
 	case "file-defs":
 		return s.handleFileDefs(ctx, req, args)
+	case "read-file":
+		return wrapStale(s.handleReadFile(ctx, req, args))
 	case "validate-plan":
 		return wrapStale(s.handleValidatePlan(ctx, req, args))
 	case "pragmas":
@@ -2621,6 +2628,85 @@ func (s *server) handleFind(_ context.Context, _ *sdkmcp.CallToolRequest, args f
 		sb.WriteString(fmt.Sprintf("- %s%s (%s) lines %d-%d\n", recv, d.Name, d.Kind, d.StartLine, d.EndLine))
 	}
 	return textResult(sb.String()), nil, nil
+}
+
+// handleReadFile returns every definition's body in a single file, sorted
+// by source order. It is the whole-file counterpart to `handleGetDefinition`
+// (which reads one def) and a body-bearing twin of `handleFileDefs` (which
+// returns just the metadata). See `.calque/registry.md`: both call
+// `s.db.FindDefinitionsByFile` — that's the single-source data layer;
+// this handler and file-defs project it differently.
+func (s *server) handleReadFile(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	file := args.File
+	if file == "" {
+		file = args.Name
+	}
+	if strings.TrimSpace(file) == "" {
+		return errResult(fmt.Errorf("read-file: file is required (pass file:\"path/to/x.go\")"))
+	}
+	// For subpath files use the dirname; for root-level files leave dir empty
+	// so the module-path LIKE-match is permissive and the source_file exact
+	// match narrows to the right file. NOTE: handleFileDefs strips a bare
+	// filename's extension into a dir hint ("main.go" → "main"), which is
+	// wrong for modules whose path doesn't contain that stem (e.g. module
+	// "testproj" + file "main.go"). That's a latent bug in handleFileDefs;
+	// this twin does the correct thing. TODO: fix handleFileDefs.
+	dir := ""
+	if idx := strings.LastIndex(file, "/"); idx >= 0 {
+		dir = file[:idx]
+	}
+	defs, err := s.db.FindDefinitionsByFile(dir, file, 0)
+	if err != nil {
+		return errResult(err)
+	}
+	if len(defs) == 0 {
+		return errResult(fmt.Errorf("read-file: no definitions found in %q (check path is relative to project root and file is ingested)", file))
+	}
+	sort.Slice(defs, func(i, j int) bool { return defs[i].StartLine < defs[j].StartLine })
+
+	// Fetch bodies in one query — FindDefinitionsByFile returns metadata only.
+	ids := make([]int64, len(defs))
+	for i, d := range defs {
+		ids[i] = d.ID
+	}
+	bodies, err := s.db.GetBodiesByDefIDs(ids)
+	if err != nil {
+		return errResult(fmt.Errorf("read-file: fetch bodies: %w", err))
+	}
+
+	// Look up module path once (all defs in this file share it).
+	var modulePath string
+	mods, _ := s.db.ListModules()
+	for _, m := range mods {
+		if m.ID == defs[0].ModuleID {
+			modulePath = m.Path
+			break
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("# %s (%d definitions", file, len(defs)))
+	if modulePath != "" {
+		sb.WriteString(", module ")
+		sb.WriteString(modulePath)
+	}
+	sb.WriteString(")\n\n")
+	for _, d := range defs {
+		recv := formatReceiver(d.Receiver)
+		sb.WriteString(fmt.Sprintf("## %s%s (%s) L%d-%d\n", recv, d.Name, d.Kind, d.StartLine, d.EndLine))
+		if d.Doc != "" {
+			sb.WriteString(d.Doc)
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString("```go\n")
+		sb.WriteString(bodies[d.ID])
+		sb.WriteString("\n```\n\n")
+	}
+	out := sb.String()
+	return withUsage(textResult(out), usageStats{
+		Op:            "read-file",
+		BytesReturned: len(out),
+	}), nil, nil
 }
 
 func (s *server) handleFileDefs(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {

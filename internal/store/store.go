@@ -1289,6 +1289,36 @@ func (s *DB) CountDefinitions() (int, error) {
 	return n, nil
 }
 
+// GetBodiesByDefIDs fetches bodies for the given def IDs in one query,
+// keyed by def ID. Missing IDs are absent from the map, not empty.
+func (s *DB) GetBodiesByDefIDs(ids []int64) (map[int64]string, error) {
+	if len(ids) == 0 {
+		return map[int64]string{}, nil
+	}
+	placeholders := strings.Repeat("?,", len(ids))
+	placeholders = placeholders[:len(placeholders)-1]
+	query := fmt.Sprintf("SELECT def_id, body FROM bodies WHERE def_id IN (%s)", placeholders)
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	rows, err := s.queryContext(s.Ctx(), query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[int64]string, len(ids))
+	for rows.Next() {
+		var id int64
+		var body string
+		if err := rows.Scan(&id, &body); err != nil {
+			return nil, err
+		}
+		out[id] = body
+	}
+	return out, rows.Err()
+}
+
 // SampleBodies returns up to n non-test definition bodies. Ordered by hash
 // so the sample is deterministic for a given corpus state — two ranker
 // calls without an intervening ingest see the same IDF table.

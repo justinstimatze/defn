@@ -144,6 +144,22 @@ Result: 13 pairs, 6 clusters. Adjudicated: **0 drift**, 5 contracted-twin-ok,
   - note: shared "table" and "status" strings are common English; the three
     handlers do unrelated work.
 
+## Added 2026-07-17 (read-file op)
+
+- pair: internal/mcp/server.go::server.handleReadFile | internal/mcp/server.go::server.handleFileDefs
+  - verdict: contracted-twin-ok (with known handleFileDefs bug flagged)
+  - reviewed: 2026-07-17
+  - note: both handlers call `s.db.FindDefinitionsByFile(dir, file, 0)` — two projections
+    of one file's def set. `handleFileDefs` returns metadata-only JSON summary;
+    `handleReadFile` returns doc + sig + body markdown per def in source order.
+    Single-source data layer: `FindDefinitionsByFile` + `GetBodiesByDefIDs` (new).
+    KNOWN DRIFT: dir-derivation for BARE filenames (no `/`) differs. handleFileDefs
+    strips the `.go`/`_test.go` extension into a dir hint (e.g. "main.go" → "main"),
+    which fails when the module path doesn't contain that stem (e.g. module
+    "testproj" + file "main.go" → LIKE '%main%' misses). handleReadFile uses
+    empty-dir (correct — permissive LIKE + exact source_file filter narrows).
+    Followup: fix handleFileDefs to match handleReadFile's dir="" pattern.
+
 ## Follow-up refactors (deferred, not drift)
 
 None of these are gate-worthy — mild ergonomics wins surfaced by the scan:
