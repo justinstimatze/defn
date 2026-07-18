@@ -57,6 +57,8 @@ func main() {
 			}
 		}
 		cmdIngest(os.Args[2], serverMode)
+	case "ingest-upstream":
+		cmdIngestUpstream(os.Args[2:])
 	case "sync":
 		file := ""
 		if len(os.Args) >= 3 {

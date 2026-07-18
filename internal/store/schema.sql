@@ -75,6 +75,36 @@ CREATE TABLE IF NOT EXISTS file_sources (
 );
 CREATE INDEX idx_file_sources_hash ON file_sources(file_hash);
 
+-- Structural fingerprints for defs in well-known upstream Go modules at
+-- specific tagged versions. Populated by `defn ingest-upstream`.
+--
+-- Used by the delta-from-prior projection: when the agent calls read on a
+-- def whose module_path is in this table AND whose structural fingerprint
+-- matches an upstream row, the read handler returns a compact provenance
+-- tag ("chi.Mux.ServeHTTP @ v5.1.0 — unchanged from upstream") instead of
+-- the full body. The agent reconstructs behavior from its training-set
+-- prior on the well-known library.
+--
+-- Provenance rules:
+-- - Match key is (module_path, def_name, kind, receiver).
+-- - fingerprint is HashBodyStructural(body), whitespace/comment-invariant
+--   but identifier-sensitive (a rename is treated as divergence in v1).
+-- - Multiple versions of the same module coexist; lookup returns any
+--   version whose fingerprint matches the local def.
+CREATE TABLE IF NOT EXISTS upstream_fingerprints (
+    module_path   VARCHAR(500) NOT NULL,
+    version       VARCHAR(100) NOT NULL,
+    def_name      VARCHAR(255) NOT NULL,
+    kind          VARCHAR(50) NOT NULL,
+    receiver      VARCHAR(255) NOT NULL DEFAULT '',
+    fingerprint   VARCHAR(64) NOT NULL,
+    signature     TEXT,
+    doc           TEXT,
+    PRIMARY KEY (module_path, version, def_name, kind, receiver)
+);
+CREATE INDEX idx_upstream_fingerprint ON upstream_fingerprints(fingerprint);
+CREATE INDEX idx_upstream_lookup ON upstream_fingerprints(module_path, def_name, kind, receiver);
+
 -- Pending merge conflicts. Populated by Dolt merge, surfaced by defn.
 CREATE TABLE IF NOT EXISTS merge_conflicts (
     id         INT PRIMARY KEY AUTO_INCREMENT,
