@@ -228,7 +228,7 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 		Name: "code",
 		Description: `Go code database. One tool, many ops. Start with impact for blast radius — it returns callers, transitives, and test coverage in one call. Don't follow up with search/explain unless you need more.
 
-Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, read-file (all defs' bodies in one file — pass file:"path"; whole-file counterpart to read; prefer over N sequential read calls when scanning), outline (compact projection — sig + doc + caller/callee summary, no body; use when body isn't needed), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create, delete, rename, move, test, apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 5 projection ops insert-precondition/replace-slice/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
+Ops: impact (blast radius — START HERE; pass format:"json" for structured output), read, read-file (all defs' bodies in one file — pass file:"path"; whole-file counterpart to read; prefer over N sequential read calls when scanning), outline (compact projection — sig + doc + caller/callee summary, no body; use when body isn't needed), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), search, explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create (single def from body; with file: set, body may hold multiple top-level decls to author a whole file in one call — the whole-file equivalent of files-mode Write), delete, rename, move, test, apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 5 projection ops insert-precondition/replace-slice/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (pass file:"path" for fast single-file sync), query, overview, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
 	}, s.handleCode)
 
 	return s, mcpServer
@@ -241,7 +241,8 @@ Ops: impact (blast radius — START HERE; pass format:"json" for structured outp
 //	search: pattern (or name as fallback)
 //	edit: name + new_body (full replace) OR name + old_fragment + new_fragment (fragment)
 //	insert: name + after + body
-//	create: body (+ optional module)
+//	create: body (+ optional module or file). When file: is set, body may
+//	         hold multiple top-level decls to author a whole file in one call.
 //	rename: old_name + new_name
 //	move: name + module
 //	find: file (+ optional line)
@@ -1597,10 +1598,15 @@ func (s *server) handleInsert(_ context.Context, _ *sdkmcp.CallToolRequest, args
 }
 
 func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args createParam) (*sdkmcp.CallToolResult, any, error) {
-	// Reject multi-decl bodies: each definition is its own atomic unit. Batch
-	// via code(op:"apply") with multiple create operations instead.
+	// Multi-decl bodies: allowed when file: is set. Each top-level decl is
+	// upserted as its own Definition, all sharing the same SourceFile.
+	// Single autoEmit+build at the end. Without file: the model has no way
+	// to say where the defs land, so keep the rejection.
 	if n := countTopLevelDecls(args.Body); n > 1 {
-		return errResult(fmt.Errorf("body contains %d top-level declarations — op:create accepts exactly one. Split into %d separate calls (or use op:apply with %d create operations)", n, n, n))
+		if args.File == "" {
+			return errResult(fmt.Errorf("body contains %d top-level declarations — op:create accepts one, OR set file: to author a whole file with multiple decls in one call", n))
+		}
+		return s.handleCreateMultiDecl(args)
 	}
 
 	// Infer name, kind, and test flag from the body.
@@ -1681,6 +1687,184 @@ func countTopLevelDecls(body string) int {
 		return 0
 	}
 	return len(f.Decls)
+}
+
+// slicedDecl is one top-level decl carved out of a multi-decl body.
+type slicedDecl struct {
+	Body     string
+	Name     string
+	Kind     string
+	Receiver string
+	IsTest   bool
+}
+
+// sliceDecls parses a multi-decl body and returns each top-level decl as
+// its own slicedDecl (verbatim text including doc comments, name/kind
+// metadata). Returns an error on unparseable input, no decls, or a decl
+// whose name cannot be inferred (e.g. imports, blank var groups).
+func sliceDecls(body string) ([]slicedDecl, error) {
+	trimmed := strings.TrimSpace(body)
+	src := "package x\n" + trimmed
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	if err != nil {
+		return nil, fmt.Errorf("parse: %v", err)
+	}
+	if len(f.Decls) == 0 {
+		return nil, fmt.Errorf("no top-level declarations found")
+	}
+	out := make([]slicedDecl, 0, len(f.Decls))
+	for i, decl := range f.Decls {
+		startPos := decl.Pos()
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			if d.Doc != nil {
+				startPos = d.Doc.Pos()
+			}
+		case *ast.GenDecl:
+			if d.Doc != nil {
+				startPos = d.Doc.Pos()
+			}
+		}
+		startOff := fset.Position(startPos).Offset
+		endOff := fset.Position(decl.End()).Offset
+		if startOff < 0 || endOff > len(src) || startOff > endOff {
+			return nil, fmt.Errorf("decl %d: bad offset range", i)
+		}
+		name, kind, receiver, isTest := inferOneDecl(decl)
+		if name == "" {
+			return nil, fmt.Errorf("decl %d: could not infer name (kind=%T)", i, decl)
+		}
+		out = append(out, slicedDecl{
+			Body:     strings.TrimSpace(src[startOff:endOff]),
+			Name:     name,
+			Kind:     kind,
+			Receiver: receiver,
+			IsTest:   isTest,
+		})
+	}
+	return out, nil
+}
+
+// inferOneDecl is the per-decl extraction logic factored out of
+// inferFromBody so both single- and multi-decl paths share the switch.
+func inferOneDecl(decl ast.Decl) (name, kind, receiver string, isTest bool) {
+	switch d := decl.(type) {
+	case *ast.FuncDecl:
+		name = d.Name.Name
+		if d.Recv != nil && len(d.Recv.List) > 0 {
+			kind = "method"
+			receiver = types.ExprString(d.Recv.List[0].Type)
+		} else {
+			kind = "function"
+		}
+	case *ast.GenDecl:
+		switch d.Tok {
+		case token.TYPE:
+			if len(d.Specs) > 0 {
+				ts := d.Specs[0].(*ast.TypeSpec)
+				name = ts.Name.Name
+				if _, ok := ts.Type.(*ast.InterfaceType); ok {
+					kind = "interface"
+				} else {
+					kind = "type"
+				}
+			}
+		case token.CONST:
+			if len(d.Specs) > 0 {
+				vs := d.Specs[0].(*ast.ValueSpec)
+				if len(vs.Names) > 0 {
+					name = vs.Names[0].Name
+				}
+				kind = "const"
+			}
+		case token.VAR:
+			if len(d.Specs) > 0 {
+				vs := d.Specs[0].(*ast.ValueSpec)
+				if len(vs.Names) > 0 {
+					name = vs.Names[0].Name
+				}
+				kind = "var"
+			}
+		}
+	}
+	if name != "" {
+		isTest = strings.HasPrefix(name, "Test") || strings.HasPrefix(name, "Benchmark")
+	}
+	return
+}
+
+// handleCreateMultiDecl authors multiple defs into a single file in one call.
+// Reached when handleCreate sees a multi-decl body and file: is set.
+// All-or-nothing: a single upsert error rolls back all prior upserts.
+func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult, any, error) {
+	decls, err := sliceDecls(args.Body)
+	if err != nil {
+		return errResult(fmt.Errorf("multi-decl parse: %v", err))
+	}
+
+	mod := s.findModuleByFile(args.File)
+	if mod == nil {
+		if args.Module != "" {
+			mod = s.findModule(args.Module)
+		}
+	}
+	if mod == nil {
+		return errResult(fmt.Errorf("file %q does not map to any known module — run defn ingest first, or pass module: explicitly", args.File))
+	}
+
+	// Pre-check: no name collides with an existing def in the target module.
+	for _, d := range decls {
+		if existing, err := s.db.GetDefinitionByName(d.Name, mod.Path); err == nil {
+			recv := formatReceiver(existing.Receiver)
+			return errResult(fmt.Errorf("definition %s%s already exists in %s (id=%d) — use code(op:\"edit\") to modify it", recv, d.Name, mod.Path, existing.ID))
+		}
+	}
+
+	commit, rollback, txErr := s.db.Begin()
+	if txErr != nil {
+		return errResult(txErr)
+	}
+	defer rollback()
+
+	ids := make([]int64, 0, len(decls))
+	for _, d := range decls {
+		exported := len(d.Name) > 0 && d.Name[0] >= 'A' && d.Name[0] <= 'Z'
+		def := &store.Definition{
+			ModuleID:   mod.ID,
+			Name:       d.Name,
+			Kind:       d.Kind,
+			Exported:   exported,
+			Test:       d.IsTest,
+			Receiver:   d.Receiver,
+			Signature:  extractSignature(d.Body),
+			Body:       d.Body,
+			SourceFile: args.File,
+		}
+		id, err := s.db.UpsertDefinition(def)
+		if err != nil {
+			return errResult(fmt.Errorf("upsert %s: %v", d.Name, err))
+		}
+		ids = append(ids, id)
+	}
+
+	if err := commit(); err != nil {
+		return errResult(fmt.Errorf("commit: %v", err))
+	}
+
+	buildResult := s.autoEmitAndBuild()
+	s.autoResolve(mod.Path)
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Created %d defs in %s (%s):\n", len(decls), args.File, mod.Path))
+	for i, d := range decls {
+		recv := formatReceiver(d.Receiver)
+		sb.WriteString(fmt.Sprintf("  + %s%s (%s, id=%d)\n", recv, d.Name, d.Kind, ids[i]))
+	}
+	if buildResult != "" {
+		sb.WriteString("\n" + buildResult)
+	}
+	return textResult(sb.String()), nil, nil
 }
 
 // findModuleByFile maps a source file path to its module by matching the

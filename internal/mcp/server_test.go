@@ -880,9 +880,9 @@ func TestHandleCreate(t *testing.T) {
 	}
 }
 
-// Bug C: op:create with multi-decl body must reject instead of silently
-// dropping all but the first decl into a single Definition.
-func TestHandleCreateRejectsMultiDecl(t *testing.T) {
+// Bug C: op:create with multi-decl body and NO file: must reject — the
+// caller has no way to say where the defs land.
+func TestHandleCreateRejectsMultiDeclWithoutFile(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
 	s := &server{db: db}
@@ -899,12 +899,115 @@ func Other() int { return 0 }`
 	if !strings.Contains(text, "top-level declarations") {
 		t.Errorf("expected multi-decl rejection error, got: %s", text)
 	}
-	// Confirm nothing was created.
 	if _, err := db.GetDefinitionByName("Helper", ""); err == nil {
 		t.Error("Helper should not have been created when body was rejected")
 	}
 	if _, err := db.GetDefinitionByName("Other", ""); err == nil {
 		t.Error("Other should not have been created when body was rejected")
+	}
+}
+
+// Multi-def file authoring: with file: set, a multi-decl body should
+// upsert each decl as its own Definition sharing the same SourceFile,
+// running a single autoEmit+build. This is the write-granularity fix
+// motivated by 2026-07-11 turns.txt trajectory analysis.
+func TestHandleCreateMultiDeclWithFile(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	body := `// Limit is the max requests per second.
+const Limit = 10
+
+// Bucket tracks tokens.
+type Bucket struct {
+	tokens int
+}
+
+// NewBucket seeds a Bucket.
+func NewBucket(n int) *Bucket {
+	return &Bucket{tokens: n}
+}
+
+// Take drains a token.
+func (b *Bucket) Take() bool {
+	if b.tokens <= 0 {
+		return false
+	}
+	b.tokens--
+	return true
+}`
+
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body: body,
+		File: "main.go",
+	})
+	text := resultText(t, result)
+
+	if !strings.Contains(text, "Created 4 defs") {
+		t.Fatalf("expected 'Created 4 defs', got: %s", text)
+	}
+	for _, name := range []string{"Limit", "Bucket", "NewBucket", "Take"} {
+		if !strings.Contains(text, name) {
+			t.Errorf("expected %s in summary, got: %s", name, text)
+		}
+	}
+
+	for _, want := range []struct{ Name, Kind string }{
+		{"Limit", "const"},
+		{"Bucket", "type"},
+		{"NewBucket", "function"},
+		{"Take", "method"},
+	} {
+		d, err := db.GetDefinitionByName(want.Name, "")
+		if err != nil {
+			t.Errorf("%s not found: %v", want.Name, err)
+			continue
+		}
+		if d.Kind != want.Kind {
+			t.Errorf("%s.Kind = %q, want %q", want.Name, d.Kind, want.Kind)
+		}
+		if d.SourceFile != "main.go" {
+			t.Errorf("%s.SourceFile = %q, want main.go", want.Name, d.SourceFile)
+		}
+		if want.Name == "Take" && d.Receiver != "*Bucket" {
+			t.Errorf("Take.Receiver = %q, want *Bucket", d.Receiver)
+		}
+		if !strings.Contains(d.Body, want.Name) {
+			t.Errorf("%s body missing name: %q", want.Name, d.Body)
+		}
+	}
+}
+
+// If any name in a multi-decl body collides with an existing def, the
+// whole batch must be rejected — no partial creates.
+func TestHandleCreateMultiDeclRejectsNameCollision(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	// Seed one def whose name will collide.
+	if _, _, err := s.handleCreate(context.Background(), nil, createParam{
+		Body: "func Existing() int { return 1 }",
+	}); err != nil {
+		t.Fatalf("seed create: %v", err)
+	}
+
+	body := `func Fresh() int { return 2 }
+
+func Existing() int { return 3 }`
+
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body: body,
+		File: "main.go",
+	})
+	text := resultText(t, result)
+
+	if !strings.Contains(text, "already exists") {
+		t.Errorf("expected 'already exists' error, got: %s", text)
+	}
+	if _, err := db.GetDefinitionByName("Fresh", ""); err == nil {
+		t.Error("Fresh must not have been created (collision aborts batch)")
 	}
 }
 
