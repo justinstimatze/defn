@@ -241,6 +241,9 @@ func TestHandleCodeValidation(t *testing.T) {
 		{"unknown op", codeParam{Op: "nonexistent"}, "unknown op"},
 		{"whitespace name", codeParam{Op: "read", Name: "  "}, "name is required"},
 		{"read-file missing file", codeParam{Op: "read-file"}, "file is required"},
+		{"replace-hunk missing name", codeParam{Op: "replace-hunk", Old: "x", New: "y"}, "name is required"},
+		{"replace-hunk missing old", codeParam{Op: "replace-hunk", Name: "F", New: "y"}, "old is required"},
+		{"replace-hunk missing new", codeParam{Op: "replace-hunk", Name: "F", Old: "x"}, "new is required"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

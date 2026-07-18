@@ -11,6 +11,7 @@ code(op: "outline", name: "handleEdit")        -- compact projection: sig+doc+re
 code(op: "slice", name: "handleEdit", slice: "error-branch") -- verbatim AST-role slice (v0.24.2)
 code(op: "insert-precondition", name: "F", condition: "x < 0", ret: "return err") -- byte-exact PUTGET; name optional if the DB has one non-test function (v0.25.0)
 code(op: "replace-slice", name: "F", slice: "return", index: 1, new: "return nil") -- byte-exact PUTGET; name optional if the DB has one non-test function (v0.25.0)
+code(op: "replace-hunk", name: "F", old: "x := 1\n", new: "x := 42\n", index: 0) -- byte-exact PUTGET; content-addressed hunk inside a def body; index required only when `old` occurs >1x; empty `new` deletes the hunk (v0.26.0)
 code(op: "wrap-in-defer", name: "F", stmt_index: 1, defer_body: "cleanup()") -- byte-exact PUTGET; name optional if the DB has one non-test function (v0.25.0)
 code(op: "rename-param", name: "F", old_param: "x", new_param: "n") -- ≡_gofmt PUTGET; name optional if the DB has one non-test function (v0.25.0)
 code(op: "add-import", import_path: "errors", file: "pkg/f.go", alias: "") -- goimports-canonical grouping; file optional if the DB has one non-test .go file (v0.25.0)
@@ -28,9 +29,9 @@ code(op: "apply", operations: [                -- BATCH multiple ops in one call
   {op: "insert-precondition", name: "F", condition: "err != nil", ret: "return err"}])
 ```
 
-**Batch when you can.** `apply` accepts create/edit/delete/rename PLUS all 5 projection ops (insert-precondition, replace-slice, wrap-in-defer, rename-param, add-import). Prefer one `apply` over N sequential calls: same file gets emitted+built once instead of N times, and any error rolls back the whole batch atomically. Especially valuable for related edits to one def.
+**Batch when you can.** `apply` accepts create/edit/delete/rename PLUS all 6 projection ops (insert-precondition, replace-slice, replace-hunk, wrap-in-defer, rename-param, add-import). Prefer one `apply` over N sequential calls: same file gets emitted+built once instead of N times, and any error rolls back the whole batch atomically. Especially valuable for related edits to one def.
 
-All ops: read, outline, slice, insert-precondition, replace-slice, wrap-in-defer, rename-param, add-import, search, impact, explain, untested, edit, create, delete, rename, move, test, apply, diff, history, find, sync, emit, query, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, traverse, literals, pragmas, file-defs, overview, patch.
+All ops: read, outline, slice, insert-precondition, replace-slice, replace-hunk, wrap-in-defer, rename-param, add-import, search, impact, explain, untested, edit, create, delete, rename, move, test, apply, diff, history, find, sync, emit, query, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, traverse, literals, pragmas, file-defs, overview, patch.
 
 ### Why defn for Go, not Edit/Write
 
