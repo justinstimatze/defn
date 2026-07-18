@@ -661,6 +661,7 @@ Read, Edit, Write, or Grep. Reserve those built-in tools for non-Go files
 code(op: "read", name: "handleEdit")           -- full source by name
 code(op: "read", name: "server.go:272")        -- or by file:line
 code(op: "read", name: "chi.Mux.ServeHTTP", full: true) -- force body when def is upstream-tagged
+code(op: "expand", name: "F", include: ["body","callers"]) -- body + callers in one call (kills read→impact→read)
 code(op: "impact", name: "Render")             -- blast radius + test coverage
 code(op: "edit", name: "Foo", new_body: "...") -- edit, auto-emit + build
 code(op: "search", pattern: "%Auth%")          -- name pattern (% wildcard)
@@ -668,7 +669,7 @@ code(op: "search", pattern: "authentication")  -- body text search
 code(op: "test", name: "Render")               -- run affected tests only
 ` + "```" + `
 
-All ops: read, search, impact, explain, untested, edit, create, delete, rename, move, test, apply, diff, history, find, sync, query, overview, patch.
+All ops: read, expand, search, impact, explain, untested, edit, create, delete, rename, move, test, apply, diff, history, find, sync, query, overview, patch.
 
 ### Why defn for Go, not Read/Edit/Grep
 

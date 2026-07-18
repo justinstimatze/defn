@@ -300,6 +300,7 @@ type codeParam struct {
 	StmtIndex   int              `json:"stmt_index,omitempty"`
 	DeferBody   string           `json:"defer_body,omitempty"`
 	Full        bool             `json:"full,omitempty"`
+	Include     []string         `json:"include,omitempty"` // expand op: which graph hops to fold in
 }
 
 type applyOp struct {
@@ -736,6 +737,8 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return s.handleSimulate(ctx, req, args)
 	case "file-defs":
 		return s.handleFileDefs(ctx, req, args)
+	case "expand":
+		return wrapStale(s.handleExpand(ctx, req, args))
 	case "read-file":
 		return wrapStale(s.handleReadFile(ctx, req, args))
 	case "validate-plan":
@@ -2790,6 +2793,122 @@ func (s *server) handleReadFile(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 	out := sb.String()
 	return withUsage(textResult(out), usageStats{
 		Op:            "read-file",
+		BytesReturned: len(out),
+	}), nil, nil
+}
+
+// handleExpand returns a definition plus caller-chosen graph neighborhoods
+// in one tool_result. Attacks the N² cache-read cost problem: every kind
+// under `include:` is a hop that would otherwise cost a separate turn.
+//
+// V1 supports two include kinds: "body" (the def source) and "callers"
+// (direct callers with source locations). Default include when omitted is
+// ["body","callers"] — the pair that kills the most common read→impact→read
+// pattern. Additional kinds fold in only if the bench shows a signal.
+//
+// Design notes in scratchpad/expand-op-design.md.
+func (s *server) handleExpand(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	if strings.TrimSpace(args.Name) == "" {
+		return errResult(fmt.Errorf("expand: name is required"))
+	}
+	d, err := s.db.GetDefinitionByName(args.Name, "")
+	if err != nil {
+		return errResult(fmt.Errorf("definition %q not found", args.Name))
+	}
+
+	includes := args.Include
+	if len(includes) == 0 {
+		includes = []string{"body", "callers"}
+	}
+	want := map[string]bool{}
+	for _, k := range includes {
+		want[strings.ToLower(strings.TrimSpace(k))] = true
+	}
+
+	// Look up module path (all sections share it).
+	var modulePath string
+	mods, _ := s.db.ListModules()
+	for _, m := range mods {
+		if m.ID == d.ModuleID {
+			modulePath = m.Path
+			break
+		}
+	}
+
+	var sb strings.Builder
+	recv := formatReceiver(d.Receiver)
+	sb.WriteString(fmt.Sprintf("## %s%s (%s)\n", recv, d.Name, d.Kind))
+	if modulePath != "" {
+		sb.WriteString(fmt.Sprintf("Module: %s\n", modulePath))
+	}
+	sb.WriteString("\n")
+
+	if want["body"] {
+		sb.WriteString("### body\n")
+		if d.Doc != "" {
+			sb.WriteString(d.Doc + "\n\n")
+		}
+		sb.WriteString("```go\n")
+		sb.WriteString(d.Body)
+		sb.WriteString("\n```\n\n")
+	}
+
+	if want["callers"] {
+		impact, err := s.db.GetImpact(d.ID)
+		if err != nil {
+			return errResult(fmt.Errorf("expand: gather callers: %w", err))
+		}
+		var prodCallers, testCallers []store.Definition
+		for _, c := range impact.DirectCallers {
+			if c.Test {
+				testCallers = append(testCallers, c)
+			} else {
+				prodCallers = append(prodCallers, c)
+			}
+		}
+		sb.WriteString(fmt.Sprintf("### callers (%d — %d production, %d test)\n",
+			len(impact.DirectCallers), len(prodCallers), len(testCallers)))
+		for _, c := range prodCallers {
+			name := formatReceiver(c.Receiver) + c.Name
+			if c.SourceFile != "" && c.StartLine > 0 {
+				sb.WriteString(fmt.Sprintf("- %s  (%s:%d)\n", name, c.SourceFile, c.StartLine))
+			} else {
+				sb.WriteString(fmt.Sprintf("- %s\n", name))
+			}
+		}
+		for _, c := range testCallers {
+			name := formatReceiver(c.Receiver) + c.Name
+			if c.SourceFile != "" && c.StartLine > 0 {
+				sb.WriteString(fmt.Sprintf("- %s _(test)_  (%s:%d)\n", name, c.SourceFile, c.StartLine))
+			} else {
+				sb.WriteString(fmt.Sprintf("- %s _(test)_\n", name))
+			}
+		}
+		if len(impact.DirectCallers) == 0 {
+			sb.WriteString("(none)\n")
+		}
+		sb.WriteString("\n")
+	}
+
+	// Warn on any unsupported include kinds so the caller learns the vocabulary.
+	var unknown []string
+	for _, k := range includes {
+		norm := strings.ToLower(strings.TrimSpace(k))
+		switch norm {
+		case "body", "callers":
+			// supported
+		default:
+			unknown = append(unknown, k)
+		}
+	}
+	if len(unknown) > 0 {
+		sb.WriteString(fmt.Sprintf("_note: unsupported include kinds ignored: %s (v1 supports: body, callers)_\n",
+			strings.Join(unknown, ", ")))
+	}
+
+	out := sb.String()
+	return withUsage(textResult(out), usageStats{
+		Op:            "expand",
 		BytesReturned: len(out),
 	}), nil, nil
 }

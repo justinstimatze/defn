@@ -594,6 +594,96 @@ func TestHandleReadFile_MissingFile(t *testing.T) {
 	}
 }
 
+// TestHandleExpand_BodyAndCallers exercises expand's happy path — one call
+// returns body + callers in one tool_result. Attacks the N² cache-read
+// problem by killing the read → impact → read multi-turn pattern.
+func TestHandleExpand_BodyAndCallers(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	result, _, err := s.handleExpand(context.Background(), nil, codeParam{
+		Name:    "Greet",
+		Include: []string{"body", "callers"},
+	})
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+	text := resultText(t, result)
+
+	if !strings.Contains(text, "### body") {
+		t.Errorf("expected body section header, got: %s", text)
+	}
+	if !strings.Contains(text, "Hello, ") {
+		t.Errorf("expected Greet body ('Hello, '), got: %s", text)
+	}
+	if !strings.Contains(text, "### callers") {
+		t.Errorf("expected callers section header, got: %s", text)
+	}
+	if !strings.Contains(text, "Farewell") {
+		t.Errorf("expected Farewell as a caller of Greet, got: %s", text)
+	}
+	// Test callers should be marked _(test)_.
+	if !strings.Contains(text, "TestGreet") {
+		t.Errorf("expected TestGreet as a (test) caller of Greet, got: %s", text)
+	}
+
+	u, ok := result.StructuredContent.(usageStats)
+	if !ok {
+		t.Fatalf("expected usageStats StructuredContent, got %T", result.StructuredContent)
+	}
+	if u.Op != "expand" {
+		t.Errorf("usage.Op = %q, want %q", u.Op, "expand")
+	}
+	if u.BytesReturned == 0 {
+		t.Error("usage.BytesReturned should be > 0")
+	}
+}
+
+// TestHandleExpand_DefaultInclude verifies empty include:[] defaults to
+// [body, callers] — the pair we picked as the MVP default.
+func TestHandleExpand_DefaultInclude(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	result, _, err := s.handleExpand(context.Background(), nil, codeParam{Name: "Greet"})
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "### body") {
+		t.Errorf("default include should include body, got: %s", text)
+	}
+	if !strings.Contains(text, "### callers") {
+		t.Errorf("default include should include callers, got: %s", text)
+	}
+}
+
+// TestHandleExpand_UnknownIncludeKind ensures unsupported include kinds
+// are ignored with a note (learn-the-vocabulary affordance) rather than
+// erroring the whole request.
+func TestHandleExpand_UnknownIncludeKind(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	result, _, err := s.handleExpand(context.Background(), nil, codeParam{
+		Name:    "Greet",
+		Include: []string{"body", "callers", "types-used"},
+	})
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "### body") {
+		t.Error("expected body section")
+	}
+	if !strings.Contains(text, "types-used") {
+		t.Error("expected note about the unsupported kind")
+	}
+}
+
 // TestHandleFileDefs_RootLevelFile is the regression for the bug that
 // let handleFileDefs miss defs when the file is at the module root and
 // the module path did not contain the file stem (e.g. module "testproj"

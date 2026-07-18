@@ -184,6 +184,29 @@ Result: 13 pairs, 6 clusters. Adjudicated: **0 drift**, 5 contracted-twin-ok,
     is whitespace/comment-invariant, used to detect that local dep body matches a
     tagged upstream release even when comments/formatting drifted.
 
+## Added 2026-07-17 (expand op v1)
+
+- pair: internal/mcp/server.go::server.handleExpand | internal/mcp/server.go::server.handleGetDefinition
+  - verdict: contracted-twin-ok
+  - reviewed: 2026-07-17
+  - note: `handleExpand` is the composable-read counterpart to `handleGetDefinition`.
+    Both call `s.db.GetDefinitionByName` + read `d.Doc` / `d.Body`. Expand's
+    v1 adds a `callers` include kind that shares call-graph queries with
+    `handleImpact` (both use `s.db.GetImpact`). Design intent: expand
+    subsumes multi-hop patterns without replacing single-def reads
+    (which stay smaller when the caller only wants one def).
+
+- pair: internal/mcp/server.go::server.handleExpand | internal/mcp/server.go::server.handleImpact
+  - verdict: contracted-twin-ok
+  - reviewed: 2026-07-17
+  - note: both surface `impact.DirectCallers`. `handleImpact` returns a
+    caller list + transitive count + test-coverage summary (blast-radius
+    projection). `handleExpand` with `include:["callers"]` returns just
+    the direct-caller subset formatted alongside body/other sections
+    (multi-hop-fusion projection). Same data-layer source (`s.db.GetImpact`),
+    different projections. If a future kind like `blast-radius` is added
+    to expand's include set, this pair MUST fold into a shared helper.
+
 ## Follow-up refactors (deferred, not drift)
 
 None of these are gate-worthy — mild ergonomics wins surfaced by the scan:
