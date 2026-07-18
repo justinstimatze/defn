@@ -16,38 +16,36 @@ For each target symbol, `measure` records five renderings and compares:
 
 ## Result 2026-07-17: chi v5.1.0 + gin v1.10.0
 
-| Corpus | files | full | compact (shipped) | tag-only |
-|---|---:|---:|---:|---:|
-| chi (20 defs) | 27,095 | 4,080 | 10,430 (**−156%** vs full) | 1,176 (**+71%** vs full) |
-| gin (19 defs) | 72,089 | 5,557 | 13,130 (**−136%** vs full) | 1,210 (**+78%** vs full) |
+**Two runs before and after the render rework:**
 
-Percentages are byte reductions vs `full` (defn-natural). Negative means
-D is *bigger* than the current body-in-fence rendering.
+| Corpus | files | defn-natural | D as first shipped (f533842) | D after rework | tag-only (minimum floor) |
+|---|---:|---:|---:|---:|---:|
+| chi (20 defs) | 27,095 | 4,080 | 10,430 (**−156%**) | **2,568 (+37%)** | 1,176 (+71%) |
+| gin (19 defs) | 72,089 | 5,557 | 13,130 (**−136%**) | **2,525 (+55%)** | 1,210 (+78%) |
 
-### Interpretation
+Percentages are byte reductions vs `defn-natural` (the current body-in-fence
+rendering). Negative means D is *bigger* than defn-natural.
 
-**Two conclusions land at once:**
+### The story
 
 1. **defn-natural already dominates files-mode by ~85-92%** on
    library-symbol reads — the "narrow body vs whole file" story is
-   real without any D involvement. This confirms the well-worn
-   read-side thesis on a fresh corpus.
+   real without any D involvement.
 
-2. **D as currently implemented does NOT help.** The compact envelope
-   (doc + sig + provenance tag) exceeds the body of a typical chi/gin
-   method (5-30 LOC), so it *inflates* byte output by ~140%.
+2. **D as first shipped (f533842) INFLATED bytes** by 140-155% because
+   the doc + sig envelope exceeded the small library method bodies
+   (chi/gin ranges 100-600 bytes; envelope 350-1300).
 
-3. **A skinnier D form CAN help.** Dropping the doc and sig leaves a
-   ~60-byte tag line, which beats defn-natural by ~72-78% on the same
-   corpus. This form gives the model just the pointer ("this is
-   Name @ version, unchanged from upstream — look it up if you need
-   more"), delegating body knowledge to the model's prior.
+3. **The fix** (this commit): drop doc + sig from `renderUpstreamMatch`
+   — keep just the header line and the `full: true` escape hatch.
+   Yields +37% (chi) / +55% (gin) real byte savings on top of
+   defn-natural. Doc and sig are still available on demand via
+   `full: true`.
 
-### Design implication
-
-Ship a rework of `renderUpstreamMatch` that emits only the tag line by
-default, not doc + sig. The doc and sig are freely available via
-`full: true` (which already returns the body anyway).
+4. **A tag-only floor** (~60 bytes, header-line only) would save
+   71-78% but loses the markdown structure other read-op outputs use.
+   Kept as a measurement floor in the bench for comparison, not
+   shipped.
 
 Open questions the byte number cannot answer:
 

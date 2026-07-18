@@ -164,10 +164,13 @@ Result: 13 pairs, 6 clusters. Adjudicated: **0 drift**, 5 contracted-twin-ok,
 
 - cluster: internal/mcp/server.go::server.handleGetDefinition | internal/mcp/server.go::server.renderUpstreamMatch | internal/mcp/server.go::server.renderDivergedFromUpstream
   - verdict: contracted-twin-ok
-  - reviewed: 2026-07-17
+  - reviewed: 2026-07-17 (updated post-bench)
   - note: three renderers for the same read op, split by upstream-fingerprint state.
     `renderUpstreamMatch` fires when local structural hash equals a known upstream
-    row → compact provenance form (sig + doc + version, no body).
+    row → tag-only provenance form (header line + full:true hint, no doc/sig/body).
+    The doc+sig version was reverted after bench/delta-prior/ showed the envelope
+    inflated bytes 140-155% over the tiny library method bodies it was meant to
+    replace. Doc/sig are freely available via `full: true`.
     `renderDivergedFromUpstream` fires when the def name exists upstream but no
     version's hash matches → full body + divergence note.
     `handleGetDefinition` tail fires otherwise (module unknown to corpus, or

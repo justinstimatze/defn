@@ -953,32 +953,21 @@ func upstreamDefName(d *store.Definition) string {
 	return strings.TrimPrefix(d.Receiver, "*") + "." + d.Name
 }
 
-// renderUpstreamMatch produces the compact provenance form — signature
-// + doc + provenance tag, no body. Substantial byte savings for
-// well-known library defs the reader can look up from memory or docs.
+// renderUpstreamMatch produces the compact provenance tag — one header
+// line and the full:true escape hatch, nothing else. Doc and sig are
+// intentionally omitted: measurement (bench/delta-prior/2026-07-17)
+// showed that including them inflates the response past the size of
+// the body they are meant to replace on typical library methods
+// (chi/gin, 5-30 LOC bodies). The tag alone gives the model the
+// pointer it needs — "this is Name @ version, unchanged from upstream"
+// — and delegates body/doc/sig lookup to its prior (or to a follow-up
+// full:true call when the prior is not enough).
 func (s *server) renderUpstreamMatch(d *store.Definition, match *store.UpstreamFingerprint, modulePath string) (*sdkmcp.CallToolResult, any, error) {
 	var sb strings.Builder
 	recv := formatReceiver(d.Receiver)
 	sb.WriteString(fmt.Sprintf("## %s%s (%s) — %s @ %s unchanged from upstream\n",
 		recv, d.Name, d.Kind, modulePath, match.Version))
-	sb.WriteString(fmt.Sprintf("Module: %s\n\n", modulePath))
-	doc := match.Doc
-	if doc == "" {
-		doc = d.Doc
-	}
-	if doc != "" {
-		sb.WriteString(doc + "\n\n")
-	}
-	sig := match.Signature
-	if sig == "" {
-		sig = d.Signature
-	}
-	if sig != "" {
-		sb.WriteString("```go\n")
-		sb.WriteString(sig)
-		sb.WriteString("\n```\n\n")
-	}
-	sb.WriteString("(body identical to upstream — pass `full: true` to see it)\n")
+	sb.WriteString("(pass `full: true` for body + doc + sig)\n")
 
 	out := sb.String()
 	return withUsage(textResult(out), usageStats{

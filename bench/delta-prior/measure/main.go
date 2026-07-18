@@ -218,7 +218,9 @@ func renderFullBytes(d *store.Definition, modulePath string) int {
 	return sb.Len()
 }
 
-// renderCompactBytes replicates renderUpstreamMatch's compact form.
+// renderCompactBytes replicates renderUpstreamMatch's compact form as
+// shipped (post-2026-07-17 rework). Header line + full:true hint only;
+// doc + sig deliberately excluded.
 func renderCompactBytes(d *store.Definition, modulePath, version string) int {
 	var sb strings.Builder
 	recv := ""
@@ -227,16 +229,7 @@ func renderCompactBytes(d *store.Definition, modulePath, version string) int {
 	}
 	sb.WriteString(fmt.Sprintf("## %s%s (%s) — %s @ %s unchanged from upstream\n",
 		recv, d.Name, d.Kind, modulePath, version))
-	sb.WriteString(fmt.Sprintf("Module: %s\n\n", modulePath))
-	if d.Doc != "" {
-		sb.WriteString(d.Doc + "\n\n")
-	}
-	if d.Signature != "" {
-		sb.WriteString("```go\n")
-		sb.WriteString(d.Signature)
-		sb.WriteString("\n```\n\n")
-	}
-	sb.WriteString("(body identical to upstream — pass `full: true` to see it)\n")
+	sb.WriteString("(pass `full: true` for body + doc + sig)\n")
 	return sb.Len()
 }
 
