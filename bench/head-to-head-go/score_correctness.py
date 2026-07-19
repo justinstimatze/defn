@@ -54,6 +54,34 @@ def normalize_path(p, prefix_workdir):
     return p.lstrip("/")
 
 
+def resolve_defname_to_file(name, workdir):
+    """Ask defn where a named def lives. Returns repo-relative path or None."""
+    if not name or not workdir or not os.path.isdir(os.path.join(workdir, ".defn")):
+        return None
+    try:
+        out = subprocess.check_output(
+            [
+                "defn",
+                "query",
+                f"SELECT DISTINCT source_file FROM definitions WHERE name = '{name}' LIMIT 1",
+            ],
+            cwd=workdir,
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+    # defn query emits JSON: [{"source_file": "path/to/file.go"}]
+    try:
+        rows = json.loads(out)
+        if rows and isinstance(rows, list) and rows[0].get("source_file"):
+            return rows[0]["source_file"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        pass
+    return None
+
+
 def arm_touched_files(arm_data, workdir_hint):
     """Extract repo-relative paths the defn arm modified (via code tool ops
     or bash write commands). Best effort — normalize what we can."""
@@ -84,15 +112,23 @@ def arm_touched_files(arm_data, workdir_hint):
                     "rename",
                     "move",
                 ):
-                    # `file` param or infer via `name`; if we have neither, skip
                     f = args.get("file") or args.get("path")
                     if f:
                         touched.add(normalize_path(f, workdir_hint))
+                    else:
+                        # Resolve def-name to source_file via defn query
+                        f = resolve_defname_to_file(args.get("name"), workdir_hint)
+                        if f:
+                            touched.add(normalize_path(f, workdir_hint))
                 elif op == "apply":
                     for sub in args.get("operations", []):
                         f = sub.get("file") or sub.get("path")
                         if f:
                             touched.add(normalize_path(f, workdir_hint))
+                        else:
+                            f = resolve_defname_to_file(sub.get("name"), workdir_hint)
+                            if f:
+                                touched.add(normalize_path(f, workdir_hint))
             # Bash-shape writes (rare, but possible): sed -i / echo > / tee
             if nm == "Bash":
                 cmd = args.get("command", "") or ""
@@ -136,8 +172,10 @@ def main():
         arm = json.load(open(arm_path))
         workdir = arm.get("workdir") or os.path.join(WORKDIR_ROOT, inst_id)
         gold = gold_files(task.get("fix_patch") or "")
-        # Prefer git status (post-emit) if the workdir exists; else parse arm tool calls.
-        touched = git_touched_files(workdir) or arm_touched_files(arm, workdir)
+        # Parse arm tool calls — git-status includes formatting churn from
+        # `defn emit` and would over-report. Fall back to git-status only
+        # if we can't extract any file paths from the trajectory.
+        touched = arm_touched_files(arm, workdir) or git_touched_files(workdir)
         hit = gold & touched
         prec = len(hit) / len(touched) if touched else 0.0
         rec = len(hit) / len(gold) if gold else 0.0
