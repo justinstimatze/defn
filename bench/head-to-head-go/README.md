@@ -83,6 +83,16 @@ defn serve &          # background; deterministic port
   images (repo-specific test envs). See
   https://github.com/multi-swe-bench/multi-swe-bench.
 
+## Security posture
+
+Driver runs with `--permission-mode bypassPermissions` (headless approval-free
+loop is required). `Bash` is deliberately excluded from `ALLOWED_TOOLS` so a
+prompt-injected problem_statement or a malicious repo file can't reach a
+shell. The tradeoff: tasks that expect `go build`/`go test` from a shell will
+fail visibly instead of exec'ing unknown commands. Use defn's `test` op for
+scoped test runs. If you need broader shell coverage, run the driver inside a
+container/gvisor sandbox — do NOT re-enable `Bash` on the host.
+
 ## Comparison metric
 
 For each task, compute:
@@ -94,6 +104,15 @@ For each task, compute:
 
 Aggregate: geomean delta per metric, plus per-task loss/win histogram.
 Discipline: report the loss cases loudly.
+
+## First driver run (1 task, incomplete — do NOT quote)
+
+Sanity ran `grpc__grpc-go-3476` at `--max-turns 15`, budget $1. Result:
+defn arm hit turn cap during exploration (14 reads, 0 edits) while
+baseline is a completed task. Reported delta -92% wire cost is a
+task-shape mismatch, not a defn win — the defn arm never wrote anything.
+A fair comparison needs the arm to complete. Re-run with `--max-turns 50`
+and `--budget-usd 3` gives ~$0.80-3 per task; 10 tasks ~ $8-30 total.
 
 ## Baseline totals (n=10)
 
