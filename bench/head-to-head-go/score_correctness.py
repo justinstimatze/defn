@@ -54,9 +54,18 @@ def normalize_path(p, prefix_workdir):
     return p.lstrip("/")
 
 
+_SAFE_DEFNAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
+
+
 def resolve_defname_to_file(name, workdir):
     """Ask defn where a named def lives. Returns repo-relative path or None."""
     if not name or not workdir or not os.path.isdir(os.path.join(workdir, ".defn")):
+        return None
+    # `name` comes from agent trajectory tool_call args. Reject anything
+    # that isn't a plain Go identifier (or dotted receiver form) to avoid
+    # SQL injection via the f-string interpolation below. `defn query`
+    # accepts raw SQL so we cannot rely on it to parameterize.
+    if not _SAFE_DEFNAME.match(name):
         return None
     try:
         out = subprocess.check_output(
