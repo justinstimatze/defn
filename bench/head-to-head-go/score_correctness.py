@@ -58,7 +58,8 @@ _SAFE_DEFNAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
 
 
 def resolve_defname_to_file(name, workdir):
-    """Ask defn where a named def lives. Returns repo-relative path or None."""
+    """Ask defn where a named def lives. Returns list of candidate paths
+    (possibly multiple — same def name across packages) or empty list."""
     if not name or not workdir or not os.path.isdir(os.path.join(workdir, ".defn")):
         return None
     # `name` comes from agent trajectory tool_call args. Reject anything
@@ -66,13 +67,13 @@ def resolve_defname_to_file(name, workdir):
     # SQL injection via the f-string interpolation below. `defn query`
     # accepts raw SQL so we cannot rely on it to parameterize.
     if not _SAFE_DEFNAME.match(name):
-        return None
+        return []
     try:
         out = subprocess.check_output(
             [
                 "defn",
                 "query",
-                f"SELECT DISTINCT source_file FROM definitions WHERE name = '{name}' LIMIT 1",
+                f"SELECT DISTINCT source_file FROM definitions WHERE name = '{name}'",
             ],
             cwd=workdir,
             text=True,
@@ -80,15 +81,15 @@ def resolve_defname_to_file(name, workdir):
             timeout=10,
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return None
-    # defn query emits JSON: [{"source_file": "path/to/file.go"}]
+        return []
+    # defn query emits JSON: [{"source_file": "path/to/file.go"}, ...]
     try:
         rows = json.loads(out)
-        if rows and isinstance(rows, list) and rows[0].get("source_file"):
-            return rows[0]["source_file"]
+        if isinstance(rows, list):
+            return [r["source_file"] for r in rows if r.get("source_file")]
     except (ValueError, KeyError, IndexError, TypeError):
         pass
-    return None
+    return []
 
 
 def arm_touched_files(arm_data, workdir_hint):
@@ -125,9 +126,9 @@ def arm_touched_files(arm_data, workdir_hint):
                     if f:
                         touched.add(normalize_path(f, workdir_hint))
                     else:
-                        # Resolve def-name to source_file via defn query
-                        f = resolve_defname_to_file(args.get("name"), workdir_hint)
-                        if f:
+                        for f in resolve_defname_to_file(
+                            args.get("name"), workdir_hint
+                        ):
                             touched.add(normalize_path(f, workdir_hint))
                 elif op == "apply":
                     for sub in args.get("operations", []):
@@ -135,8 +136,9 @@ def arm_touched_files(arm_data, workdir_hint):
                         if f:
                             touched.add(normalize_path(f, workdir_hint))
                         else:
-                            f = resolve_defname_to_file(sub.get("name"), workdir_hint)
-                            if f:
+                            for f in resolve_defname_to_file(
+                                sub.get("name"), workdir_hint
+                            ):
                                 touched.add(normalize_path(f, workdir_hint))
             # Bash-shape writes (rare, but possible): sed -i / echo > / tee
             if nm == "Bash":
