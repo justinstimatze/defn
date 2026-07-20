@@ -68,13 +68,23 @@ def resolve_defname_to_file(name, workdir):
     # accepts raw SQL so we cannot rely on it to parameterize.
     if not _SAFE_DEFNAME.match(name):
         return []
+    # Method names arrive as "Receiver.Method" (agent syntax) but the DB
+    # stores the bare name in the `name` column and the receiver separately.
+    # Split on the last dot so top-level identifiers with dots (rare) still
+    # match; if the split half hits any def with the receiver-ish column
+    # non-null we prefer that, else fall back to the whole-name query.
+    if "." in name:
+        recv, bare = name.rsplit(".", 1)
+        sql = (
+            "SELECT DISTINCT source_file FROM definitions "
+            f"WHERE name = '{bare}' AND (receiver = '{recv}' "
+            f"OR receiver = '*{recv}' OR receiver LIKE '%{recv}')"
+        )
+    else:
+        sql = f"SELECT DISTINCT source_file FROM definitions WHERE name = '{name}'"
     try:
         out = subprocess.check_output(
-            [
-                "defn",
-                "query",
-                f"SELECT DISTINCT source_file FROM definitions WHERE name = '{name}'",
-            ],
+            ["defn", "query", sql],
             cwd=workdir,
             text=True,
             stderr=subprocess.DEVNULL,
@@ -90,6 +100,44 @@ def resolve_defname_to_file(name, workdir):
     except (ValueError, KeyError, IndexError, TypeError):
         pass
     return []
+
+
+WRITE_OPS = (
+    "edit",
+    "create",
+    "insert-precondition",
+    "replace-slice",
+    "replace-hunk",
+    "wrap-in-defer",
+    "rename-param",
+    "add-import",
+    "insert",
+    "delete",
+    "rename",
+    "move",
+    "apply",
+)
+
+
+def arm_write_count(arm_data):
+    """Number of write ops the arm attempted (regardless of resolution).
+    Used to distinguish 'no writes' (informational answer) from 'writes
+    made but names didn't resolve' (partial trajectory extraction)."""
+    n = 0
+    for msg in arm_data.get("fncall_messages", []):
+        if msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls") or []:
+            fn = tc.get("function", {})
+            if not fn.get("name", "").endswith("__code"):
+                continue
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except Exception:
+                continue
+            if args.get("op") in WRITE_OPS:
+                n += 1
+    return n
 
 
 def arm_touched_files(arm_data, workdir_hint):
@@ -183,10 +231,19 @@ def main():
         arm = json.load(open(arm_path))
         workdir = arm.get("workdir") or os.path.join(WORKDIR_ROOT, inst_id)
         gold = gold_files(task.get("fix_patch") or "")
-        # Parse arm tool calls — git-status includes formatting churn from
-        # `defn emit` and would over-report. Fall back to git-status only
-        # if we can't extract any file paths from the trajectory.
-        touched = arm_touched_files(arm, workdir) or git_touched_files(workdir)
+        # Parse arm tool calls first. git-status includes formatting churn
+        # from `defn emit` and over-reports; only fall back to it when the
+        # arm didn't make ANY write ops (informational-answer case), so an
+        # informational-answer scores 0/0. If writes were attempted but
+        # resolve failed (partial trajectory extraction), keep the partial
+        # set rather than fall back to the noisy git snapshot.
+        n_writes = arm_write_count(arm)
+        touched = arm_touched_files(arm, workdir)
+        # No git-status fallback: `defn emit` re-formats every file in a
+        # module after any DB mutation, so git status is not a reliable
+        # source-of-truth for what the agent chose to edit. If the arm
+        # made zero code writes, score as unattempted (0/0). Callers can
+        # filter on n_writes to separate "made bad edits" from "gave up".
         hit = gold & touched
         prec = len(hit) / len(touched) if touched else 0.0
         rec = len(hit) / len(gold) if gold else 0.0
@@ -194,6 +251,7 @@ def main():
         rows.append(
             {
                 "id": inst_id,
+                "n_writes": n_writes,
                 "gold": sorted(gold),
                 "touched": sorted(touched),
                 "hit": sorted(hit),
@@ -210,13 +268,13 @@ def main():
 
     print(f"=== correctness (files-touched approximation) ===")
     print(
-        f"  {'instance':30s}  {'P':>5s} {'R':>5s} {'F1':>5s}  gold  touched  hit  cost"
+        f"  {'instance':30s}  {'P':>5s} {'R':>5s} {'F1':>5s}  gold  touched  hit  wr  cost"
     )
     for r in rows:
         cost = f"${r['cost']:.3f}" if r["cost"] else "-"
         print(
             f"  {r['id']:30s}  {r['precision']:>5.2f} {r['recall']:>5.2f} {r['f1']:>5.2f}  "
-            f"{len(r['gold']):>4}  {len(r['touched']):>7}  {len(r['hit']):>3}  {cost}"
+            f"{len(r['gold']):>4}  {len(r['touched']):>7}  {len(r['hit']):>3}  {r['n_writes']:>2}  {cost}"
         )
 
     import statistics
@@ -227,6 +285,25 @@ def main():
     print(f"  mean F1:        {statistics.mean(r['f1'] for r in rows):.3f}")
     hits = sum(1 for r in rows if r["f1"] >= 0.5)
     print(f"  F1 >= 0.5: {hits}/{len(rows)}")
+
+    # Sub-aggregate: tasks where the arm actually attempted writes. This
+    # separates the "gave up" cost from the "wrong edit" cost.
+    attempted = [r for r in rows if r["n_writes"] > 0]
+    if attempted and len(attempted) < len(rows):
+        print(
+            f"\n=== ATTEMPTED-ONLY ({len(attempted)}/{len(rows)} arms with writes>0) ==="
+        )
+        print(
+            f"  mean precision: {statistics.mean(r['precision'] for r in attempted):.3f}"
+        )
+        print(
+            f"  mean recall:    {statistics.mean(r['recall'] for r in attempted):.3f}"
+        )
+        print(f"  mean F1:        {statistics.mean(r['f1'] for r in attempted):.3f}")
+        att_hits = sum(1 for r in attempted if r["f1"] >= 0.5)
+        print(f"  F1 >= 0.5: {att_hits}/{len(attempted)}")
+        no_writes = [r["id"] for r in rows if r["n_writes"] == 0]
+        print(f"  no-write arms: {no_writes}")
     total_cost = sum(r["cost"] or 0 for r in rows)
     print(f"  total cost:  ${total_cost:.2f}")
 
