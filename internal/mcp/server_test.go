@@ -1736,6 +1736,11 @@ func TestSearchShapedSQLRedirect(t *testing.T) {
 		{"describe", "DESCRIBE bodies", "schema is documented", false},
 		{"info_schema", "SELECT * FROM INFORMATION_SCHEMA.COLUMNS", "schema is documented", false},
 
+		// File-scoped SQL (the go-zero-1907 anti-pattern)
+		{"file_scoped_like", "select d.name, d.kind from definitions d where d.source_file like 'zrpc/%' and d.name like '%Interceptor%'", "op:\"file-defs\"", false},
+		{"file_scoped_eq", "select d.name, d.start_line from definitions d where d.source_file='zrpc/client.go' order by d.start_line", "op:\"file-defs\"", false},
+		{"file_scoped_in", "select d.name from definitions d where d.source_file in ('a.go','b.go') and d.start_line > 82", "op:\"file-defs\"", false},
+
 		// Legitimate analytics — should pass through
 		{"count_by_kind", "SELECT `kind`, COUNT(*) FROM definitions GROUP BY `kind`", "", true},
 		{"orphan_refs", "SELECT * FROM refs WHERE target_id NOT IN (SELECT id FROM definitions)", "", true},
