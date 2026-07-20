@@ -3146,10 +3146,43 @@ func (s *server) handleReadFile(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 		sb.WriteString("\n```\n\n")
 	}
 	out := sb.String()
+	if !args.Full && len(out) > readFileCapBytes {
+		out = compactReadFile(file, modulePath, defs, len(out))
+	}
 	return withUsage(textResult(out), usageStats{
 		Op:            "read-file",
 		BytesReturned: len(out),
 	}), nil, nil
+}
+
+// readFileCapBytes is the size ceiling above which read-file downgrades to
+// a signatures-only projection. 8000 was picked from the head-to-head-go
+// bench: files above this size are almost always exploratory browsing, not
+// preparation to edit. Model can bypass with `full:true` or fetch specific
+// bodies with `read name:"..."`.
+const readFileCapBytes = 8000
+
+func compactReadFile(file, modulePath string, defs []store.Definition, fullSize int) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("# %s (%d definitions", file, len(defs)))
+	if modulePath != "" {
+		sb.WriteString(", module ")
+		sb.WriteString(modulePath)
+	}
+	sb.WriteString(") [signatures only — file exceeds cap]\n\n")
+	for _, d := range defs {
+		recv := formatReceiver(d.Receiver)
+		sig := d.Signature
+		if sig == "" {
+			sig = "(sig unavailable)"
+		}
+		sb.WriteString(fmt.Sprintf("- %s%s (%s) L%d-%d — %s\n", recv, d.Name, d.Kind, d.StartLine, d.EndLine, sig))
+	}
+	sb.WriteString(fmt.Sprintf(
+		"\n[read-file capped: full response would be %d bytes; showing signatures only. Fetch individual bodies with `code(op:\"read\", name:\"<Name>\")`, or pass `full:true` to bypass the cap.]\n",
+		fullSize,
+	))
+	return sb.String()
 }
 
 // handleExpand returns a definition plus caller-chosen graph neighborhoods

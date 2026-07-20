@@ -586,6 +586,33 @@ func TestHandleReadFile(t *testing.T) {
 	}
 }
 
+func TestCompactReadFile(t *testing.T) {
+	defs := []store.Definition{
+		{Name: "Foo", Kind: "function", Signature: "func Foo(x int) error", StartLine: 10, EndLine: 42},
+		{Name: "Bar", Kind: "method", Receiver: "*T", Signature: "func (t *T) Bar() string", StartLine: 50, EndLine: 80},
+		{Name: "Baz", Kind: "function", StartLine: 90, EndLine: 100}, // no sig
+	}
+	out := compactReadFile("pkg/x.go", "example.com/mod", defs, 12345)
+	if !strings.Contains(out, "signatures only") {
+		t.Errorf("expected 'signatures only' header marker; got %q", out[:200])
+	}
+	if !strings.Contains(out, "Foo (function) L10-42 — func Foo(x int) error") {
+		t.Errorf("expected Foo sig line; got %q", out)
+	}
+	if !strings.Contains(out, "(*T).Bar (method) L50-80 — func (t *T) Bar() string") {
+		t.Errorf("expected Bar sig line (with receiver); got %q", out)
+	}
+	if !strings.Contains(out, "Baz (function) L90-100 — (sig unavailable)") {
+		t.Errorf("expected Baz sig unavailable line; got %q", out)
+	}
+	if !strings.Contains(out, "would be 12345 bytes") {
+		t.Errorf("expected full-size mention; got %q", out)
+	}
+	if strings.Contains(out, "```go") {
+		t.Errorf("compact form should not include code fences; got %q", out)
+	}
+}
+
 func TestHandleReadFile_MissingFile(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()

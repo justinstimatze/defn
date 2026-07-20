@@ -41,7 +41,20 @@ DEFN_MCP_CONFIG = {
 # (e.g., `go build` for compile check), it will fail visibly rather than
 # silently exec unknown commands.
 ALLOWED_TOOLS = "mcp__defn__code TodoWrite"
-DISALLOWED_TOOLS = "Read Write Edit MultiEdit NotebookEdit Bash"
+# Escape hatches close: Grep/Glob let the model bypass defn's `search` op;
+# Agent/Task* let it spawn subagents that use full tool set; dispatch is
+# cross-session messaging. n=10 measurement 2026-07-20 found 170k / 481k
+# (35%) of measured wire went to these off-tool paths, invisibly diluting
+# every defn-side lever we measured. Closing them here so the "defn arm"
+# actually is defn-only.
+DISALLOWED_TOOLS = (
+    "Read Write Edit MultiEdit NotebookEdit Bash "
+    "Grep Glob "
+    "Agent Task TaskCreate TaskUpdate TaskGet TaskList TaskOutput TaskStop "
+    "mcp__dispatch__dispatch mcp__dispatch__peek mcp__dispatch__ack "
+    "mcp__dispatch__who mcp__dispatch__subscribe mcp__dispatch__unsubscribe "
+    "SendMessage WebFetch WebSearch"
+)
 
 SYSTEM_APPEND = """
 IMPORTANT — this session is Go-only, defn-only. Use `mcp__defn__code` for ALL
