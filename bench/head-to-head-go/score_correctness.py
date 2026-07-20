@@ -61,7 +61,7 @@ def resolve_defname_to_file(name, workdir):
     """Ask defn where a named def lives. Returns list of candidate paths
     (possibly multiple — same def name across packages) or empty list."""
     if not name or not workdir or not os.path.isdir(os.path.join(workdir, ".defn")):
-        return None
+        return []
     # `name` comes from agent trajectory tool_call args. Reject anything
     # that isn't a plain Go identifier (or dotted receiver form) to avoid
     # SQL injection via the f-string interpolation below. `defn query`
