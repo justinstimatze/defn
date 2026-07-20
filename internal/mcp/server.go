@@ -228,7 +228,7 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 		Name: "code",
 		Description: `Go code database. One tool, many ops. Orient before you read: overview (project shape) → outline (def shape) → impact (when you know which def matters). Only read whole bodies when you're about to edit them; whole-file reads on files you won't touch are pure wire cost — use outline or search instead.
 
-Ops: overview (project-wide shape — packages, top-level defs, module summary; the right first-touch when you don't know which def matters yet), outline (compact projection of a def — sig + doc + caller/callee summary, no body; use when body isn't needed), search, impact (blast radius of a known def — pass format:"json" for structured output; callers, transitives, test coverage in one call), read, read-file (all defs' bodies in one file — pass file:"path"; whole-file counterpart to read; prefer over N sequential read calls when scanning), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), replace-hunk (replace a byte-exact occurrence of 'old' inside a def body with 'new' — byte-exact PUTGET, content-addressed inside the def; pass name+old+new, plus index=1..N if 'old' occurs more than once; empty 'new' deletes the hunk. Send zero anchor context when the hunk is def-unique — the name argument does the file-level disambiguation), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create (single def from body; with file: set, body may hold multiple top-level decls to author a whole file in one call — the whole-file equivalent of files-mode Write), delete, rename, move, test (run ONLY tests that cover a given def — pass name; scoped subset, not the full suite; prefer over bash 'go test ./...' when you only need coverage for a specific change), apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 6 projection ops insert-precondition/replace-slice/replace-hunk/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (pass file:"path" for fast single-file sync), query, patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
+Ops: overview (project-wide shape — packages, top-level defs, module summary; the right first-touch when you don't know which def matters yet), outline (compact projection of a def — sig + doc + caller/callee summary, no body; use when body isn't needed), search, impact (blast radius of a known def — pass format:"json" for structured output; callers, transitives, test coverage in one call), read, read-file (all defs' bodies in one file — pass file:"path"; whole-file counterpart to read; prefer over N sequential read calls when scanning), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), replace-hunk (replace a byte-exact occurrence of 'old' inside a def body with 'new' — byte-exact PUTGET, content-addressed inside the def; pass name+old+new, plus index=1..N if 'old' occurs more than once; empty 'new' deletes the hunk. Send zero anchor context when the hunk is def-unique — the name argument does the file-level disambiguation), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create (single def from body; with file: set, body may hold multiple top-level decls to author a whole file in one call — the whole-file equivalent of files-mode Write), delete, rename, move, test (run ONLY tests that cover a given def — pass name; scoped subset, not the full suite; prefer over bash 'go test ./...' when you only need coverage for a specific change), apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 6 projection ops insert-precondition/replace-slice/replace-hunk/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (pass file:"path" for fast single-file sync), query (raw SQL escape hatch — for schema analytics only; NEVER use to look up a def by name, grep bodies, or list files — use search/outline/read-file/impact instead, which are far cheaper on the wire), patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
 	}, s.handleCode)
 
 	return s, mcpServer
@@ -2537,7 +2537,7 @@ func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args n
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Running %d of %d tests (affected by %s):\n\n",
 		len(testNames), len(testNames), args.Name))
-	sb.WriteString(string(out))
+	sb.WriteString(truncateTestOutput(string(out)))
 
 	if err != nil {
 		sb.WriteString("\nSOME TESTS FAILED")
@@ -2548,7 +2548,97 @@ func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args n
 	return textResult(sb.String()), nil, nil
 }
 
+// testOutputCap is the byte threshold above which `test` op output is
+// summarized rather than returned verbatim. Chosen to fit the interesting
+// case (~1-2 failures + context) while cutting worst-case blowups (cli-3461
+// paid ~30 KB for 10 test runs). Verbose subtest output on a large package
+// can reach 100+ KB; we cap that hard.
+const testOutputCap = 6000
+
+// truncateTestOutput compresses `go test -v` output that exceeds the cap.
+// Preserves head (first N lines — first failure's context), all `--- FAIL:`
+// lines (which subtests broke), all package-level `FAIL`/`ok` lines (which
+// packages ran), and tail (last N lines — summary). Emits a marker showing
+// how many lines were dropped so the model can widen the search if needed.
+func truncateTestOutput(out string) string {
+	if len(out) <= testOutputCap {
+		return out
+	}
+	lines := strings.Split(out, "\n")
+	const headN, tailN = 40, 20
+	if len(lines) <= headN+tailN {
+		return out
+	}
+	head := lines[:headN]
+	tail := lines[len(lines)-tailN:]
+
+	// Collect failures and package-level results from the middle band.
+	var failures, pkgResults []string
+	seen := make(map[string]bool)
+	for _, l := range lines[headN : len(lines)-tailN] {
+		t := strings.TrimSpace(l)
+		switch {
+		case strings.HasPrefix(t, "--- FAIL:"):
+			if !seen[t] {
+				failures = append(failures, l)
+				seen[t] = true
+			}
+		case strings.HasPrefix(t, "FAIL\t"), strings.HasPrefix(t, "ok  \t"):
+			pkgResults = append(pkgResults, l)
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString(strings.Join(head, "\n"))
+	sb.WriteString("\n")
+	dropped := len(lines) - headN - tailN - len(failures) - len(pkgResults)
+	if len(failures) > 0 {
+		sb.WriteString(fmt.Sprintf("\n... [%d lines truncated; failed subtests below] ...\n", dropped))
+		sb.WriteString(strings.Join(failures, "\n"))
+		sb.WriteString("\n")
+	} else {
+		sb.WriteString(fmt.Sprintf("\n... [%d lines truncated; no failures in the middle] ...\n", dropped))
+	}
+	if len(pkgResults) > 0 {
+		sb.WriteString("\n")
+		sb.WriteString(strings.Join(pkgResults, "\n"))
+		sb.WriteString("\n")
+	}
+	sb.WriteString("\n... [tail] ...\n")
+	sb.WriteString(strings.Join(tail, "\n"))
+	return sb.String()
+}
+
+// searchShapedSQLRedirects detects `query` op SQL that is really trying to
+// do work the model should route through a first-class op. Returns a
+// non-empty redirect message when the SQL matches a known anti-pattern
+// (grepping bodies, direct name lookups, schema introspection), else "".
+// The intercept exists because raw SQL for these shapes is a wire-cost
+// disaster: the model burns turns re-discovering the schema and returns
+// blob rows when a compact projection would do.
+var (
+	sqlBodyGrep    = regexp.MustCompile(`(?i)\bbody\s+LIKE\s+'`)
+	sqlNameLookup  = regexp.MustCompile(`(?i)\b(?:d\.)?name\s*=\s*'`)
+	sqlSchemaProbe = regexp.MustCompile(`(?i)^\s*(?:SHOW\s+(?:TABLES|DATABASES|COLUMNS)|DESCRIBE\s|DESC\s|EXPLAIN\s)`)
+	sqlInfoSchema  = regexp.MustCompile(`(?i)\bINFORMATION_SCHEMA\b`)
+)
+
+func searchShapedSQLRedirect(sql string) string {
+	switch {
+	case sqlBodyGrep.MatchString(sql):
+		return "raw SQL grep on definitions.bodies is a wire-cost anti-pattern — use `code(op:\"search\", pattern:\"<text>\")` instead; it returns compact name+file+line rows, not full bodies. If you truly need SQL analytics (e.g., counts, joins across tables), use `defn query` from the CLI."
+	case sqlNameLookup.MatchString(sql):
+		return "direct name lookup via SQL is a wire-cost anti-pattern — use `code(op:\"read\", name:\"<name>\")` for the body, `code(op:\"outline\", name:\"<name>\")` for the shape, or `code(op:\"impact\", name:\"<name>\")` for callers. All are cheaper on the wire than blob rows."
+	case sqlSchemaProbe.MatchString(sql) || sqlInfoSchema.MatchString(sql):
+		return "schema introspection via SQL is unnecessary — the DB schema is documented at internal/store/schema.sql. Tables: definitions (name, kind, source_file, start_line, ...), bodies (def_id, body), refs, imports, modules, project_files. Use the graph ops (search/outline/read/impact) instead of raw SQL."
+	}
+	return ""
+}
+
 func (s *server) handleQuery(_ context.Context, _ *sdkmcp.CallToolRequest, args sqlParam) (*sdkmcp.CallToolResult, any, error) {
+	if msg := searchShapedSQLRedirect(args.SQL); msg != "" {
+		return errResult(fmt.Errorf("%s", msg))
+	}
 	results, err := s.db.Query(args.SQL)
 	if err != nil {
 		return errResult(err)

@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1663,5 +1664,98 @@ func RunB(x int) int {
 	}
 	if names["Handle"] != 1 {
 		t.Errorf("post-reopen DB should have exactly one Handle def, got: %v", names)
+	}
+}
+
+func TestTruncateTestOutput(t *testing.T) {
+	// Small output passes through untouched.
+	small := "=== RUN   TestFoo\n--- PASS: TestFoo (0.00s)\nPASS\nok  \tpkg\t0.001s\n"
+	if got := truncateTestOutput(small); got != small {
+		t.Errorf("small output should pass through; got altered")
+	}
+
+	// Large output gets summarized: head + failures preserved, middle dropped.
+	var large strings.Builder
+	for i := 0; i < 200; i++ {
+		large.WriteString(fmt.Sprintf("=== RUN   TestFoo_%d\n", i))
+		large.WriteString("    foo_test.go:10: some noisy output that would inflate wire cost\n")
+		if i == 100 {
+			large.WriteString("--- FAIL: TestFoo_100 (0.01s)\n")
+		} else {
+			large.WriteString(fmt.Sprintf("--- PASS: TestFoo_%d (0.00s)\n", i))
+		}
+	}
+	large.WriteString("FAIL\tpkg\t0.500s\n")
+	large.WriteString("FAIL\n")
+	got := truncateTestOutput(large.String())
+	if len(got) >= len(large.String()) {
+		t.Errorf("expected truncation, got same-or-larger length %d vs %d", len(got), len(large.String()))
+	}
+	if !strings.Contains(got, "--- FAIL: TestFoo_100") {
+		t.Errorf("truncated output must preserve failed-test names, got:\n%s", got)
+	}
+	if !strings.Contains(got, "FAIL\tpkg\t0.500s") {
+		t.Errorf("truncated output must preserve package-level result, got:\n%s", got)
+	}
+	if !strings.Contains(got, "truncated") {
+		t.Errorf("truncated output must include truncation marker, got:\n%s", got)
+	}
+
+	// All-pass large output still gets summarized but marker says no failures.
+	var allPass strings.Builder
+	for i := 0; i < 200; i++ {
+		allPass.WriteString(fmt.Sprintf("=== RUN   TestFoo_%d\n--- PASS: TestFoo_%d (0.00s)\n", i, i))
+	}
+	allPass.WriteString("PASS\nok  \tpkg\t0.500s\n")
+	got = truncateTestOutput(allPass.String())
+	if !strings.Contains(got, "no failures") {
+		t.Errorf("all-pass truncation should say 'no failures', got:\n%s", got)
+	}
+	if !strings.Contains(got, "ok  \tpkg\t0.500s") {
+		t.Errorf("all-pass truncation must preserve package result, got:\n%s", got)
+	}
+}
+
+func TestSearchShapedSQLRedirect(t *testing.T) {
+	tests := []struct {
+		name      string
+		sql       string
+		wantHint  string
+		wantEmpty bool
+	}{
+		// Body grep (the cli-3461 anti-pattern)
+		{"body_like", "SELECT d.name FROM definitions d JOIN bodies b ON b.def_id = d.id WHERE b.body LIKE '%api/v3%'", "op:\"search\"", false},
+		{"body_like_lower", "select * from bodies where body like '%foo%'", "op:\"search\"", false},
+
+		// Direct name lookup
+		{"name_eq", "SELECT * FROM definitions WHERE name = 'GetJobs'", "op:\"read\"", false},
+		{"d_name_eq", "SELECT d.name, b.body FROM definitions d JOIN bodies b ON b.def_id=d.id WHERE d.name = 'GetJobs'", "op:\"read\"", false},
+
+		// Schema introspection
+		{"show_tables", "SHOW TABLES", "schema is documented", false},
+		{"describe", "DESCRIBE bodies", "schema is documented", false},
+		{"info_schema", "SELECT * FROM INFORMATION_SCHEMA.COLUMNS", "schema is documented", false},
+
+		// Legitimate analytics — should pass through
+		{"count_by_kind", "SELECT `kind`, COUNT(*) FROM definitions GROUP BY `kind`", "", true},
+		{"orphan_refs", "SELECT * FROM refs WHERE target_id NOT IN (SELECT id FROM definitions)", "", true},
+		{"file_scan", "SELECT DISTINCT source_file FROM definitions", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := searchShapedSQLRedirect(tt.sql)
+			if tt.wantEmpty {
+				if got != "" {
+					t.Errorf("expected pass-through, got redirect: %q", got)
+				}
+				return
+			}
+			if got == "" {
+				t.Fatalf("expected redirect containing %q, got empty (SQL not intercepted)", tt.wantHint)
+			}
+			if !strings.Contains(got, tt.wantHint) {
+				t.Errorf("redirect missing hint %q, got: %q", tt.wantHint, got)
+			}
+		})
 	}
 }
