@@ -28,6 +28,29 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TASKS = os.path.join(HERE, "tasks.jsonl")
 ARM_DIR = os.path.join(HERE, "arm_defn")
 WORKDIR_ROOT = "/tmp/defn-h2h-go"
+# Cached fresh .defn/ per (instance_id, defn_binary_hash). Contamination
+# fix (6abe8e1) forces a fresh ingest per arm — ~30-90s of pure CPU per
+# arm. Snapshot after first ingest, restore on subsequent runs; hit path
+# is ~2s (tarball extract) vs full re-parse. Invalidates on defn binary
+# change so DB schema drift doesn't corrupt cached DBs.
+DEFN_CACHE_ROOT = "/tmp/defn-h2h-go-cache"
+
+
+def _defn_binary_hash():
+    """sha256[:12] of the defn binary on PATH — cache key component so
+    a rebuilt defn (schema drift, ingest-logic change) invalidates
+    stale snapshots automatically."""
+    try:
+        which = subprocess.check_output(["which", "defn"], text=True).strip()
+        out = subprocess.check_output(["sha256sum", which], text=True)
+        return out.split()[0][:12]
+    except subprocess.CalledProcessError:
+        return "unknown"
+
+
+def _defn_cache_path(inst_id, binhash):
+    return os.path.join(DEFN_CACHE_ROOT, f"{inst_id}__{binhash}.tar")
+
 
 DEFN_MCP_CONFIG = {
     "mcpServers": {"defn": {"type": "stdio", "command": "defn", "args": ["serve"]}}
@@ -159,38 +182,58 @@ def setup_workspace(task):
     # Force a fresh .defn/ per arm. Keeping it across reruns wedges the DB
     # in the previous run's post-write state (fabricated tests etc.);
     # subsequent op:test would call emit.Emit and write that stale state
-    # back to the freshly-reset disk. ~1 min per arm to re-ingest is worth
-    # not silently corrupting every measurement.
+    # back to the freshly-reset disk. Cache the fresh ingest result per
+    # (inst_id, defn binary hash) so repeat runs pay ~2s tarball extract
+    # instead of ~30-90s full re-parse.
+    import shutil
+
     defn_dir = os.path.join(workdir, ".defn")
     if os.path.isdir(defn_dir):
-        import shutil
-
         shutil.rmtree(defn_dir)
 
+    binhash = _defn_binary_hash()
+    cache_path = _defn_cache_path(inst, binhash)
+    os.makedirs(DEFN_CACHE_ROOT, exist_ok=True)
+
+    if os.path.exists(cache_path):
+        print(
+            f"[setup] restoring cached .defn/ ({os.path.basename(cache_path)})",
+            file=sys.stderr,
+        )
+        subprocess.check_call(["tar", "-xf", cache_path, "-C", workdir])
+        return workdir
+
+    print(f"[setup] defn init + ingest (~1 min)", file=sys.stderr)
+    # Bug-fix bench workdirs contain broken code (that's the whole
+    # point) — package-parse errors are expected on some ingests.
+    # Use subprocess.run and check that `.defn/` was created rather
+    # than trusting exit status; ingest returns non-zero when any
+    # package fails but still persists what it could parse.
+    subprocess.run(
+        ["defn", "init", workdir],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["defn", "ingest", workdir],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     if not os.path.isdir(defn_dir):
-        print(f"[setup] defn init + ingest (~1 min)", file=sys.stderr)
-        # Bug-fix bench workdirs contain broken code (that's the whole
-        # point) — package-parse errors are expected on some ingests.
-        # Use subprocess.run and check that `.defn/` was created rather
-        # than trusting exit status; ingest returns non-zero when any
-        # package fails but still persists what it could parse.
-        subprocess.run(
-            ["defn", "init", workdir],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        raise RuntimeError(
+            f"[setup] defn init/ingest did not create {defn_dir} — "
+            f"see manual `defn init {workdir}` for the underlying error"
         )
-        subprocess.run(
-            ["defn", "ingest", workdir],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        if not os.path.isdir(defn_dir):
-            raise RuntimeError(
-                f"[setup] defn init/ingest did not create {defn_dir} — "
-                f"see manual `defn init {workdir}` for the underlying error"
-            )
-    else:
-        print(f"[setup] defn already initialized", file=sys.stderr)
+
+    # Cache the fresh ingest. Tar (no compression) — Dolt's noms store
+    # is already densely packed; gzip barely helps and doubles extract cost.
+    tmp_cache = cache_path + ".tmp"
+    subprocess.check_call(["tar", "-cf", tmp_cache, "-C", workdir, ".defn"])
+    os.replace(tmp_cache, cache_path)
+    print(
+        f"[setup] cached fresh .defn/ -> {os.path.basename(cache_path)}",
+        file=sys.stderr,
+    )
     return workdir
 
 
