@@ -835,7 +835,11 @@ func (s *server) handleImpact(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		}
 	}
 	sb.WriteString(fmt.Sprintf("Direct callers: %d (%d production, %d test)\n", len(impact.DirectCallers), len(prodCallers), len(testCallers)))
-	for _, c := range prodCallers {
+	for i, c := range prodCallers {
+		if i >= impactCallerCap {
+			sb.WriteString(fmt.Sprintf("  … (%d more production callers omitted; pass format:\"json\" for full list)\n", len(prodCallers)-impactCallerCap))
+			break
+		}
 		name := formatReceiver(c.Receiver) + c.Name
 		if c.SourceFile != "" && c.StartLine > 0 {
 			sb.WriteString(fmt.Sprintf("  %s  (%s:%d)\n", name, c.SourceFile, c.StartLine))
@@ -3835,6 +3839,38 @@ func stmtKind(s ast.Stmt) string {
 	return ""
 }
 
+// outlineCalleeCap and outlineFlowCap bound the caller/flow lists in
+// outline output. Bench trajectories showed some outlines pushing 7 kB
+// entirely from unbounded callee lists; head-of-list is enough for the
+// model to orient, and the total count is still reported.
+const (
+	outlineCalleeCap = 15
+	outlineFlowCap   = 20
+	// impactCallerCap bounds the markdown caller list in handleImpact.
+	// Model rarely acts on more than the top 10-15; full list is still
+	// available via format:"json" for the rare deep-analysis case.
+	impactCallerCap = 15
+)
+
+// truncateList returns "a, b, c, … (N more)" when the list exceeds cap,
+// else the full comma-joined string. Preserves the count in the summary
+// so the model knows there's more if it needs to `read` for the full body.
+func truncateList(names []string, cap int) string {
+	if len(names) <= cap {
+		return strings.Join(names, ", ")
+	}
+	return strings.Join(names[:cap], ", ") + fmt.Sprintf(", … (%d more)", len(names)-cap)
+}
+
+// truncateFlow is truncateList's " → " variant for the top-level flow
+// summary (control-flow tokens joined by arrows, not commas).
+func truncateFlow(flow []string, cap int) string {
+	if len(flow) <= cap {
+		return strings.Join(flow, " → ")
+	}
+	return strings.Join(flow[:cap], " → ") + fmt.Sprintf(" → … (%d more)", len(flow)-cap)
+}
+
 // handleOutline returns a compact projection of a definition: header +
 // signature (with doc prefix) + caller/callee summary + top-level flow
 // outline + body byte/line counts. Deliberately excludes body content.
@@ -3911,13 +3947,13 @@ func (s *server) handleOutline(_ context.Context, req *sdkmcp.CallToolRequest, a
 			names = append(names, formatReceiver(c.Receiver)+c.Name)
 		}
 		sort.Strings(names)
-		sb.WriteString(fmt.Sprintf("Callees (%d): %s\n", len(callees), strings.Join(names, ", ")))
+		sb.WriteString(fmt.Sprintf("Callees (%d): %s\n", len(callees), truncateList(names, outlineCalleeCap)))
 	} else {
 		sb.WriteString("Callees: 0\n")
 	}
 
 	if flow := topLevelFlow(d.Body); len(flow) > 0 {
-		sb.WriteString(fmt.Sprintf("Flow (%d): %s\n", len(flow), strings.Join(flow, " → ")))
+		sb.WriteString(fmt.Sprintf("Flow (%d): %s\n", len(flow), truncateFlow(flow, outlineFlowCap)))
 	}
 
 	out := sb.String()

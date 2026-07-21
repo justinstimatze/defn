@@ -63,6 +63,16 @@ def's shape, op:search for symbol/text search, op:read for a def body, op:edit
 / op:replace-hunk / op:create for writes. Never call Read/Write/Edit on .go
 files — those are disabled. For running tests, use code op:test (scoped to
 defs) — direct shell is not available. Complete the task and stop.
+
+The issue describes a bug that CURRENTLY EXISTS in this codebase. Assume
+the fix is not already in place until you have PROVEN it — either by
+reading the exact code the issue names and confirming the failing input
+would still fail, OR by running `code op:test` on the target and
+observing the failure. If your entire set of writes ends up in
+`_test.go` files, you have NOT implemented the fix — production code
+must change. Do not conclude the task complete without a production-code
+write unless you can cite the exact def and line whose current
+implementation already handles the issue.
 """.strip()
 
 
