@@ -987,6 +987,43 @@ func TestHandleSearch_Stage3FallsBackToBodyScan(t *testing.T) {
 	}
 }
 
+// Bundle B1: `%Hello%` (agent LIKE-glob form) with 0 name hits must strip
+// wildcards and body-scan. Regression bug: stage-3 was skipping ANY pattern
+// containing `%`, so `%JobsURL%` and similar returned nothing when the def
+// body would have matched.
+func TestHandleSearch_Stage3StripsWildcards(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	result, _, _ := s.handleSearch(context.Background(), nil, codeParam{Pattern: "%Hello%"})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Greet") {
+		t.Errorf("wildcard-strip fallback should find Greet via '%%Hello%%' in body; got %q", text)
+	}
+	// The scan query should be the stripped form, not the wildcard form.
+	if strings.Contains(text, "%Hello%") {
+		t.Errorf("expected scan header to show stripped pattern, saw raw wildcards: %q", text)
+	}
+}
+
+// Bundle B1: `_` name-wildcard is not something we substitute — refuse to
+// body-scan under it (would silently mean the wrong thing). Test locks in
+// that guard so a future refactor doesn't paper over the semantic mismatch.
+func TestHandleSearch_Stage3SkipsUnderscore(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	// _ is SQL LIKE's single-char wildcard. `Hell_` is a name-LIKE query
+	// that finds nothing here — we should NOT then body-scan "Hell_".
+	result, _, _ := s.handleSearch(context.Background(), nil, codeParam{Pattern: "Hell_"})
+	text := resultText(t, result)
+	if strings.Contains(text, "Greet") {
+		t.Errorf("underscore-pattern should not trigger body-scan; got %q", text)
+	}
+}
+
 func TestHandleCreate(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()

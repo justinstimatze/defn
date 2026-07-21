@@ -1062,14 +1062,23 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// Stage 3: substring body-scan. Model reaches here when name-LIKE
 	// found nothing and FTS was word-tokenized past the actual query
 	// (camelCase substrings, stopwords, short tokens). Grep-parity move:
-	// return def-scoped snippets so results are self-locating. Only
-	// fires when the pattern is non-empty and doesn't already contain
-	// LIKE metachars (those went through stage 1 verbatim).
-	if len(defs) == 0 && args.Pattern != "" && !strings.ContainsAny(args.Pattern, "%_") {
-		return s.bodyScanResult(args.Pattern, limit)
+	// return def-scoped snippets so results are self-locating. When the
+	// pattern arrived as an explicit LIKE glob (%JobsURL%), strip the
+	// wildcards for body-scan — the wildcards make sense for name-LIKE
+	// but block substring search from ever running. `_` is a name-only
+	// wildcard we don't try to substitute; skip stage-3 in that case.
+	if len(defs) == 0 && args.Pattern != "" && !strings.Contains(args.Pattern, "_") {
+		scanPattern := strings.Trim(args.Pattern, "%")
+		if scanPattern != "" && !strings.Contains(scanPattern, "%") {
+			return s.bodyScanResult(scanPattern, limit)
+		}
 	}
 
-	if args.Rank {
+	// Auto-rank when the candidate set exceeds `limit`. Alphabetical
+	// truncation buries the useful defs behind whatever sorts first,
+	// so trigger the caller-count/text-overlap ranker so the head of
+	// the list is actually informative. Explicit rank:true still works.
+	if args.Rank || len(defs) > limit {
 		return s.rankedSearchResult(args.Pattern, defs, limit)
 	}
 
