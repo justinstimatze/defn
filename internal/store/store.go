@@ -1416,6 +1416,85 @@ func (s *DB) SearchDefinitions(query string) ([]Definition, error) {
 	return scanDefinitions(rows)
 }
 
+// BodyMatch is a single substring hit inside a definition body — the
+// output shape for grep-style body search. Line is the 1-indexed line
+// within the definition (StartLine + offset), Snippet is the surrounding
+// context (~40 chars) with the matched substring in the middle. Used by
+// handleSearch's stage-3 fallback so text-inside-a-body queries return
+// self-locating results, not blank hits.
+type BodyMatch struct {
+	Name       string
+	Kind       string
+	Receiver   string
+	SourceFile string
+	Line       int // absolute line in source file
+	Snippet    string
+}
+
+// SearchBodiesLike scans definition bodies for a literal substring
+// (case-insensitive) and returns every hit with a snippet. Slower than
+// FTS (no index on body substrings — full scan) but essential for
+// grep-parity: FTS misses camelCase substrings, stopwords, and short
+// tokens. Caller bounds via limit. The pattern is matched as a plain
+// substring — SQL LIKE metachars are NOT interpreted (backslash-escaped
+// before the query) so callers can pass user input safely.
+func (s *DB) SearchBodiesLike(pattern string, limit int) ([]BodyMatch, error) {
+	if pattern == "" {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(pattern)
+	like := "%" + esc + "%"
+	rows, err := s.queryContext(s.Ctx(), `
+		SELECT d.name, d.kind, COALESCE(d.receiver, ''),
+		       COALESCE(d.source_file, ''), COALESCE(d.start_line, 0),
+		       b.body
+		FROM bodies b
+		JOIN definitions d ON d.id = b.def_id
+		WHERE LOWER(b.body) LIKE LOWER(?)
+		LIMIT ?`, like, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []BodyMatch
+	needle := strings.ToLower(pattern)
+	for rows.Next() {
+		var m BodyMatch
+		var body string
+		if err := rows.Scan(&m.Name, &m.Kind, &m.Receiver, &m.SourceFile, &m.Line, &body); err != nil {
+			return nil, err
+		}
+		idx := strings.Index(strings.ToLower(body), needle)
+		if idx < 0 {
+			continue
+		}
+		lineOffset := strings.Count(body[:idx], "\n")
+		m.Line += lineOffset
+		start := idx - 30
+		if start < 0 {
+			start = 0
+		}
+		end := idx + len(pattern) + 30
+		if end > len(body) {
+			end = len(body)
+		}
+		snip := body[start:end]
+		snip = strings.ReplaceAll(snip, "\n", " ")
+		if start > 0 {
+			snip = "…" + snip
+		}
+		if end < len(body) {
+			snip = snip + "…"
+		}
+		m.Snippet = snip
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
 // DistinctSourceFiles returns every distinct source_file recorded in
 // file_sources. Paths are module-relative (the format ingest writes).
 // Used by the incremental ingest path to detect file additions and

@@ -896,6 +896,126 @@ func TestHandleSearch(t *testing.T) {
 	}
 }
 
+func TestSearchBodiesLike(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+
+	// "Hello" appears in Greet's body (`return "Hello, " + name`) — single
+	// hit, snippet should include the substring.
+	hits, err := db.SearchBodiesLike("Hello", 100)
+	if err != nil {
+		t.Fatalf("SearchBodiesLike: %v", err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit for 'Hello', got %d", len(hits))
+	}
+	h := hits[0]
+	if h.Name != "Greet" {
+		t.Errorf("hit.Name = %q, want Greet", h.Name)
+	}
+	if !strings.Contains(h.Snippet, "Hello") {
+		t.Errorf("snippet missing needle: %q", h.Snippet)
+	}
+	if h.Line < h.Line || h.Line == 0 {
+		t.Errorf("Line should be >0 (absolute in source): %d", h.Line)
+	}
+
+	// Case-insensitive: "hello" (lowercase) should also find Greet.
+	hits, err = db.SearchBodiesLike("hello", 100)
+	if err != nil || len(hits) != 1 {
+		t.Fatalf("case-insensitive miss: %d hits, err=%v", len(hits), err)
+	}
+
+	// "goodbye" appears in Farewell's body.
+	hits, _ = db.SearchBodiesLike("goodbye", 100)
+	found := false
+	for _, h := range hits {
+		if h.Name == "Farewell" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected Farewell hit for 'goodbye', got %+v", hits)
+	}
+
+	// No matches: empty slice, no error.
+	hits, err = db.SearchBodiesLike("this-string-is-nowhere-in-the-fixture", 100)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(hits) != 0 {
+		t.Errorf("expected 0 hits, got %d", len(hits))
+	}
+}
+
+func TestSearchBodiesLike_EscapesLikeMetachars(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+
+	// User pattern with a literal % should not become a wildcard: without
+	// escaping this would match everything; with escaping it should match
+	// nothing since no body contains a literal %.
+	hits, err := db.SearchBodiesLike("%", 100)
+	if err != nil {
+		t.Fatalf("SearchBodiesLike: %v", err)
+	}
+	if len(hits) != 0 {
+		t.Errorf("literal %% should not wildcard-match everything; got %d hits", len(hits))
+	}
+}
+
+func TestBodyScanResult_Empty(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	result, _, err := s.bodyScanResult("no-such-string-anywhere", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "no matches") || !strings.Contains(text, "body-scan") {
+		t.Errorf("expected 'no matches' + 'body-scan' hint; got %q", text)
+	}
+}
+
+func TestBodyScanResult_Hits(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	result, _, err := s.bodyScanResult("Hello", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := resultText(t, result)
+	// Header line: "[body-scan for \"Hello\" — N hits."
+	if !strings.Contains(text, "body-scan for \"Hello\"") {
+		t.Errorf("expected header naming pattern; got %q", text[:200])
+	}
+	// JSON body includes name+file+snippet.
+	if !strings.Contains(text, `"name": "Greet"`) {
+		t.Errorf("expected Greet in JSON body; got %q", text)
+	}
+	if !strings.Contains(text, `"snippet"`) {
+		t.Errorf("expected snippet field; got %q", text)
+	}
+}
+
+func TestHandleSearch_Stage3FallsBackToBodyScan(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	// "Hello" is not a def name and unlikely to be an FTS match (short-ish
+	// and inside a string literal). Stage-3 body-scan should catch it.
+	result, _, _ := s.handleSearch(context.Background(), nil, codeParam{Pattern: "Hello"})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Greet") {
+		t.Errorf("stage-3 body-scan should find Greet via 'Hello' in body; got %q", text)
+	}
+}
+
 func TestHandleCreate(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()

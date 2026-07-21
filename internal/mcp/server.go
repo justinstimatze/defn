@@ -1065,6 +1065,16 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		limit = args.Limit
 	}
 
+	// Stage 3: substring body-scan. Model reaches here when name-LIKE
+	// found nothing and FTS was word-tokenized past the actual query
+	// (camelCase substrings, stopwords, short tokens). Grep-parity move:
+	// return def-scoped snippets so results are self-locating. Only
+	// fires when the pattern is non-empty and doesn't already contain
+	// LIKE metachars (those went through stage 1 verbatim).
+	if len(defs) == 0 && args.Pattern != "" && !strings.ContainsAny(args.Pattern, "%_") {
+		return s.bodyScanResult(args.Pattern, limit)
+	}
+
 	if args.Rank {
 		return s.rankedSearchResult(args.Pattern, defs, limit)
 	}
@@ -1094,6 +1104,49 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	if truncated != "" {
 		text += truncated
 	}
+	return textResult(text), nil, nil
+}
+
+// bodyScanResult formats stage-3 search results (substring-in-body hits)
+// as compact JSON with def name + file:line + snippet, so the model can
+// re-locate the match without a follow-up read. Empty result set returns
+// a message that names the fallback tried, distinguishing "no def named
+// X + no body containing X" from "search op failed silently."
+func (s *server) bodyScanResult(pattern string, limit int) (*sdkmcp.CallToolResult, any, error) {
+	hits, err := s.db.SearchBodiesLike(pattern, limit)
+	if err != nil {
+		return errResult(fmt.Errorf("search body-scan: %w", err))
+	}
+	if len(hits) == 0 {
+		msg := fmt.Sprintf(
+			"[no matches for %q — tried name-LIKE, FTS on doc+body, and substring body-scan. If you're grepping for a comment or string literal, this substring wasn't found in any indexed body. Try `overview` for project shape or a broader pattern.]",
+			pattern,
+		)
+		return textResult(msg), nil, nil
+	}
+	type match struct {
+		Name       string `json:"name"`
+		Kind       string `json:"kind"`
+		Receiver   string `json:"receiver,omitempty"`
+		SourceFile string `json:"file"`
+		Line       int    `json:"line"`
+		Snippet    string `json:"snippet"`
+	}
+	var out []match
+	for _, h := range hits {
+		out = append(out, match{
+			Name: h.Name, Kind: h.Kind, Receiver: h.Receiver,
+			SourceFile: h.SourceFile, Line: h.Line, Snippet: h.Snippet,
+		})
+	}
+	text, err := toJSON(out)
+	if err != nil {
+		return errResult(err)
+	}
+	text = fmt.Sprintf(
+		"[body-scan for %q — %d hits. Each row is a definition whose body contains the substring. Use `read name:\"<Name>\"` for the full body.]\n%s",
+		pattern, len(hits), text,
+	)
 	return textResult(text), nil, nil
 }
 
