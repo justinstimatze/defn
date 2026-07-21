@@ -126,19 +126,61 @@ def setup_workspace(task):
         stderr=subprocess.DEVNULL,
     )
 
+    # Contamination fix: prior arm runs left modified tracked files AND
+    # untracked scratch files in the workdir. On rerun the model was reading
+    # its own historical writes as "the current state" — completely invalidating
+    # every measurement made on a rerun'd workdir. Reset tracked files to
+    # base_commit_sha and clean untracked, preserving only bench-harness
+    # artifacts (.defn/, .mcp-*, .claude-stream.jsonl, CLAUDE.md).
+    subprocess.check_call(
+        ["git", "-C", workdir, "reset", "--hard", "--quiet", task["base_commit_sha"]],
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.check_call(
+        [
+            "git",
+            "-C",
+            workdir,
+            "clean",
+            "-fd",
+            "--quiet",
+            "-e",
+            ".defn",
+            "-e",
+            ".mcp-defn-only.json",
+            "-e",
+            ".mcp.json",
+            "-e",
+            ".claude-stream.jsonl",
+            "-e",
+            "CLAUDE.md",
+        ],
+        stderr=subprocess.DEVNULL,
+    )
+
     defn_dir = os.path.join(workdir, ".defn")
     if not os.path.isdir(defn_dir):
         print(f"[setup] defn init + ingest (~1 min)", file=sys.stderr)
-        subprocess.check_call(
+        # Bug-fix bench workdirs contain broken code (that's the whole
+        # point) — package-parse errors are expected on some ingests.
+        # Use subprocess.run and check that `.defn/` was created rather
+        # than trusting exit status; ingest returns non-zero when any
+        # package fails but still persists what it could parse.
+        subprocess.run(
             ["defn", "init", workdir],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        subprocess.check_call(
+        subprocess.run(
             ["defn", "ingest", workdir],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        if not os.path.isdir(defn_dir):
+            raise RuntimeError(
+                f"[setup] defn init/ingest did not create {defn_dir} — "
+                f"see manual `defn init {workdir}` for the underlying error"
+            )
     else:
         print(f"[setup] defn already initialized", file=sys.stderr)
     return workdir
