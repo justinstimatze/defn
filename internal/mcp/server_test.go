@@ -416,21 +416,10 @@ func TestHandleRead(t *testing.T) {
 		t.Error("expected function body containing 'Hello'")
 	}
 
-	// Structured usage: op labeled, bytes non-zero, alt bytes populated
-	// from file_sources (ingest wrote main.go there).
-	u, ok := result.StructuredContent.(usageStats)
-	if !ok {
-		t.Fatalf("expected StructuredContent = usageStats, got %T", result.StructuredContent)
-	}
-	if u.Op != "read" {
-		t.Errorf("usage.Op = %q, want %q", u.Op, "read")
-	}
-	if u.BytesReturned == 0 {
-		t.Error("usage.BytesReturned should be > 0")
-	}
-	if u.BytesAltRead == 0 {
-		t.Error("usage.BytesAltRead should be > 0 (file_sources not populated?)")
-	}
+	// StructuredContent is intentionally not set (see withUsage comment):
+	// Claude's tool_result serialization drops the text body when
+	// structuredContent is populated. Usage metadata now lives in the
+	// footer only.
 }
 
 // TestHandleRead_UpstreamMatch seeds an upstream fingerprint whose hash
@@ -574,16 +563,7 @@ func TestHandleReadFile(t *testing.T) {
 		t.Errorf("expected Greet before Farewell in source order, got Greet@%d Farewell@%d", gi, fi)
 	}
 
-	u, ok := result.StructuredContent.(usageStats)
-	if !ok {
-		t.Fatalf("expected StructuredContent = usageStats, got %T", result.StructuredContent)
-	}
-	if u.Op != "read-file" {
-		t.Errorf("usage.Op = %q, want %q", u.Op, "read-file")
-	}
-	if u.BytesReturned == 0 {
-		t.Error("usage.BytesReturned should be > 0")
-	}
+	// StructuredContent no longer set (see withUsage comment).
 }
 
 func TestCompactReadFile(t *testing.T) {
@@ -659,16 +639,7 @@ func TestHandleExpand_BodyAndCallers(t *testing.T) {
 		t.Errorf("expected TestGreet as a (test) caller of Greet, got: %s", text)
 	}
 
-	u, ok := result.StructuredContent.(usageStats)
-	if !ok {
-		t.Fatalf("expected usageStats StructuredContent, got %T", result.StructuredContent)
-	}
-	if u.Op != "expand" {
-		t.Errorf("usage.Op = %q, want %q", u.Op, "expand")
-	}
-	if u.BytesReturned == 0 {
-		t.Error("usage.BytesReturned should be > 0")
-	}
+	// StructuredContent no longer set (see withUsage comment).
 }
 
 // TestHandleExpand_DefaultInclude verifies empty include:[] defaults to

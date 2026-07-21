@@ -61,7 +61,6 @@ type server struct {
 	ready           atomic.Bool  // true after startup ingest+resolve completes
 	autoCommitCount atomic.Int64 // counts auto-commits; triggers GC every 10
 	idf             *rank.LazyIDF
-	respCache       *respCache // per-session dedup of read-side responses
 }
 
 // Run starts the MCP server over stdio. projDir is the project root where
@@ -199,7 +198,6 @@ func mcpHTTPMux(mcpServer *sdkmcp.Server, projDir string) http.Handler {
 func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*server, *sdkmcp.Server) {
 	s := &server{db: database, projectDir: projDir}
 	s.idf = newIDF(database)
-	s.respCache = newRespCache()
 
 	if projDir != "" {
 		// Reconcile changes made while defn was not running (file moves,
@@ -415,10 +413,19 @@ func (s *server) fileAltBytes(d *store.Definition) int {
 	return len(raw)
 }
 
-// withUsage attaches u to r.StructuredContent and, when the alt-Read
-// savings are both dramatic (≥50%) and non-trivial (alt ≥ 512 bytes),
-// appends a one-line footer to r's text content. No-op on nil / error
-// results.
+// withUsage optionally appends a one-line savings footer to r's text
+// content when the alt-Read savings are dramatic (≥50%) and non-trivial
+// (alt ≥ 512 bytes). No-op on nil / error results.
+//
+// Historical note: this function previously ALSO set r.StructuredContent
+// = u for bench harnesses. Claude's tool_result serialization treats
+// structuredContent as a replacement for text content when both are set,
+// so every read/read-file/outline/slice/file-defs/expand response
+// silently reached the model as a JSON usage envelope — no body text
+// at all. Detected 2026-07-20 via bench trajectories where the model
+// literally complained "content stripped for the whole session." The
+// StructuredContent write is removed; the footer stays because it's
+// visible in-band and useful signal.
 func withUsage(r *sdkmcp.CallToolResult, u usageStats) *sdkmcp.CallToolResult {
 	if r == nil || r.IsError {
 		return r
@@ -430,7 +437,6 @@ func withUsage(r *sdkmcp.CallToolResult, u usageStats) *sdkmcp.CallToolResult {
 		}
 		u.SavingsPct = 100 * saved / u.BytesAltRead
 	}
-	r.StructuredContent = u
 	if u.BytesAltRead >= 512 && u.SavingsPct >= 50 {
 		footer := fmt.Sprintf("\n_— returned %dB vs ~%dB for full-file Read (-%d%%)_\n",
 			u.BytesReturned, u.BytesAltRead, u.SavingsPct)
@@ -489,22 +495,6 @@ func (s *server) modulePath(moduleID int64) string {
 // handleCode is the single entry point for all operations.
 // It dispatches based on the "op" field to the appropriate handler.
 func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, args codeParam) (result *sdkmcp.CallToolResult, structured any, err error) {
-	// Post-dispatch: read ops dedup identical repeat responses within the
-	// session; write ops invalidate the whole session cache so the next
-	// read is a clean miss. See internal/mcp/dedup.go.
-	defer func() {
-		if err != nil || result == nil || result.IsError || req == nil {
-			return
-		}
-		if op, argKey, ok := dedupOpKey(args); ok {
-			result = s.respCache.dedup(req.Session, op, argKey, result)
-			return
-		}
-		if isWriteOp(args.Op) {
-			s.respCache.invalidate(req.Session)
-		}
-	}()
-
 	// Validate required params per op (fail fast with clear error).
 	need := func(field, label string) (*sdkmcp.CallToolResult, any, error) {
 		if strings.TrimSpace(field) == "" {
