@@ -145,8 +145,6 @@ def setup_workspace(task):
             "-fd",
             "--quiet",
             "-e",
-            ".defn",
-            "-e",
             ".mcp-defn-only.json",
             "-e",
             ".mcp.json",
@@ -158,7 +156,17 @@ def setup_workspace(task):
         stderr=subprocess.DEVNULL,
     )
 
+    # Force a fresh .defn/ per arm. Keeping it across reruns wedges the DB
+    # in the previous run's post-write state (fabricated tests etc.);
+    # subsequent op:test would call emit.Emit and write that stale state
+    # back to the freshly-reset disk. ~1 min per arm to re-ingest is worth
+    # not silently corrupting every measurement.
     defn_dir = os.path.join(workdir, ".defn")
+    if os.path.isdir(defn_dir):
+        import shutil
+
+        shutil.rmtree(defn_dir)
+
     if not os.path.isdir(defn_dir):
         print(f"[setup] defn init + ingest (~1 min)", file=sys.stderr)
         # Bug-fix bench workdirs contain broken code (that's the whole
