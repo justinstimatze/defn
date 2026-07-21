@@ -422,6 +422,44 @@ func TestHandleRead(t *testing.T) {
 	// footer only.
 }
 
+// L10: not-found errors should attach a "Did you mean" list drawn from
+// name-LIKE candidates so the model can retry without a round-trip.
+func TestNotFoundResult_SuggestsClosest(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	// "reet" is a substring of Greet; case-preserved LIKE should surface it.
+	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "reet"})
+	text := resultText(t, result)
+	if !strings.Contains(text, "not found") {
+		t.Fatalf("expected 'not found', got %q", text)
+	}
+	if !strings.Contains(text, "Did you mean") {
+		t.Errorf("expected 'Did you mean' suggestion, got %q", text)
+	}
+	if !strings.Contains(text, "Greet") {
+		t.Errorf("expected Greet in suggestions, got %q", text)
+	}
+}
+
+// L10: when the name has no partial matches at all, degrade to the plain
+// error — don't invent noise.
+func TestNotFoundResult_NoSuggestionsWhenAbsent(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Xylophone123"})
+	text := resultText(t, result)
+	if !strings.Contains(text, "not found") {
+		t.Fatalf("expected 'not found', got %q", text)
+	}
+	if strings.Contains(text, "Did you mean") {
+		t.Errorf("expected no suggestion when no candidates match, got %q", text)
+	}
+}
+
 // TestHandleRead_UpstreamMatch seeds an upstream fingerprint whose hash
 // matches the local Greet body exactly, then verifies the read op
 // returns the compact provenance form (no body, tagged with version).

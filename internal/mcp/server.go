@@ -456,6 +456,51 @@ func errResult(err error) (*sdkmcp.CallToolResult, any, error) {
 	}, nil, nil
 }
 
+// notFoundSuggestCap bounds the "did you mean" list attached to
+// definition-not-found errors. 5 is enough to catch the common
+// case-swap / prefix / suffix miss without ballooning error size.
+const notFoundSuggestCap = 5
+
+// notFoundResult builds the "definition %q not found" error and — when
+// the DB has close-name candidates — appends a compact "Did you mean:"
+// list so the model can retry with a real def name instead of a bare
+// grep. Falls back to the plain error when no candidates match, so
+// zero-length arg or truly-absent name don't get noisy suggestions.
+func (s *server) notFoundResult(name string) (*sdkmcp.CallToolResult, any, error) {
+	msg := fmt.Sprintf("definition %q not found", name)
+	if name == "" || s.db == nil {
+		return errResult(fmt.Errorf("%s", msg))
+	}
+	// Case-insensitive prefix/suffix contains — the common cases are
+	// "case wrong", "receiver missing", "prefix/suffix mismatch".
+	// FindDefinitions ORDER BY name so we get a stable head-of-list.
+	cands, err := s.db.FindDefinitions("%" + name + "%")
+	if err != nil || len(cands) == 0 {
+		return errResult(fmt.Errorf("%s", msg))
+	}
+	var seen []string
+	dedup := make(map[string]bool, len(cands))
+	for _, c := range cands {
+		key := formatReceiver(c.Receiver) + c.Name
+		if dedup[key] {
+			continue
+		}
+		dedup[key] = true
+		seen = append(seen, key)
+		if len(seen) >= notFoundSuggestCap {
+			break
+		}
+	}
+	suffix := ""
+	if len(cands) > len(seen) {
+		suffix = fmt.Sprintf(" (+%d more — refine with op:\"search\" pattern:%q)",
+			len(cands)-len(seen), "%"+name+"%")
+	}
+	full := fmt.Sprintf("%s. Did you mean: %s%s",
+		msg, strings.Join(seen, ", "), suffix)
+	return errResult(fmt.Errorf("%s", full))
+}
+
 func toJSON(v any) (string, error) {
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
@@ -802,7 +847,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 func (s *server) handleImpact(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return errResult(fmt.Errorf("definition %q not found", args.Name))
+		return s.notFoundResult(args.Name)
 	}
 	impact, err := s.db.GetImpact(d.ID)
 	if err != nil {
@@ -923,7 +968,7 @@ func (s *server) impactJSON(impact *store.Impact) (*sdkmcp.CallToolResult, any, 
 func (s *server) handleGetDefinition(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return errResult(fmt.Errorf("definition %q not found", args.Name))
+		return s.notFoundResult(args.Name)
 	}
 
 	// Look up module path for this definition.
@@ -1255,7 +1300,7 @@ func (s *server) handleUntested(_ context.Context, _ *sdkmcp.CallToolRequest, _ 
 func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args editParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return errResult(fmt.Errorf("definition %q not found", args.Name))
+		return s.notFoundResult(args.Name)
 	}
 
 	// Validate new body parses as Go.
@@ -1575,7 +1620,7 @@ func extractSignature(body string) string {
 func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return errResult(fmt.Errorf("definition %q not found", args.Name))
+		return s.notFoundResult(args.Name)
 	}
 
 	// Reject empty old_fragment (strings.ReplaceAll inserts between every char).
@@ -1645,7 +1690,7 @@ func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest
 func (s *server) handleInsert(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return errResult(fmt.Errorf("definition %q not found", args.Name))
+		return s.notFoundResult(args.Name)
 	}
 
 	idx := strings.Index(d.Body, args.After)
@@ -2467,7 +2512,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return errResult(fmt.Errorf("definition %q not found", args.Name))
+		return s.notFoundResult(args.Name)
 	}
 
 	// Show what we're about to delete.
@@ -2507,7 +2552,7 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 
 	d, err := s.db.GetDefinitionByName(args.OldName, "")
 	if err != nil {
-		return errResult(fmt.Errorf("definition %q not found", args.OldName))
+		return s.notFoundResult(args.OldName)
 	}
 
 	// Compose the qualified old-name the safety net compares against (methods
@@ -2574,7 +2619,7 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return errResult(fmt.Errorf("definition %q not found", args.Name))
+		return s.notFoundResult(args.Name)
 	}
 
 	impact, err := s.db.GetImpact(d.ID)
@@ -2840,7 +2885,7 @@ func humanSize(n int64) string {
 func (s *server) handleSimilar(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return errResult(fmt.Errorf("definition %q not found", args.Name))
+		return s.notFoundResult(args.Name)
 	}
 	if d.Signature == "" {
 		return errResult(fmt.Errorf("definition %q has no signature", args.Name))
@@ -2972,7 +3017,7 @@ func (s *server) handlePatch(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return errResult(fmt.Errorf("definition %q not found", args.Name))
+		return s.notFoundResult(args.Name)
 	}
 
 	if !strings.Contains(d.Body, args.OldName) {
@@ -3257,7 +3302,7 @@ func (s *server) handleExpand(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	}
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return errResult(fmt.Errorf("definition %q not found", args.Name))
+		return s.notFoundResult(args.Name)
 	}
 
 	includes := args.Include
@@ -3688,7 +3733,7 @@ func (s *server) handleTestCoverage(_ context.Context, _ *sdkmcp.CallToolRequest
 	}
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return errResult(fmt.Errorf("definition %q not found", args.Name))
+		return s.notFoundResult(args.Name)
 	}
 	impact, err := s.db.GetImpact(d.ID)
 	if err != nil {
@@ -3895,7 +3940,7 @@ func truncateFlow(flow []string, cap int) string {
 func (s *server) handleOutline(_ context.Context, req *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return errResult(fmt.Errorf("definition %q not found", args.Name))
+		return s.notFoundResult(args.Name)
 	}
 
 	// Size-aware fallback: for tiny bodies, read is smaller than
@@ -3993,7 +4038,7 @@ func (s *server) handleSlice(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return errResult(fmt.Errorf("definition %q not found", args.Name))
+		return s.notFoundResult(args.Name)
 	}
 
 	slices, err := projection.Slices(d.Body, args.Slice)
