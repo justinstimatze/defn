@@ -319,6 +319,76 @@ func TestFarewell(t *testing.T) {
 	return db, projDir
 }
 
+// L14: op:read-and-verify returns the def body concatenated with its
+// covering test-run output, so a single call surfaces source + behavior.
+func TestHandleReadAndVerify_CombinesReadAndTest(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db, projectDir: projDir}
+
+	result, _, _ := s.handleReadAndVerify(context.Background(), nil,
+		codeParam{Name: "Greet"})
+	text := resultText(t, result)
+
+	// Read portion: body content
+	if !strings.Contains(text, "Hello") {
+		t.Errorf("expected Greet body containing 'Hello', got %q", text)
+	}
+	// Verify portion: test-run status
+	if !strings.Contains(text, "TESTS PASSED") && !strings.Contains(text, "TESTS FAILED") {
+		t.Errorf("expected test-run status, got %q", text)
+	}
+}
+
+// L14: not-found def surfaces the not-found error (with suggestions from
+// L10) rather than swallowing the read error and trying the test path.
+func TestHandleReadAndVerify_NotFoundBubbles(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db, projectDir: projDir}
+
+	result, _, _ := s.handleReadAndVerify(context.Background(), nil,
+		codeParam{Name: "NoSuchDefXyz"})
+	text := resultText(t, result)
+	if !strings.Contains(text, "not found") {
+		t.Errorf("expected not-found bubble, got %q", text)
+	}
+}
+
+// L15: impact output lists covering test names and warns when none of
+// them lexically mention the def — surfaces "indirectly tested" cases.
+func TestHandleImpact_ListsTestNamesAndCoherenceHint(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db, projectDir: projDir}
+
+	// TestGreet covers Greet — name mentions the def; no coherence warning.
+	result, _, _ := s.handleImpact(context.Background(), nil, codeParam{Name: "Greet"})
+	text := resultText(t, result)
+	if !strings.Contains(text, "TestGreet") {
+		t.Errorf("expected test name in impact output, got %q", text)
+	}
+	if strings.Contains(text, "coverage is indirect") {
+		t.Errorf("Greet has TestGreet — should not warn about indirect coverage: %q", text)
+	}
+}
+
+// L18: op:overview with no file/name returns a project-wide module summary.
+func TestHandleOverview_EmptyReturnsProjectSummary(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+
+	result, _, _ := s.handleOverview(context.Background(), nil, codeParam{})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Project overview") {
+		t.Errorf("expected project overview header, got %q", text)
+	}
+	if !strings.Contains(text, "testproj") {
+		t.Errorf("expected module 'testproj' listed, got %q", text)
+	}
+}
+
 // L11: op:test test:"TestX" runs a named test directly (bypasses the
 // def-name → coverage → -run path). Reproduces a bug from an issue's
 // named failing test in one turn.

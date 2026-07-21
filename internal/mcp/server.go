@@ -228,7 +228,7 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 		Name: "code",
 		Description: `Go code database. One tool, many ops. Orient before you read: overview (project shape) → outline (def shape) → impact (when you know which def matters). Only read whole bodies when you're about to edit them; whole-file reads on files you won't touch are pure wire cost — use outline or search instead.
 
-Ops: overview (project-wide shape — packages, top-level defs, module summary; the right first-touch when you don't know which def matters yet), outline (compact projection of a def — sig + doc + caller/callee summary, no body; use when body isn't needed), search, impact (blast radius of a known def — pass format:"json" for structured output; callers, transitives, test coverage in one call), read, read-file (all defs' bodies in one file — pass file:"path"; whole-file counterpart to read; prefer over N sequential read calls when scanning), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), replace-hunk (replace a byte-exact occurrence of 'old' inside a def body with 'new' — byte-exact PUTGET, content-addressed inside the def; pass name+old+new, plus index=1..N if 'old' occurs more than once; empty 'new' deletes the hunk. Send zero anchor context when the hunk is def-unique — the name argument does the file-level disambiguation), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create (single def from body; with file: set, body may hold multiple top-level decls to author a whole file in one call — the whole-file equivalent of files-mode Write), delete, rename, move, test (run ONLY tests that cover a given def — pass name; scoped subset, not the full suite; prefer over bash 'go test ./...' when you only need coverage for a specific change. Also accepts test:"TestX" to run one test by name — use this to REPRODUCE a bug from the issue BEFORE writing any code; a passing test means your hypothesis about which def is broken is wrong), apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 6 projection ops insert-precondition/replace-slice/replace-hunk/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (rarely needed — every edit op auto-syncs the DB; only use after external file changes outside the code tool), query (raw SQL escape hatch — for schema analytics only; NEVER use to look up a def by name, grep bodies, or list files/defs-in-file — use search/outline/read-file/file-defs/impact instead, which are far cheaper on the wire), patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
+Ops: overview (project-wide shape when called with no args — one line per module with def counts + first exported names; pass file:"pkg-path" or file:"pkg-path/file.go" to drill in; the right first-touch when you don't know which def matters yet), outline (compact projection of a def — sig + doc + caller/callee summary, no body; use when body isn't needed), search, impact (blast radius of a known def — pass format:"json" for structured output; callers, transitives, test coverage in one call), read, read-and-verify (read a def AND run its covering tests in one call — use during bug triage so you see behavior alongside source and don't spiral into read-loops; pass name), read-file (all defs' bodies in one file — pass file:"path"; whole-file counterpart to read; prefer over N sequential read calls when scanning), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), replace-hunk (replace a byte-exact occurrence of 'old' inside a def body with 'new' — byte-exact PUTGET, content-addressed inside the def; pass name+old+new, plus index=1..N if 'old' occurs more than once; empty 'new' deletes the hunk. Send zero anchor context when the hunk is def-unique — the name argument does the file-level disambiguation), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create (single def from body; with file: set, body may hold multiple top-level decls to author a whole file in one call — the whole-file equivalent of files-mode Write), delete, rename, move, test (run ONLY tests that cover a given def — pass name; scoped subset, not the full suite; prefer over bash 'go test ./...' when you only need coverage for a specific change. Also accepts test:"TestX" to run one test by name — use this to REPRODUCE a bug from the issue BEFORE writing any code; a passing test means your hypothesis about which def is broken is wrong), apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 6 projection ops insert-precondition/replace-slice/replace-hunk/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (rarely needed — every edit op auto-syncs the DB; only use after external file changes outside the code tool), query (raw SQL escape hatch — for schema analytics only; NEVER use to look up a def by name, grep bodies, or list files/defs-in-file — use search/outline/read-file/file-defs/impact instead, which are far cheaper on the wire), patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
 	}, s.handleCode)
 
 	return s, mcpServer
@@ -732,6 +732,8 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	switch args.Op {
 	case "read":
 		return wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name, Full: args.Full}))
+	case "read-and-verify":
+		return wrapStale(s.handleReadAndVerify(ctx, req, args))
 	case "outline":
 		return wrapStale(s.handleOutline(ctx, req, nameParam{Name: args.Name}))
 	case "slice":
@@ -844,7 +846,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "gc":
 		return s.handleGC(ctx, req, args)
 	default:
-		return errResult(fmt.Errorf("unknown op %q — valid: read, outline, slice, insert-precondition, replace-slice, replace-hunk, wrap-in-defer, rename-param, add-import, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc", args.Op))
+		return errResult(fmt.Errorf("unknown op %q — valid: read, read-and-verify, outline, slice, insert-precondition, replace-slice, replace-hunk, wrap-in-defer, rename-param, add-import, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc", args.Op))
 	}
 }
 
@@ -898,11 +900,54 @@ func (s *server) handleImpact(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	}
 	sb.WriteString(fmt.Sprintf("Transitive callers: %d\n", impact.TransitiveCount))
 	sb.WriteString(fmt.Sprintf("Tests covering this: %d\n", len(impact.Tests)))
+	// L15: surface test names + a coherence hint. When none of the covering
+	// test names lexically contain the def name (case-insensitive), the def
+	// is likely indirectly tested — a bugfix here may not be verified by
+	// its own coverage. Cheap "you may be looking at the wrong def" signal.
+	if names := testNames(impact.Tests, impactTestNameCap); len(names) > 0 {
+		sb.WriteString(fmt.Sprintf("  Names: %s\n", strings.Join(names, ", ")))
+		if !anyTestNameMentions(impact.Tests, impact.Definition.Name) {
+			sb.WriteString("  Note: no covering test name mentions this def by name — coverage is indirect. If you fix it, prefer running one of the above tests to verify (op:test test:\"<TestX>\").\n")
+		}
+	}
 	if impact.UncoveredBy > 0 {
 		sb.WriteString(fmt.Sprintf("Uncovered direct callers: %d\n", impact.UncoveredBy))
 	}
 
 	return textResult(sb.String()), nil, nil
+}
+
+const impactTestNameCap = 10
+
+// testNames returns up to `cap` test names, in the order impact.Tests
+// arrived (which is source-file order). Used by the markdown formatter.
+func testNames(tests []store.Definition, cap int) []string {
+	out := make([]string, 0, len(tests))
+	for _, t := range tests {
+		out = append(out, t.Name)
+		if len(out) >= cap {
+			break
+		}
+	}
+	return out
+}
+
+// anyTestNameMentions reports whether any test in `tests` has the def
+// name as a case-insensitive substring in its name. Cheap coherence
+// check for the L15 hint — if the def is Foo and no test contains "foo",
+// the def is indirectly tested and the model should verify via a named
+// test rather than assume coverage means safety.
+func anyTestNameMentions(tests []store.Definition, defName string) bool {
+	if defName == "" || len(tests) == 0 {
+		return true
+	}
+	needle := strings.ToLower(defName)
+	for _, t := range tests {
+		if strings.Contains(strings.ToLower(t.Name), needle) {
+			return true
+		}
+	}
+	return false
 }
 
 type impactDefRef struct {
@@ -967,6 +1012,45 @@ func (s *server) impactJSON(impact *store.Impact) (*sdkmcp.CallToolResult, any, 
 		return errResult(err)
 	}
 	return textResult(text), nil, nil
+}
+
+// handleReadAndVerify reads a def AND runs its covering tests in one call.
+// L14: agents that read + read + read never see behavior; combining source
+// with observed test outcome in one turn short-circuits the read-loop.
+// Reuses handleGetDefinition + handleTest so ranking, upstream matching,
+// and test truncation stay consistent with the individual ops.
+func (s *server) handleReadAndVerify(ctx context.Context, req *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	readResult, _, err := s.handleGetDefinition(ctx, req, nameParam{Name: args.Name, Full: args.Full})
+	if err != nil {
+		return nil, nil, err
+	}
+	if readResult != nil && readResult.IsError {
+		return readResult, nil, nil
+	}
+	testResult, _, err := s.handleTest(ctx, req, nameParam{Name: args.Name})
+	if err != nil {
+		return readResult, nil, nil // read succeeded; surface it even if test wiring failed
+	}
+	var sb strings.Builder
+	sb.WriteString(resultTextRaw(readResult))
+	sb.WriteString("\n---\n")
+	sb.WriteString(resultTextRaw(testResult))
+	return textResult(sb.String()), nil, nil
+}
+
+// resultTextRaw extracts the text content of a CallToolResult. Empty
+// string when there is no TextContent. Cheap concatenation helper for
+// ops that stitch other ops' outputs together (read-and-verify).
+func resultTextRaw(r *sdkmcp.CallToolResult) string {
+	if r == nil {
+		return ""
+	}
+	for _, c := range r.Content {
+		if tc, ok := c.(*sdkmcp.TextContent); ok {
+			return tc.Text
+		}
+	}
+	return ""
 }
 
 func (s *server) handleGetDefinition(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
@@ -2974,13 +3058,63 @@ func (s *server) handleSimilar(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 	return textResult(fmt.Sprintf("Definitions with similar signatures to %s:\n\n%s", args.Name, text)), nil, nil
 }
 
+// projectOverview returns a compact module-level summary: package path,
+// def count, first ~3 exported def names per module. Used by handleOverview
+// when called with no file/name arg — orientation before the model
+// commits to a subtree.
+const projectOverviewModuleCap = 40
+const projectOverviewDefsPerModule = 3
+
+func (s *server) projectOverview() (*sdkmcp.CallToolResult, any, error) {
+	mods, err := s.db.ListModules()
+	if err != nil {
+		return errResult(fmt.Errorf("list modules: %w", err))
+	}
+	if len(mods) == 0 {
+		return textResult("[project overview: no modules ingested — run defn ingest .]"), nil, nil
+	}
+	sort.Slice(mods, func(i, j int) bool { return mods[i].Path < mods[j].Path })
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("## Project overview (%d modules)\n\n", len(mods)))
+	shown := 0
+	for _, m := range mods {
+		if shown >= projectOverviewModuleCap {
+			sb.WriteString(fmt.Sprintf("… (%d more modules omitted — pass file:\"path/to/pkg\" for a subtree)\n", len(mods)-shown))
+			break
+		}
+		defs, _ := s.db.GetModuleDefinitions(m.ID)
+		nExp := 0
+		var exemplars []string
+		for _, d := range defs {
+			if !d.Exported || d.Test {
+				continue
+			}
+			nExp++
+			if len(exemplars) < projectOverviewDefsPerModule {
+				exemplars = append(exemplars, formatReceiver(d.Receiver)+d.Name)
+			}
+		}
+		sb.WriteString(fmt.Sprintf("- %s — %d defs (%d exported)", m.Path, len(defs), nExp))
+		if len(exemplars) > 0 {
+			sb.WriteString(fmt.Sprintf(" — %s", strings.Join(exemplars, ", ")))
+		}
+		sb.WriteString("\n")
+		shown++
+	}
+	sb.WriteString("\nUse `op:\"overview\" file:\"<pkg-path>\"` to drill in, `op:\"search\" pattern:\"<term>\"` to jump to a def.\n")
+	return textResult(sb.String()), nil, nil
+}
+
 func (s *server) handleOverview(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	file := args.File
 	if file == "" {
 		file = args.Name
 	}
 	if strings.TrimSpace(file) == "" {
-		return errResult(fmt.Errorf("overview: file or name is required"))
+		// L18: empty overview → project-wide module summary. The preamble
+		// calls overview "the right first-touch" but the old impl errored
+		// without a file; agents got a rejection instead of orientation.
+		return s.projectOverview()
 	}
 
 	// Strip filename to get package directory.

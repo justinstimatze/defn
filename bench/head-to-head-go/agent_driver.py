@@ -79,6 +79,14 @@ before writing anything: `code op:test test:"TestFoo"` runs one test by
 name. A test that passes today means the bug is not what you think it is
 — re-read before editing. A test that fails is a concrete anchor for
 your fix; iterate against it.
+
+Read-then-give-up is the most common failure mode on this bench. After
+5 read/outline/read-file/overview calls WITHOUT a write or a test-run,
+STOP READING. Instead: form a concrete hypothesis (name the def and
+the exact behavior change), then either (a) `op:test test:"TestX"` to
+observe the current behavior, or (b) `op:edit` / `op:replace-hunk` to
+implement your best guess and iterate. Additional reads past that point
+almost never surface new information — you already have what you need.
 """.strip()
 
 
