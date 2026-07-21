@@ -228,7 +228,7 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 		Name: "code",
 		Description: `Go code database. One tool, many ops. Orient before you read: overview (project shape) → outline (def shape) → impact (when you know which def matters). Only read whole bodies when you're about to edit them; whole-file reads on files you won't touch are pure wire cost — use outline or search instead.
 
-Ops: overview (project-wide shape — packages, top-level defs, module summary; the right first-touch when you don't know which def matters yet), outline (compact projection of a def — sig + doc + caller/callee summary, no body; use when body isn't needed), search, impact (blast radius of a known def — pass format:"json" for structured output; callers, transitives, test coverage in one call), read, read-file (all defs' bodies in one file — pass file:"path"; whole-file counterpart to read; prefer over N sequential read calls when scanning), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), replace-hunk (replace a byte-exact occurrence of 'old' inside a def body with 'new' — byte-exact PUTGET, content-addressed inside the def; pass name+old+new, plus index=1..N if 'old' occurs more than once; empty 'new' deletes the hunk. Send zero anchor context when the hunk is def-unique — the name argument does the file-level disambiguation), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create (single def from body; with file: set, body may hold multiple top-level decls to author a whole file in one call — the whole-file equivalent of files-mode Write), delete, rename, move, test (run ONLY tests that cover a given def — pass name; scoped subset, not the full suite; prefer over bash 'go test ./...' when you only need coverage for a specific change), apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 6 projection ops insert-precondition/replace-slice/replace-hunk/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (rarely needed — every edit op auto-syncs the DB; only use after external file changes outside the code tool), query (raw SQL escape hatch — for schema analytics only; NEVER use to look up a def by name, grep bodies, or list files/defs-in-file — use search/outline/read-file/file-defs/impact instead, which are far cheaper on the wire), patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
+Ops: overview (project-wide shape — packages, top-level defs, module summary; the right first-touch when you don't know which def matters yet), outline (compact projection of a def — sig + doc + caller/callee summary, no body; use when body isn't needed), search, impact (blast radius of a known def — pass format:"json" for structured output; callers, transitives, test coverage in one call), read, read-file (all defs' bodies in one file — pass file:"path"; whole-file counterpart to read; prefer over N sequential read calls when scanning), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), replace-hunk (replace a byte-exact occurrence of 'old' inside a def body with 'new' — byte-exact PUTGET, content-addressed inside the def; pass name+old+new, plus index=1..N if 'old' occurs more than once; empty 'new' deletes the hunk. Send zero anchor context when the hunk is def-unique — the name argument does the file-level disambiguation), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create (single def from body; with file: set, body may hold multiple top-level decls to author a whole file in one call — the whole-file equivalent of files-mode Write), delete, rename, move, test (run ONLY tests that cover a given def — pass name; scoped subset, not the full suite; prefer over bash 'go test ./...' when you only need coverage for a specific change. Also accepts test:"TestX" to run one test by name — use this to REPRODUCE a bug from the issue BEFORE writing any code; a passing test means your hypothesis about which def is broken is wrong), apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 6 projection ops insert-precondition/replace-slice/replace-hunk/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (rarely needed — every edit op auto-syncs the DB; only use after external file changes outside the code tool), query (raw SQL escape hatch — for schema analytics only; NEVER use to look up a def by name, grep bodies, or list files/defs-in-file — use search/outline/read-file/file-defs/impact instead, which are far cheaper on the wire), patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
 	}, s.handleCode)
 
 	return s, mcpServer
@@ -303,6 +303,7 @@ type codeParam struct {
 	DeferBody   string           `json:"defer_body,omitempty"`
 	Full        bool             `json:"full,omitempty"`
 	Include     []string         `json:"include,omitempty"` // expand op: which graph hops to fold in
+	Test        string           `json:"test,omitempty"`    // L11: op:test named-test reproduction (`-run <regex>` verbatim)
 }
 
 type applyOp struct {
@@ -778,6 +779,9 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "move":
 		return s.handleMove(ctx, req, moveParam{Name: args.Name, ToModule: args.Module})
 	case "test":
+		if args.Test != "" {
+			return s.handleTestByName(ctx, req, args.Test)
+		}
 		return s.handleTest(ctx, req, nameParam{Name: args.Name})
 	case "similar":
 		return wrapStale(s.handleSimilar(ctx, req, nameParam{Name: args.Name}))
@@ -2612,6 +2616,39 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	}
 	if buildResult != "" {
 		sb.WriteString("\n" + buildResult)
+	}
+	return textResult(sb.String()), nil, nil
+}
+
+// handleTestByName runs `go test -run <pattern>` verbatim so the model
+// can reproduce a bug from an issue that names the failing test directly.
+// L11: agents that read the right code but never confirm the failure loop
+// through the read graph without committing to a fix. Naming a test lets
+// the model turn a hypothesis into an observation before writing.
+func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, pattern string) (*sdkmcp.CallToolResult, any, error) {
+	if s.projectDir == "" {
+		return errResult(fmt.Errorf("no project directory configured"))
+	}
+	if pattern == "" {
+		return errResult(fmt.Errorf("test: pattern is empty"))
+	}
+	// Ensure files reflect any pending DB edits so the test sees them.
+	if err := emit.Emit(s.db, s.projectDir); err != nil {
+		return errResult(fmt.Errorf("emit: %w", err))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "test", "-run", pattern, "-count=1", "-v", "./...")
+	cmd.Dir = s.projectDir
+	out, err := cmd.CombinedOutput()
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Running -run %q across ./...:\n\n", pattern))
+	sb.WriteString(truncateTestOutput(string(out)))
+	if err != nil {
+		sb.WriteString("\nSOME TESTS FAILED")
+	} else {
+		sb.WriteString("\nALL TESTS PASSED")
 	}
 	return textResult(sb.String()), nil, nil
 }

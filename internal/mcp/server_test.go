@@ -319,6 +319,40 @@ func TestFarewell(t *testing.T) {
 	return db, projDir
 }
 
+// L11: op:test test:"TestX" runs a named test directly (bypasses the
+// def-name → coverage → -run path). Reproduces a bug from an issue's
+// named failing test in one turn.
+func TestHandleTestByName_RunsNamedTest(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db, projectDir: projDir}
+
+	// Setup DB seeds TestGreet + TestFarewell as passing tests. Run just one.
+	result, _, _ := s.handleTestByName(context.Background(), nil, "TestGreet")
+	text := resultText(t, result)
+	if !strings.Contains(text, "TestGreet") {
+		t.Errorf("expected TestGreet in output, got %q", text)
+	}
+	if !strings.Contains(text, "ALL TESTS PASSED") {
+		t.Errorf("expected passing status, got %q", text)
+	}
+	if strings.Contains(text, "TestFarewell") {
+		t.Errorf("TestFarewell should not run under -run TestGreet, got %q", text)
+	}
+}
+
+func TestHandleTestByName_EmptyPatternRejected(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db, projectDir: projDir}
+
+	result, _, _ := s.handleTestByName(context.Background(), nil, "")
+	text := resultText(t, result)
+	if !strings.Contains(text, "empty") {
+		t.Errorf("expected empty-pattern rejection, got %q", text)
+	}
+}
+
 func TestHandleEmit(t *testing.T) {
 	db, projDir := setupTestDB(t)
 	defer db.Close()

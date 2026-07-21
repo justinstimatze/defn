@@ -73,6 +73,12 @@ observing the failure. If your entire set of writes ends up in
 must change. Do not conclude the task complete without a production-code
 write unless you can cite the exact def and line whose current
 implementation already handles the issue.
+
+If the issue names a failing test (`TestFoo` / `TestBar`), REPRODUCE it
+before writing anything: `code op:test test:"TestFoo"` runs one test by
+name. A test that passes today means the bug is not what you think it is
+— re-read before editing. A test that fails is a concrete anchor for
+your fix; iterate against it.
 """.strip()
 
 
