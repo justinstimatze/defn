@@ -22,14 +22,14 @@ import (
 
 // Resolve analyzes all loaded packages and populates the references table.
 // Includes test packages so test→definition references are captured.
-func Resolve(db *store.DB, modulePath string) error {
+func Resolve(db store.Backend, modulePath string) error {
 	return resolve(db, nil, modulePath, "")
 }
 
 // ResolvePackages is like Resolve but accepts pre-loaded packages.
 // Use with goload.LoadAll to share one packages.Load between ingest
 // and resolve, saving ~1-2 GB of memory.
-func ResolvePackages(db *store.DB, pkgs []*packages.Package, projectDir string) error {
+func ResolvePackages(db store.Backend, pkgs []*packages.Package, projectDir string) error {
 	return resolve(db, pkgs, projectDir, "")
 }
 
@@ -37,7 +37,7 @@ func ResolvePackages(db *store.DB, pkgs []*packages.Package, projectDir string) 
 // in the specified module. Still loads all packages for type information,
 // but skips reference extraction for other modules. Much faster for
 // single-definition edits.
-func ResolveModule(db *store.DB, projectDir, modulePath string) error {
+func ResolveModule(db store.Backend, projectDir, modulePath string) error {
 	return resolve(db, nil, projectDir, modulePath)
 }
 
@@ -51,7 +51,7 @@ func ResolveModule(db *store.DB, projectDir, modulePath string) error {
 // re-resolved here — those still flow from the prior full Resolve. If a
 // caller renames or removes a def that other packages reference, a full
 // Resolve is still needed to clean up the stale outgoing edges.
-func ResolveFile(db *store.DB, projectDir, filePath string) error {
+func ResolveFile(db store.Backend, projectDir, filePath string) error {
 	cfg := &packages.Config{
 		// NeedDeps intentionally omitted: it forces type-checking the
 		// transitive closure per invocation (~19s on cli/cli's tree),
@@ -102,7 +102,7 @@ func ResolveFile(db *store.DB, projectDir, filePath string) error {
 	return resolve(db, pkgs, projectDir, target)
 }
 
-func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule string) error {
+func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyModule string) error {
 	var pkgs []*packages.Package
 	if preloaded != nil {
 		pkgs = preloaded
@@ -402,8 +402,13 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 	// sub-second fast paths used after a single-def edit, and DOLT_GC
 	// costs seconds.
 	if onlyModule == "" {
-		if err := db.Commit("resolve-checkpoint"); err != nil {
-			return fmt.Errorf("post-resolve commit: %w", err)
+		// Dolt-only: checkpoint + GC to release the chunk cache. Non-Dolt
+		// backends implement Backend without Commit; the type assertion
+		// makes this a no-op for them.
+		if committer, ok := db.(interface{ Commit(string) error }); ok {
+			if err := committer.Commit("resolve-checkpoint"); err != nil {
+				return fmt.Errorf("post-resolve commit: %w", err)
+			}
 		}
 		if err := db.GC(); err != nil {
 			return fmt.Errorf("post-resolve gc: %w", err)
@@ -442,7 +447,7 @@ func (i *defIndex) lookupMethod(name, receiver string) int64 {
 	return 0
 }
 
-func loadDefIndex(db *store.DB, pkgPath string) *defIndex {
+func loadDefIndex(db store.Backend, pkgPath string) *defIndex {
 	if pkgPath == "" {
 		return nil
 	}
@@ -478,7 +483,7 @@ func loadDefIndex(db *store.DB, pkgPath string) *defIndex {
 // single-goroutine).
 type pkgIndexCache map[string]*defIndex
 
-func (c pkgIndexCache) get(db *store.DB, pkgPath string) *defIndex {
+func (c pkgIndexCache) get(db store.Backend, pkgPath string) *defIndex {
 	if idx, ok := c[pkgPath]; ok {
 		return idx
 	}
@@ -487,7 +492,7 @@ func (c pkgIndexCache) get(db *store.DB, pkgPath string) *defIndex {
 	return idx
 }
 
-func lookupTypeDefID(db *store.DB, pkgPath, typeName string, cache pkgIndexCache) int64 {
+func lookupTypeDefID(db store.Backend, pkgPath, typeName string, cache pkgIndexCache) int64 {
 	if id := cache.get(db, pkgPath).lookupName(typeName); id > 0 {
 		return id
 	}
@@ -498,7 +503,7 @@ func lookupTypeDefID(db *store.DB, pkgPath, typeName string, cache pkgIndexCache
 	return d.ID
 }
 
-func lookupMethodDefID(db *store.DB, pkgPath, typeName, methodName string, cache pkgIndexCache) int64 {
+func lookupMethodDefID(db store.Backend, pkgPath, typeName, methodName string, cache pkgIndexCache) int64 {
 	idx := cache.get(db, pkgPath)
 	// Try *Type first (most methods have pointer receivers).
 	if id := idx.lookupMethod(methodName, "*"+typeName); id > 0 {
@@ -519,7 +524,7 @@ func lookupMethodDefID(db *store.DB, pkgPath, typeName, methodName string, cache
 }
 
 // lookupVarDefID finds the definition ID for a package-level var or const.
-func lookupVarDefID(db *store.DB, pkgPath, name string, cache pkgIndexCache) int64 {
+func lookupVarDefID(db store.Backend, pkgPath, name string, cache pkgIndexCache) int64 {
 	if id := cache.get(db, pkgPath).lookupName(name); id > 0 {
 		return id
 	}
@@ -743,7 +748,7 @@ func isPackageLevelOrMethod(obj types.Object, pkgScope *types.Scope) bool {
 	return obj.Parent() == pkgScope
 }
 
-func lookupDefID(db *store.DB, pkgPath string, ident *ast.Ident, obj types.Object, cache pkgIndexCache) int64 {
+func lookupDefID(db store.Backend, pkgPath string, ident *ast.Ident, obj types.Object, cache pkgIndexCache) int64 {
 	// For methods, use receiver-qualified lookup to avoid ambiguity.
 	if fn, ok := obj.(*types.Func); ok {
 		sig := fn.Signature()
@@ -768,7 +773,7 @@ func lookupDefID(db *store.DB, pkgPath string, ident *ast.Ident, obj types.Objec
 	return d.ID
 }
 
-func lookupFuncDefID(db *store.DB, pkgPath string, fn *ast.FuncDecl, cache pkgIndexCache) int64 {
+func lookupFuncDefID(db store.Backend, pkgPath string, fn *ast.FuncDecl, cache pkgIndexCache) int64 {
 	// For methods, include receiver in lookup.
 	if fn.Recv != nil && len(fn.Recv.List) > 0 {
 		recv := types.ExprString(fn.Recv.List[0].Type)

@@ -71,31 +71,31 @@ type Opts struct {
 
 // Emit writes all definitions from the database as .go files into outDir.
 // Each module becomes a directory, and definitions are grouped into files by kind.
-func Emit(db *store.DB, outDir string) error {
+func Emit(db store.Backend, outDir string) error {
 	_, err := emitWithOpts(db, outDir, Opts{})
 	return err
 }
 
 // EmitWithMap is like Emit but also returns a source map: for each emitted
 // line, which definition it belongs to. This powers defn lint.
-func EmitWithMap(db *store.DB, outDir string) ([]DefLocation, error) {
+func EmitWithMap(db store.Backend, outDir string) ([]DefLocation, error) {
 	return emitWithOpts(db, outDir, Opts{})
 }
 
 // EmitWithOpts is Emit with caller-supplied Opts (e.g. AllowedRemovals so
 // a code(op:"delete") can actually land on disk without safeWriteGoFile
 // blocking the write).
-func EmitWithOpts(db *store.DB, outDir string, opts Opts) error {
+func EmitWithOpts(db store.Backend, outDir string, opts Opts) error {
 	_, err := emitWithOpts(db, outDir, opts)
 	return err
 }
 
 // EmitWithMapAndOpts is EmitWithMap with caller-supplied Opts.
-func EmitWithMapAndOpts(db *store.DB, outDir string, opts Opts) ([]DefLocation, error) {
+func EmitWithMapAndOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, error) {
 	return emitWithOpts(db, outDir, opts)
 }
 
-func emitWithOpts(db *store.DB, outDir string, opts Opts) ([]DefLocation, error) {
+func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, error) {
 	var allLocs []DefLocation
 	timing := os.Getenv("DEFN_MEASURE_TIMING") == "1"
 	timeIt := func(name string, t0 time.Time) {
@@ -323,7 +323,7 @@ type writtenFile struct {
 	SourceFile string // project-relative; empty means don't refresh file_sources
 }
 
-func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string, allowedRemovals []string, touchedSet map[string]bool) ([]DefLocation, []writtenFile, error) {
+func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, allowedRemovals []string, touchedSet map[string]bool) ([]DefLocation, []writtenFile, error) {
 	scoped := len(touchedSet) > 0
 	defs, err := db.GetModuleDefinitions(mod.ID)
 	if err != nil {

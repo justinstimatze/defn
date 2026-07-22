@@ -19,7 +19,7 @@ import (
 // It updates bodies, signatures, and line numbers for existing definitions,
 // and adds new definitions found in the file. It does NOT update references
 // (call graph) — use resolve.Resolve for that after structural changes.
-func IngestFile(db *store.DB, modulePath string, filePath string) (int, error) {
+func IngestFile(db store.Backend, modulePath string, filePath string) (int, error) {
 	absModule, err := filepath.Abs(modulePath)
 	if err != nil {
 		return 0, fmt.Errorf("abs module path: %w", err)

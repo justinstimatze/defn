@@ -24,7 +24,7 @@ import (
 
 // Ingest loads a Go module from modulePath and stores all definitions
 // into the database. modulePath should be a directory containing go.mod.
-func Ingest(db *store.DB, modulePath string) error {
+func Ingest(db store.Backend, modulePath string) error {
 	pkgs, err := goload.LoadAll(modulePath)
 	if err != nil {
 		return err
@@ -35,7 +35,7 @@ func Ingest(db *store.DB, modulePath string) error {
 // IngestPackages is like Ingest but accepts pre-loaded packages.
 // Use with goload.LoadAll to share one packages.Load between ingest
 // and resolve, saving ~1-2 GB of memory.
-func IngestPackages(db *store.DB, pkgs []*packages.Package, modulePath string) error {
+func IngestPackages(db store.Backend, pkgs []*packages.Package, modulePath string) error {
 	clearSourceFileCache()
 
 	// Check for load errors.
@@ -112,8 +112,10 @@ func IngestPackages(db *store.DB, pkgs []*packages.Package, modulePath string) e
 		if m.HeapAlloc < midLoopGCThresholdBytes {
 			continue
 		}
-		if err := db.Commit("ingest-checkpoint"); err != nil {
-			return fmt.Errorf("checkpoint commit: %w", err)
+		if committer, ok := db.(interface{ Commit(string) error }); ok {
+			if err := committer.Commit("ingest-checkpoint"); err != nil {
+				return fmt.Errorf("checkpoint commit: %w", err)
+			}
 		}
 		if err := db.GC(); err != nil {
 			return fmt.Errorf("checkpoint gc: %w", err)
@@ -130,8 +132,10 @@ func IngestPackages(db *store.DB, pkgs []*packages.Package, modulePath string) e
 	// next DOLT_GC. cmdIngest's compactEmbedded covers the same ground for
 	// the CLI path but serve's per-edit re-ingest does NOT — adding the GC
 	// here means every ingest cycle releases, regardless of caller.
-	if err := db.Commit("ingest-checkpoint"); err != nil {
-		return fmt.Errorf("post-ingest commit: %w", err)
+	if committer, ok := db.(interface{ Commit(string) error }); ok {
+		if err := committer.Commit("ingest-checkpoint"); err != nil {
+			return fmt.Errorf("post-ingest commit: %w", err)
+		}
 	}
 	if err := db.GC(); err != nil {
 		return fmt.Errorf("post-ingest gc: %w", err)
@@ -170,7 +174,7 @@ func IngestPackages(db *store.DB, pkgs []*packages.Package, modulePath string) e
 	return nil
 }
 
-func ingestPackage(db *store.DB, pkg *packages.Package, modulePath string, state *ingestState) error {
+func ingestPackage(db store.Backend, pkg *packages.Package, modulePath string, state *ingestState) error {
 	// Strip _test suffix from external test package paths so test definitions
 	// are stored in the same module as the code they test.
 	pkgPath := pkg.PkgPath
@@ -265,7 +269,7 @@ func ingestPackage(db *store.DB, pkg *packages.Package, modulePath string, state
 
 // ingestEmbedFiles finds //go:embed referenced files in a package
 // and stores them as project files with their relative paths.
-func ingestEmbedFiles(db *store.DB, pkg *packages.Package, modulePath string) error {
+func ingestEmbedFiles(db store.Backend, pkg *packages.Package, modulePath string) error {
 	// Use EmbedPatterns if available (requires NeedEmbedPatterns).
 	if len(pkg.EmbedPatterns) == 0 {
 		return nil
@@ -311,7 +315,7 @@ func ingestEmbedFiles(db *store.DB, pkg *packages.Package, modulePath string) er
 	return nil
 }
 
-func ingestFile(db *store.DB, pkg *packages.Package, mod *store.Module, file *ast.File, isTest bool, sourceFile string, state *ingestState) error {
+func ingestFile(db store.Backend, pkg *packages.Package, mod *store.Module, file *ast.File, isTest bool, sourceFile string, state *ingestState) error {
 	fset := pkg.Fset
 
 	for _, decl := range file.Decls {
@@ -349,7 +353,7 @@ type defInterval struct {
 
 // ingestComments extracts all comments from a file, associates them with
 // definitions by line range, and stores them in the database.
-func ingestComments(db *store.DB, fset *token.FileSet, file *ast.File, sourceFile string) error {
+func ingestComments(db store.Backend, fset *token.FileSet, file *ast.File, sourceFile string) error {
 	// Build intervals from AST declarations, extended to include doc comments.
 	// We use the AST directly (not a DB query) so we get doc comment positions.
 	var intervals []defInterval
@@ -494,7 +498,7 @@ func (s *ingestState) enqueueDef(d *store.Definition) {
 // the returned IDs in liveDefIDs, and clears the buffer. Safe on empty
 // buffer. Called at package boundaries so any single ingest failure only
 // wastes one package's work (matches per-row failure semantics roughly).
-func (s *ingestState) flushDefs(db *store.DB) error {
+func (s *ingestState) flushDefs(db store.Backend) error {
 	if len(s.pendingDefs) == 0 {
 		return nil
 	}
@@ -509,7 +513,7 @@ func (s *ingestState) flushDefs(db *store.DB) error {
 	return nil
 }
 
-func ingestFunc(db *store.DB, fset *token.FileSet, mod *store.Module, file *ast.File, fn *ast.FuncDecl, isTest bool, sourceFile string, state *ingestState) error {
+func ingestFunc(db store.Backend, fset *token.FileSet, mod *store.Module, file *ast.File, fn *ast.FuncDecl, isTest bool, sourceFile string, state *ingestState) error {
 	start := fset.Position(fn.Pos())
 	end := fset.Position(fn.End())
 
@@ -573,7 +577,7 @@ func containsIota(gd *ast.GenDecl) bool {
 	return found
 }
 
-func ingestGenDecl(db *store.DB, fset *token.FileSet, mod *store.Module, file *ast.File, gd *ast.GenDecl, isTest bool, sourceFile string, state *ingestState) error {
+func ingestGenDecl(db store.Backend, fset *token.FileSet, mod *store.Module, file *ast.File, gd *ast.GenDecl, isTest bool, sourceFile string, state *ingestState) error {
 	grouped := gd.Lparen.IsValid() // parenthesized group: const (...), var (...), type (...)
 
 	// Iota const blocks must be stored as a single definition because
@@ -660,7 +664,7 @@ func ingestGenDecl(db *store.DB, fset *token.FileSet, mod *store.Module, file *a
 // valueSpecCtx bundles the per-file parameters a ValueSpec ingest
 // needs, so the helper doesn't have to pass nine positional args.
 type valueSpecCtx struct {
-	db         *store.DB
+	db         store.Backend
 	fset       *token.FileSet
 	mod        *store.Module
 	gd         *ast.GenDecl
