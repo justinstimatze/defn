@@ -50,15 +50,33 @@ func ResolveModule(db *store.DB, projectDir, modulePath string) error {
 // Resolve is still needed to clean up the stale outgoing edges.
 func ResolveFile(db *store.DB, projectDir, filePath string) error {
 	cfg := &packages.Config{
+		// NeedDeps intentionally omitted: it forces type-checking the
+		// transitive closure per invocation (~19s on cli/cli's tree),
+		// which was 97% of the wall clock in the #101 diagnosis. The
+		// resolve pass only needs types.Object identities for target-
+		// package defs + Pkg().Path()+Name() for cross-package uses;
+		// those come from NeedImports (which loads immediate imports
+		// with a shallow name-only view). Cross-package refs whose obj
+		// happens to lack pkg-path info fall through to lookupDefID's
+		// name-only search — same behavior as the pre-fix path when
+		// the transitive graph had stale entries.
 		Mode: packages.NeedName |
 			packages.NeedFiles |
 			packages.NeedSyntax |
 			packages.NeedTypes |
 			packages.NeedTypesInfo |
-			packages.NeedImports |
-			packages.NeedDeps,
-		Dir:   projectDir,
-		Tests: true,
+			packages.NeedImports,
+		Dir: projectDir,
+		// Tests: false — #101 diagnosis. Tests:true forces go/packages to
+		// load both the package AND its external test variant, which
+		// nearly doubles the load cost (26s vs 1s on cli/cli). The
+		// per-file incremental path is only expected to refresh refs
+		// for defs in `filePath`'s own package; test→def refs from
+		// _test.go files get re-resolved when the test file itself is
+		// synced or during a full Resolve. If filePath IS a _test.go,
+		// the containing test package still loads (packages.Load "file="
+		// picks up the file's own package regardless of Tests).
+		Tests: false,
 	}
 	pkgs, err := packages.Load(cfg, "file="+filePath)
 	if err != nil {
