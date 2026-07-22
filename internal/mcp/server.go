@@ -1442,7 +1442,7 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 
 	recv := formatReceiver(d.Receiver)
 
-	buildResult := s.autoEmitAndBuild()
+	buildResult := s.autoEmitAndBuildForFile(d.SourceFile)
 
 	s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
 
@@ -1699,6 +1699,18 @@ func (s *server) autoEmitAndBuild() string {
 	return s.autoEmitAndBuildWithOpts(emit.Opts{})
 }
 
+// autoEmitAndBuildForFile is the file-scoped variant: pass the single
+// source file the mutation touched, get goimports scoped to that file
+// via emit.Opts.GoimportsFiles. On cli/cli warm rename this dropped
+// goimports from 707ms → 11ms (#109 pass 3). Empty file falls through
+// to the full-project recursive goimports.
+func (s *server) autoEmitAndBuildForFile(sourceFile string) string {
+	if sourceFile == "" {
+		return s.autoEmitAndBuild()
+	}
+	return s.autoEmitAndBuildWithOpts(emit.Opts{GoimportsFiles: []string{sourceFile}})
+}
+
 // autoEmitAndBuildWithOpts is autoEmitAndBuild with caller-supplied
 // emit.Opts. Used by handleDelete to whitelist the deleted decl through
 // emit.safeWriteGoFile so the intentional removal isn't blocked by the
@@ -1827,7 +1839,7 @@ func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest
 		return errResult(err)
 	}
 
-	buildResult := s.autoEmitAndBuild()
+	buildResult := s.autoEmitAndBuildForFile(d.SourceFile)
 	s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
 
 	var sb strings.Builder
@@ -1883,7 +1895,7 @@ func (s *server) handleInsert(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		return errResult(err)
 	}
 
-	buildResult := s.autoEmitAndBuild()
+	buildResult := s.autoEmitAndBuildForFile(d.SourceFile)
 	s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
 
 	var sb strings.Builder
@@ -1959,8 +1971,8 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		return errResult(err)
 	}
 
-	buildResult := s.autoEmitAndBuild()
-	s.autoResolve(mod.Path)
+	buildResult := s.autoEmitAndBuildForFile(args.File)
+	s.autoResolveFile(args.File, mod.Path)
 
 	var sb strings.Builder
 	loc := mod.Path
@@ -2185,8 +2197,8 @@ func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult
 		return errResult(fmt.Errorf("commit: %v", err))
 	}
 
-	buildResult := s.autoEmitAndBuild()
-	s.autoResolve(mod.Path)
+	buildResult := s.autoEmitAndBuildForFile(args.File)
+	s.autoResolveFile(args.File, mod.Path)
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Created %d defs in %s (%s):\n", len(decls), args.File, mod.Path))
@@ -2734,7 +2746,14 @@ func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolR
 		}
 	}
 
-	buildResult := s.autoEmitAndBuildWithOpts(emit.Opts{})
+	// #109 pass 3: pass the touched files through to goimports so it
+	// only re-formats the changed files instead of walking the whole
+	// project tree. Same set already collected for the scoped resolve.
+	goimportsFiles := make([]string, 0, len(touched))
+	for fp := range touched {
+		goimportsFiles = append(goimportsFiles, fp.file)
+	}
+	buildResult := s.autoEmitAndBuildWithOpts(emit.Opts{GoimportsFiles: goimportsFiles})
 	// Scoped resolve: iterate the unique touched files instead of the
 	// whole project. Safety valve: if we couldn't collect any touched
 	// files (e.g., every def had empty SourceFile — shouldn't happen),
@@ -2893,7 +2912,11 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	if d.Receiver != "" {
 		qualified = strings.TrimPrefix(d.Receiver, "*") + "." + d.Name
 	}
-	buildResult := s.autoEmitAndBuildWithOpts(emit.Opts{AllowedRemovals: []string{qualified}})
+	deleteOpts := emit.Opts{AllowedRemovals: []string{qualified}}
+	if d.SourceFile != "" {
+		deleteOpts.GoimportsFiles = []string{d.SourceFile}
+	}
+	buildResult := s.autoEmitAndBuildWithOpts(deleteOpts)
 	// #109 pass 2 (winze op-classification): skip autoResolve on delete.
 	// DeleteDefinition already dropped every refs row where from_def=D
 	// OR to_def=D (store.go:201), so both the def's own outgoing edges
@@ -3523,7 +3546,7 @@ func (s *server) handlePatch(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		return errResult(err)
 	}
 
-	buildResult := s.autoEmitAndBuild()
+	buildResult := s.autoEmitAndBuildForFile(d.SourceFile)
 	s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
 
 	var sb strings.Builder
@@ -4685,7 +4708,7 @@ func (s *server) handleAddImport(_ context.Context, _ *sdkmcp.CallToolRequest, a
 	if err := s.db.SetImports(moduleID, updated); err != nil {
 		return errResult(fmt.Errorf("add-import: set imports: %w", err))
 	}
-	buildResult := s.autoEmitAndBuild()
+	buildResult := s.autoEmitAndBuildForFile(file)
 	snippet := fmt.Sprintf("import %q", args.ImportPath)
 	if args.Alias != "" {
 		snippet = fmt.Sprintf("import %s %q", args.Alias, args.ImportPath)
@@ -4898,7 +4921,7 @@ func (s *server) applyEditTerse(name, action, snippet, newBody string) (*sdkmcp.
 	if _, err := s.db.UpsertDefinition(d); err != nil {
 		return errResult(err)
 	}
-	buildResult := s.autoEmitAndBuild()
+	buildResult := s.autoEmitAndBuildForFile(d.SourceFile)
 	s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
 
 	recv := formatReceiver(d.Receiver)
