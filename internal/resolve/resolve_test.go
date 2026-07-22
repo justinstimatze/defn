@@ -19,10 +19,10 @@ func writeFile(t *testing.T, dir, rel, body string) {
 	}
 }
 
-func testDB(t *testing.T) *store.DB {
+func testDB(t *testing.T) store.Backend {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := store.Open(filepath.Join(dir, "test.db"))
+	db, err := store.OpenBackend(filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

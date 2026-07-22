@@ -48,7 +48,7 @@ func main() {
 	rawTargets := args
 
 	dbPath := filepath.Join(root, ".defn")
-	db, err := store.Open(dbPath)
+	db, err := store.OpenBackend(dbPath)
 	if err != nil {
 		fatalf("open db %s: %v", dbPath, err)
 	}

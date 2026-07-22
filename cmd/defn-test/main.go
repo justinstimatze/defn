@@ -147,7 +147,7 @@ func testProject(p project) error {
 
 	// Open database.
 	dbDir := filepath.Join(dir, "defndb")
-	db, err := store.Open(dbDir)
+	db, err := store.OpenBackend(dbDir)
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
 	}

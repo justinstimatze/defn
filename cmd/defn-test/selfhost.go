@@ -71,7 +71,7 @@ func runSelfhostTest() workflowResult {
 	defer os.RemoveAll(tmp)
 
 	dbDir := filepath.Join(tmp, "db")
-	db, err := store.Open(dbDir)
+	db, err := store.OpenBackend(dbDir)
 	if err != nil {
 		return workflowResult{name: "selfhost", message: fmt.Sprintf("store open: %v", err)}
 	}

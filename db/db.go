@@ -30,7 +30,7 @@ import (
 // DB is a read-only handle to a defn database.
 type DB struct {
 	mu sync.Mutex
-	s  *store.DB
+	s  store.Backend
 }
 
 // Open opens a defn database at the given path (e.g. ".defn").
@@ -38,7 +38,7 @@ type DB struct {
 // Also accepts a MySQL DSN (containing "@") to connect to a running
 // dolt sql-server.
 func Open(path string) (*DB, error) {
-	s, err := store.Open(path)
+	s, err := store.OpenBackend(path)
 	if err != nil {
 		return nil, err
 	}

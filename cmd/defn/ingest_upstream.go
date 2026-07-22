@@ -67,7 +67,7 @@ func cmdIngestUpstream(args []string) {
 	// Open the current project's DB (not the module's — we're writing
 	// upstream fingerprints INTO the caller's project).
 	dbPath := getDBPath()
-	db, err := store.Open(dbPath)
+	db, err := store.OpenBackend(dbPath)
 	if err != nil {
 		fatal(fmt.Errorf("open db: %w", err))
 	}

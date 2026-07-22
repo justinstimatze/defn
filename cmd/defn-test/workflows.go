@@ -48,7 +48,7 @@ func runWorkflowTests() {
 	}
 
 	dbDir := filepath.Join(dir, "db")
-	db, err := store.Open(dbDir)
+	db, err := store.OpenBackend(dbDir)
 	if err != nil {
 		fmt.Printf("FAIL: open db: %v\n", err)
 		return
@@ -107,7 +107,7 @@ func runWorkflowTests() {
 	fmt.Printf("\n=== Workflow Results: %d passed, %d failed ===\n", passed, failed)
 }
 
-func testNavigate(db *store.DB) workflowResult {
+func testNavigate(db store.Backend) workflowResult {
 	// Search for a pattern.
 	defs, err := db.FindDefinitions("%Route%")
 	if err != nil || len(defs) == 0 {
@@ -123,7 +123,7 @@ func testNavigate(db *store.DB) workflowResult {
 	return workflowResult{"navigate (search + read)", true, fmt.Sprintf("found %d Route* defs, read NewMux (%d bytes)", len(defs), len(d.Body))}
 }
 
-func testUnderstand(db *store.DB) workflowResult {
+func testUnderstand(db store.Backend) workflowResult {
 	d, err := db.GetDefinitionByName("NewMux", "")
 	if err != nil {
 		return workflowResult{"understand: impact", false, fmt.Sprintf("lookup failed: %v", err)}
@@ -141,7 +141,7 @@ func testUnderstand(db *store.DB) workflowResult {
 	return workflowResult{"understand (impact)", true, fmt.Sprintf("%d direct callers, %d transitive, %d tests", len(impact.DirectCallers), impact.TransitiveCount, len(impact.Tests))}
 }
 
-func testEdit(db *store.DB) workflowResult {
+func testEdit(db store.Backend) workflowResult {
 	d, err := db.GetDefinitionByName("NewMux", "")
 	if err != nil {
 		return workflowResult{"edit", false, fmt.Sprintf("lookup failed: %v", err)}
@@ -164,7 +164,7 @@ func testEdit(db *store.DB) workflowResult {
 	return workflowResult{"edit", true, fmt.Sprintf("edited NewMux (id=%d)", id)}
 }
 
-func testCreate(db *store.DB) workflowResult {
+func testCreate(db store.Backend) workflowResult {
 	mod, err := db.GetModuleByPath("github.com/go-chi/chi/v5")
 	if err != nil {
 		// Try without v5.
@@ -199,7 +199,7 @@ func testCreate(db *store.DB) workflowResult {
 	return workflowResult{"create", true, fmt.Sprintf("created WorkflowTestHelper (id=%d) in %s", id, d2.Name)}
 }
 
-func testDelete(db *store.DB) workflowResult {
+func testDelete(db store.Backend) workflowResult {
 	// Delete the test helper we just created.
 	d, err := db.GetDefinitionByName("WorkflowTestHelper", "")
 	if err != nil {
@@ -219,7 +219,7 @@ func testDelete(db *store.DB) workflowResult {
 	return workflowResult{"delete", true, "deleted WorkflowTestHelper"}
 }
 
-func testRename(db *store.DB) workflowResult {
+func testRename(db store.Backend) workflowResult {
 	// Create a temp definition to rename.
 	mods, _ := db.ListModules()
 	if len(mods) == 0 {
@@ -256,14 +256,14 @@ func testRename(db *store.DB) workflowResult {
 	return workflowResult{"rename", true, "renamed OldName → NewName"}
 }
 
-func testVerify(_ *store.DB) workflowResult {
+func testVerify(_ store.Backend) workflowResult {
 	// diff/commit/log removed with Dolt Category A. The workflow harness
 	// keeps this step as a stub so the results table stays comparable
 	// across runs; delete when the harness is next rewritten.
 	return workflowResult{"verify (n/a — Dolt removed)", true, "skipped"}
 }
 
-func testUntested(db *store.DB) workflowResult {
+func testUntested(db store.Backend) workflowResult {
 	defs, err := db.GetUntested()
 	if err != nil {
 		return workflowResult{"untested", false, fmt.Sprintf("GetUntested failed: %v", err)}

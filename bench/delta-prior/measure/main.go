@@ -46,7 +46,7 @@ func main() {
 	}
 
 	dbFile := filepath.Join(*dbPath, ".defn")
-	db, err := store.Open(dbFile)
+	db, err := store.OpenBackend(dbFile)
 	if err != nil {
 		fatal(fmt.Errorf("open db %s: %w", dbFile, err))
 	}
@@ -154,7 +154,7 @@ func loadTargets(path string) ([]target, error) {
 	return ts, nil
 }
 
-func lookupDef(db *store.DB, t target) (*store.Definition, error) {
+func lookupDef(db store.Backend, t target) (*store.Definition, error) {
 	defs, err := db.FindDefinitions("%" + t.Name + "%")
 	if err != nil {
 		return nil, err

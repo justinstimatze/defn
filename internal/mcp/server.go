@@ -60,16 +60,7 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 }
 
 type server struct {
-	// backend is the storage-agnostic surface. Non-Dolt callers (Phase 1+
-	// SQLite backend) will populate this without dolt. In Phase 0, both
-	// fields point at the same *store.DB.
-	backend store.Backend
-	// dolt is the concrete Dolt-specific handle used only for Category A
-	// version-control ops (branch, checkout, commit, merge, diff, log,
-	// conflicts) in tools_extra.go, plus the autoCommit checkpoint path.
-	// Non-Dolt backends leave this nil; Category A op handlers must
-	// nil-check and return "op not supported" when so.
-	dolt            *store.DB
+	backend         store.Backend
 	projectDir      string
 	lastResolved    atomic.Int64 // UnixNano timestamp of last resolve (to debounce watcher)
 	ready           atomic.Bool  // true after startup ingest+resolve completes
@@ -79,14 +70,14 @@ type server struct {
 
 // Run starts the MCP server over stdio. projDir is the project root where
 // files should be emitted (for in-place sync with file-based tools).
-func Run(ctx context.Context, database *store.DB, projDir string) error {
+func Run(ctx context.Context, database store.Backend, projDir string) error {
 	_, mcpServer := newMCPServer(ctx, database, projDir)
 	return mcpServer.Run(ctx, &sdkmcp.StdioTransport{})
 }
 
 // RunHTTP starts the MCP server over HTTP/SSE on addr (e.g. ":9420").
 // Multiple clients can connect to the same server, sharing one defn process.
-func RunHTTP(ctx context.Context, database *store.DB, projDir, addr string) error {
+func RunHTTP(ctx context.Context, database store.Backend, projDir, addr string) error {
 	_, mcpServer := newMCPServer(ctx, database, projDir)
 	fmt.Fprintf(os.Stderr, "defn: listening on %s\n", addr)
 	srv := &http.Server{Addr: addr, Handler: mcpHTTPMux(mcpServer, projDir)}
@@ -100,7 +91,7 @@ func RunHTTP(ctx context.Context, database *store.DB, projDir, addr string) erro
 // RunShared starts an HTTP/SSE server on addr and simultaneously serves
 // this client over stdio. Used for auto-sharing: first session starts the
 // HTTP daemon; subsequent sessions proxy to it via RunProxy.
-func RunShared(ctx context.Context, database *store.DB, projDir, addr string) error {
+func RunShared(ctx context.Context, database store.Backend, projDir, addr string) error {
 	_, mcpServer := newMCPServer(ctx, database, projDir)
 
 	// Start HTTP/SSE in background.
@@ -213,8 +204,8 @@ func mcpHTTPMux(mcpServer *sdkmcp.Server, projDir string) http.Handler {
 // for perf measurement (see cmd/defn measure-rename) so a caller can
 // time the same code path an MCP client would drive without spinning
 // up a full serve. Skips the async startup ingest.
-func MeasureRename(database *store.DB, projDir, oldName, newName string) (time.Duration, string, error) {
-	s := &server{backend: database, dolt: database, projectDir: projDir}
+func MeasureRename(database store.Backend, projDir, oldName, newName string) (time.Duration, string, error) {
+	s := &server{backend: database, projectDir: projDir}
 	s.idf = newIDF(database)
 	s.ready.Store(true) // caller-driven; skip the async ingest wait
 	start := time.Now()
@@ -237,8 +228,8 @@ func MeasureRename(database *store.DB, projDir, oldName, newName string) (time.D
 // uses this to time the edit thesis on their reference-dense corpus —
 // same shape as MeasureRename but exercises the file-scoped goimports
 // + autoResolveFile lever (#109 pass 3) rather than rename's skip path.
-func MeasureEdit(database *store.DB, projDir, name, newBody string) (time.Duration, string, error) {
-	s := &server{backend: database, dolt: database, projectDir: projDir}
+func MeasureEdit(database store.Backend, projDir, name, newBody string) (time.Duration, string, error) {
+	s := &server{backend: database, projectDir: projDir}
 	s.idf = newIDF(database)
 	s.ready.Store(true)
 	start := time.Now()
@@ -258,8 +249,8 @@ func MeasureEdit(database *store.DB, projDir, name, newBody string) (time.Durati
 }
 
 // Shared by both stdio and HTTP transports.
-func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*server, *sdkmcp.Server) {
-	s := &server{backend: database, dolt: database, projectDir: projDir}
+func newMCPServer(ctx context.Context, database store.Backend, projDir string) (*server, *sdkmcp.Server) {
+	s := &server{backend: database, projectDir: projDir}
 	s.idf = newIDF(database)
 
 	if projDir != "" {
@@ -1240,7 +1231,11 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	} else {
 		// Search names/signatures first (indexed, fast).
 		defs, err = s.backend.FindDefinitions("%" + args.Pattern + "%")
-		if err != nil || len(defs) == 0 {
+		// `_` is SQL LIKE's single-char wildcard; under the SQLite backend
+		// SearchDefinitions is LIKE-based on bodies, so an underscore
+		// query would silently glob to unrelated defs. Skip the doc/body
+		// fallback in that case — matches the stage-3 guard below.
+		if (err != nil || len(defs) == 0) && !strings.Contains(args.Pattern, "_") {
 			// Fall back to body/doc search (LIKE scan, slower).
 			defs, err = s.backend.SearchDefinitions(args.Pattern)
 		}

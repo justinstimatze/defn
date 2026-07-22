@@ -42,7 +42,7 @@ func (d Diagnostic) String() string {
 
 // Check emits files to a temp directory, runs golangci-lint, and remaps
 // the output back to defn definitions.
-func Check(db *store.DB) ([]Diagnostic, error) {
+func Check(db store.Backend) ([]Diagnostic, error) {
 	tmpDir, err := os.MkdirTemp("", "defn-lint-*")
 	if err != nil {
 		return nil, fmt.Errorf("create temp dir: %w", err)

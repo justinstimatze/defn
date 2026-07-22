@@ -487,7 +487,7 @@ func cmdInit(modulePath string) {
 
 	dbPath := getDBPath()
 	checkEmbeddedAvailable(dbPath)
-	db, err := store.Open(dbPath)
+	db, err := store.OpenBackend(dbPath)
 	if err != nil {
 		if isCorruptDBError(err) && !strings.Contains(dbPath, "@") {
 			fatal(fmt.Errorf("%w\n\n.defn/ appears to be corrupted. run 'defn repair %s' to rebuild from source",
@@ -723,7 +723,7 @@ func cmdIngest(modulePath string, serverMode bool) {
 		fmt.Fprintf(os.Stderr, "using server: %s\n", dsn)
 	}
 	checkEmbeddedAvailable(dbPath)
-	db, err := store.Open(dbPath)
+	db, err := store.OpenBackend(dbPath)
 	if err != nil {
 		if isCorruptDBError(err) && !strings.Contains(dbPath, "@") {
 			fatal(fmt.Errorf("%w\n\n.defn/ appears to be corrupted. run 'defn repair %s' to rebuild from source",
@@ -814,7 +814,7 @@ func isCorruptDBError(err error) bool {
 // Respects DEFN_SKIP_GC=1 for ingest flows that want to skip the
 // post-ingest compact (e.g. scripted workflows that run many ingests
 // in sequence and GC once at the end).
-func compactEmbedded(db *store.DB, dbPath string) {
+func compactEmbedded(db store.Backend, dbPath string) {
 	if strings.Contains(dbPath, "@") {
 		return
 	}
@@ -853,7 +853,7 @@ func compactEmbedded(db *store.DB, dbPath string) {
 func cmdMeasureRename(oldName, newName string, inPlace bool) {
 	dbPath := getDBPath()
 	checkEmbeddedAvailable(dbPath)
-	db, err := store.Open(dbPath)
+	db, err := store.OpenBackend(dbPath)
 	if err != nil {
 		fatal(err)
 	}
@@ -890,7 +890,7 @@ func cmdMeasureEdit(name, bodyFile string, inPlace bool) {
 	if err != nil {
 		fatal(fmt.Errorf("read body: %w", err))
 	}
-	db, err := store.Open(dbPath)
+	db, err := store.OpenBackend(dbPath)
 	if err != nil {
 		fatal(err)
 	}
@@ -922,7 +922,7 @@ func cmdMeasureEdit(name, bodyFile string, inPlace bool) {
 // can't build. Untimed by design — measures the incremental cost, not
 // the from-empty cost. Prints how long the pre-populate took so callers
 // can factor it out when analyzing the wall.
-func prepopulate(inPlace bool, db *store.DB, scratch, verb string) {
+func prepopulate(inPlace bool, db store.Backend, scratch, verb string) {
 	if !inPlace {
 		return
 	}
@@ -947,7 +947,7 @@ func cmdSync(file string) {
 	}
 	dbPath := getDBPath()
 	checkEmbeddedAvailable(dbPath)
-	db, err := store.Open(dbPath)
+	db, err := store.OpenBackend(dbPath)
 	if err != nil {
 		if isCorruptDBError(err) && !strings.Contains(dbPath, "@") {
 			fatal(fmt.Errorf("%w\n\n.defn/ appears to be corrupted. run 'defn repair .' to rebuild from source", err))
@@ -1020,7 +1020,7 @@ func cmdSearch(pattern string, rank bool, jsonOutput bool, limit int) {
 	if pattern == "" {
 		fatal(fmt.Errorf("usage: defn search [--rank] [--json] [--limit N] <pattern>"))
 	}
-	db, err := store.Open(getDBPath())
+	db, err := store.OpenBackend(getDBPath())
 	if err != nil {
 		fatal(err)
 	}
@@ -1081,7 +1081,7 @@ func cmdSearch(pattern string, rank bool, jsonOutput bool, limit int) {
 // so the graph-signal features actually fire; the lazy IDF is built
 // from a fresh body sample so the CLI doesn't need a running serve.
 func searchRanked(pattern string, defs []store.Definition, limit int, jsonOutput bool) {
-	db, err := store.Open(getDBPath())
+	db, err := store.OpenBackend(getDBPath())
 	if err != nil {
 		fatal(err)
 	}
@@ -1136,11 +1136,11 @@ func searchRanked(pattern string, defs []store.Definition, limit int, jsonOutput
 	}
 }
 
-// cliBodySource adapts *store.DB to rank.BodySource for the CLI's
+// cliBodySource adapts store.Backend to rank.BodySource for the CLI's
 // one-shot search. Same shape as the MCP-side adapter in
 // internal/mcp/ranking.go; kept separate to avoid making cmd/defn
 // depend on internal/mcp just for the adapter.
-type cliBodySource struct{ db *store.DB }
+type cliBodySource struct{ db store.Backend }
 
 func (a cliBodySource) CountDefinitions() (int, error)       { return a.db.CountDefinitions() }
 func (a cliBodySource) SampleBodies(n int) ([]string, error) { return a.db.SampleBodies(n) }
@@ -1180,7 +1180,7 @@ func cmdRepair(modulePath string) {
 
 	// Always open the embedded path directly so auto-detection doesn't
 	// redirect us to a running server — repair rebuilds the embedded copy.
-	db, err := store.Open(filepath.Join(absModulePath, ".defn"))
+	db, err := store.OpenBackend(filepath.Join(absModulePath, ".defn"))
 	if err != nil {
 		fatal(err)
 	}
@@ -1417,7 +1417,7 @@ func cmdServe(httpAddr string) {
 
 	// Explicit --http mode: just start the HTTP server.
 	if httpAddr != "" {
-		db, err := store.Open(dbPath)
+		db, err := store.OpenBackend(dbPath)
 		if err != nil {
 			fatal(err)
 		}
@@ -1457,7 +1457,7 @@ func cmdServe(httpAddr string) {
 
 		if !isDefnListening(addr) {
 			// Free — claim it as the shared backend for this project.
-			db, err := store.Open(dbPath)
+			db, err := store.OpenBackend(dbPath)
 			if err != nil {
 				fatal(err)
 			}
@@ -1582,7 +1582,7 @@ func defnIdentityAt(addr string) string {
 func cmdEmit(outDir string) {
 	dbPath := getDBPath()
 	checkEmbeddedAvailable(dbPath)
-	db, err := store.Open(dbPath)
+	db, err := store.OpenBackend(dbPath)
 	if err != nil {
 		fatal(err)
 	}
@@ -1596,7 +1596,7 @@ func cmdEmit(outDir string) {
 }
 
 func cmdGC() {
-	db, err := store.Open(getDBPath())
+	db, err := store.OpenBackend(getDBPath())
 	if err != nil {
 		fatal(err)
 	}
@@ -1789,7 +1789,7 @@ func fetchVersion(addr string) string {
 }
 
 func cmdQuery(sql string) {
-	db, err := store.Open(getDBPath())
+	db, err := store.OpenBackend(getDBPath())
 	if err != nil {
 		fatal(err)
 	}
@@ -1809,7 +1809,7 @@ func cmdQuery(sql string) {
 
 // lastIngestUnix returns the recorded last-ingest timestamp, or 0 when
 // the DB predates the meta (very old DBs) or has never been ingested.
-func lastIngestUnix(db *store.DB) int64 {
+func lastIngestUnix(db store.Backend) int64 {
 	s, err := db.GetMeta("last_ingest")
 	if err != nil || s == "" {
 		return 0
@@ -1871,7 +1871,7 @@ func walkGoFiles(projectDir string, since int64) (all []string, stale []string) 
 // been modified since the last ingest. Returns (0, "") when the DB
 // has no last_ingest meta (older DBs) or nothing is stale. sample is
 // the first stale path encountered, for user-facing messages.
-func countStaleFiles(db *store.DB, projectDir string) (count int, sample string) {
+func countStaleFiles(db store.Backend, projectDir string) (count int, sample string) {
 	since := lastIngestUnix(db)
 	if since == 0 {
 		return 0, ""
@@ -1889,7 +1889,7 @@ func countStaleFiles(db *store.DB, projectDir string) (count int, sample string)
 // package-only files) — querying definitions would undercount and miss
 // deletions of def-bearing files in projects that also contain
 // package-only files.
-func countDBSourceFiles(db *store.DB) (int, error) {
+func countDBSourceFiles(db store.Backend) (int, error) {
 	rows, err := db.Query("SELECT COUNT(DISTINCT source_file) AS n FROM file_sources")
 	if err != nil {
 		return 0, err
@@ -1946,7 +1946,7 @@ const incrementalCounterMeta = "incremental_count"
 // refreshed here; that's documented in resolve.ResolveFile and
 // acceptable for editor-save hook flows where a periodic full ingest
 // closes the gap.
-func tryIncrementalIngest(db *store.DB, projectDir, dbPath string, serverMode bool) bool {
+func tryIncrementalIngest(db store.Backend, projectDir, dbPath string, serverMode bool) bool {
 	stale, added, deleted, ok := incrementalPreflight(db, projectDir, dbPath, serverMode)
 	if !ok {
 		return false
@@ -1971,7 +1971,7 @@ func tryIncrementalIngest(db *store.DB, projectDir, dbPath string, serverMode bo
 // Disqualifies the fast path on: server/DSN mode, no last_ingest meta
 // (first ingest), or total churn (stale + added + deleted) above
 // incrementalIngestThreshold.
-func incrementalPreflight(db *store.DB, projectDir, dbPath string, serverMode bool) (stale, added []string, deleted []string, ok bool) {
+func incrementalPreflight(db store.Backend, projectDir, dbPath string, serverMode bool) (stale, added []string, deleted []string, ok bool) {
 	if serverMode || strings.Contains(dbPath, "@") {
 		return nil, nil, nil, false
 	}
@@ -2053,7 +2053,7 @@ func subtractAbsPaths(xs, ys []string) []string {
 // error it logs and returns false so the caller falls through to full
 // ingest. Best-effort compaction runs every incrementalCompactInterval
 // invocations.
-func applyIncrementalIngest(db *store.DB, projectDir, dbPath string, stale, added, deleted []string) bool {
+func applyIncrementalIngest(db store.Backend, projectDir, dbPath string, stale, added, deleted []string) bool {
 	start := time.Now()
 	fmt.Fprintf(os.Stderr, "incremental ingest: %d modified, %d added, %d removed...\n",
 		len(stale), len(added), len(deleted))
@@ -2128,7 +2128,7 @@ func applyIncrementalIngest(db *store.DB, projectDir, dbPath string, stale, adde
 // ingestStaleFiles runs ingest.IngestFile on each stale file and
 // returns a directory→representative-file map for the resolve pass.
 // Returns ok=false on the first per-file error (caller falls through).
-func ingestStaleFiles(db *store.DB, projectDir string, stale []string) (map[string]string, bool) {
+func ingestStaleFiles(db store.Backend, projectDir string, stale []string) (map[string]string, bool) {
 	uniqueDirs := make(map[string]string, len(stale))
 	for _, f := range stale {
 		if _, err := ingest.IngestFile(db, projectDir, f); err != nil {
@@ -2166,7 +2166,7 @@ func firstGoFileIn(dir string) (string, bool) {
 // resolveUniqueDirs calls resolve.ResolveFile once per unique package
 // directory using the recorded representative file. Returns false on
 // the first error.
-func resolveUniqueDirs(db *store.DB, projectDir string, uniqueDirs map[string]string) bool {
+func resolveUniqueDirs(db store.Backend, projectDir string, uniqueDirs map[string]string) bool {
 	for _, rep := range uniqueDirs {
 		if err := resolve.ResolveFile(db, projectDir, rep); err != nil {
 			fmt.Fprintf(os.Stderr, "incremental resolve failed on %s: %v — falling back to full ingest\n", rep, err)
@@ -2179,7 +2179,7 @@ func resolveUniqueDirs(db *store.DB, projectDir string, uniqueDirs map[string]st
 // bumpIncrementalCounter increments the incremental-ingest counter
 // stored in DB meta. Best-effort: a failure here just means we may
 // compact slightly later than scheduled, never silently corrupt.
-func bumpIncrementalCounter(db *store.DB) {
+func bumpIncrementalCounter(db store.Backend) {
 	cur := 0
 	if s, err := db.GetMeta(incrementalCounterMeta); err == nil && s != "" {
 		if n, perr := strconv.Atoi(s); perr == nil {
@@ -2193,7 +2193,7 @@ func bumpIncrementalCounter(db *store.DB) {
 // reaches incrementalCompactInterval, then resets it. The full ingest
 // path compacts on every call; this catches up for projects driven
 // mostly by hook-fired incremental ingests.
-func maybeCompactAfterIncremental(db *store.DB, dbPath string) {
+func maybeCompactAfterIncremental(db store.Backend, dbPath string) {
 	s, err := db.GetMeta(incrementalCounterMeta)
 	if err != nil || s == "" {
 		return
@@ -2211,7 +2211,7 @@ func maybeCompactAfterIncremental(db *store.DB, dbPath string) {
 // files newer than the last ingest — signaling that read ops (query,
 // status) may return stale results. Silent when up to date or when
 // the DB predates last_ingest.
-func warnIfStale(db *store.DB, projectDir string) {
+func warnIfStale(db store.Backend, projectDir string) {
 	count, sample := countStaleFiles(db, projectDir)
 	if count == 0 {
 		return
@@ -2227,7 +2227,7 @@ func warnIfStale(db *store.DB, projectDir string) {
 // on entry to ingest/sync so the user sees staleness was detected and
 // is being resolved by the current operation — closing the loop that
 // `warnIfStale` opens on read paths.
-func announceStaleIngest(db *store.DB, projectDir string) {
+func announceStaleIngest(db store.Backend, projectDir string) {
 	count, sample := countStaleFiles(db, projectDir)
 	if count == 0 {
 		return
@@ -2246,7 +2246,7 @@ func announceStaleIngest(db *store.DB, projectDir string) {
 // which usually means the containing var/type was filtered out or not
 // loaded).
 func cmdCheck() {
-	db, err := store.Open(getDBPath())
+	db, err := store.OpenBackend(getDBPath())
 	if err != nil {
 		fatal(err)
 	}
@@ -2377,7 +2377,7 @@ func collectStatus(dbPath string) statusReport {
 		return r
 	}
 
-	db, err := store.Open(dbPath)
+	db, err := store.OpenBackend(dbPath)
 	if err != nil {
 		fatal(err)
 	}
@@ -2453,7 +2453,7 @@ func printStatus(r statusReport) {
 }
 
 func cmdImpact(name string, jsonOutput bool) {
-	db, err := store.Open(getDBPath())
+	db, err := store.OpenBackend(getDBPath())
 	if err != nil {
 		fatal(err)
 	}
@@ -2569,7 +2569,7 @@ func cmdImpact(name string, jsonOutput bool) {
 }
 
 func cmdUntested() {
-	db, err := store.Open(getDBPath())
+	db, err := store.OpenBackend(getDBPath())
 	if err != nil {
 		fatal(err)
 	}
@@ -2627,7 +2627,7 @@ func cmdWatch(modulePath string) {
 
 		if newestGo > lastMod && lastMod > 0 {
 			fmt.Fprintf(os.Stderr, "change detected, re-ingesting...\n")
-			db, err := store.Open(getDBPath())
+			db, err := store.OpenBackend(getDBPath())
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "  error: %v\n", err)
 			} else {
@@ -2651,7 +2651,7 @@ func cmdWatch(modulePath string) {
 }
 
 func cmdLint() {
-	db, err := store.Open(getDBPath())
+	db, err := store.OpenBackend(getDBPath())
 	if err != nil {
 		fatal(err)
 	}
