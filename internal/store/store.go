@@ -1654,17 +1654,40 @@ func (s *DB) SetLiteralFields(defID int64, fields []LiteralField) error {
 	if _, err := s.execContext(ctx, "DELETE FROM literal_fields WHERE def_id = ?", defID); err != nil {
 		return fmt.Errorf("clear literal_fields: %w", err)
 	}
-	for _, f := range fields {
-		if _, err := s.execContext(ctx,
-			`INSERT INTO literal_fields (def_id, type_name, field_name, field_value, line)
-			 VALUES (?, ?, ?, ?, ?)`,
-			defID, f.TypeName, f.FieldName, f.FieldValue, f.Line,
-		); err != nil {
-			return fmt.Errorf("insert literal_field: %w", err)
+	if len(fields) == 0 {
+		return nil
+	}
+	// Batch INSERTs — mirrors the SetReferences fix (#108). winze's
+	// measurement showed literal_fields to be even MORE dense than refs
+	// on their KB corpus (54 fields vs 42 refs per apophenia def) and
+	// this unbatched loop dominated the ~36s residual after the
+	// SetReferences batch + txn wrap landed. Same chunking rules as
+	// SetReferences: 500 rows/stmt to stay under max_allowed_packet.
+	for start := 0; start < len(fields); start += setLitFieldsBatchSize {
+		end := start + setLitFieldsBatchSize
+		if end > len(fields) {
+			end = len(fields)
+		}
+		chunk := fields[start:end]
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, 5*len(chunk))
+		for i, f := range chunk {
+			placeholders[i] = "(?, ?, ?, ?, ?)"
+			args = append(args, defID, f.TypeName, f.FieldName, f.FieldValue, f.Line)
+		}
+		q := `INSERT INTO literal_fields (def_id, type_name, field_name, field_value, line) VALUES ` +
+			strings.Join(placeholders, ", ")
+		if _, err := s.execContext(ctx, q, args...); err != nil {
+			return fmt.Errorf("insert literal_fields (batch %d..%d of %d): %w", start, end, len(fields), err)
 		}
 	}
 	return nil
 }
+
+// setLitFieldsBatchSize caps rows per SetLiteralFields INSERT batch.
+// 500 matches SetReferences setRefsBatchSize; both are well under
+// MySQL's default max_allowed_packet.
+const setLitFieldsBatchSize = 500
 
 // SetMeta upserts a key/value pair into the defn_meta table.
 func (s *DB) SetMeta(key, value string) error {
