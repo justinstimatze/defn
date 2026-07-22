@@ -5,11 +5,11 @@
 ```bash
 git clone https://github.com/justinstimatze/defn.git
 cd defn
-CGO_ENABLED=1 go build ./cmd/defn
+go build ./cmd/defn
 go test ./... -count=1
 ```
 
-Requires Go 1.26+ and CGO (for Dolt embedded database).
+Requires Go 1.26+. Pure-Go build via `modernc.org/sqlite` — no CGO, no external database.
 
 ## Running Checks
 
@@ -35,7 +35,7 @@ claude                                    # Use code(op:"impact"), code(op:"read
 cmd/defn/           CLI (init, ingest, emit, serve, impact, untested, ...)
 cmd/defn-test/      Integration tests against chi, mux, gin, toml
 cmd/defn-bench/     Token/tool-call benchmark
-internal/store/     Dolt database layer
+internal/store/     SQLite storage (modernc.org/sqlite, pure Go)
 internal/ingest/    Go source parsing (go/ast + go/types)
 internal/resolve/   Reference graph (go/types, test packages, receiver-qualified)
 internal/emit/      Database → .go files

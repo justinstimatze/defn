@@ -61,13 +61,20 @@ defn is Apache 2.0 licensed.
 
 - **Dolt** ([dolthub.com](https://www.dolthub.com/), Apache 2.0) — Git
   semantics over SQL. Branch, merge, diff, pull requests on structured data.
-  defn uses Dolt as its storage engine, getting native branch/merge/diff/commit
-  semantics on structured code data. Steve Yegge's
+  defn was originally built on Dolt for its branch/merge/diff/commit semantics
+  over structured code data. Steve Yegge's
   [Wasteland/Gas Town](https://medium.com/@steve.yegge) (March 2026) uses Dolt
-  as the foundation for a federated AI agent work marketplace, validating that
-  SQL + git semantics is the right substrate for AI agent coordination. Yegge:
-  "Dolt predicted the Wasteland, because there could not be a more perfect
-  technology for it."
+  as the foundation for a federated AI agent work marketplace. In v0.27
+  (2026-07) defn migrated to SQLite: the git-style ops on the DB were
+  redundant with users' actual workflow (git worktrees), and the CGO+icu4c
+  build tax made the binary 10x larger than necessary. Dolt remains the right
+  answer for workloads that need branch-diff-merge on data — just not this one.
+
+- **SQLite** ([sqlite.org](https://www.sqlite.org/), Public Domain) —
+  Zero-config embedded SQL. defn stores the code graph in a single
+  `.defn/defn.db` file via [modernc.org/sqlite](https://gitlab.com/cznic/sqlite)
+  (a pure-Go transpilation), so builds need neither CGO nor a bundled engine.
+  FTS5 backs body-text search.
 
 ## Parsing & Code Intelligence
 
@@ -131,7 +138,7 @@ than package-level tools, without requiring coverage instrumentation.
   granularity but requires Datadog and a coverage run.
 
 defn's approach: the reference graph is pre-computed and persistent in
-Dolt. "Which tests call this definition?" is a SQL query traversing the
+SQLite. "Which tests call this definition?" is a SQL query traversing the
 `refs` table — no coverage instrumentation, no build graph rebuild,
 no CI service. Function-level, not package-level.
 

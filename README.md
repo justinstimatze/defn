@@ -21,7 +21,7 @@ Edit through defn or edit files directly. Either side auto-syncs to the other. E
 
 **Files don't know about each other.** grep finds text matches, not callers. Reading `context.go` doesn't tell you that `responseWriter` satisfies `ResponseWriter`, or that changing `WriteHeader` breaks 238 tests through interface dispatch. That information exists in the type system but dies when you close your editor.
 
-**defn makes it permanent.** It parses your code with `go/types` (the same type checker gopls uses) and stores the result in [Dolt](https://www.dolthub.com/) — a SQL database with git semantics. The reference graph persists across sessions, includes interface satisfaction, and is queryable:
+**defn makes it permanent.** It parses your code with `go/types` (the same type checker gopls uses) and stores the result in SQLite (`modernc.org/sqlite`, pure Go, no CGO). The reference graph persists across sessions, includes interface satisfaction, and is queryable:
 
 ```sql
 -- Who calls Render and has no tests?
@@ -43,8 +43,7 @@ go install github.com/justinstimatze/defn/cmd/defn@latest
 go install golang.org/x/tools/cmd/goimports@latest
 
 cd your-go-project
-defn init . --server    # recommended: starts Dolt server for multi-agent
-defn init .             # or: embedded mode, no server needed
+defn init .
 ```
 
 Then start Claude Code or Codex and ask:
@@ -55,16 +54,9 @@ Then start Claude Code or Codex and ask:
 "Find all functions that handle authentication"
 ```
 
-To remove everything: `defn clean`
+To remove everything: `rm -rf .defn`
 
-Requires Go 1.26+, CGO, and `goimports`. Binary is ~140MB due to embedded Dolt engine.
-
-**macOS:** `brew install icu4c` then:
-```bash
-export CGO_CFLAGS="-I$(brew --prefix icu4c)/include"
-export CGO_LDFLAGS="-L$(brew --prefix icu4c)/lib"
-go install github.com/justinstimatze/defn/cmd/defn@latest
-```
+Requires Go 1.26+ and `goimports`. Pure-Go build — no CGO, no icu4c, no external database. The `.defn/defn.db` SQLite file is a rebuildable artifact of `defn ingest`.
 
 ## How it works
 
@@ -121,28 +113,18 @@ One MCP tool — `code` — with an `op` field. Your AI agent calls it naturally
 | `traverse` | BFS over the ref graph, direction + kind filtered | `name`, `direction` |
 | `literals` | Composite literal fields (type/field/value) | `pattern`, `name`, `body` |
 | `pragmas` | Comment pragmas (`//go:generate`, `//winze:...`) | `pattern` |
-| `branch`, `checkout`, `merge`, `commit`, `status` | git-style versioning on the DB | see Versioning |
-| `conflicts`, `resolve`, `merge-abort` | Definition-level merge conflict resolution | `name`, `body` or `pick` |
-| `diff-defs` | Structural diff between two refs | `from`, optional `to` |
+| `status` | Backend stats + uncommitted-file summary | — |
+| `diff-defs` | Structural diff between two source snapshots | `from`, optional `to` |
 
 </details>
 
 Name-based ops accept `file:line` paths and `Receiver.Method` syntax (`Context.Render`, `(*Router).Handle`).
 
-## Versioning
+## Concurrency
 
-Dolt gives git semantics on SQL data. Branch, merge, diff, commit — natively, on definitions.
+Treat `.defn/defn.db` as a build artifact of the working tree. For branch experiments, use `git worktree` and run one `defn serve` per worktree — each gets a deterministic per-project port (FNV-hashed into 9420-9999) and auto-shares within a worktree.
 
-```bash
-defn branch feature && defn checkout feature
-# make changes
-defn commit "add auth middleware"
-defn checkout main && defn merge feature
-```
-
-In server mode, multiple agents branch and merge concurrently on the same Dolt server. For filesystem isolation, `defn worktree <branch> [<path>]` emits a new tree pinned to a branch (writes `.defn-worktree.json` so all CLI invocations in that dir stay on that branch).
-
-Only one `defn serve` process can own an embedded `.defn/` at a time — enforced via `syscall.Flock` on `.defn/serve.pid`. A concurrent CLI gets an actionable error pointing at `defn worktree` or `DEFN_DSN`, and `defn status` shows who's holding the lock along with any version skew between the running serve and the on-disk binary.
+Only one `defn serve` process can own a `.defn/` at a time — enforced via `syscall.Flock` on `.defn/serve.pid`. A concurrent CLI gets an actionable error, and `defn status` shows who's holding the lock along with any version skew between the running serve and the on-disk binary.
 
 ## Scale
 
@@ -161,4 +143,4 @@ Init is a one-time cost. Incremental resolve after edits is much faster.
 
 ## License
 
-Apache 2.0. Built on [Dolt](https://github.com/dolthub/dolt) (Apache 2.0) and [adit-code](https://github.com/justinstimatze/adit-code) research. See [INFLUENCES.md](INFLUENCES.md).
+Apache 2.0. Built on [modernc.org/sqlite](https://gitlab.com/cznic/sqlite) (BSD-3) and [adit-code](https://github.com/justinstimatze/adit-code) research. See [INFLUENCES.md](INFLUENCES.md).
