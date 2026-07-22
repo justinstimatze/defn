@@ -1229,11 +1229,48 @@ func (s *DB) Query(query string) ([]map[string]any, error) {
 		}
 		row := make(map[string]any, len(cols))
 		for i, col := range cols {
-			row[col] = vals[i]
+			// #123: generic Scan into `any` returns the driver's native
+			// type — for TEXT columns above Dolt's inline threshold that's
+			// *val.TextStorage, which JSON-marshals as a raw {Buf, Addr}
+			// struct instead of the actual string. Detect the wrapper
+			// interfaces (same shape textCol handles) and unwrap here so
+			// `defn query` returns readable text for large-body columns.
+			row[col] = unwrapDriverValue(vals[i])
 		}
 		results = append(results, row)
 	}
 	return results, rows.Err()
+}
+
+// unwrapDriverValue collapses Dolt's out-of-band *val.TextStorage wrapper
+// (and anything else implementing the Unwrap/UnwrapAny interfaces) down
+// to a plain string. Non-wrapper values pass through unchanged. Used by
+// the generic Query path so `defn query` and MCP query op return
+// human/JSON-readable text for large TEXT columns.
+func unwrapDriverValue(v any) any {
+	switch x := v.(type) {
+	case nil, string, []byte, int, int64, uint, uint64, float64, bool:
+		return v
+	case interface {
+		Unwrap(ctx context.Context) (string, error)
+	}:
+		if s, err := x.Unwrap(context.Background()); err == nil {
+			return s
+		}
+	case interface {
+		UnwrapAny(ctx context.Context) (interface{}, error)
+	}:
+		if raw, err := x.UnwrapAny(context.Background()); err == nil {
+			if s, ok := raw.(string); ok {
+				return s
+			}
+			if b, ok := raw.([]byte); ok {
+				return string(b)
+			}
+			return raw
+		}
+	}
+	return v
 }
 
 // QueryLiteralFields searches literal fields. All params are optional filters.
