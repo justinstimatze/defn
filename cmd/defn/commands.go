@@ -456,10 +456,11 @@ func compactEmbedded(db store.Backend, dbPath string) {
 func cmdMeasureRename(oldName, newName string, inPlace bool) {
 	dbPath := getDBPath()
 	checkEmbeddedAvailable(dbPath)
-	db, err := store.OpenBackend(dbPath)
+	db, _, cleanupDB, err := openMeasurementDB(dbPath)
 	if err != nil {
 		fatal(err)
 	}
+	defer cleanupDB()
 	defer db.Close()
 	scratch, err := os.MkdirTemp("", "defn-measure-rename-*")
 	if err != nil {
@@ -493,10 +494,11 @@ func cmdMeasureEdit(name, bodyFile string, inPlace bool) {
 	if err != nil {
 		fatal(fmt.Errorf("read body: %w", err))
 	}
-	db, err := store.OpenBackend(dbPath)
+	db, _, cleanupDB, err := openMeasurementDB(dbPath)
 	if err != nil {
 		fatal(err)
 	}
+	defer cleanupDB()
 	defer db.Close()
 	scratch, err := os.MkdirTemp("", "defn-measure-edit-*")
 	if err != nil {
@@ -516,6 +518,58 @@ func cmdMeasureEdit(name, bodyFile string, inPlace bool) {
 	if msg != "" {
 		fmt.Println(msg)
 	}
+}
+
+// openMeasurementDB copies the on-disk .defn/defn.db (plus WAL/SHM
+// sidecars if present) into a scratch tempdir and opens the copy. Keeps
+// measure-rename/measure-edit non-destructive to the source DB —
+// handleRename/handleEdit mutate whatever backend they're handed, so
+// running them against the live .defn would silently corrupt it. Winze
+// flagged the emit-to-cwd twin of this bug (msg-dcca7715); this covers
+// the DB side.
+func openMeasurementDB(srcDir string) (store.Backend, string, func(), error) {
+	dstDir, err := os.MkdirTemp("", "defn-measure-db-*")
+	if err != nil {
+		return nil, "", func() {}, fmt.Errorf("mktemp db: %w", err)
+	}
+	cleanup := func() { os.RemoveAll(dstDir) }
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		src := filepath.Join(srcDir, "defn.db"+suffix)
+		if _, err := os.Stat(src); err != nil {
+			if suffix == "" {
+				cleanup()
+				return nil, "", func() {}, fmt.Errorf("source db not found at %s: %w", src, err)
+			}
+			continue
+		}
+		if err := copyFileForMeasure(src, filepath.Join(dstDir, "defn.db"+suffix)); err != nil {
+			cleanup()
+			return nil, "", func() {}, fmt.Errorf("copy %s: %w", src, err)
+		}
+	}
+	b, err := store.OpenBackend(dstDir)
+	if err != nil {
+		cleanup()
+		return nil, "", func() {}, err
+	}
+	return b, dstDir, cleanup, nil
+}
+
+func copyFileForMeasure(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
 }
 
 // prepopulate seeds the scratch dir with one full emit BEFORE the timed
