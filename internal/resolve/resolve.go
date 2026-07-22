@@ -11,6 +11,7 @@ import (
 	"go/types"
 	"os"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
@@ -587,14 +588,18 @@ func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef 
 							if !ok {
 								continue
 							}
-							var buf bytes.Buffer
-							if err := format.Node(&buf, fset, kv.Value); err != nil {
-								continue
+							fieldValue, ok := evalStringLiteral(kv.Value)
+							if !ok {
+								var buf bytes.Buffer
+								if err := format.Node(&buf, fset, kv.Value); err != nil {
+									continue
+								}
+								fieldValue = buf.String()
 							}
 							litFields = append(litFields, store.LiteralField{
 								TypeName:   typeName,
 								FieldName:  ident.Name,
-								FieldValue: buf.String(),
+								FieldValue: fieldValue,
 								Line:       fset.Position(kv.Pos()).Line,
 							})
 						}
@@ -648,6 +653,42 @@ func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef 
 		return true
 	})
 	return refs, litFields
+}
+
+// evalStringLiteral collapses an *ast.BasicLit STRING or an *ast.BinaryExpr
+// chain of +-concatenated string literals into the evaluated prose. Returns
+// (value, true) when every leaf is a compile-time string literal; otherwise
+// (_, false) so the caller falls back to source-form rendering. Fixes a
+// data-correctness bug where multi-line +-concatenated Quote-style fields
+// were stored as Go source (e.g. `"first " + "second"`) instead of prose.
+func evalStringLiteral(expr ast.Expr) (string, bool) {
+	switch x := expr.(type) {
+	case *ast.BasicLit:
+		if x.Kind != token.STRING {
+			return "", false
+		}
+		s, err := strconv.Unquote(x.Value)
+		if err != nil {
+			return "", false
+		}
+		return s, true
+	case *ast.BinaryExpr:
+		if x.Op != token.ADD {
+			return "", false
+		}
+		lhs, ok := evalStringLiteral(x.X)
+		if !ok {
+			return "", false
+		}
+		rhs, ok := evalStringLiteral(x.Y)
+		if !ok {
+			return "", false
+		}
+		return lhs + rhs, true
+	case *ast.ParenExpr:
+		return evalStringLiteral(x.X)
+	}
+	return "", false
 }
 
 // innerIdent unwraps *ast.StarExpr and *ast.SelectorExpr to find the

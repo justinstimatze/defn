@@ -10,7 +10,7 @@ Runs that produced the wrong output are visible, not hidden.
 
 ## What we measure and why
 
-Two kinds of workloads live here today:
+Three kinds of workloads live here today:
 
 - **`retrieval/`** — read-side questions ("what does X do", "who calls
   Y"). Static ground truth from a vendored corpus with a SHA1
@@ -21,9 +21,30 @@ Two kinds of workloads live here today:
   (Read/Edit/Write) and `defn` mode (the `code` MCP tool). A run is
   **correct** only if the final file, whitespace-canonicalized,
   equals the golden.
+- **`trajectories/`** — static analysis of external agent
+  trajectories (no defn run). Take a real-world OpenHands or similar
+  trajectory and label each tool call as graph-collapsible / neutral.
+  This is *not* a benchmark — it's evidence-gathering for what defn
+  would save on real production workloads.
+- **`session-cumulative/`** — end-to-end multi-turn Claude Code
+  sessions run through `claude -p --resume`, per-turn usage measured
+  including cache_read / cache_creation. This is the workload class
+  users actually pay for.
 
 Correctness is not optional. A defn win under a correctness drop is
 not a win.
+
+## Session-cumulative benches
+
+| Run | Date | Task | Turns | Correct | Cost Δ | Notes |
+|---|---|---|---|---|---|---|
+| [chi-ratelimit](./session-cumulative/2026-07-11-chi-ratelimit.md) | 2026-07-11 | add RateLimit middleware to chi + ctx-cancel refactor | 10 | files 4/4 · defn 3/3 · defn-forced 4/4 | **+40% natural / +28% forced (still WORSE)** | Opus 4.8 uses defn *additively*. Hard tool restriction (`--disallowedTools`) forces substitution but reveals granularity cost: 13 `create` calls vs 1 `Write`. Defn's op vocabulary optimized for surgical mutations, not multi-symbol authoring. |
+
+## Trajectory analyses
+
+| Run | Date | Data source | N | Est. call Δ | Notes |
+|---|---|---|---|---|---|
+| [openhands-analysis](./trajectories/2026-07-11-openhands-analysis.md) | 2026-07-11 | `nebius/SWE-rebench-openhands-trajectories` | 1,991 aggregate + 4 labeled | **−15% to −25%** | first look at real production trajectories; 40–50% of every trajectory is test-run time, untouchable by defn |
 
 ## Mutation benches
 
@@ -83,9 +104,20 @@ Three things every citation of a number here should carry:
    read-side retrieval, not single-op edits. Replacement work:
    scale the chain-bench and instrument the retrieval bench for
    input-token measurement.
-5. **Compute-constrained enterprise angle.** Cost-per-refactor for
-   teams running many agents against big codebases. That's the
-   buyer conversation.
+5. **Meet the real production baseline: OpenHands, not `claude -p`.**
+   Our early benches used `claude -p` — which has Grep + Read tools
+   built in — as the "no-defn" baseline. That's a very strong
+   baseline. Real production agent traffic runs against baselines
+   with a handful of tools and no dedicated code lookup: e.g.
+   OpenHands' five-tool set (`execute_bash`, `str_replace_editor`,
+   `think`, `finish`, `task_tracker`). On 1,991 real successful
+   OpenHands trajectories analyzed, 28.9% of bash calls were
+   grep/find/ls and 61% of editor calls were `view` — an estimated
+   15–25% of tool calls per trajectory would collapse under a code
+   graph. See
+   [`trajectories/2026-07-11-openhands-analysis.md`](./trajectories/2026-07-11-openhands-analysis.md).
+   Enterprise cost-per-refactor argument still applies but grounds in
+   this data instead of small-N synthetic runs.
 
 ## What we won't do
 

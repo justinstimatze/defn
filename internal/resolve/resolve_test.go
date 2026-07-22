@@ -1,6 +1,7 @@
 package resolve
 
 import (
+	"go/parser"
 	"os"
 	"path/filepath"
 	"testing"
@@ -198,5 +199,82 @@ type Person struct {
 	rs, _ = db.QueryRefs("Person", "Other", "embed", 0)
 	if len(rs) == 0 {
 		t.Errorf("expected fresh Person → Other embed after ResolveFile, missing")
+	}
+}
+
+// TestEvalStringLiteral covers the BinaryExpr concat collapse used by
+// composite-literal field extraction. Fix for winze msg-34edc119: multi-line
+// +-concatenated string literals (e.g. Provenance.Quote) used to be stored
+// as Go-source-form (`"first " + "second"`), corrupting display, audit, and
+// FTS. Mixed chains with identifiers must still fall through to format.Node.
+func TestEvalStringLiteral(t *testing.T) {
+	cases := []struct {
+		name   string
+		expr   string
+		want   string
+		wantOk bool
+	}{
+		{"bare literal", `"hello"`, "hello", true},
+		{"raw string", "`raw \"world\"`", `raw "world"`, true},
+		{"two-part concat", `"first " + "second"`, "first second", true},
+		{"three-part multi-line", `"a " +` + "\n\t\t\"b \" +\n\t\t\"c\"", "a b c", true},
+		{"paren wrap", `("wrapped")`, "wrapped", true},
+		{"mixed with ident", `"prefix " + x`, "", false},
+		{"non-add op", `"a" - "b"`, "", false},
+		{"int literal", `42`, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			expr, err := parser.ParseExpr(tc.expr)
+			if err != nil {
+				t.Fatalf("parse %q: %v", tc.expr, err)
+			}
+			got, ok := evalStringLiteral(expr)
+			if ok != tc.wantOk {
+				t.Fatalf("evalStringLiteral(%q) ok = %v, want %v", tc.expr, ok, tc.wantOk)
+			}
+			if ok && got != tc.want {
+				t.Errorf("evalStringLiteral(%q) = %q, want %q", tc.expr, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveCollapsesBinaryExprLiterals is the end-to-end regression:
+// composite literals with +-concatenated string fields must be stored as
+// prose in literal_fields, not as Go-source-form.
+func TestResolveCollapsesBinaryExprLiterals(t *testing.T) {
+	src := `package refsbug
+
+type Provenance struct {
+	Quote string
+}
+
+var Sample = Provenance{
+	Quote: "first line " +
+		"second line " +
+		"third line",
+}
+`
+	dir := writeModule(t, map[string]string{"main.go": src})
+
+	db := testDB(t)
+	if err := ingest.Ingest(db, dir); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if err := Resolve(db, dir); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	rows, err := db.QueryLiteralFields("%Provenance", "Quote", "", nil, 0)
+	if err != nil {
+		t.Fatalf("query literal fields: %v", err)
+	}
+	if len(rows) == 0 {
+		t.Fatalf("expected at least one Provenance.Quote literal, got none")
+	}
+	want := "first line second line third line"
+	if rows[0].FieldValue != want {
+		t.Errorf("Quote stored as %q; want %q (BinaryExpr collapse regression)", rows[0].FieldValue, want)
 	}
 }
