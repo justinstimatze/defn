@@ -1,5 +1,19 @@
 # defn — Claude Code Instructions
 
+## Product rule — parity is the floor
+
+**Every defn feature must be at least as efficient as not-using-defn** on total
+weighted session cost (tokens + wall-clock). If a mutation path pays more
+tokens or more wall than the equivalent Edit/Write/`gopls`/native shell
+sequence, defn is a net loss for that workload and the feature is broken.
+Parity is the floor; aim for materially better. Measure vs the *real* native
+baseline (AST splice + `go build .`, not `go build ./...`), not vs
+defn-on-defn benches.
+
+Perf work is judged by real-workload numbers, not synthetic sweep curves.
+When in doubt, ask winze (or another external user) to run their shape and
+report the number before claiming a win.
+
 ## Code Navigation and Editing
 
 **The database is authoritative. Files are an I/O projection.** For Go code, use the `code` MCP tool — not Edit/Write/Read. Edit/Write are for non-Go files (YAML, JSON, Markdown, shell scripts).

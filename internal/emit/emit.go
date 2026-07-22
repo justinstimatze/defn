@@ -52,6 +52,21 @@ type Opts struct {
 	// should populate this. Non-existent paths are silently skipped by
 	// goimports so it's safe to over-list.
 	GoimportsFiles []string
+
+	// TouchedFiles optionally restricts which files emit rewrites at all
+	// (project-relative paths). Empty (default) emits every file for
+	// every module — the full reconstruction. Non-empty limits both the
+	// module-writes loop and the project-file writes to only these files:
+	// rename → {def.SourceFile} ∪ {caller.SourceFile}, edit → {def.SourceFile},
+	// add-import → {file}. On winze's 43-file corpus, a 3-file rename
+	// wall was 1.2s full-emit; scoping to 3 files drops to per-file
+	// cost. Winze dispatch 2026-07-22: this is THE remaining lever
+	// once #109 moved the wall out of autoResolve. Non-existent paths
+	// are silently skipped (mirrors GoimportsFiles semantics). When
+	// non-empty, the loc-index rebuild + project-file writes are also
+	// skipped — callers using TouchedFiles are the singleton-mutation
+	// paths that don't consume the loc index and never touch go.mod.
+	TouchedFiles []string
 }
 
 // Emit writes all definitions from the database as .go files into outDir.
@@ -89,28 +104,47 @@ func emitWithOpts(db *store.DB, outDir string, opts Opts) ([]DefLocation, error)
 		}
 	}
 
-	// Write project-level files (go.mod, go.sum).
-	t := time.Now()
-	projectFiles, err := db.ListProjectFiles()
-	if err != nil {
-		return nil, fmt.Errorf("list project files: %w", err)
-	}
-	for _, pf := range projectFiles {
-		content, err := db.GetProjectFile(pf)
-		if err != nil {
-			return nil, fmt.Errorf("get project file %s: %w", pf, err)
-		}
-		// Sanitize path to prevent directory traversal.
-		clean := filepath.Clean(pf)
+	// Build the project-relative scope set once. Empty = full emit,
+	// non-empty = restrict module + project-file writes to just these
+	// paths. Sanitize now so downstream loops can just check membership.
+	scoped := len(opts.TouchedFiles) > 0
+	touchedSet := make(map[string]bool, len(opts.TouchedFiles))
+	for _, tf := range opts.TouchedFiles {
+		clean := filepath.Clean(tf)
 		if filepath.IsAbs(clean) || strings.Contains(clean, "..") {
-			return nil, fmt.Errorf("invalid project file path: %s", pf)
+			continue
 		}
-		dst := filepath.Join(outDir, clean)
-		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
-			return nil, err
+		touchedSet[filepath.ToSlash(clean)] = true
+	}
+
+	// Write project-level files (go.mod, go.sum). Scoped emit skips this
+	// loop entirely — singleton mutations (rename/edit/delete/add-import)
+	// never touch go.mod / go.sum, and re-writing them on every call is
+	// wasted disk + Dolt read cost. Full emit (empty TouchedFiles) still
+	// runs the loop so `defn emit /tmp/out` produces a buildable tree.
+	t := time.Now()
+	if !scoped {
+		projectFiles, err := db.ListProjectFiles()
+		if err != nil {
+			return nil, fmt.Errorf("list project files: %w", err)
 		}
-		if err := os.WriteFile(dst, []byte(content), 0644); err != nil {
-			return nil, fmt.Errorf("write %s: %w", pf, err)
+		for _, pf := range projectFiles {
+			content, err := db.GetProjectFile(pf)
+			if err != nil {
+				return nil, fmt.Errorf("get project file %s: %w", pf, err)
+			}
+			// Sanitize path to prevent directory traversal.
+			clean := filepath.Clean(pf)
+			if filepath.IsAbs(clean) || strings.Contains(clean, "..") {
+				return nil, fmt.Errorf("invalid project file path: %s", pf)
+			}
+			dst := filepath.Join(outDir, clean)
+			if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+				return nil, err
+			}
+			if err := os.WriteFile(dst, []byte(content), 0644); err != nil {
+				return nil, fmt.Errorf("write %s: %w", pf, err)
+			}
 		}
 	}
 	timeIt("project-files", t)
@@ -127,7 +161,7 @@ func emitWithOpts(db *store.DB, outDir string, opts Opts) ([]DefLocation, error)
 
 	var writtenFiles []writtenFile
 	for _, mod := range modules {
-		locs, written, err := emitModule(db, &mod, outDir, moduleRoot, opts.AllowedRemovals)
+		locs, written, err := emitModule(db, &mod, outDir, moduleRoot, opts.AllowedRemovals, touchedSet)
 		if err != nil {
 			return nil, fmt.Errorf("emit %s: %w", mod.Path, err)
 		}
@@ -195,6 +229,13 @@ func emitWithOpts(db *store.DB, outDir string, opts Opts) ([]DefLocation, error)
 	t = time.Now()
 
 	// Rebuild location index after goimports (it may shift line numbers).
+	// Skip in scoped mode: MCP mutation callers (rename/edit/delete/apply)
+	// never consume the loc index — it's a `defn lint` construct — and
+	// walking every module here would defeat the point of file-scoping.
+	if scoped {
+		timeIt("rebuild-loc-index-skipped", t)
+		return nil, nil
+	}
 	allLocs = nil
 	for _, mod := range modules {
 		defs, err := db.GetModuleDefinitions(mod.ID)
@@ -265,13 +306,19 @@ type writtenFile struct {
 	SourceFile string // project-relative; empty means don't refresh file_sources
 }
 
-func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string, allowedRemovals []string) ([]DefLocation, []writtenFile, error) {
+func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string, allowedRemovals []string, touchedSet map[string]bool) ([]DefLocation, []writtenFile, error) {
+	scoped := len(touchedSet) > 0
 	defs, err := db.GetModuleDefinitions(mod.ID)
 	if err != nil {
 		return nil, nil, err
 	}
 	if len(defs) == 0 {
-		// No definitions — clean up any previously emitted files for this module.
+		// No definitions — clean up any previously emitted files for this
+		// module. Scoped emit skips this cleanup: a singleton rename/edit
+		// against an unrelated module shouldn't garbage-collect it.
+		if scoped {
+			return nil, nil, nil
+		}
 		relPath := mod.Path
 		if moduleRoot != "" && strings.HasPrefix(mod.Path, moduleRoot) {
 			relPath = strings.TrimPrefix(mod.Path, moduleRoot)
@@ -340,6 +387,32 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string, allo
 	}
 	sort.Strings(fileNames)
 
+	// Scoped emit filter: keep only files whose canonical project-relative
+	// path is in touchedSet. Pick the canonical path from the bucket's
+	// first def with a non-empty SourceFile (same invariant as projectRelByFile
+	// below — buckets share a SourceFile). Files without any SourceFile
+	// (fresh defs) are always kept. If no file in this module matched,
+	// return early — nothing to emit here.
+	if scoped {
+		kept := fileNames[:0]
+		for _, file := range fileNames {
+			projectRel := ""
+			for _, d := range byFile[file] {
+				if d.SourceFile != "" {
+					projectRel = filepath.ToSlash(filepath.Clean(d.SourceFile))
+					break
+				}
+			}
+			if projectRel == "" || touchedSet[projectRel] {
+				kept = append(kept, file)
+			}
+		}
+		fileNames = kept
+		if len(fileNames) == 0 {
+			return nil, nil, nil
+		}
+	}
+
 	// Phase C: pre-fetch the raw sources for this module. When present,
 	// writeFile uses them as the authoritative merge base — that's the
 	// byte-faithful copy, unaffected by whatever's on disk (which might
@@ -388,7 +461,11 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string, allo
 		}
 	}
 	docTarget := ""
-	if mod.Doc != "" && !docAlreadyPresent {
+	// In scoped emit, never attach mod.Doc to a touched file — the doc
+	// belongs where it already lives (usually a file NOT in touchedSet),
+	// and attaching it to an unrelated touched file would duplicate on
+	// full re-emit. A singleton rename/edit never needs to (re)attach doc.
+	if mod.Doc != "" && !docAlreadyPresent && !scoped {
 		for _, file := range fileNames {
 			if !strings.HasSuffix(file, "_test.go") {
 				docTarget = file

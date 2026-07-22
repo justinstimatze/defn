@@ -1724,15 +1724,21 @@ func (s *server) autoEmitAndBuild() string {
 }
 
 // autoEmitAndBuildForFile is the file-scoped variant: pass the single
-// source file the mutation touched, get goimports scoped to that file
-// via emit.Opts.GoimportsFiles. On cli/cli warm rename this dropped
-// goimports from 707ms → 11ms (#109 pass 3). Empty file falls through
-// to the full-project recursive goimports.
+// source file the mutation touched, get goimports AND emit scoped to
+// that file via emit.Opts.GoimportsFiles + Opts.TouchedFiles. On
+// cli/cli warm rename this dropped goimports from 707ms → 11ms (#109
+// pass 3); #117 adds the same scoping to emit itself so we don't
+// rewrite every file in the tree for a single-def mutation (winze:
+// 1.2s full-emit → per-touched-file cost). Empty file falls through
+// to the full-project recursive form.
 func (s *server) autoEmitAndBuildForFile(sourceFile string) string {
 	if sourceFile == "" {
 		return s.autoEmitAndBuild()
 	}
-	return s.autoEmitAndBuildWithOpts(emit.Opts{GoimportsFiles: []string{sourceFile}})
+	return s.autoEmitAndBuildWithOpts(emit.Opts{
+		GoimportsFiles: []string{sourceFile},
+		TouchedFiles:   []string{sourceFile},
+	})
 }
 
 // autoEmitAndBuildWithOpts is autoEmitAndBuild with caller-supplied
@@ -2768,6 +2774,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		buildResult = s.autoEmitAndBuildWithOpts(emit.Opts{
 			AllowedRemovals: allowedRemovals,
 			GoimportsFiles:  goimportsFiles,
+			TouchedFiles:    goimportsFiles,
 		})
 		for fp := range resolveSet {
 			s.autoResolveFile(fp.file, fp.module)
@@ -2851,7 +2858,10 @@ func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolR
 	for fp := range touched {
 		goimportsFiles = append(goimportsFiles, fp.file)
 	}
-	buildResult := s.autoEmitAndBuildWithOpts(emit.Opts{GoimportsFiles: goimportsFiles})
+	buildResult := s.autoEmitAndBuildWithOpts(emit.Opts{
+		GoimportsFiles: goimportsFiles,
+		TouchedFiles:   goimportsFiles,
+	})
 	// Scoped resolve: iterate the unique touched files instead of the
 	// whole project. Safety valve: if we couldn't collect any touched
 	// files (e.g., every def had empty SourceFile — shouldn't happen),
@@ -3013,6 +3023,7 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	deleteOpts := emit.Opts{AllowedRemovals: []string{qualified}}
 	if d.SourceFile != "" {
 		deleteOpts.GoimportsFiles = []string{d.SourceFile}
+		deleteOpts.TouchedFiles = []string{d.SourceFile}
 	}
 	buildResult := s.autoEmitAndBuildWithOpts(deleteOpts)
 	// #109 pass 2 (winze op-classification): skip autoResolve on delete.
@@ -3117,6 +3128,7 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	buildResult := s.autoEmitAndBuildWithOpts(emit.Opts{
 		AllowedRemovals: []string{qualifiedOld},
 		GoimportsFiles:  goimportsFiles,
+		TouchedFiles:    goimportsFiles,
 	})
 	// #109: rename is a name-preserving semantic transform — every from_def
 	// → to_def edge in the refs table is ID-based, and no def IDs change
