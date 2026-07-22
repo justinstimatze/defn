@@ -11,6 +11,60 @@ import (
 	_ "github.com/dolthub/driver"
 )
 
+// TestTextColScan regression-tests every driver.Value shape that Dolt
+// might hand to Scan for a COALESCE(text) column. Winze session
+// (dispatch defn-sync-perf) tracked a transient crash across the July
+// 2026 Dolt bump where the driver returned *val.TextStorage instead of
+// string; #110 added the textCol Scanner. This test locks in the
+// contract that any of the standard-plus-wrapper shapes decode
+// correctly — synthetic wrappers exercise the Unwrap / UnwrapAny paths
+// without needing a live Dolt DB in the tricky state that triggers it.
+type fakeStringWrapper struct{ v string }
+
+func (f *fakeStringWrapper) Unwrap(_ context.Context) (string, error) { return f.v, nil }
+
+type fakeAnyWrapper struct{ v any }
+
+func (f *fakeAnyWrapper) UnwrapAny(_ context.Context) (any, error) { return f.v, nil }
+
+func TestTextColScan(t *testing.T) {
+	cases := []struct {
+		name string
+		src  any
+		want string
+	}{
+		{"nil", nil, ""},
+		{"string", "hello", "hello"},
+		{"empty string", "", ""},
+		{"bytes", []byte("hello"), "hello"},
+		{"empty bytes", []byte{}, ""},
+		{"string-wrapper (val.TextStorage shape)", &fakeStringWrapper{v: "wrapped"}, "wrapped"},
+		{"any-wrapper string", &fakeAnyWrapper{v: "unwrapped"}, "unwrapped"},
+		{"any-wrapper bytes", &fakeAnyWrapper{v: []byte("byteswrapped")}, "byteswrapped"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var got textCol
+			if err := got.Scan(c.src); err != nil {
+				t.Fatalf("Scan(%#v) error: %v", c.src, err)
+			}
+			if string(got) != c.want {
+				t.Errorf("Scan(%#v) = %q, want %q", c.src, string(got), c.want)
+			}
+		})
+	}
+}
+
+func TestTextColScan_UnsupportedType(t *testing.T) {
+	var got textCol
+	if err := got.Scan(42); err == nil {
+		t.Error("expected error for int source, got nil")
+	}
+	if err := got.Scan(struct{}{}); err == nil {
+		t.Error("expected error for struct source, got nil")
+	}
+}
+
 // TestSalvageZeroJournalIdx is the regression for SIGTERM leaving an
 // empty journal.idx that breaks the next Open with "invalid index
 // checksum". salvageZeroJournalIdx must rename the empty file aside so
