@@ -467,7 +467,17 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string, allo
 		for _, file := range fileNames {
 			src := rawByFile[file]
 			if len(src) == 0 {
-				if data, err := os.ReadFile(filepath.Join(pkgDir, file)); err == nil {
+				// #120 root fix: read from the same path emit will write to.
+				// Use source_file under outDir when it has a directory prefix;
+				// pkgDir+basename otherwise (matches the write logic below).
+				var readPath string
+				projRel := projectRelByFile[file]
+				if projRel != "" && filepath.Dir(filepath.Clean(projRel)) != "." {
+					readPath = filepath.Join(outDir, projRel)
+				} else {
+					readPath = filepath.Join(pkgDir, file)
+				}
+				if data, err := os.ReadFile(readPath); err == nil {
 					src = data
 				}
 			}
@@ -494,7 +504,25 @@ func emitModule(db *store.DB, mod *store.Module, outDir, moduleRoot string, allo
 	var allLocs []DefLocation
 	var written []writtenFile
 	for _, file := range fileNames {
-		path := filepath.Join(pkgDir, file)
+		// #120 root fix: when source_file carries an intra-project
+		// directory prefix (e.g. "command/root.go"), use it as the
+		// authoritative output location under outDir. Previously we
+		// joined the module-derived pkgDir with the basename — that
+		// dropped the directory prefix on single-module projects where
+		// module.Path == moduleRoot (relPath collapses to "."). Preserve
+		// the old pkgDir+basename shortcut when source_file is a bare
+		// filename (some tests + legacy ingests store source_file as
+		// just "pkg.go" and rely on module.Path to fill in the directory).
+		var path string
+		projRel := projectRelByFile[file]
+		if projRel != "" && filepath.Dir(filepath.Clean(projRel)) != "." {
+			path = filepath.Join(outDir, projRel)
+			if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+				return nil, nil, err
+			}
+		} else {
+			path = filepath.Join(pkgDir, file)
+		}
 		pkgDoc := ""
 		if file == docTarget {
 			pkgDoc = mod.Doc
