@@ -1419,7 +1419,7 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 
 	buildResult := s.autoEmitAndBuild()
 
-	s.autoResolve(s.modulePath(d.ModuleID))
+	s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Updated %s%s (id=%d, hash=%s)\n", recv, d.Name, id, store.HashBody(args.NewBody)[:12]))
@@ -1486,6 +1486,38 @@ func (s *server) autoResolve(modulePath string) {
 	}
 	// Best effort — log to stderr if commit fails so the operator notices
 	// without breaking the edit they just made.
+	if err := s.autoCommit(); err != nil {
+		fmt.Fprintf(os.Stderr, "defn: auto-commit failed (post-resolve): %v\n", err)
+	}
+	s.lastResolved.Store(time.Now().UnixNano())
+	if s.idf != nil {
+		s.idf.Invalidate()
+	}
+}
+
+// autoResolveFile is the file-scoped counterpart to autoResolve. Used
+// after single-def edits when we know which source file changed — calls
+// resolve.ResolveFile (loads ONE package, not the whole module) instead
+// of resolve.ResolveModule (loads ./... for the whole project). #109.
+//
+// Caveat: cross-package refs FROM other packages TO the changed def's
+// package aren't refreshed here — see resolve.ResolveFile doc. That's
+// the same limitation cmdSync's fast path lives with; for op:edit /
+// op:create / op:delete on a single def within its own package, callers
+// in other packages don't need re-resolve because their outgoing edges
+// are ID-based and IDs are stable across body-edit UpsertDefinition.
+// Fall back to autoResolve(modulePath) if sourceFile is empty (e.g.,
+// caller didn't have file info handy).
+func (s *server) autoResolveFile(sourceFile, modulePath string) {
+	if s.projectDir == "" {
+		return
+	}
+	if sourceFile == "" {
+		s.autoResolve(modulePath)
+		return
+	}
+	absFile := filepath.Join(s.projectDir, sourceFile)
+	_ = resolve.ResolveFile(s.db, s.projectDir, absFile) // best-effort
 	if err := s.autoCommit(); err != nil {
 		fmt.Fprintf(os.Stderr, "defn: auto-commit failed (post-resolve): %v\n", err)
 	}
@@ -1762,7 +1794,7 @@ func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest
 	}
 
 	buildResult := s.autoEmitAndBuild()
-	s.autoResolve(s.modulePath(d.ModuleID))
+	s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
 
 	var sb strings.Builder
 	replaced := "1 occurrence"
@@ -1818,7 +1850,7 @@ func (s *server) handleInsert(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	}
 
 	buildResult := s.autoEmitAndBuild()
-	s.autoResolve(s.modulePath(d.ModuleID))
+	s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Inserted into %s%s\n", recv, d.Name))
@@ -2877,7 +2909,21 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	}
 
 	buildResult := s.autoEmitAndBuildWithOpts(emit.Opts{AllowedRemovals: []string{qualifiedOld}})
-	s.autoResolve("")
+	// #109: rename is a name-preserving semantic transform — every from_def
+	// → to_def edge in the refs table is ID-based, and no def IDs change
+	// on rename. Caller bodies were already rewritten via astRename so
+	// their AST-shape matches, but the edge SET is identical. Interface
+	// satisfaction is preserved because it's driven by types.Object
+	// identities (also stable). Skipping autoResolve here removes the
+	// full-module ResolveModule call that dominated a single-symbol
+	// rename on winze (5,239 refs re-derived for one name change).
+	// Still autocommit so the DB working set stays clean.
+	if err := s.autoCommit(); err != nil {
+		fmt.Fprintf(os.Stderr, "defn: auto-commit failed (post-rename): %v\n", err)
+	}
+	if s.idf != nil {
+		s.idf.Invalidate()
+	}
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Renamed %s → %s\n", args.OldName, args.NewName))
@@ -3390,7 +3436,7 @@ func (s *server) handlePatch(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	}
 
 	buildResult := s.autoEmitAndBuild()
-	s.autoResolve(s.modulePath(d.ModuleID))
+	s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Patched %s: replaced %q → %q\n", args.Name, args.OldName, args.NewName))
@@ -4765,7 +4811,7 @@ func (s *server) applyEditTerse(name, action, snippet, newBody string) (*sdkmcp.
 		return errResult(err)
 	}
 	buildResult := s.autoEmitAndBuild()
-	s.autoResolve(s.modulePath(d.ModuleID))
+	s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
 
 	recv := formatReceiver(d.Receiver)
 	var sb strings.Builder
