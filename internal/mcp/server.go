@@ -873,10 +873,6 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return wrapStale(s.handleSimilar(ctx, req, nameParam{Name: args.Name}))
 	case "apply":
 		return s.handleApply(ctx, req, applyParam{Operations: args.Operations, DryRun: args.DryRun})
-	case "diff":
-		return wrapStale(s.handleCodeDiff(ctx, req, emptyParam{}))
-	case "history":
-		return wrapStale(s.handleHistory(ctx, req, nameParam{Name: args.Name}))
 	case "query":
 		return wrapStale(s.handleQuery(ctx, req, sqlParam{SQL: args.SQL}))
 	case "find":
@@ -907,24 +903,6 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return wrapStale(s.handleLiterals(ctx, req, args))
 	case "traverse":
 		return wrapStale(s.handleTraverse(ctx, req, args))
-	case "branch":
-		return s.handleBranch(ctx, req, args)
-	case "checkout":
-		return s.handleCheckout(ctx, req, args)
-	case "merge":
-		return s.handleMerge(ctx, req, args)
-	case "commit":
-		return s.handleCommit(ctx, req, args)
-	case "status":
-		return wrapStale(s.handleStatus(ctx, req, args))
-	case "conflicts":
-		return wrapStale(s.handleConflicts(ctx, req, args))
-	case "resolve":
-		return s.handleResolve(ctx, req, args)
-	case "merge-abort":
-		return s.handleMergeAbort(ctx, req, args)
-	case "diff-defs":
-		return wrapStale(s.handleDiffDefs(ctx, req, args))
 	case "emit":
 		return s.handleEmit(ctx, req, args)
 	case "gc":
@@ -1601,22 +1579,17 @@ func (s *server) autoResolveFile(sourceFile, modulePath string) {
 	}
 }
 
-// autoCommit commits the working set with an auto-generated message.
-// This keeps Dolt's working set small so chunk accumulation doesn't
-// cause storage bloat. No-op if nothing changed. Runs GC every 10
-// auto-commits to compact the noms store. A separate time-based
-// ticker (see startGCTicker) covers serves that don't hit 10 commits.
-//
-// Returns the commit error so callers can fail loudly when a write
-// can't be persisted (e.g. "database is read only" after GC). Earlier
-// versions swallowed this and left writes silently dropped.
+// autoCommit is a no-op checkpoint that keeps the storage compact.
+// Under SQLite writes persist on tx commit — there's no working-set-to-
+// branch step like Dolt had. The GC hook (WAL checkpoint) still fires
+// every 10 calls; the time-based ticker (startGCTicker) covers serves
+// that don't hit 10 within the tick window.
 func (s *server) autoCommit() error {
-	err := s.dolt.Commit("auto-sync")
 	s.backend.CleanTempFiles()
 	if n := s.autoCommitCount.Add(1); n%10 == 0 {
 		go s.backend.GC() // background — GC can be slow on large databases
 	}
-	return err
+	return nil
 }
 
 // startGCTicker fires a background GC every gcInterval. Counter-based

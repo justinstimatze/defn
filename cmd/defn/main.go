@@ -137,30 +137,6 @@ func main() {
 		cmdStatus(jsonFlag)
 	case "check":
 		cmdCheck()
-	case "branch":
-		cmdBranch(os.Args[2:])
-	case "checkout":
-		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: defn checkout <branch>")
-			os.Exit(1)
-		}
-		cmdCheckout(os.Args[2])
-	case "merge":
-		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: defn merge <branch>")
-			os.Exit(1)
-		}
-		cmdMerge(os.Args[2])
-	case "commit":
-		msg := "snapshot"
-		if len(os.Args) >= 3 {
-			msg = os.Args[2]
-		}
-		cmdCommit(msg)
-	case "diff":
-		cmdDiff()
-	case "log":
-		cmdLog()
 	case "watch":
 		dir := "."
 		if len(os.Args) >= 3 {
@@ -173,20 +149,6 @@ func main() {
 			os.Exit(1)
 		}
 		cmdQuery(os.Args[2])
-	case "worktree":
-		cmdWorktree(os.Args[2:])
-	case "push":
-		if len(os.Args) < 4 {
-			fmt.Fprintln(os.Stderr, "usage: defn push <remote> <branch>")
-			os.Exit(1)
-		}
-		cmdPush(os.Args[2], os.Args[3])
-	case "pull":
-		if len(os.Args) < 4 {
-			fmt.Fprintln(os.Stderr, "usage: defn pull <remote> <branch>")
-			os.Exit(1)
-		}
-		cmdPull(os.Args[2], os.Args[3])
 	case "gc":
 		cmdGC()
 	case "restart":
@@ -221,23 +183,14 @@ Usage:
   defn lint                    Lint with diagnostics → definitions
   defn status                  Current branch + stats
   defn check                   Consistency diagnostics (defs by kind, orphan literal types)
-  defn branch [name]           List or create branches
-  defn checkout <branch>       Switch branch
-  defn merge <branch>          Merge a branch (Dolt 3-way merge)
-  defn commit <message>        Dolt commit
-  defn diff                    Show uncommitted changes
-  defn log                     Commit history
   defn query <sql>             Read-only SQL query
-  defn gc                      Compact Dolt storage (garbage collection)
+  defn gc                      Compact storage
   defn restart [--all]         Gracefully bounce this project's serve (or all)
   defn measure-rename [--in-place] <old> <new>    Time a rename against .defn without spinning up serve
   defn measure-edit   [--in-place] <name> <body-file>  Time an edit; body-file keeps multi-line source shell-safe
                                --in-place pre-populates scratch with one full emit before timing so
                                file-scoped emit + package-scoped build actually apply (real interactive
-                               cost); without it, fresh-tempdir mode gives the un-optimized ceiling number.
-  defn worktree <branch>       Clone DB on a branch (for multi-agent)
-  defn push <remote> <branch>  Push branch to remote
-  defn pull <remote> <branch>  Pull from remote`)
+                               cost); without it, fresh-tempdir mode gives the un-optimized ceiling number.`)
 }
 
 // extractInPlaceFlag pops --in-place out of argv (if present) and

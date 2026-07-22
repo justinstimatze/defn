@@ -515,13 +515,7 @@ func cmdInit(modulePath string) {
 		fatal(err)
 	}
 
-	if err := db.Commit("initial ingest"); err != nil {
-		fatal(err)
-	}
-
-	// Compact the noms store. A fresh ingest writes ~200 MB of journal
-	// chunks that GC folds into a ~1.5 MB packed file. Costs <1s; skip
-	// for DSN-backed DBs since the server manages its own GC.
+	// Compact storage after a fresh ingest.
 	compactEmbedded(db, dbPath)
 
 	mods, _ := db.ListModules()
@@ -784,9 +778,6 @@ func cmdIngest(modulePath string, serverMode bool) {
 		fatal(err)
 	}
 
-	if err := db.Commit("reingest"); err != nil {
-		fatal(err)
-	}
 	compactEmbedded(db, dbPath)
 
 	fmt.Fprintf(os.Stderr, "done. root hash: %s\n", hash[:16])
@@ -995,10 +986,6 @@ func cmdSync(file string) {
 	}
 	phase("resolve-file (packages.Load)", t)
 	t = time.Now()
-	if err := db.Commit("sync " + file); err != nil {
-		fatal(err)
-	}
-	phase("dolt-commit", t)
 	fmt.Fprintf(os.Stderr, "synced %s: %d definitions updated\n", file, n)
 }
 
@@ -1220,9 +1207,6 @@ func cmdRepair(modulePath string) {
 		fatal(fmt.Errorf("compute root hash: %w", err))
 	}
 
-	if err := db.Commit("repair (reingest)"); err != nil {
-		fatal(err)
-	}
 	compactEmbedded(db, filepath.Join(absModulePath, ".defn"))
 
 	fmt.Fprintf(os.Stderr, "done. %d modules, %d definitions, root hash: %s\n",
@@ -2134,12 +2118,6 @@ func applyIncrementalIngest(db *store.DB, projectDir, dbPath string, stale, adde
 		return false
 	}
 	bumpIncrementalCounter(db)
-	if err := db.Commit("incremental ingest"); err != nil {
-		fmt.Fprintf(os.Stderr, "commit failed: %v — falling back to full ingest\n", err)
-		return false
-	}
-	phase("dolt-commit", t)
-	t = time.Now()
 	maybeCompactAfterIncremental(db, dbPath)
 	phase("maybe-compact", t)
 	fmt.Fprintf(os.Stderr, "done in %s (%d file(s), %d package(s)).\n",
@@ -2261,148 +2239,6 @@ func announceStaleIngest(db *store.DB, projectDir string) {
 	}
 }
 
-func cmdWorktree(args []string) {
-	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: defn worktree <branch> [<path>]")
-		fmt.Fprintln(os.Stderr, "  creates a worktree (new file tree) pinned to <branch> on the defn server.")
-		fmt.Fprintln(os.Stderr, "  default path is ../<cwd-basename>-<branch>")
-		os.Exit(1)
-	}
-	branchName := args[0]
-
-	srcPath := getDBPath()
-	isServer := strings.Contains(srcPath, "@")
-	if !isServer {
-		fatal(fmt.Errorf("worktree requires server mode — run 'defn init . --server' first"))
-	}
-
-	cwd, err := os.Getwd()
-	if err != nil {
-		fatal(err)
-	}
-	var wtPath string
-	if len(args) >= 2 {
-		wtPath = args[1]
-		if !filepath.IsAbs(wtPath) {
-			wtPath = filepath.Join(cwd, wtPath)
-		}
-	} else {
-		wtPath = filepath.Join(filepath.Dir(cwd), filepath.Base(cwd)+"-"+branchName)
-	}
-	if _, err := os.Stat(wtPath); err == nil {
-		fatal(fmt.Errorf("worktree path %s already exists", wtPath))
-	}
-
-	// Create branch on server if it doesn't already exist.
-	db, err := store.Open(srcPath)
-	if err != nil {
-		fatal(err)
-	}
-	branches, _ := db.ListBranches()
-	exists := false
-	for _, b := range branches {
-		if b == branchName {
-			exists = true
-			break
-		}
-	}
-	if !exists {
-		if err := db.Branch(branchName); err != nil {
-			db.Close()
-			fatal(fmt.Errorf("create branch: %w", err))
-		}
-		fmt.Fprintf(os.Stderr, "created branch %s\n", branchName)
-	}
-	db.Close()
-
-	// Re-open with the branch pinned so emit sees the branch's state.
-	_ = os.Setenv("DEFN_BRANCH", branchName)
-	db2, err := store.Open(srcPath)
-	if err != nil {
-		fatal(fmt.Errorf("reopen pinned to %s: %w", branchName, err))
-	}
-	defer db2.Close()
-
-	if err := os.MkdirAll(wtPath, 0755); err != nil {
-		fatal(fmt.Errorf("create worktree dir: %w", err))
-	}
-	fmt.Fprintf(os.Stderr, "emitting branch %s to %s...\n", branchName, wtPath)
-	if err := emit.Emit(db2, wtPath); err != nil {
-		fatal(err)
-	}
-
-	marker := struct {
-		DSN    string `json:"dsn"`
-		Branch string `json:"branch"`
-	}{DSN: srcPath, Branch: branchName}
-	data, _ := json.MarshalIndent(marker, "", "  ")
-	if err := os.WriteFile(filepath.Join(wtPath, ".defn-worktree.json"), data, 0644); err != nil {
-		fatal(fmt.Errorf("write worktree marker: %w", err))
-	}
-
-	fmt.Fprintf(os.Stderr, "worktree ready at %s (branch %s)\n", wtPath, branchName)
-	fmt.Fprintf(os.Stderr, "  cd %s && defn serve\n", wtPath)
-}
-
-func cmdPush(remote, branch string) {
-	db, err := store.Open(getDBPath())
-	if err != nil {
-		fatal(err)
-	}
-	defer db.Close()
-
-	if err := db.Push(remote, branch); err != nil {
-		fatal(fmt.Errorf("push: %w", err))
-	}
-	fmt.Fprintf(os.Stderr, "pushed %s to %s\n", branch, remote)
-}
-
-func cmdPull(remote, branch string) {
-	db, err := store.Open(getDBPath())
-	if err != nil {
-		fatal(err)
-	}
-	defer db.Close()
-
-	if err := db.Pull(remote, branch); err != nil {
-		fatal(fmt.Errorf("pull: %w", err))
-	}
-	fmt.Fprintf(os.Stderr, "pulled %s from %s\n", branch, remote)
-}
-
-func cmdCommit(message string) {
-	db, err := store.Open(getDBPath())
-	if err != nil {
-		fatal(err)
-	}
-	defer db.Close()
-
-	if err := db.Commit(message); err != nil {
-		fatal(err)
-	}
-	fmt.Fprintln(os.Stderr, "committed.")
-}
-
-func cmdDiff() {
-	db, err := store.Open(getDBPath())
-	if err != nil {
-		fatal(err)
-	}
-	defer db.Close()
-
-	status, err := db.Diff()
-	if err != nil {
-		fatal(err)
-	}
-	if len(status) == 0 {
-		fmt.Fprintln(os.Stderr, "no changes.")
-		return
-	}
-	for _, s := range status {
-		fmt.Printf("  %s  %s\n", s["status"], s["table"])
-	}
-}
-
 // cmdCheck runs consistency diagnostics against the ingested database.
 // Surfaces counts by kind (so you can tell at a glance if an entire
 // category like 'var' wasn't ingested) and orphaned literal-field
@@ -2486,7 +2322,6 @@ type versionSkewInfo struct {
 
 type databaseInfo struct {
 	Path        string `json:"path"`
-	Branch      string `json:"branch"`
 	Modules     int    `json:"modules"`
 	Definitions int    `json:"definitions"`
 }
@@ -2548,11 +2383,10 @@ func collectStatus(dbPath string) statusReport {
 	}
 	defer db.Close()
 
-	branch, _ := db.GetCurrentBranch()
 	mods, _ := db.ListModules()
 	defs, _ := db.FindDefinitions("%")
 	r.Database = &databaseInfo{
-		Path: dbPath, Branch: branch,
+		Path:    dbPath,
 		Modules: len(mods), Definitions: len(defs),
 	}
 
@@ -2598,7 +2432,6 @@ func printStatus(r statusReport) {
 		return
 	}
 
-	fmt.Printf("On branch %s\n", r.Database.Branch)
 	fmt.Printf("Database: %s\n", r.Database.Path)
 	fmt.Printf("%d modules, %d definitions\n", r.Database.Modules, r.Database.Definitions)
 	fmt.Fprintln(os.Stderr)
@@ -2616,86 +2449,6 @@ func printStatus(r statusReport) {
 		fmt.Fprintf(os.Stderr, "Database may be stale: %d files modified since last ingest (e.g. %s)\n",
 			r.Freshness.StaleCount, r.Freshness.Sample)
 		fmt.Fprintln(os.Stderr, "  run: defn ingest .")
-	}
-}
-
-func cmdBranch(args []string) {
-	db, err := store.Open(getDBPath())
-	if err != nil {
-		fatal(err)
-	}
-	defer db.Close()
-
-	if len(args) == 0 {
-		current, _ := db.GetCurrentBranch()
-		branches, err := db.ListBranches()
-		if err != nil {
-			fatal(err)
-		}
-		for _, name := range branches {
-			marker := "  "
-			if name == current {
-				marker = "* "
-			}
-			fmt.Printf("%s%s\n", marker, name)
-		}
-		return
-	}
-
-	// Create a branch.
-	if err := db.Branch(args[0]); err != nil {
-		fatal(err)
-	}
-	fmt.Fprintf(os.Stderr, "created branch %s\n", args[0])
-}
-
-func cmdCheckout(branchName string) {
-	db, err := store.Open(getDBPath())
-	if err != nil {
-		fatal(err)
-	}
-	defer db.Close()
-
-	if err := db.Checkout(branchName); err != nil {
-		fatal(err)
-	}
-	fmt.Fprintf(os.Stderr, "switched to branch %s\n", branchName)
-}
-
-func cmdMerge(branchName string) {
-	db, err := store.Open(getDBPath())
-	if err != nil {
-		fatal(err)
-	}
-	defer db.Close()
-
-	if err := db.Merge(branchName); err != nil {
-		fatal(err)
-	}
-	fmt.Fprintf(os.Stderr, "merged %s\n", branchName)
-}
-
-func cmdLog() {
-	db, err := store.Open(getDBPath())
-	if err != nil {
-		fatal(err)
-	}
-	defer db.Close()
-
-	entries, err := db.Log(20)
-	if err != nil {
-		fatal(err)
-	}
-	if len(entries) == 0 {
-		fmt.Fprintln(os.Stderr, "no commits.")
-		return
-	}
-	for _, e := range entries {
-		hash := fmt.Sprint(e["hash"])
-		if len(hash) > 12 {
-			hash = hash[:12]
-		}
-		fmt.Printf("%s  %s  %s\n", hash, e["date"], e["message"])
 	}
 }
 
@@ -2886,7 +2639,6 @@ func cmdWatch(modulePath string) {
 				} else if err := resolve.ResolvePackages(db, pkgs, absPath); err != nil {
 					fmt.Fprintf(os.Stderr, "  resolve error: %v\n", err)
 				} else {
-					db.Commit("auto-ingest")
 					fmt.Fprintf(os.Stderr, "  done.\n")
 				}
 				db.Close()
