@@ -1231,12 +1231,10 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	} else {
 		// Search names/signatures first (indexed, fast).
 		defs, err = s.backend.FindDefinitions("%" + args.Pattern + "%")
-		// `_` is SQL LIKE's single-char wildcard; under the SQLite backend
-		// SearchDefinitions is LIKE-based on bodies, so an underscore
-		// query would silently glob to unrelated defs. Skip the doc/body
-		// fallback in that case — matches the stage-3 guard below.
-		if (err != nil || len(defs) == 0) && !strings.Contains(args.Pattern, "_") {
-			// Fall back to body/doc search (LIKE scan, slower).
+		if err != nil || len(defs) == 0 {
+			// Fall back to body/doc search. Uses trigram FTS5 under
+			// SQLite (task #137) which treats `_` as content, so no
+			// underscore-guard needed anymore.
 			defs, err = s.backend.SearchDefinitions(args.Pattern)
 		}
 	}
@@ -1249,15 +1247,12 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		limit = args.Limit
 	}
 
-	// Stage 3: substring body-scan. Model reaches here when name-LIKE
-	// found nothing and FTS was word-tokenized past the actual query
-	// (camelCase substrings, stopwords, short tokens). Grep-parity move:
-	// return def-scoped snippets so results are self-locating. When the
-	// pattern arrived as an explicit LIKE glob (%JobsURL%), strip the
-	// wildcards for body-scan — the wildcards make sense for name-LIKE
-	// but block substring search from ever running. `_` is a name-only
-	// wildcard we don't try to substitute; skip stage-3 in that case.
-	if len(defs) == 0 && args.Pattern != "" && !strings.Contains(args.Pattern, "_") {
+	// Stage 3: substring body-scan with def-scoped snippets. Reached
+	// when name-LIKE + FTS body match both produced nothing. Trigram
+	// FTS5 already substring-matches on bodies (task #137), so this
+	// path is rarely hit — mostly useful when the caller supplied a
+	// LIKE glob (%JobsURL%) that FTS wouldn't parse as a phrase.
+	if len(defs) == 0 && args.Pattern != "" {
 		scanPattern := strings.Trim(args.Pattern, "%")
 		if scanPattern != "" && !strings.Contains(scanPattern, "%") {
 			return s.bodyScanResult(scanPattern, limit)

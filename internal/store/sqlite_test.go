@@ -133,3 +133,160 @@ func TestSQLiteSmoke(t *testing.T) {
 		t.Errorf("Simulate: expected ErrNotImplemented, got %v", err)
 	}
 }
+
+// TestSearchDefinitions_FTS5Trigram locks in the tokenizer contract for
+// task #137: camelCase / snake_case / dotted-path / substring queries all
+// match, and a subsequent body edit is reflected via the sync triggers.
+// Regression guard for the underscore-guard hack we removed from
+// handleSearch — trigram FTS handles `_` as content, not a wildcard.
+func TestSearchDefinitions_FTS5Trigram(t *testing.T) {
+	dir := t.TempDir()
+	db, err := OpenSQLite(filepath.Join(dir, "defn.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	mod, err := db.EnsureModule("example.com/pkg", "pkg", "")
+	if err != nil {
+		t.Fatalf("EnsureModule: %v", err)
+	}
+
+	// Seed a small def set that exercises Go's naming idioms.
+	seed := []struct {
+		name, body string
+	}{
+		{"handleEdit", "func handleEdit() { doStuff() }"},
+		{"handle_snake", "func handle_snake() { snakeStuff() }"},
+		{"PkgMethod", "// pkg.Method dispatches\nfunc PkgMethod() error { return nil }"},
+		{"Authenticate", "// authentication handler for the API\nfunc Authenticate() {}"},
+		{"CamelCaseIdentifier", "func CamelCaseIdentifier() {}"},
+	}
+	for _, s := range seed {
+		d := &Definition{
+			ModuleID: mod.ID, Name: s.name, Kind: "function",
+			Exported: true, Body: s.body, Hash: HashBody(s.body),
+		}
+		if _, err := db.UpsertDefinition(d); err != nil {
+			t.Fatalf("UpsertDefinition %s: %v", s.name, err)
+		}
+	}
+
+	cases := []struct {
+		query   string
+		wantHit string // one name we expect in the result set
+	}{
+		{"handleEdit", "handleEdit"},        // full identifier
+		{"handle", "handleEdit"},            // camelCase prefix (unicode61 misses this)
+		{"Edit", "handleEdit"},              // camelCase suffix
+		{"handle_snake", "handle_snake"},    // underscore literal (Chunk C bug)
+		{"snake", "handle_snake"},           // substring across snake_case
+		{"pkg.Method", "PkgMethod"},         // dotted path in doc comment
+		{"authentication", "Authenticate"},  // doc comment substring
+		{"CamelCase", "CamelCaseIdentifier"}, // camelCase middle
+	}
+	for _, tc := range cases {
+		defs, err := db.SearchDefinitions(tc.query)
+		if err != nil {
+			t.Errorf("SearchDefinitions(%q): %v", tc.query, err)
+			continue
+		}
+		found := false
+		names := make([]string, len(defs))
+		for i, d := range defs {
+			names[i] = d.Name
+			if d.Name == tc.wantHit {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("SearchDefinitions(%q): want hit %q, got %v", tc.query, tc.wantHit, names)
+		}
+	}
+
+	// Body update propagates through the FTS trigger: an edit that adds
+	// a distinctive token should be searchable immediately.
+	target, err := db.GetDefinitionByName("handleEdit", "example.com/pkg")
+	if err != nil || target == nil {
+		t.Fatalf("lookup handleEdit: %v (nil=%v)", err, target == nil)
+	}
+	target.Body = "func handleEdit() { veryDistinctiveMarker() }"
+	target.Hash = HashBody(target.Body)
+	if _, err := db.UpsertDefinition(target); err != nil {
+		t.Fatalf("update handleEdit body: %v", err)
+	}
+	defs, err := db.SearchDefinitions("veryDistinctiveMarker")
+	if err != nil {
+		t.Fatalf("SearchDefinitions veryDistinctiveMarker: %v", err)
+	}
+	if len(defs) == 0 {
+		t.Error("body update did not propagate through FTS trigger (search for new token returned 0)")
+	}
+
+	// Sub-trigram query (2 chars) must not error — falls back to LIKE.
+	if _, err := db.SearchDefinitions("Ed"); err != nil {
+		t.Errorf("short-query LIKE fallback errored: %v", err)
+	}
+}
+
+// TestSearchDefinitions_FTSBackfill covers the migration path: a DB
+// populated BEFORE the FTS triggers existed must have its FTS index
+// backfilled on the next OpenSQLite. Guards against silent search-
+// misses on upgrade.
+func TestSearchDefinitions_FTSBackfill(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "defn.db")
+
+	// First open: create schema, seed defs, close.
+	db, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	mod, err := db.EnsureModule("example.com/mig", "mig", "")
+	if err != nil {
+		t.Fatalf("EnsureModule: %v", err)
+	}
+	d := &Definition{
+		ModuleID: mod.ID, Name: "Preexisting", Kind: "function",
+		Exported: true, Body: "func Preexisting() { backfillMarker() }",
+	}
+	d.Hash = HashBody(d.Body)
+	if _, err := db.UpsertDefinition(d); err != nil {
+		t.Fatalf("UpsertDefinition: %v", err)
+	}
+
+	// Sanity: search works on first open (trigger fired).
+	defs, err := db.SearchDefinitions("backfillMarker")
+	if err != nil || len(defs) == 0 {
+		t.Fatalf("first-open search: err=%v defs=%d", err, len(defs))
+	}
+	_ = db.Close()
+
+	// Simulate an "old DB" state by wiping the FTS tables directly
+	// (bypassing triggers). Re-opening should backfill.
+	dbRaw, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("re-open: %v", err)
+	}
+	if _, err := dbRaw.db.Exec("DELETE FROM bodies_fts"); err != nil {
+		t.Fatalf("wipe bodies_fts: %v", err)
+	}
+	if _, err := dbRaw.db.Exec("DELETE FROM definitions_fts"); err != nil {
+		t.Fatalf("wipe definitions_fts: %v", err)
+	}
+	_ = dbRaw.Close()
+
+	// Third open: backfill should repopulate bodies_fts from bodies.
+	db2, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("third open (after wipe): %v", err)
+	}
+	defer db2.Close()
+	defs, err = db2.SearchDefinitions("backfillMarker")
+	if err != nil {
+		t.Fatalf("post-backfill search: %v", err)
+	}
+	if len(defs) == 0 {
+		t.Error("backfill did not populate FTS (search for existing body returned 0)")
+	}
+}

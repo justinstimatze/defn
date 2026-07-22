@@ -9,7 +9,9 @@
 // modernc.org/sqlite returns plain strings for TEXT columns — no textCol
 // wrapper needed (that's a Dolt-only concern; see textcol_audit_test.go).
 //
-// FTS5 SearchDefinitions is deferred to task #137. Phase 1 uses LIKE.
+// FTS5 SearchDefinitions uses a trigram tokenizer over bodies.body and
+// definitions.doc. See schema_sqlite.sql for the rationale (camelCase +
+// snake_case + dotted paths all indexed as substrings).
 
 package store
 
@@ -89,7 +91,47 @@ func OpenSQLite(path string) (*SQLiteDB, error) {
 		return nil, fmt.Errorf("sqlite: apply schema: %w", err)
 	}
 
+	// Backfill FTS if this is an existing DB predating the FTS5 addition
+	// (task #137). The CREATE VIRTUAL TABLE IF NOT EXISTS runs above but
+	// doesn't populate — triggers only fire on future writes. If the
+	// source tables have rows and the FTS table is empty, seed it.
+	if err := backfillFTS(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("sqlite: backfill fts: %w", err)
+	}
+
 	return &SQLiteDB{db: db, path: path}, nil
+}
+
+func backfillFTS(db *sql.DB) error {
+	ctx := context.Background()
+	pairs := []struct {
+		ftsTable, srcTable, srcRowid, srcCol, col string
+	}{
+		{"bodies_fts", "bodies", "def_id", "body", "body"},
+		{"definitions_fts", "definitions", "id", "COALESCE(doc,'')", "doc"},
+	}
+	for _, p := range pairs {
+		var ftsN, srcN int64
+		if err := db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s", p.ftsTable)).Scan(&ftsN); err != nil {
+			return fmt.Errorf("count %s: %w", p.ftsTable, err)
+		}
+		if ftsN > 0 {
+			continue
+		}
+		if err := db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s", p.srcTable)).Scan(&srcN); err != nil {
+			return fmt.Errorf("count %s: %w", p.srcTable, err)
+		}
+		if srcN == 0 {
+			continue
+		}
+		sql := fmt.Sprintf("INSERT INTO %s(rowid, %s) SELECT %s, %s FROM %s",
+			p.ftsTable, p.col, p.srcRowid, p.srcCol, p.srcTable)
+		if _, err := db.ExecContext(ctx, sql); err != nil {
+			return fmt.Errorf("backfill %s (%d rows): %w", p.ftsTable, srcN, err)
+		}
+	}
+	return nil
 }
 
 // --- Lifecycle ---
@@ -474,11 +516,55 @@ func (s *SQLiteDB) CountDefinitions() (int, error) {
 	return n, nil
 }
 
-// SearchDefinitions is LIKE-based for Phase 1. FTS5 is task #137.
+// SearchDefinitions runs a trigram FTS5 MATCH over both bodies_fts.body
+// and definitions_fts.doc, unioned by definition id and ranked by bm25.
+// Trigram tokenization makes `handleEdit`, `handle_edit`, `pkg.Method`,
+// and `authentication` all substring-searchable — including winze's
+// underscore case that the LIKE-based Phase 1 impl broke.
 func (s *SQLiteDB) SearchDefinitions(query string) ([]Definition, error) {
 	if query == "" {
 		return nil, nil
 	}
+	// FTS5 MATCH treats certain characters (space, ", parentheses, ':')
+	// as query syntax. For a substring-of-identifier search we want the
+	// raw needle to be interpreted literally; wrap in double quotes and
+	// escape embedded ones. Trigram requires the phrase to be ≥3 chars;
+	// shorter needles fall back to LIKE.
+	needle := strings.TrimSpace(query)
+	if len(needle) < 3 {
+		return s.searchDefinitionsLike(query)
+	}
+	phrase := `"` + strings.ReplaceAll(needle, `"`, `""`) + `"`
+	rows, err := s.db.QueryContext(s.Ctx(), `
+		WITH matched AS (
+		  SELECT rowid AS def_id, MIN(rank) AS rank FROM (
+		    SELECT rowid, bm25(bodies_fts) AS rank FROM bodies_fts WHERE bodies_fts MATCH ?
+		    UNION ALL
+		    SELECT rowid, bm25(definitions_fts) AS rank FROM definitions_fts WHERE definitions_fts MATCH ?
+		  )
+		  GROUP BY rowid
+		)
+		SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
+		       COALESCE(d.signature,''), '', COALESCE(d.doc,''),
+		       COALESCE(d.start_line,0), COALESCE(d.end_line,0),
+		       COALESCE(d.source_file,''), d.hash
+		FROM matched m
+		JOIN definitions d ON d.id = m.def_id
+		ORDER BY m.rank ASC
+		LIMIT 100`, phrase, phrase)
+	if err != nil {
+		// FTS MATCH can error on rare query shapes even after quoting
+		// (odd Unicode, punctuation-only). Fall back to LIKE rather
+		// than surface a scary error to the caller.
+		return s.searchDefinitionsLike(query)
+	}
+	defer rows.Close()
+	return scanSQLiteDefinitions(rows)
+}
+
+// searchDefinitionsLike is the pre-FTS fallback, kept for <3-char needles
+// (trigram tokenizer requires ≥3 chars) and rare FTS MATCH errors.
+func (s *SQLiteDB) searchDefinitionsLike(query string) ([]Definition, error) {
 	like := "%" + query + "%"
 	rows, err := s.db.QueryContext(s.Ctx(),
 		`SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),

@@ -107,11 +107,48 @@ CREATE INDEX IF NOT EXISTS idx_def_exported ON definitions(name, module_id);
 CREATE INDEX IF NOT EXISTS idx_def_location ON definitions(module_id, start_line, end_line);
 CREATE INDEX IF NOT EXISTS idx_def_source_file ON definitions(source_file);
 
--- FTS5 virtual tables are deferred to task #137 (tokenizer quality on
--- Go-source strings). Phase 1 uses LIKE-based SearchDefinitions instead.
--- When FTS5 lands, add external-content virtual tables + AFTER
--- INSERT/UPDATE/DELETE triggers on definitions/bodies/comments/
--- literal_fields to keep the FTS index in sync.
+-- FTS5 with trigram tokenizer: substring-friendly matching over doc + body.
+-- Trigram is the right pick for Go source: it collapses camelCase, snake_case,
+-- and dotted paths into a single substring index (unicode61's word tokens
+-- miss camelCase entirely — `handleEdit` becomes one token, not searchable
+-- by "handle" or "edit"). Trigram also matches Dolt-era winze behavior on
+-- `_` (treats it as content, not a wildcard — kills the underscore-guard
+-- workaround in handleSearch stage-2).
+--
+-- Storage overhead: ~1-2x the indexed text. For defn-self (~4MB) that adds
+-- maybe 2MB; for winze's ~1GB monolith that's ~1GB. Acceptable to start;
+-- swap to content='' external-content if needed.
+CREATE VIRTUAL TABLE IF NOT EXISTS bodies_fts USING fts5(
+    body,
+    tokenize='trigram'
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS definitions_fts USING fts5(
+    doc,
+    tokenize='trigram'
+);
+
+-- Sync triggers: keep the FTS index in lockstep with source tables.
+-- bodies.def_id and definitions.id are the FTS rowid — same integer used
+-- as the join key in SearchDefinitions.
+CREATE TRIGGER IF NOT EXISTS bodies_ai AFTER INSERT ON bodies BEGIN
+    INSERT INTO bodies_fts(rowid, body) VALUES (new.def_id, new.body);
+END;
+CREATE TRIGGER IF NOT EXISTS bodies_ad AFTER DELETE ON bodies BEGIN
+    DELETE FROM bodies_fts WHERE rowid = old.def_id;
+END;
+CREATE TRIGGER IF NOT EXISTS bodies_au AFTER UPDATE ON bodies BEGIN
+    UPDATE bodies_fts SET body = new.body WHERE rowid = new.def_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS definitions_ai AFTER INSERT ON definitions BEGIN
+    INSERT INTO definitions_fts(rowid, doc) VALUES (new.id, COALESCE(new.doc, ''));
+END;
+CREATE TRIGGER IF NOT EXISTS definitions_ad AFTER DELETE ON definitions BEGIN
+    DELETE FROM definitions_fts WHERE rowid = old.id;
+END;
+CREATE TRIGGER IF NOT EXISTS definitions_au AFTER UPDATE OF doc ON definitions BEGIN
+    UPDATE definitions_fts SET doc = COALESCE(new.doc, '') WHERE rowid = new.id;
+END;
 
 CREATE TABLE IF NOT EXISTS comments (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
