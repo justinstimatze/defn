@@ -2666,6 +2666,15 @@ func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolR
 	}
 	updated := 0
 	var affectedNames []string
+	// #109 pass 2: collect the (file, modulePath) tuples we touched so
+	// we can scope the post-op resolve. Retarget only changes composite
+	// literal string values → refs graph is unaffected; only literal_fields
+	// need re-derivation for the touched defs. autoResolveFile per unique
+	// (file, module) tuple gives us that without a full-project ResolveModule.
+	type filePkg struct {
+		file, module string
+	}
+	touched := make(map[filePkg]bool)
 	for _, m := range mods {
 		defs, err := s.db.GetModuleDefinitions(m.ID)
 		if err != nil {
@@ -2682,6 +2691,9 @@ func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolR
 				return errResult(fmt.Errorf("update %s: %w", d.Name, err))
 			}
 			updated++
+			if d.SourceFile != "" {
+				touched[filePkg{d.SourceFile, m.Path}] = true
+			}
 			if len(affectedNames) < 10 {
 				affectedNames = append(affectedNames, formatReceiver(d.Receiver)+d.Name)
 			}
@@ -2689,7 +2701,17 @@ func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolR
 	}
 
 	buildResult := s.autoEmitAndBuildWithOpts(emit.Opts{})
-	s.autoResolve("")
+	// Scoped resolve: iterate the unique touched files instead of the
+	// whole project. Safety valve: if we couldn't collect any touched
+	// files (e.g., every def had empty SourceFile — shouldn't happen),
+	// fall back to full autoResolve for correctness.
+	if len(touched) == 0 {
+		s.autoResolve("")
+	} else {
+		for fp := range touched {
+			s.autoResolveFile(fp.file, fp.module)
+		}
+	}
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Retargeted %s.%s: %q → %q in %d def(s).\n",
@@ -2838,7 +2860,22 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		qualified = strings.TrimPrefix(d.Receiver, "*") + "." + d.Name
 	}
 	buildResult := s.autoEmitAndBuildWithOpts(emit.Opts{AllowedRemovals: []string{qualified}})
-	s.autoResolve("") // full resolve — deletion may affect other modules' references
+	// #109 pass 2 (winze op-classification): skip autoResolve on delete.
+	// DeleteDefinition already dropped every refs row where from_def=D
+	// OR to_def=D (store.go:201), so both the def's own outgoing edges
+	// and every caller's edge INTO D are gone. Caller bodies still name
+	// D textually, but a full re-resolve would just walk those bodies,
+	// fail to find D in the DB, and skip — no ref changes. Skipping
+	// autoResolve removes the full-project ResolveModule walk on every
+	// delete. Same autocommit + IDF-invalidate as the rename skip path.
+	// force:true delete still applies (safe-delete's caller check gates
+	// unforced deletes at zero-callers anyway).
+	if err := s.autoCommit(); err != nil {
+		fmt.Fprintf(os.Stderr, "defn: auto-commit failed (post-delete): %v\n", err)
+	}
+	if s.idf != nil {
+		s.idf.Invalidate()
+	}
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Deleted %s%s (id=%d)\n", recv, d.Name, d.ID))
