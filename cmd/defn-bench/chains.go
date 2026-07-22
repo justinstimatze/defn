@@ -131,6 +131,416 @@ func RunB(x int) int {
 			"caller_b.go": {`ProcessData(i)`},
 		},
 	},
+	// #71/#75: winze-shape refactor. Retarget a field value across
+	// composite literals scattered across files. defn ships this as
+	// op:retarget-field-value (one atomic call); files-mode has to
+	// grep, then careful-substitute across every match.
+	{
+		name: "retarget-field-across-composites",
+		fixtures: []chainFixture{
+			{
+				path: "types.go",
+				content: `package fixture
+
+type Claim struct {
+	Subject string
+	Verb    string
+	Object  string
+}
+`,
+			},
+			{
+				path: "claims_alpha.go",
+				content: `package fixture
+
+var ClaimA1 = Claim{Subject: "alice", Verb: "knows", Object: "OldTarget"}
+var ClaimA2 = Claim{Subject: "bob", Verb: "knows", Object: "OldTarget"}
+var ClaimA3 = Claim{Subject: "carol", Verb: "trusts", Object: "SomeoneElse"}
+`,
+			},
+			{
+				path: "claims_beta.go",
+				content: `package fixture
+
+var ClaimB1 = Claim{Subject: "dave", Verb: "cites", Object: "OldTarget"}
+var ClaimB2 = Claim{Subject: "eve", Verb: "refutes", Object: "OldTarget"}
+`,
+			},
+		},
+		prompt: `In this fixture, several Claim values have Object: "OldTarget". Retarget every one of those to Object: "NewTarget". Do not touch Claim values whose Object is something else (like "SomeoneElse"). Do not change Subject or Verb on any claim.`,
+		mustContain: map[string][]string{
+			"claims_alpha.go": {
+				`ClaimA1 = Claim{Subject: "alice", Verb: "knows", Object: "NewTarget"}`,
+				`ClaimA2 = Claim{Subject: "bob", Verb: "knows", Object: "NewTarget"}`,
+				`ClaimA3 = Claim{Subject: "carol", Verb: "trusts", Object: "SomeoneElse"}`,
+			},
+			"claims_beta.go": {
+				`ClaimB1 = Claim{Subject: "dave", Verb: "cites", Object: "NewTarget"}`,
+				`ClaimB2 = Claim{Subject: "eve", Verb: "refutes", Object: "NewTarget"}`,
+			},
+		},
+		mustNotContain: map[string][]string{
+			"claims_alpha.go": {`Object: "OldTarget"`},
+			"claims_beta.go":  {`Object: "OldTarget"`},
+		},
+	},
+	// #71/#75: safe-delete with orphan cleanup. Removing a def leaves
+	// dangling references — safe-delete refuses; the agent must first
+	// rewrite callers, then delete. defn: 2 ops (edit callers + delete);
+	// files: read every file that MIGHT reference it, edit each.
+	{
+		name: "safe-delete-with-orphan-fix",
+		fixtures: []chainFixture{
+			{
+				path: "helpers.go",
+				content: `package fixture
+
+// LegacyHelper is being retired.
+func LegacyHelper(s string) string {
+	return "[legacy] " + s
+}
+
+// Preferred is the new API.
+func Preferred(s string) string {
+	return "[preferred] " + s
+}
+`,
+			},
+			{
+				path: "site_a.go",
+				content: `package fixture
+
+func UseA(s string) string {
+	return LegacyHelper(s)
+}
+`,
+			},
+			{
+				path: "site_b.go",
+				content: `package fixture
+
+func UseB(s string) string {
+	return "prefix:" + LegacyHelper(s)
+}
+`,
+			},
+		},
+		prompt: `LegacyHelper is being retired. Every call site must switch to Preferred (same signature), then delete LegacyHelper itself. When you're done, LegacyHelper should no longer exist and every previous call site should now call Preferred.`,
+		mustContain: map[string][]string{
+			"site_a.go": {`Preferred(s)`},
+			"site_b.go": {`Preferred(s)`},
+		},
+		mustNotContain: map[string][]string{
+			"helpers.go": {`LegacyHelper`},
+			"site_a.go":  {`LegacyHelper`},
+			"site_b.go":  {`LegacyHelper`},
+		},
+	},
+	// #71/#75: rename a package-level var across the package. defn:
+	// op:rename does def + all callers in one shot (verified in
+	// TestHandleRename_PackageLevelVar). files-mode: N reads + N edits.
+	{
+		name: "rename-package-var",
+		fixtures: []chainFixture{
+			{
+				path: "config.go",
+				content: `package fixture
+
+const DefaultTimeoutSecs = 30
+
+var DefaultRetries = 3
+`,
+			},
+			{
+				path: "client.go",
+				content: `package fixture
+
+import "fmt"
+
+func Connect() string {
+	return fmt.Sprintf("timeout=%d retries=%d", DefaultTimeoutSecs, DefaultRetries)
+}
+`,
+			},
+			{
+				path: "worker.go",
+				content: `package fixture
+
+func Retry() int {
+	total := 0
+	for i := 0; i < DefaultRetries; i++ {
+		total += DefaultTimeoutSecs
+	}
+	return total
+}
+`,
+			},
+		},
+		prompt: `Rename the package-level var DefaultRetries to MaxAttempts across the whole package. Every reference must be updated. Do not touch DefaultTimeoutSecs — that name stays.`,
+		mustContain: map[string][]string{
+			"config.go": {`var MaxAttempts = 3`},
+			"client.go": {`MaxAttempts`, `DefaultTimeoutSecs`},
+			"worker.go": {`i < MaxAttempts`, `total += DefaultTimeoutSecs`},
+		},
+		mustNotContain: map[string][]string{
+			"config.go": {`var DefaultRetries`},
+			"client.go": {`DefaultRetries`},
+			"worker.go": {`DefaultRetries`},
+		},
+	},
+	// #71/#75: extract a magic-number pattern into a named constant
+	// across multiple call sites. Exercises exploration (find the
+	// occurrences) + write (add const + rewrite call sites).
+	{
+		name: "extract-magic-number-constant",
+		fixtures: []chainFixture{
+			{
+				path: "limits.go",
+				content: `package fixture
+
+// Existing constants live here.
+const HeaderSize = 8
+`,
+			},
+			{
+				path: "buffer.go",
+				content: `package fixture
+
+func BufferCap(items int) int {
+	return items * 1024
+}
+`,
+			},
+			{
+				path: "stream.go",
+				content: `package fixture
+
+func StreamChunks(total int) int {
+	if total < 1024 {
+		return 1
+	}
+	return total / 1024
+}
+`,
+			},
+		},
+		prompt: `The number 1024 appears in buffer.go and stream.go as a magic number for "chunk size". Extract it as a named constant ChunkSize (declared in limits.go alongside HeaderSize), then rewrite every 1024 reference in buffer.go and stream.go to use ChunkSize instead. Do NOT change HeaderSize.`,
+		mustContain: map[string][]string{
+			"limits.go": {`const HeaderSize = 8`, `ChunkSize = 1024`},
+			"buffer.go": {`items * ChunkSize`},
+			"stream.go": {`total < ChunkSize`, `total / ChunkSize`},
+		},
+		mustNotContain: map[string][]string{
+			"buffer.go": {`* 1024`},
+			"stream.go": {`< 1024`, `/ 1024`},
+		},
+	},
+	// #71/#75: move a def between packages. defn: op:move updates all
+	// import sites in one shot; files-mode has to add the new file,
+	// remove the old, and edit every importer's import block by hand.
+	{
+		name: "move-def-between-packages",
+		fixtures: []chainFixture{
+			{
+				path: "go.mod",
+				content: "module fixture\n\ngo 1.26\n",
+			},
+			{
+				path: "util/util.go",
+				content: `package util
+
+// Slugify normalizes a string for use as an identifier.
+func Slugify(s string) string {
+	out := make([]rune, 0, len(s))
+	for _, r := range s {
+		if r == ' ' {
+			out = append(out, '-')
+			continue
+		}
+		out = append(out, r)
+	}
+	return string(out)
+}
+`,
+			},
+			{
+				path: "app/handler.go",
+				content: `package app
+
+import "fixture/util"
+
+func Handle(name string) string {
+	return "app/" + util.Slugify(name)
+}
+`,
+			},
+			{
+				path: "app/router.go",
+				content: `package app
+
+import "fixture/util"
+
+func Route(path string) string {
+	return "/api/" + util.Slugify(path)
+}
+`,
+			},
+		},
+		prompt: `Move the Slugify function from the util package to the app package. After the move: (a) util/util.go should not contain Slugify anymore (delete the file if empty), (b) app package should own Slugify, (c) app/handler.go and app/router.go should call Slugify directly (same package now — no import path prefix, no util. qualifier). Do not change Slugify's behavior.`,
+		mustContain: map[string][]string{
+			"app/handler.go": {`Slugify(name)`},
+			"app/router.go":  {`Slugify(path)`},
+		},
+		mustNotContain: map[string][]string{
+			"app/handler.go": {`util.Slugify`},
+			"app/router.go":  {`util.Slugify`},
+			"util/util.go":   {`func Slugify`},
+		},
+	},
+	// #71/#75: split a monolithic function into extracted helpers.
+	// Native tools: cut-and-paste extraction; defn: op:create + op:edit
+	// as an atomic apply batch.
+	{
+		name: "split-monolithic-function",
+		fixtures: []chainFixture{
+			{
+				path: "report.go",
+				content: `package fixture
+
+import "fmt"
+
+// GenerateReport does a lot: normalizes the title, formats each row, and
+// joins the whole thing with a footer. It's grown too big; split it.
+func GenerateReport(title string, rows []string) string {
+	normalized := ""
+	for _, r := range title {
+		if r == ' ' {
+			normalized += "_"
+		} else {
+			normalized += string(r)
+		}
+	}
+
+	formatted := make([]string, 0, len(rows))
+	for i, row := range rows {
+		formatted = append(formatted, fmt.Sprintf("[%d] %s", i, row))
+	}
+
+	body := ""
+	for _, f := range formatted {
+		body += f + "\n"
+	}
+	return normalized + "\n" + body + "-- end --"
+}
+`,
+			},
+		},
+		prompt: `Split GenerateReport into three helpers in the same file: normalizeTitle(title string) string, formatRows(rows []string) []string, and joinBody(rows []string) string. Rewrite GenerateReport to just call the three helpers plus append "-- end --". Do not change external behavior (same output for the same input).`,
+		mustContain: map[string][]string{
+			"report.go": {
+				`func normalizeTitle(title string) string`,
+				`func formatRows(rows []string) []string`,
+				`func joinBody(rows []string) string`,
+				`normalizeTitle(title)`,
+				`formatRows(rows)`,
+				`joinBody(`,
+				`"-- end --"`,
+			},
+		},
+	},
+	// #71/#75: add an import + use it. defn: op:add-import (goimports-
+	// canonical) + op:edit. files-mode: careful import-block edit +
+	// body edit.
+	{
+		name: "add-import-and-use",
+		fixtures: []chainFixture{
+			{
+				path: "greet.go",
+				content: `package fixture
+
+import "fmt"
+
+func Greet(name string) string {
+	return fmt.Sprintf("hello, %s", name)
+}
+`,
+			},
+		},
+		prompt: `Update Greet so the name is normalized to lowercase before formatting. Use strings.ToLower from the standard library — that requires adding an import for "strings" (imports must stay goimports-canonical: stdlib group, alphabetized). Do not touch the fmt import.`,
+		mustContain: map[string][]string{
+			"greet.go": {
+				`"fmt"`,
+				`"strings"`,
+				`strings.ToLower(name)`,
+			},
+		},
+	},
+	// #71/#75: interface-satisfaction rename. Rename a method on the
+	// interface; every concrete implementor must rename its method too
+	// or the type stops satisfying. defn: op:rename (with receiver);
+	// files: search for interface + all types satisfying it + rename in each.
+	{
+		name: "rename-interface-method-across-impls",
+		fixtures: []chainFixture{
+			{
+				path: "iface.go",
+				content: `package fixture
+
+type Handler interface {
+	Handle(msg string) string
+}
+`,
+			},
+			{
+				path: "impl_shout.go",
+				content: `package fixture
+
+import "strings"
+
+type Shout struct{}
+
+func (s Shout) Handle(msg string) string {
+	return strings.ToUpper(msg) + "!"
+}
+`,
+			},
+			{
+				path: "impl_whisper.go",
+				content: `package fixture
+
+import "strings"
+
+type Whisper struct{}
+
+func (w Whisper) Handle(msg string) string {
+	return "(" + strings.ToLower(msg) + ")"
+}
+`,
+			},
+			{
+				path: "dispatch.go",
+				content: `package fixture
+
+func Dispatch(h Handler, msg string) string {
+	return h.Handle(msg)
+}
+`,
+			},
+		},
+		prompt: `Rename the Handler interface's method from Handle to Process. Every type that satisfies Handler (Shout, Whisper) must rename its method too so they still satisfy Handler. Every call site (Dispatch calls h.Handle) must update. Do not rename the types themselves.`,
+		mustContain: map[string][]string{
+			"iface.go":         {`Process(msg string) string`},
+			"impl_shout.go":    {`func (s Shout) Process(`},
+			"impl_whisper.go":  {`func (w Whisper) Process(`},
+			"dispatch.go":      {`h.Process(msg)`},
+		},
+		mustNotContain: map[string][]string{
+			"iface.go":        {`Handle(msg`},
+			"impl_shout.go":   {`func (s Shout) Handle(`},
+			"impl_whisper.go": {`func (w Whisper) Handle(`},
+			"dispatch.go":     {`h.Handle(`},
+		},
+	},
 }
 
 // runChainBench runs every chain case in both files-mode and defn-mode.
