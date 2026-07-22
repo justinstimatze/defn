@@ -1486,6 +1486,147 @@ func TestHandleRename(t *testing.T) {
 	}
 }
 
+// #105 winze ask #4: safe-delete refuses when references remain, unless
+// caller opts in via force:true. A KB where deletes leave dangling
+// references is worse than one where you must fix references first.
+func TestHandleDelete_SafeRefusesWhenReferenced(t *testing.T) {
+	db, projDir := setupTestDBWithVars(t)
+	defer db.Close()
+	s := &server{db: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	// OriginalClaim is referenced by Reference1 + Reference2. Delete must refuse.
+	result, _, _ := s.handleDelete(context.Background(), nil, nameParam{Name: "OriginalClaim"})
+	text := resultText(t, result)
+	if !result.IsError {
+		t.Fatalf("expected error result, got success: %s", text)
+	}
+	if !strings.Contains(text, "refused") {
+		t.Errorf("expected 'refused' in error, got %q", text)
+	}
+	if !strings.Contains(text, "Reference1") || !strings.Contains(text, "Reference2") {
+		t.Errorf("expected caller names in error, got %q", text)
+	}
+
+	// Def must still exist — refusal is atomic.
+	if _, err := db.GetDefinitionByName("OriginalClaim", ""); err != nil {
+		t.Errorf("OriginalClaim should still exist after refused delete: %v", err)
+	}
+}
+
+func TestHandleDelete_ForceBypassesSafetyCheck(t *testing.T) {
+	db, projDir := setupTestDBWithVars(t)
+	defer db.Close()
+	s := &server{db: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	// force:true — deletes even with live references. Legacy escape hatch.
+	result, _, _ := s.handleDelete(context.Background(), nil, nameParam{Name: "OriginalClaim", Force: true})
+	text := resultText(t, result)
+	if result.IsError {
+		t.Fatalf("expected success with force:true, got error: %s", text)
+	}
+	if !strings.Contains(text, "Deleted") {
+		t.Errorf("expected 'Deleted', got %q", text)
+	}
+
+	if _, err := db.GetDefinitionByName("OriginalClaim", ""); err == nil {
+		t.Error("OriginalClaim should be gone after force delete")
+	}
+}
+
+func TestHandleDelete_SucceedsWhenNoReferences(t *testing.T) {
+	db, projDir := setupTestDBWithVars(t)
+	defer db.Close()
+	s := &server{db: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	// Reference2 has no callers — safe delete without force.
+	result, _, _ := s.handleDelete(context.Background(), nil, nameParam{Name: "Reference2"})
+	text := resultText(t, result)
+	if result.IsError {
+		t.Fatalf("Reference2 has no callers — should delete without force: %s", text)
+	}
+}
+
+// #105 winze ask #4: rename op must also work on package-level vars
+// (winze is declarative Go — 838 var-decls of composite literals with
+// heavy cross-referencing). Confirms existing handleRename generalizes
+// beyond funcs before we build additional mutation ops.
+func TestHandleRename_PackageLevelVar(t *testing.T) {
+	db, projDir := setupTestDBWithVars(t)
+	defer db.Close()
+	s := &server{db: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleRename(context.Background(), nil, renameParam{
+		OldName: "OriginalClaim",
+		NewName: "RefinedClaim",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Renamed") {
+		t.Fatalf("expected 'Renamed', got: %s", text)
+	}
+
+	// The var itself renamed.
+	d, err := db.GetDefinitionByName("RefinedClaim", "")
+	if err != nil {
+		t.Fatalf("RefinedClaim not found after rename: %v", err)
+	}
+	if d.Kind != "var" {
+		t.Errorf("expected kind var, got %s", d.Kind)
+	}
+	// Every referencing var should now name RefinedClaim, not OriginalClaim.
+	for _, name := range []string{"Reference1", "Reference2"} {
+		d, err := db.GetDefinitionByName(name, "")
+		if err != nil {
+			t.Fatalf("%s not found: %v", name, err)
+		}
+		if strings.Contains(d.Body, "OriginalClaim") {
+			t.Errorf("%s still references OriginalClaim: %s", name, d.Body)
+		}
+		if !strings.Contains(d.Body, "RefinedClaim") {
+			t.Errorf("%s should reference RefinedClaim: %s", name, d.Body)
+		}
+	}
+}
+
+// setupTestDBWithVars is a winze-shape fixture: package-level vars that
+// cross-reference each other, no functions to speak of. Used by #105
+// mutation-op tests.
+func setupTestDBWithVars(t *testing.T) (*store.DB, string) {
+	t.Helper()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "claims.go"), []byte(`package main
+
+type Claim struct {
+	Subject string
+	Object  string
+}
+
+var OriginalClaim = Claim{Subject: "s", Object: "o"}
+
+var Reference1 = Claim{Subject: "one", Object: OriginalClaim.Object}
+
+var Reference2 = Claim{Subject: "two", Object: OriginalClaim.Subject}
+`), 0644)
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+	return db, projDir
+}
+
 func resultText(t *testing.T, result *sdkmcp.CallToolResult) string {
 	t.Helper()
 	if result == nil || len(result.Content) == 0 {
