@@ -68,20 +68,26 @@ func main() {
 	case "measure-rename":
 		// #109 pass 2 measurement path — winze needs a way to time
 		// rename against a live .defn without spinning up serve + MCP.
-		if len(os.Args) < 4 {
-			fmt.Fprintln(os.Stderr, "usage: defn measure-rename <old-name> <new-name>")
+		// #119 --in-place: pre-populate scratch with one full emit
+		// (untimed), then time the rename so file-scoped emit + package-
+		// scoped build (#117/#118) actually apply. Without this the
+		// tempdir starts empty, forcing full emit + full build every time
+		// and masking the optimization.
+		args, inPlace := extractInPlaceFlag(os.Args[2:])
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: defn measure-rename [--in-place] <old-name> <new-name>")
 			os.Exit(1)
 		}
-		cmdMeasureRename(os.Args[2], os.Args[3])
+		cmdMeasureRename(args[0], args[1], inPlace)
 	case "measure-edit":
-		// #115 symmetric measurement path for the edit thesis. The
-		// body-file argument keeps the CLI shell-safe (no need to
-		// escape multi-line Go source through argv).
-		if len(os.Args) < 4 {
-			fmt.Fprintln(os.Stderr, "usage: defn measure-edit <name> <body-file>")
+		// #115 symmetric measurement path for the edit thesis.
+		// #119 --in-place: same rationale as measure-rename above.
+		args, inPlace := extractInPlaceFlag(os.Args[2:])
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: defn measure-edit [--in-place] <name> <body-file>")
 			os.Exit(1)
 		}
-		cmdMeasureEdit(os.Args[2], os.Args[3])
+		cmdMeasureEdit(args[0], args[1], inPlace)
 	case "search":
 		pattern, rank, jsonFlag, limit, err := parseSearchArgs(os.Args[2:])
 		if err != nil {
@@ -227,6 +233,22 @@ Usage:
   defn worktree <branch>       Clone DB on a branch (for multi-agent)
   defn push <remote> <branch>  Push branch to remote
   defn pull <remote> <branch>  Pull from remote`)
+}
+
+// extractInPlaceFlag pops --in-place out of argv (if present) and
+// returns the remaining positional args plus a bool. Kept here so both
+// measure-rename and measure-edit share the same tiny flag parsing.
+func extractInPlaceFlag(args []string) ([]string, bool) {
+	out := args[:0]
+	inPlace := false
+	for _, a := range args {
+		if a == "--in-place" {
+			inPlace = true
+			continue
+		}
+		out = append(out, a)
+	}
+	return out, inPlace
 }
 
 // parseSearchArgs parses the argv tail for `defn search`. Returned err

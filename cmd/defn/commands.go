@@ -848,7 +848,7 @@ func compactEmbedded(db *store.DB, dbPath string) {
 // but the default is safe. Also produces measurement fidelity: real
 // MCP rename's autoEmit is a full-project emit + goimports, which we
 // still exercise; the only difference is where the bytes land.
-func cmdMeasureRename(oldName, newName string) {
+func cmdMeasureRename(oldName, newName string, inPlace bool) {
 	dbPath := getDBPath()
 	checkEmbeddedAvailable(dbPath)
 	db, err := store.Open(dbPath)
@@ -861,6 +861,7 @@ func cmdMeasureRename(oldName, newName string) {
 		fatal(fmt.Errorf("mktemp: %w", err))
 	}
 	defer os.RemoveAll(scratch)
+	prepopulate(inPlace, db, scratch, "rename")
 	elapsed, msg, err := mcpserver.MeasureRename(db, scratch, oldName, newName)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "rename failed after %s: %v\n", elapsed.Round(time.Millisecond), err)
@@ -869,7 +870,7 @@ func cmdMeasureRename(oldName, newName string) {
 		}
 		os.Exit(1)
 	}
-	fmt.Printf("rename %s → %s: %s\n", oldName, newName, elapsed.Round(time.Millisecond))
+	fmt.Printf("rename %s → %s: %s%s\n", oldName, newName, elapsed.Round(time.Millisecond), inPlaceSuffix(inPlace))
 	if msg != "" {
 		fmt.Println(msg)
 	}
@@ -880,7 +881,7 @@ func cmdMeasureRename(oldName, newName string) {
 // the same MCP handleEdit path a real client would drive — file-scoped
 // goimports + autoResolveFile (#109 pass 3). Same tempdir emit safety
 // story as measure-rename.
-func cmdMeasureEdit(name, bodyFile string) {
+func cmdMeasureEdit(name, bodyFile string, inPlace bool) {
 	dbPath := getDBPath()
 	checkEmbeddedAvailable(dbPath)
 	body, err := os.ReadFile(bodyFile)
@@ -897,6 +898,7 @@ func cmdMeasureEdit(name, bodyFile string) {
 		fatal(fmt.Errorf("mktemp: %w", err))
 	}
 	defer os.RemoveAll(scratch)
+	prepopulate(inPlace, db, scratch, "edit")
 	elapsed, msg, err := mcpserver.MeasureEdit(db, scratch, name, string(body))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "edit failed after %s: %v\n", elapsed.Round(time.Millisecond), err)
@@ -905,10 +907,35 @@ func cmdMeasureEdit(name, bodyFile string) {
 		}
 		os.Exit(1)
 	}
-	fmt.Printf("edit %s: %s\n", name, elapsed.Round(time.Millisecond))
+	fmt.Printf("edit %s: %s%s\n", name, elapsed.Round(time.Millisecond), inPlaceSuffix(inPlace))
 	if msg != "" {
 		fmt.Println(msg)
 	}
+}
+
+// prepopulate seeds the scratch dir with one full emit BEFORE the timed
+// mutation. Required for --in-place mode to exercise the file-scoped
+// emit + package-scoped build path (#117/#118): those paths only rewrite
+// touched files, so an empty scratch would produce a broken tree that
+// can't build. Untimed by design — measures the incremental cost, not
+// the from-empty cost. Prints how long the pre-populate took so callers
+// can factor it out when analyzing the wall.
+func prepopulate(inPlace bool, db *store.DB, scratch, verb string) {
+	if !inPlace {
+		return
+	}
+	t := time.Now()
+	if err := emit.Emit(db, scratch); err != nil {
+		fatal(fmt.Errorf("prepopulate emit: %w", err))
+	}
+	fmt.Fprintf(os.Stderr, "  [prepopulate] full emit for %s: %s\n", verb, time.Since(t).Round(time.Millisecond))
+}
+
+func inPlaceSuffix(inPlace bool) string {
+	if inPlace {
+		return " (in-place)"
+	}
+	return ""
 }
 
 func cmdSync(file string) {
