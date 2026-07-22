@@ -37,6 +37,19 @@ var sqliteSchemaSQL string
 // ErrNotImplemented marks Backend methods not yet ported to SQLite.
 var ErrNotImplemented = errors.New("sqlite: not yet implemented")
 
+// Batch sizes for bulk inserts. Kept generous — SQLite parameter limit is
+// 32k, so up to ~500 rows of 14 columns fits comfortably.
+const (
+	upsertDefsBatchSize    = 500
+	setRefsBatchSize       = 1000
+	setLitFieldsBatchSize  = 500
+)
+
+// rowScanner is the common Scan surface of *sql.Row and *sql.Rows.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
 // SQLiteDB is a store.Backend backed by a local SQLite database file.
 // Writes hit disk on transaction commit (WAL mode). Safe for concurrent
 // read; writers are serialized by SQLite itself (single-writer model).

@@ -1,21 +1,12 @@
 // Backend is the storage-agnostic surface that internal/mcp, internal/emit,
 // internal/resolve, internal/ingest, and cmd/defn call to read and mutate
-// the defn code graph. It DOES NOT include Dolt-specific version-control
-// operations (branch, checkout, commit, merge, diff, log, remotes,
-// conflicts) — those live only on the concrete *DB type and will be
-// removed when the Dolt backend is retired.
-//
-// Any new backend (SQLite, in-memory, gopls-hybrid) must implement this
-// interface. Existing callers should be migrated to depend on Backend
-// rather than *DB so they compile against any backend.
+// the defn code graph. SQLite (*SQLiteDB) is the only implementation as
+// of Phase 4; a future backend (in-memory, gopls-hybrid) would slot in
+// here without touching callers.
 package store
 
 import "context"
 
-// Backend is the migration-target surface. In Phase 0 it lives alongside
-// *DB, which implements it via var _ Backend = (*DB)(nil) below. Category A
-// methods (branch, checkout, commit, merge, diff, log, remotes) are
-// deliberately excluded — they're implementation-specific to Dolt.
 type Backend interface {
 	// Lifecycle
 	Close() error
@@ -109,8 +100,3 @@ type Backend interface {
 	Simulate(mutations []Mutation) (*SimulationResult, error)
 }
 
-// Compile-time assertion: the concrete *DB must satisfy Backend. If a
-// method is added to *DB and belongs in the interface, add it here; if a
-// method is Dolt-specific version-control (branch, merge, commit, diff,
-// log, remotes, conflicts), leave it OFF the interface.
-var _ Backend = (*DB)(nil)
