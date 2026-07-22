@@ -28,6 +28,33 @@ func Open(path string) (*DB, error) {
 	return openEmbedded(path)
 }
 
+// OpenBackend opens whichever Backend the DEFN_BACKEND env var selects:
+//
+//   - "sqlite"          → *SQLiteDB at <path>/defn.db
+//   - "dolt" or unset   → *DB via Open(path)
+//
+// Category A ops (branch/checkout/commit/merge/log/diff/conflicts) only
+// exist on *DB, so callers that need them must type-assert or use Open()
+// directly. Phase 2 A/B seam — Phase 3 flips the default to sqlite; Phase 4
+// removes Dolt entirely.
+func OpenBackend(path string) (Backend, error) {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DEFN_BACKEND"))) {
+	case "sqlite":
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			return nil, fmt.Errorf("abs path: %w", err)
+		}
+		if err := os.MkdirAll(absPath, 0755); err != nil {
+			return nil, fmt.Errorf("create db dir: %w", err)
+		}
+		return OpenSQLite(filepath.Join(absPath, "defn.db"))
+	case "", "dolt":
+		return Open(path)
+	default:
+		return nil, fmt.Errorf("unknown DEFN_BACKEND=%q (want \"sqlite\" or \"dolt\")", os.Getenv("DEFN_BACKEND"))
+	}
+}
+
 // execQuerier is the common subset of *sql.DB and *sql.Conn used by
 // schema init + migration helpers so they work for both the MySQL
 // (pooled) and embedded Dolt (pinned connection) paths.
