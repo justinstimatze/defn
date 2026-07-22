@@ -1,5 +1,5 @@
 // Command defn is an AI-native code database for Go source code.
-// Stores definitions in Dolt (SQL database with git semantics).
+// Stores definitions in SQLite via internal/store.
 package main
 
 import (
@@ -17,28 +17,10 @@ func main() {
 	switch os.Args[1] {
 	case "init":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: defn init <path> [--server]")
+			fmt.Fprintln(os.Stderr, "usage: defn init <path>")
 			os.Exit(1)
 		}
-		serverMode := false
-		for _, a := range os.Args[3:] {
-			if a == "--server" {
-				serverMode = true
-			}
-		}
-		if serverMode {
-			cmdInitServer(os.Args[2])
-		} else {
-			cmdInit(os.Args[2])
-		}
-	case "server":
-		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: defn server <start|stop|status>")
-			os.Exit(1)
-		}
-		cmdServer(os.Args[2])
-	case "clean":
-		cmdClean()
+		cmdInit(os.Args[2])
 	case "repair":
 		dir := "."
 		if len(os.Args) >= 3 {
@@ -47,16 +29,10 @@ func main() {
 		cmdRepair(dir)
 	case "ingest":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: defn ingest <path> [--server]")
+			fmt.Fprintln(os.Stderr, "usage: defn ingest <path>")
 			os.Exit(1)
 		}
-		serverMode := false
-		for _, a := range os.Args[3:] {
-			if a == "--server" {
-				serverMode = true
-			}
-		}
-		cmdIngest(os.Args[2], serverMode)
+		cmdIngest(os.Args[2])
 	case "ingest-upstream":
 		cmdIngestUpstream(os.Args[2:])
 	case "sync":
@@ -166,25 +142,22 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `defn — AI-native code database (powered by Dolt)
+	fmt.Fprintln(os.Stderr, `defn — AI-native code database (SQLite-backed)
 
 Usage:
-  defn init <path>              Ingest + commit + configure MCP
-  defn init <path> --server    Same, but starts a Dolt server (recommended)
-  defn server start|stop       Manage background Dolt server
-  defn clean                   Remove all defn files from project
+  defn init <path>             Ingest + configure MCP
   defn repair [path]           Delete .defn and re-ingest (recovers from corruption)
-  defn ingest <path> [--server]  Parse Go source → Dolt database (--server: use running sql-server)
+  defn ingest <path>           Parse Go source → SQLite database
   defn sync [file]             Re-ingest (single file: fast path via IngestFile+ResolveFile; falls back to full ingest above 50 stale files)
   defn serve                   MCP server for Claude Code
-  defn emit <output-dir>       Dolt → .go files
+  defn emit <output-dir>       Database → .go files
   defn impact <name>           Blast radius + test coverage
   defn untested                Definitions without test coverage
   defn lint                    Lint with diagnostics → definitions
-  defn status                  Current branch + stats
+  defn status                  Backend stats
   defn check                   Consistency diagnostics (defs by kind, orphan literal types)
   defn query <sql>             Read-only SQL query
-  defn gc                      Compact storage
+  defn gc                      Compact storage (VACUUM)
   defn restart [--all]         Gracefully bounce this project's serve (or all)
   defn measure-rename [--in-place] <old> <new>    Time a rename against .defn without spinning up serve
   defn measure-edit   [--in-place] <name> <body-file>  Time an edit; body-file keeps multi-line source shell-safe

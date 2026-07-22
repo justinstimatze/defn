@@ -2,14 +2,11 @@ package main
 
 import (
 	"context"
-	cryptoRand "crypto/rand"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -31,8 +28,6 @@ import (
 	"github.com/justinstimatze/defn/internal/rank"
 	"github.com/justinstimatze/defn/internal/resolve"
 	"github.com/justinstimatze/defn/internal/store"
-
-	_ "github.com/go-sql-driver/mysql"
 )
 
 func init() {
@@ -67,57 +62,16 @@ func init() {
 }
 
 func getDBPath() string {
-	// Explicit DSN always wins.
-	if dsn := os.Getenv("DEFN_DSN"); dsn != "" {
-		logBackend("using DEFN_DSN=" + sanitizeDSN(dsn))
-		return dsn
-	}
-	// Explicit DB path honored as-is (may be filesystem path or DSN).
 	if p := os.Getenv("DEFN_DB"); p != "" {
-		logBackend("using DEFN_DB=" + sanitizeDSN(p))
+		logBackend("using DEFN_DB=" + p)
 		return p
-	}
-	// Worktree marker: this dir is a worktree on a specific branch of
-	// a shared defn server. Marker sets DSN + branch pin.
-	if dsn, branch := readWorktreeMarker("."); dsn != "" {
-		if branch != "" && os.Getenv("DEFN_BRANCH") == "" {
-			os.Setenv("DEFN_BRANCH", branch)
-		}
-		logBackend(fmt.Sprintf("using worktree dsn=%s branch=%s", sanitizeDSN(dsn), branch))
-		return dsn
-	}
-	// Auto-detect a running dolt sql-server so the CLI falls back to it
-	// when the local .defn/ is missing or corrupted, matching the
-	// behavior of the db/ library's Open.
-	if dsn := detectRunningServer(".defn"); dsn != "" {
-		logBackend("using dolt server " + dsnHostDisplay(dsn))
-		return dsn
 	}
 	logBackend("using embedded .defn/")
 	return ".defn"
 }
 
-// readWorktreeMarker reads .defn-worktree.json in dir if present, returning
-// the (dsn, branch) it pins to.
-func readWorktreeMarker(dir string) (dsn, branch string) {
-	data, err := os.ReadFile(filepath.Join(dir, ".defn-worktree.json"))
-	if err != nil {
-		return "", ""
-	}
-	var m struct {
-		DSN    string `json:"dsn"`
-		Branch string `json:"branch"`
-	}
-	if err := json.Unmarshal(data, &m); err != nil {
-		return "", ""
-	}
-	return m.DSN, m.Branch
-}
-
-// logBackend prints a one-line backend selection notice to stderr so
-// users can tell whether they're hitting a running server or the
-// embedded store (different performance characteristics). Silenced by
-// DEFN_QUIET=1.
+// logBackend prints a one-line backend selection notice to stderr.
+// Silenced by DEFN_QUIET=1.
 func logBackend(msg string) {
 	if os.Getenv("DEFN_QUIET") != "" {
 		return
@@ -125,349 +79,6 @@ func logBackend(msg string) {
 	fmt.Fprintln(os.Stderr, "defn: "+msg)
 }
 
-// sanitizeDSN strips passwords from a MySQL DSN before logging.
-func sanitizeDSN(dsn string) string {
-	i := strings.Index(dsn, "@")
-	if i < 0 {
-		return dsn
-	}
-	if c := strings.Index(dsn[:i], ":"); c >= 0 {
-		return dsn[:c+1] + "***" + dsn[i:]
-	}
-	return dsn
-}
-
-// dsnHostDisplay pulls the addr out of a DSN for a terse log line.
-func dsnHostDisplay(dsn string) string {
-	if i := strings.Index(dsn, "tcp("); i >= 0 {
-		rest := dsn[i+4:]
-		if j := strings.Index(rest, ")"); j >= 0 {
-			return rest[:j]
-		}
-	}
-	return sanitizeDSN(dsn)
-}
-
-// detectRunningServer returns a DSN for a running dolt sql-server hosting
-// this project's database, or "" if none is reachable. Resolves the port
-// from (in order) .defn/server.port (embedded mode), .defn-server.port
-// (--server mode), then falls back to 3307. Verifies ownership via a
-// `SELECT COUNT(*) FROM definitions` query before returning the DSN —
-// a stranger's mysql/dolt on the same port won't have that table.
-//
-// Uses a short TCP dial first to avoid driver-level timeouts when
-// nothing is listening.
-func detectRunningServer(dbPath string) string {
-	port := "3307"
-	if data, err := os.ReadFile(filepath.Join(dbPath, "server.port")); err == nil {
-		port = strings.TrimSpace(string(data))
-	} else if data, err := os.ReadFile(".defn-server.port"); err == nil {
-		// --server mode writes the chosen port next to the pidfile at
-		// the project root; embedded mode uses .defn/server.port.
-		port = strings.TrimSpace(string(data))
-	}
-	addr := "127.0.0.1:" + port
-	conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
-	if err != nil {
-		return ""
-	}
-	conn.Close()
-
-	absPath, err := filepath.Abs(dbPath)
-	if err != nil {
-		return ""
-	}
-	dbName := filepath.Base(absPath)
-	for _, user := range []string{"defn", "root"} {
-		dsn := fmt.Sprintf("%s@tcp(%s)/%s", user, addr, dbName)
-		sqlDB, err := sql.Open("mysql", dsn)
-		if err != nil {
-			continue
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-		// Verify this is actually a defn database — a random MySQL server
-		// on the same port wouldn't have a definitions table.
-		var n int
-		err = sqlDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM definitions").Scan(&n)
-		cancel()
-		sqlDB.Close()
-		if err == nil {
-			return dsn
-		}
-	}
-	return ""
-}
-
-// findFreePort returns the first port at or above start that no listener
-// currently holds, by trying to bind 127.0.0.1:<port>. Returns start
-// unchanged after 20 attempts if all are taken — caller will get a clear
-// bind failure on spawn rather than mistakenly connect to a stranger's
-// server. Used by cmdInitServer to avoid 3307 collisions with other
-// dolt instances on the host.
-func findFreePort(start int) int {
-	for p := start; p < start+20; p++ {
-		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
-		if err != nil {
-			continue
-		}
-		ln.Close()
-		return p
-	}
-	return start
-}
-
-func cmdInitServer(modulePath string) {
-	// Check dolt is installed.
-	doltBin, err := exec.LookPath("dolt")
-	if err != nil {
-		fatal(fmt.Errorf("dolt not found — install with:\n  curl -L https://github.com/dolthub/dolt/releases/latest/download/install.sh | bash"))
-	}
-
-	absModulePath, _ := filepath.Abs(modulePath)
-	serverDir := filepath.Join(absModulePath, ".defn-server")
-	pidFile := filepath.Join(absModulePath, ".defn-server.pid")
-	portFile := filepath.Join(absModulePath, ".defn-server.port")
-	port := os.Getenv("DEFN_PORT")
-	if port == "" {
-		// Probe for a free port starting at 3307 so we don't conflict
-		// with another dolt sql-server on the host (e.g. another defn
-		// project, or an unrelated dolt instance). Without this, the
-		// dial-readiness loop below succeeds against whoever's on the
-		// port and init proceeds against a stranger's database.
-		port = strconv.Itoa(findFreePort(3307))
-	}
-	dbName := filepath.Base(absModulePath)
-
-	// Create data directory and dolt init if needed.
-	if _, err := os.Stat(serverDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(serverDir, 0755); err != nil {
-			fatal(err)
-		}
-		cmd := exec.Command(doltBin, "init")
-		cmd.Dir = serverDir
-		if out, err := cmd.CombinedOutput(); err != nil {
-			fatal(fmt.Errorf("dolt init: %s", out))
-		}
-	}
-
-	// Start dolt sql-server in background.
-	cmd := exec.Command(doltBin, "sql-server", "--host", "127.0.0.1", "--port", port)
-	cmd.Dir = serverDir
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	if err := cmd.Start(); err != nil {
-		fatal(fmt.Errorf("start dolt server: %w", err))
-	}
-	pid := cmd.Process.Pid
-	fmt.Fprintf(os.Stderr, "starting dolt server (pid %d) on 127.0.0.1:%s...\n", pid, port)
-
-	// Wait for server to be ready (poll, don't sleep).
-	dsn := fmt.Sprintf("root@tcp(127.0.0.1:%s)/%s", port, dbName)
-	ready := false
-	for range 30 {
-		// If our spawned dolt has already exited (e.g. couldn't bind
-		// because something else owned the port), fail fast — don't
-		// wait for the dial to succeed against the squatter.
-		if cmd.ProcessState != nil {
-			fatal(fmt.Errorf("dolt server exited during startup (port %s likely already in use)", port))
-		}
-		conn, err := net.DialTimeout("tcp", "127.0.0.1:"+port, time.Second)
-		if err == nil {
-			conn.Close()
-			ready = true
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	if !ready {
-		cmd.Process.Kill()
-		fatal(fmt.Errorf("dolt server failed to start on port %s after 15s", port))
-	}
-
-	// Write pidfile + portfile only after server is confirmed ready.
-	os.WriteFile(pidFile, fmt.Appendf(nil, "%d", pid), 0644)
-	os.WriteFile(portFile, []byte(port), 0644)
-	fmt.Fprintf(os.Stderr, "dolt server ready\n")
-
-	// Create a defn user with a random password (don't use root/no-password).
-	// Generate a cryptographically random password.
-	var randBytes [16]byte
-	if _, err := cryptoRand.Read(randBytes[:]); err != nil {
-		fatal(fmt.Errorf("generate password: %w", err))
-	}
-	password := fmt.Sprintf("%x", randBytes)
-	rootConn, err := sql.Open("mysql", fmt.Sprintf("root@tcp(127.0.0.1:%s)/", port))
-	if err == nil {
-		rootConn.Exec(fmt.Sprintf("CREATE USER IF NOT EXISTS 'defn'@'%%' IDENTIFIED BY '%s'", password))
-		escapedDB := strings.ReplaceAll(dbName, "`", "``")
-		rootConn.Exec(fmt.Sprintf("GRANT ALL ON `%s`.* TO 'defn'@'%%'", escapedDB))
-		rootConn.Close()
-		dsn = fmt.Sprintf("defn:%s@tcp(127.0.0.1:%s)/%s", password, port, dbName)
-		fmt.Fprintf(os.Stderr, "created user 'defn' with generated password\n")
-	}
-
-	// Set DEFN_DB so the rest of init uses server mode.
-	os.Setenv("DEFN_DB", dsn)
-
-	// Add .defn-server/ and pidfile to gitignore.
-	gitignorePath := filepath.Join(absModulePath, ".gitignore")
-	gitignoreContent, _ := os.ReadFile(gitignorePath)
-	if !strings.Contains(string(gitignoreContent), ".defn-server") {
-		f, err := os.OpenFile(gitignorePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err == nil {
-			if len(gitignoreContent) > 0 && !strings.HasSuffix(string(gitignoreContent), "\n") {
-				f.WriteString("\n")
-			}
-			f.WriteString(".defn-server/\n.defn-server.pid\n")
-			f.Close()
-		}
-	}
-
-	// Run normal init with server-mode DEFN_DB.
-	cmdInit(modulePath)
-}
-
-func cmdServer(action string) {
-	absPath, _ := filepath.Abs(".")
-	pidFile := filepath.Join(absPath, ".defn-server.pid")
-
-	switch action {
-	case "start":
-		doltBin, err := exec.LookPath("dolt")
-		if err != nil {
-			fatal(fmt.Errorf("dolt not found"))
-		}
-		serverDir := filepath.Join(absPath, ".defn-server")
-		if _, err := os.Stat(serverDir); os.IsNotExist(err) {
-			fatal(fmt.Errorf(".defn-server not found — run defn init --server first"))
-		}
-		portFile := filepath.Join(absPath, ".defn-server.port")
-		port := os.Getenv("DEFN_PORT")
-		if port == "" {
-			// Reuse the port the original init picked so subsequent
-			// `defn ingest` / `defn query` invocations (which call
-			// detectRunningServer) keep finding the same server. If no
-			// portfile exists, probe-for-free starting at 3307.
-			if data, err := os.ReadFile(portFile); err == nil {
-				port = strings.TrimSpace(string(data))
-			} else {
-				port = strconv.Itoa(findFreePort(3307))
-			}
-		}
-		cmd := exec.Command(doltBin, "sql-server", "--host", "127.0.0.1", "--port", port)
-		cmd.Dir = serverDir
-		if err := cmd.Start(); err != nil {
-			fatal(fmt.Errorf("start: %w", err))
-		}
-		os.WriteFile(pidFile, fmt.Appendf(nil, "%d", cmd.Process.Pid), 0644)
-		os.WriteFile(portFile, []byte(port), 0644)
-		fmt.Fprintf(os.Stderr, "started dolt server (pid %d) on 127.0.0.1:%s\n", cmd.Process.Pid, port)
-
-	case "stop":
-		data, err := os.ReadFile(pidFile)
-		if err != nil {
-			fatal(fmt.Errorf("no pidfile — server not running?"))
-		}
-		var pid int
-		fmt.Sscanf(string(data), "%d", &pid)
-		proc, err := os.FindProcess(pid)
-		if err != nil {
-			fatal(fmt.Errorf("find process %d: %w", pid, err))
-		}
-		proc.Signal(os.Interrupt)
-		os.Remove(pidFile)
-		fmt.Fprintf(os.Stderr, "stopped dolt server (pid %d)\n", pid)
-
-	case "status":
-		data, err := os.ReadFile(pidFile)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "not running")
-			return
-		}
-		var pid int
-		fmt.Sscanf(string(data), "%d", &pid)
-		proc, err := os.FindProcess(pid)
-		if err != nil || proc.Signal(os.Signal(nil)) != nil {
-			fmt.Fprintln(os.Stderr, "not running (stale pidfile)")
-			os.Remove(pidFile)
-			return
-		}
-		fmt.Fprintf(os.Stderr, "running (pid %d)\n", pid)
-
-	default:
-		fatal(fmt.Errorf("unknown action %q — use start, stop, or status", action))
-	}
-}
-
-func cmdClean() {
-	absPath, _ := filepath.Abs(".")
-
-	// Stop server if running.
-	pidFile := filepath.Join(absPath, ".defn-server.pid")
-	if data, err := os.ReadFile(pidFile); err == nil {
-		var pid int
-		fmt.Sscanf(string(data), "%d", &pid)
-		if proc, err := os.FindProcess(pid); err == nil {
-			proc.Signal(os.Interrupt)
-			fmt.Fprintf(os.Stderr, "stopped dolt server (pid %d)\n", pid)
-		}
-	}
-
-	// Remove defn artifacts.
-	removed := 0
-	for _, name := range []string{
-		".defn",
-		".defn-server",
-		".defn-server.pid",
-	} {
-		path := filepath.Join(absPath, name)
-		if _, err := os.Stat(path); err == nil {
-			os.RemoveAll(path)
-			fmt.Fprintf(os.Stderr, "removed %s\n", name)
-			removed++
-		}
-	}
-
-	// Remove defn entry from .mcp.json (preserve other servers).
-	mcpPath := filepath.Join(absPath, ".mcp.json")
-	if data, err := os.ReadFile(mcpPath); err == nil {
-		var config map[string]any
-		if err := json.Unmarshal(data, &config); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: .mcp.json is malformed, removing: %v\n", err)
-			os.Remove(mcpPath)
-			removed++
-		} else if config != nil {
-			if servers, ok := config["mcpServers"].(map[string]any); ok {
-				if _, exists := servers["defn"]; exists {
-					delete(servers, "defn")
-					removed++
-					if len(servers) == 0 {
-						os.Remove(mcpPath)
-						fmt.Fprintf(os.Stderr, "removed .mcp.json (no servers left)\n")
-					} else {
-						updated, _ := json.MarshalIndent(config, "", "  ")
-						os.WriteFile(mcpPath, updated, 0644)
-						fmt.Fprintf(os.Stderr, "removed defn from .mcp.json (other servers preserved)\n")
-					}
-				}
-			}
-		}
-	}
-
-	// Remove .codex/config.toml defn entry (or whole dir if only defn).
-	codexPath := filepath.Join(absPath, ".codex", "config.toml")
-	if _, err := os.Stat(codexPath); err == nil {
-		os.RemoveAll(filepath.Join(absPath, ".codex"))
-		fmt.Fprintf(os.Stderr, "removed .codex/\n")
-		removed++
-	}
-
-	if removed == 0 {
-		fmt.Fprintln(os.Stderr, "nothing to clean")
-	} else {
-		fmt.Fprintln(os.Stderr, "defn cleaned. CLAUDE.md was left in place (may contain your edits).")
-	}
-}
 
 func cmdInit(modulePath string) {
 	// Operate from the target project dir so .defn/, .mcp.json, etc. all
@@ -697,7 +308,7 @@ func logMem(phase string) {
 		runtime.NumGoroutine())
 }
 
-func cmdIngest(modulePath string, serverMode bool) {
+func cmdIngest(modulePath string) {
 	// Normalize to absolute so downstream filepath.Rel calls (in ingest
 	// and resolve) compute module-relative source_file paths consistently
 	// regardless of where defn was invoked. With a relative ".", Rel
@@ -714,18 +325,10 @@ func cmdIngest(modulePath string, serverMode bool) {
 		fatal(err)
 	}
 	dbPath := getDBPath()
-	if serverMode {
-		dsn := detectRunningServer(".defn")
-		if dsn == "" {
-			fatal(fmt.Errorf("--server: no dolt sql-server reachable on 127.0.0.1:3307 — start one with 'defn server start' or 'defn init <path> --server'"))
-		}
-		dbPath = dsn
-		fmt.Fprintf(os.Stderr, "using server: %s\n", dsn)
-	}
 	checkEmbeddedAvailable(dbPath)
 	db, err := store.OpenBackend(dbPath)
 	if err != nil {
-		if isCorruptDBError(err) && !strings.Contains(dbPath, "@") {
+		if isCorruptDBError(err) {
 			fatal(fmt.Errorf("%w\n\n.defn/ appears to be corrupted. run 'defn repair %s' to rebuild from source",
 				err, modulePath))
 		}
@@ -739,7 +342,7 @@ func cmdIngest(modulePath string, serverMode bool) {
 	// ingest.IngestFile + resolve.ResolveFile (~10 ms per file). This
 	// is the common case for editor-save hooks that re-run `defn ingest .`
 	// on every .go change in projects without a live serve.
-	if tryIncrementalIngest(db, modulePath, dbPath, serverMode) {
+	if tryIncrementalIngest(db, modulePath, dbPath) {
 		return
 	}
 
@@ -942,7 +545,7 @@ func inPlaceSuffix(inPlace bool) string {
 
 func cmdSync(file string) {
 	if file == "" {
-		cmdIngest(".", false)
+		cmdIngest(".")
 		return
 	}
 	dbPath := getDBPath()
@@ -1946,8 +1549,8 @@ const incrementalCounterMeta = "incremental_count"
 // refreshed here; that's documented in resolve.ResolveFile and
 // acceptable for editor-save hook flows where a periodic full ingest
 // closes the gap.
-func tryIncrementalIngest(db store.Backend, projectDir, dbPath string, serverMode bool) bool {
-	stale, added, deleted, ok := incrementalPreflight(db, projectDir, dbPath, serverMode)
+func tryIncrementalIngest(db store.Backend, projectDir, dbPath string) bool {
+	stale, added, deleted, ok := incrementalPreflight(db, projectDir, dbPath)
 	if !ok {
 		return false
 	}
@@ -1968,13 +1571,9 @@ func tryIncrementalIngest(db store.Backend, projectDir, dbPath string, serverMod
 // deleted is module-relative (matches the source_file format the DB
 // stores and that store.DeleteFile takes).
 //
-// Disqualifies the fast path on: server/DSN mode, no last_ingest meta
-// (first ingest), or total churn (stale + added + deleted) above
-// incrementalIngestThreshold.
-func incrementalPreflight(db store.Backend, projectDir, dbPath string, serverMode bool) (stale, added []string, deleted []string, ok bool) {
-	if serverMode || strings.Contains(dbPath, "@") {
-		return nil, nil, nil, false
-	}
+// Disqualifies the fast path on: no last_ingest meta (first ingest), or
+// total churn (stale + added + deleted) above incrementalIngestThreshold.
+func incrementalPreflight(db store.Backend, projectDir, dbPath string) (stale, added []string, deleted []string, ok bool) {
 	since := lastIngestUnix(db)
 	if since == 0 {
 		return nil, nil, nil, false // first ingest, or pre-meta DB
