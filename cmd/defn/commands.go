@@ -858,18 +858,31 @@ func cmdSync(file string) {
 		fatal(err)
 	}
 
+	verbose := os.Getenv("DEFN_SYNC_TIMING") == "1"
+	phase := func(name string, t0 time.Time) {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "  [phase] %s: %s\n", name, time.Since(t0).Round(time.Millisecond))
+		}
+	}
+
+	t := time.Now()
 	n, err := ingest.IngestFile(db, modulePath, absFile)
 	if err != nil {
 		fatal(err)
 	}
+	phase("ingest-file (go/parser)", t)
 	// Re-resolve refs for the affected package. Without this, embed and
 	// implements refs drift away from source as files are edited.
+	t = time.Now()
 	if err := resolve.ResolveFile(db, modulePath, absFile); err != nil {
 		fatal(fmt.Errorf("resolve file: %w", err))
 	}
+	phase("resolve-file (packages.Load)", t)
+	t = time.Now()
 	if err := db.Commit("sync " + file); err != nil {
 		fatal(err)
 	}
+	phase("dolt-commit", t)
 	fmt.Fprintf(os.Stderr, "synced %s: %d definitions updated\n", file, n)
 }
 
@@ -1945,10 +1958,18 @@ func applyIncrementalIngest(db *store.DB, projectDir, dbPath string, stale, adde
 	fmt.Fprintf(os.Stderr, "incremental ingest: %d modified, %d added, %d removed...\n",
 		len(stale), len(added), len(deleted))
 
+	verbose := os.Getenv("DEFN_SYNC_TIMING") == "1"
+	phase := func(name string, t0 time.Time) {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "  [phase] %s: %s\n", name, time.Since(t0).Round(time.Millisecond))
+		}
+	}
+
 	// Prune deleted files first. Their defs may be referenced by surviving
 	// files in the same package; the package resolve below rebuilds refs
 	// for survivors. If a deletion fails partway we fall through to full
 	// ingest, which will rebuild from a clean slate.
+	t := time.Now()
 	deletedDirs := make(map[string]string, len(deleted))
 	for _, rel := range deleted {
 		if err := db.DeleteFile(rel); err != nil {
@@ -1962,13 +1983,16 @@ func applyIncrementalIngest(db *store.DB, projectDir, dbPath string, stale, adde
 		absDir := filepath.Join(projectDir, filepath.Dir(rel))
 		deletedDirs[absDir] = ""
 	}
+	phase("delete-pruning", t)
 
 	// Ingest stale + added files (both go through IngestFile).
+	t = time.Now()
 	work := append(append([]string{}, stale...), added...)
 	uniqueDirs, ok := ingestStaleFiles(db, projectDir, work)
 	if !ok {
 		return false
 	}
+	phase("ingest-files (go/parser)", t)
 
 	// For deleted files' directories, pick a surviving sibling as the
 	// resolve representative if we didn't already touch the dir via
@@ -1983,9 +2007,12 @@ func applyIncrementalIngest(db *store.DB, projectDir, dbPath string, stale, adde
 		}
 	}
 
+	t = time.Now()
 	if !resolveUniqueDirs(db, projectDir, uniqueDirs) {
 		return false
 	}
+	phase("resolve-dirs (packages.Load)", t)
+	t = time.Now()
 	if err := db.SetMeta("last_ingest", strconv.FormatInt(time.Now().Unix(), 10)); err != nil {
 		fmt.Fprintf(os.Stderr, "set last_ingest: %v — falling back to full ingest\n", err)
 		return false
@@ -1995,7 +2022,10 @@ func applyIncrementalIngest(db *store.DB, projectDir, dbPath string, stale, adde
 		fmt.Fprintf(os.Stderr, "commit failed: %v — falling back to full ingest\n", err)
 		return false
 	}
+	phase("dolt-commit", t)
+	t = time.Now()
 	maybeCompactAfterIncremental(db, dbPath)
+	phase("maybe-compact", t)
 	fmt.Fprintf(os.Stderr, "done in %s (%d file(s), %d package(s)).\n",
 		time.Since(start).Round(time.Millisecond), len(stale), len(uniqueDirs))
 	return true
