@@ -5,7 +5,9 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/format"
@@ -519,6 +521,20 @@ func errResult(err error) (*sdkmcp.CallToolResult, any, error) {
 // case-swap / prefix / suffix miss without ballooning error size.
 const notFoundSuggestCap = 5
 
+// notFoundOrErr distinguishes a genuine "not found" from a real DB
+// error (e.g. scan crash, connection failure). Winze dispatch 2026-07-22:
+// swallowing every getter error as notFoundResult cost them an hour
+// misdiagnosing the TextStorage regression — GetDefinitionByName was
+// crashing on scan and the caller reported "not found", masking the
+// real bug. Callers should use this in place of the bare notFoundResult
+// call after a GetDefinitionByName-shape lookup.
+func (s *server) notFoundOrErr(name string, err error) (*sdkmcp.CallToolResult, any, error) {
+	if errors.Is(err, sql.ErrNoRows) {
+		return s.notFoundResult(name)
+	}
+	return errResult(fmt.Errorf("lookup %q: %w", name, err))
+}
+
 // notFoundResult builds the "definition %q not found" error and — when
 // the DB has close-name candidates — appends a compact "Did you mean:"
 // list so the model can retry with a real def name instead of a bare
@@ -912,7 +928,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 func (s *server) handleImpact(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return s.notFoundResult(args.Name)
+		return s.notFoundOrErr(args.Name, err)
 	}
 	impact, err := s.db.GetImpact(d.ID)
 	if err != nil {
@@ -1115,7 +1131,7 @@ func resultTextRaw(r *sdkmcp.CallToolResult) string {
 func (s *server) handleGetDefinition(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return s.notFoundResult(args.Name)
+		return s.notFoundOrErr(args.Name, err)
 	}
 
 	// Look up module path for this definition.
@@ -1447,7 +1463,7 @@ func (s *server) handleUntested(_ context.Context, _ *sdkmcp.CallToolRequest, _ 
 func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args editParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return s.notFoundResult(args.Name)
+		return s.notFoundOrErr(args.Name, err)
 	}
 
 	// Validate new body parses as Go.
@@ -1870,7 +1886,7 @@ func extractSignature(body string) string {
 func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return s.notFoundResult(args.Name)
+		return s.notFoundOrErr(args.Name, err)
 	}
 
 	// Reject empty old_fragment (strings.ReplaceAll inserts between every char).
@@ -1940,7 +1956,7 @@ func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest
 func (s *server) handleInsert(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return s.notFoundResult(args.Name)
+		return s.notFoundOrErr(args.Name, err)
 	}
 
 	idx := strings.Index(d.Body, args.After)
@@ -3023,7 +3039,7 @@ func compositeMatchesType(expr ast.Expr, typeName string) bool {
 func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return s.notFoundResult(args.Name)
+		return s.notFoundOrErr(args.Name, err)
 	}
 
 	// #105 safe-delete: refuse when references remain unless caller
@@ -3106,7 +3122,7 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 
 	d, err := s.db.GetDefinitionByName(args.OldName, "")
 	if err != nil {
-		return s.notFoundResult(args.OldName)
+		return s.notFoundOrErr(args.OldName, err)
 	}
 
 	// Compose the qualified old-name the safety net compares against (methods
@@ -3238,7 +3254,7 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return s.notFoundResult(args.Name)
+		return s.notFoundOrErr(args.Name, err)
 	}
 
 	impact, err := s.db.GetImpact(d.ID)
@@ -3504,7 +3520,7 @@ func humanSize(n int64) string {
 func (s *server) handleSimilar(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return s.notFoundResult(args.Name)
+		return s.notFoundOrErr(args.Name, err)
 	}
 	if d.Signature == "" {
 		return errResult(fmt.Errorf("definition %q has no signature", args.Name))
@@ -3686,7 +3702,7 @@ func (s *server) handlePatch(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return s.notFoundResult(args.Name)
+		return s.notFoundOrErr(args.Name, err)
 	}
 
 	if !strings.Contains(d.Body, args.OldName) {
@@ -3971,7 +3987,7 @@ func (s *server) handleExpand(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	}
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return s.notFoundResult(args.Name)
+		return s.notFoundOrErr(args.Name, err)
 	}
 
 	includes := args.Include
@@ -4402,7 +4418,7 @@ func (s *server) handleTestCoverage(_ context.Context, _ *sdkmcp.CallToolRequest
 	}
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return s.notFoundResult(args.Name)
+		return s.notFoundOrErr(args.Name, err)
 	}
 	impact, err := s.db.GetImpact(d.ID)
 	if err != nil {
@@ -4609,7 +4625,7 @@ func truncateFlow(flow []string, cap int) string {
 func (s *server) handleOutline(_ context.Context, req *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return s.notFoundResult(args.Name)
+		return s.notFoundOrErr(args.Name, err)
 	}
 
 	// Size-aware fallback: for tiny bodies, read is smaller than
@@ -4707,7 +4723,7 @@ func (s *server) handleSlice(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 
 	d, err := s.db.GetDefinitionByName(args.Name, "")
 	if err != nil {
-		return s.notFoundResult(args.Name)
+		return s.notFoundOrErr(args.Name, err)
 	}
 
 	slices, err := projection.Slices(d.Body, args.Slice)
