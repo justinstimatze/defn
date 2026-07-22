@@ -111,8 +111,25 @@ func TestSQLiteSmoke(t *testing.T) {
 		t.Errorf("GC: %v", err)
 	}
 
-	// ComputeRootHash is a Phase 1 followup stub.
-	if _, err := db.ComputeRootHash(); err != ErrNotImplemented {
-		t.Errorf("ComputeRootHash: expected ErrNotImplemented, got %v", err)
+	// ComputeRootHash on empty definitions table = hash of empty stream.
+	// Not asserting an exact value; just that it's stable + non-error.
+	h1, err := db.ComputeRootHash()
+	if err != nil {
+		t.Fatalf("ComputeRootHash: %v", err)
+	}
+	h2, err := db.ComputeRootHash()
+	if err != nil {
+		t.Fatalf("ComputeRootHash (repeat): %v", err)
+	}
+	if h1 != h2 {
+		t.Errorf("ComputeRootHash not stable: %q vs %q", h1, h2)
+	}
+	if h1 == "" {
+		t.Error("ComputeRootHash returned empty string")
+	}
+
+	// Simulate: Phase 1 stub returns ErrNotImplemented.
+	if _, err := db.Simulate(nil); err != ErrNotImplemented {
+		t.Errorf("Simulate: expected ErrNotImplemented, got %v", err)
 	}
 }

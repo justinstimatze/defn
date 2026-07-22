@@ -3,7 +3,7 @@
 --   * INT PRIMARY KEY AUTO_INCREMENT       -> INTEGER PRIMARY KEY AUTOINCREMENT
 --   * VARCHAR(N) / LONGTEXT / MEDIUMTEXT   -> TEXT
 --   * BOOLEAN                              -> INTEGER (0/1)
---   * CREATE FULLTEXT INDEX ... ON t(col)  -> CREATE VIRTUAL TABLE ... USING fts5(...)
+--   * CREATE FULLTEXT INDEX ... ON t(col)  -> deferred to task #137 (FTS5 tokenizer)
 --   * Reserved-name columns (`key`, `value`) quoted with "..."
 
 CREATE TABLE IF NOT EXISTS modules (
@@ -107,16 +107,11 @@ CREATE INDEX IF NOT EXISTS idx_def_exported ON definitions(name, module_id);
 CREATE INDEX IF NOT EXISTS idx_def_location ON definitions(module_id, start_line, end_line);
 CREATE INDEX IF NOT EXISTS idx_def_source_file ON definitions(source_file);
 
--- FTS5 external-content: docs, bodies, comments, literal-field values.
--- contentless_delete=1 lets us DELETE by rowid on per-def updates without a
--- full rebuild. content_rowid ties each FTS row to the source table's PK so
--- searches JOIN by rowid.
-CREATE VIRTUAL TABLE IF NOT EXISTS definitions_doc_fts USING fts5(
-    doc, content='definitions', content_rowid='id'
-);
-CREATE VIRTUAL TABLE IF NOT EXISTS bodies_fts USING fts5(
-    body, content='bodies', content_rowid='def_id'
-);
+-- FTS5 virtual tables are deferred to task #137 (tokenizer quality on
+-- Go-source strings). Phase 1 uses LIKE-based SearchDefinitions instead.
+-- When FTS5 lands, add external-content virtual tables + AFTER
+-- INSERT/UPDATE/DELETE triggers on definitions/bodies/comments/
+-- literal_fields to keep the FTS index in sync.
 
 CREATE TABLE IF NOT EXISTS comments (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -132,9 +127,6 @@ CREATE TABLE IF NOT EXISTS comments (
 CREATE INDEX IF NOT EXISTS idx_comment_def ON comments(def_id);
 CREATE INDEX IF NOT EXISTS idx_comment_pragma ON comments(pragma_key);
 CREATE INDEX IF NOT EXISTS idx_comment_file ON comments(source_file, line);
-CREATE VIRTUAL TABLE IF NOT EXISTS comments_text_fts USING fts5(
-    text, content='comments', content_rowid='id'
-);
 
 CREATE TABLE IF NOT EXISTS literal_fields (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -149,9 +141,6 @@ CREATE INDEX IF NOT EXISTS idx_litfield_type ON literal_fields(type_name);
 CREATE INDEX IF NOT EXISTS idx_litfield_field ON literal_fields(field_name);
 CREATE INDEX IF NOT EXISTS idx_litfield_def ON literal_fields(def_id);
 CREATE INDEX IF NOT EXISTS idx_litfield_type_field ON literal_fields(type_name, field_name);
-CREATE VIRTUAL TABLE IF NOT EXISTS literal_fields_value_fts USING fts5(
-    field_value, content='literal_fields', content_rowid='id'
-);
 
 CREATE TABLE IF NOT EXISTS defn_meta (
     "key"   TEXT PRIMARY KEY,
