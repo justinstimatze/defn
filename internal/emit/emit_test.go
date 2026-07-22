@@ -1247,3 +1247,116 @@ func TestRoundTrip(t *testing.T) {
 		t.Fatalf("go build failed:\n%s", out)
 	}
 }
+
+// TestEmitOptsTouchedFilesFiltersModuleFiles covers the #117 scoped
+// emit path: TouchedFiles restricts which files get written, leaving
+// others untouched on disk. Sibling files in the same module that
+// aren't in the touched set must NOT be rewritten.
+func TestEmitOptsTouchedFilesFiltersModuleFiles(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test/pkg", "pkg", "")
+
+	// Two defs in two different files within the same module.
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Touched", Kind: "function", Exported: true,
+		Body: "func Touched() {}", SourceFile: "pkg/touched.go",
+	})
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Untouched", Kind: "function", Exported: true,
+		Body: "func Untouched() {}", SourceFile: "pkg/untouched.go",
+	})
+
+	outDir := t.TempDir()
+	// Full emit first to populate baseline.
+	if err := Emit(db, outDir); err != nil {
+		t.Fatal(err)
+	}
+	baselineUntouched, err := os.Stat(filepath.Join(outDir, "pkg", "untouched.go"))
+	if err != nil {
+		t.Fatalf("baseline untouched.go missing: %v", err)
+	}
+	baselineModTime := baselineUntouched.ModTime()
+
+	// Rewrite Touched's body, then scoped emit only touched.go. untouched.go
+	// must NOT be rewritten (mtime unchanged).
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Touched", Kind: "function", Exported: true,
+		Body: "func Touched() { /* changed */ }", SourceFile: "pkg/touched.go",
+	})
+	if err := EmitWithOpts(db, outDir, Opts{TouchedFiles: []string{"pkg/touched.go"}}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(filepath.Join(outDir, "pkg", "untouched.go"))
+	if err != nil {
+		t.Fatalf("untouched.go disappeared: %v", err)
+	}
+	if after.ModTime() != baselineModTime {
+		t.Errorf("scoped emit rewrote untouched.go — mtime changed %s → %s",
+			baselineModTime, after.ModTime())
+	}
+	// touched.go must reflect the new body.
+	touchedContent, err := os.ReadFile(filepath.Join(outDir, "pkg", "touched.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(touchedContent), "/* changed */") {
+		t.Errorf("touched.go missing rewritten body:\n%s", string(touchedContent))
+	}
+}
+
+// TestEmitScopedAlwaysWritesProjectFiles covers the 8ce7427 followup:
+// scoped emit into a fresh empty tempdir must still write go.mod/go.sum,
+// otherwise the tree can't build. Earlier #117 skipped project_files on
+// scoped to save the write; that broke the ceiling measure path.
+func TestEmitScopedAlwaysWritesProjectFiles(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test/pkg", "pkg", "")
+	db.SetProjectFile("go.mod", "module example.com/test\n\ngo 1.21\n")
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "F", Kind: "function", Exported: true,
+		Body: "func F() {}", SourceFile: "pkg/f.go",
+	})
+
+	outDir := t.TempDir()
+	// Scoped emit into empty dir — must still write go.mod even though it
+	// isn't in TouchedFiles.
+	if err := EmitWithOpts(db, outDir, Opts{TouchedFiles: []string{"pkg/f.go"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(outDir, "go.mod")); err != nil {
+		t.Fatalf("scoped emit skipped go.mod on fresh tempdir: %v", err)
+	}
+}
+
+// TestEmitSingleModulePreservesSourceFilePath covers #120: single-module
+// projects where module.Path == moduleRoot must NOT drop the source_file
+// directory prefix. Regression: cli/cli's "command/root.go" was being
+// written to outDir/root.go because relPath collapsed to "." and only the
+// basename survived.
+func TestEmitSingleModulePreservesSourceFilePath(t *testing.T) {
+	db := testDB(t)
+	// Single module whose Path is itself a subdirectory-shaped path.
+	// detectModuleRoot on a single module returns that module's Path as the
+	// prefix — so relPath = "", pkgDir = outDir. Pre-fix, basename joining
+	// dropped "command/". The #120 fix uses source_file directly under outDir
+	// when it has a directory prefix.
+	mod, _ := db.EnsureModule("github.com/cli/cli/command", "command", "")
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Root", Kind: "function", Exported: true,
+		Body: "func Root() {}", SourceFile: "command/root.go",
+	})
+
+	outDir := t.TempDir()
+	if err := Emit(db, outDir); err != nil {
+		t.Fatal(err)
+	}
+	wantPath := filepath.Join(outDir, "command", "root.go")
+	if _, err := os.Stat(wantPath); err != nil {
+		t.Fatalf("expected %s, not found: %v", wantPath, err)
+	}
+	// The wrong location (basename only, at outDir root) must NOT exist.
+	if _, err := os.Stat(filepath.Join(outDir, "root.go")); err == nil {
+		t.Errorf("emit still wrote root.go at outDir root (pre-#120 behavior)")
+	}
+}
+
