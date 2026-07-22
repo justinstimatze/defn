@@ -65,6 +65,42 @@ func TestTextColScan_UnsupportedType(t *testing.T) {
 	}
 }
 
+// TestTextColScan_RealisticSizes covers the size range that actually
+// triggered winze's crash (per their measurement: crashing doc was
+// 805 bytes; their largest module doc was 1326 bytes). An 8KB fixture
+// alone would prove the "obviously large" path but miss the shape
+// that broke real-world usage. Loop through 100B, 800B, 1.3KB, and
+// 8KB payloads to defend against any spill-threshold shift in future
+// Dolt versions.
+func TestTextColScan_RealisticSizes(t *testing.T) {
+	sizes := []int{100, 805, 1326, 8000}
+	for _, n := range sizes {
+		t.Run(fmt.Sprintf("%dB", n), func(t *testing.T) {
+			payload := make([]byte, n)
+			for i := range payload {
+				payload[i] = byte('a' + (i % 26))
+			}
+			want := string(payload)
+			// Through the string wrapper path (what val.TextStorage traverses).
+			var got textCol
+			if err := got.Scan(&fakeStringWrapper{v: want}); err != nil {
+				t.Fatalf("Scan(wrapper %dB) error: %v", n, err)
+			}
+			if string(got) != want {
+				t.Errorf("Scan(wrapper %dB): length %d != want %d", n, len(got), n)
+			}
+			// And through raw []byte, the other realistic driver return.
+			var got2 textCol
+			if err := got2.Scan(payload); err != nil {
+				t.Fatalf("Scan(bytes %dB) error: %v", n, err)
+			}
+			if string(got2) != want {
+				t.Errorf("Scan(bytes %dB): mismatch", n)
+			}
+		})
+	}
+}
+
 // TestSalvageZeroJournalIdx is the regression for SIGTERM leaving an
 // empty journal.idx that breaks the next Open with "invalid index
 // checksum". salvageZeroJournalIdx must rename the empty file aside so
