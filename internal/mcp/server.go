@@ -2379,8 +2379,34 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	}
 	defer rollback()
 
+	// #114 batch scoping: collect the union of files touched, files whose
+	// refs need re-derivation, and qualified names being removed. Mirrors
+	// the singleton paths (#109 pass 1/3) so an N-op apply pays one
+	// scoped emit + goimports + per-file autoResolveFile at the tail
+	// instead of a full-project autoEmitAndBuild + autoResolve.
+	type filePkg struct{ file, module string }
+	touchedFiles := map[string]bool{}
+	resolveSet := map[filePkg]bool{}
+	var allowedRemovals []string
+	addTouched := func(f string) {
+		if f != "" {
+			touchedFiles[f] = true
+		}
+	}
+	addResolve := func(f string, moduleID int64) {
+		if f == "" {
+			return
+		}
+		mp := s.modulePath(moduleID)
+		if mp == "" {
+			return
+		}
+		resolveSet[filePkg{f, mp}] = true
+	}
+
 	// projEdit resolves the target name (with single-def inference), runs
 	// the pure projection function, validates the new body, and upserts.
+	// Body-changing → adds the def's source file to both touched + resolve.
 	projEdit := func(op applyOp, compute func(body string) (string, error)) (string, string) {
 		name := op.Name
 		if name == "" {
@@ -2407,6 +2433,8 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		if _, err := s.db.UpsertDefinition(d); err != nil {
 			return "", fmt.Sprintf("%s %s: %v", op.Op, name, err)
 		}
+		addTouched(d.SourceFile)
+		addResolve(d.SourceFile, d.ModuleID)
 		return fmt.Sprintf("~ %s on %s\n", op.Op, name), ""
 	}
 
@@ -2457,6 +2485,8 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("create %s: %v", name, err))
 			} else {
+				addTouched(op.File)
+				addResolve(op.File, mod.ID)
 				sb.WriteString(fmt.Sprintf("+ created %s (id=%d)\n", name, id))
 			}
 
@@ -2497,6 +2527,8 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			if _, err := s.db.UpsertDefinition(d); err != nil {
 				errors = append(errors, fmt.Sprintf("edit %s: %v", op.Name, err))
 			} else {
+				addTouched(d.SourceFile)
+				addResolve(d.SourceFile, d.ModuleID)
 				sb.WriteString(fmt.Sprintf("~ edited %s\n", op.Name))
 			}
 
@@ -2509,6 +2541,14 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			if err := s.db.DeleteDefinition(d.ID); err != nil {
 				errors = append(errors, fmt.Sprintf("delete %s: %v", op.Name, err))
 			} else {
+				addTouched(d.SourceFile)
+				// #109 rationale: DeleteDefinition already dropped every refs
+				// row where from_def=D OR to_def=D — no resolve needed.
+				qualified := d.Name
+				if d.Receiver != "" {
+					qualified = strings.TrimPrefix(d.Receiver, "*") + "." + d.Name
+				}
+				allowedRemovals = append(allowedRemovals, qualified)
 				sb.WriteString(fmt.Sprintf("- deleted %s\n", op.Name))
 			}
 
@@ -2522,6 +2562,15 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				errors = append(errors, fmt.Sprintf("rename %s: not found", op.Name))
 				continue
 			}
+			// Reserve the qualified pre-rename name so safeWriteGoFile lets
+			// the disappearing decl actually vanish from the file (same as
+			// handleRename's qualifiedOld).
+			qualifiedOld := d.Name
+			if d.Receiver != "" {
+				qualifiedOld = strings.TrimPrefix(d.Receiver, "*") + "." + d.Name
+			}
+			allowedRemovals = append(allowedRemovals, qualifiedOld)
+			addTouched(d.SourceFile)
 			d.Body, _ = astRename(d.Body, op.Name, op.NewName)
 			d.Name = op.NewName
 			d.Signature = extractSignature(d.Body)
@@ -2539,10 +2588,13 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 					if _, err := s.db.UpsertDefinition(&caller); err != nil {
 						errors = append(errors, fmt.Sprintf("rename caller %s: %v", caller.Name, err))
 					} else {
+						addTouched(caller.SourceFile)
 						callerCount++
 					}
 				}
 			}
+			// #109: rename is ID-preserving semantic transform — refs edges
+			// unchanged. Skip adding to resolveSet.
 			sb.WriteString(fmt.Sprintf("→ renamed %s → %s (%d callers updated)\n", op.Name, op.NewName, callerCount))
 
 		case "insert-precondition":
@@ -2657,6 +2709,9 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			if err := s.db.SetImports(moduleID, updated); err != nil {
 				errors = append(errors, fmt.Sprintf("add-import %q: %v", op.ImportPath, err))
 			} else {
+				// add-import changes imports header only; body/refs untouched.
+				// Touch file so goimports re-formats the imports block.
+				addTouched(file)
 				sb.WriteString(fmt.Sprintf("+ added import %q\n", op.ImportPath))
 			}
 
@@ -2676,8 +2731,27 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		return errResult(fmt.Errorf("commit: %w", err))
 	}
 
-	buildResult := s.autoEmitAndBuild()
-	s.autoResolve("")
+	// #114 batch scoping: if we tracked any touched files, run one scoped
+	// emit + goimports + per-file resolve at the tail. Safety valve — if
+	// tracking came up empty (every op had empty SourceFile, edge case),
+	// fall back to full autoEmitAndBuild + autoResolve for correctness.
+	var buildResult string
+	if len(touchedFiles) > 0 || len(allowedRemovals) > 0 {
+		goimportsFiles := make([]string, 0, len(touchedFiles))
+		for f := range touchedFiles {
+			goimportsFiles = append(goimportsFiles, f)
+		}
+		buildResult = s.autoEmitAndBuildWithOpts(emit.Opts{
+			AllowedRemovals: allowedRemovals,
+			GoimportsFiles:  goimportsFiles,
+		})
+		for fp := range resolveSet {
+			s.autoResolveFile(fp.file, fp.module)
+		}
+	} else {
+		buildResult = s.autoEmitAndBuild()
+		s.autoResolve("")
+	}
 	if buildResult != "" {
 		sb.WriteString("\n" + buildResult)
 	}
