@@ -230,6 +230,11 @@ Usage:
   defn query <sql>             Read-only SQL query
   defn gc                      Compact Dolt storage (garbage collection)
   defn restart [--all]         Gracefully bounce this project's serve (or all)
+  defn measure-rename [--in-place] <old> <new>    Time a rename against .defn without spinning up serve
+  defn measure-edit   [--in-place] <name> <body-file>  Time an edit; body-file keeps multi-line source shell-safe
+                               --in-place pre-populates scratch with one full emit before timing so
+                               file-scoped emit + package-scoped build actually apply (real interactive
+                               cost); without it, fresh-tempdir mode gives the un-optimized ceiling number.
   defn worktree <branch>       Clone DB on a branch (for multi-agent)
   defn push <remote> <branch>  Push branch to remote
   defn pull <remote> <branch>  Pull from remote`)

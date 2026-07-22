@@ -67,6 +67,52 @@ go run ./cmd/defn-test    # integration tests against real Go projects (clones f
 
 Go 1.26+ required.
 
+## Perf measurement
+
+Two CLI subcommands time a single mutation against a live `.defn` without
+spinning up serve + MCP. Use them to compare defn's write path against native
+(`AST splice + go build .`) on a real repo.
+
+```bash
+defn measure-rename [--in-place] <old-name> <new-name>
+defn measure-edit   [--in-place] <name> <body-file>
+```
+
+- Without `--in-place`: fresh tempdir per run. Reports the CEILING cost
+  (full emit + full build every time). Multi-package trees may fail to
+  build in the tempdir — expected.
+- With `--in-place`: pre-populates scratch with one full emit BEFORE the
+  timer, then runs the timed mutation against a warm tree. This exercises
+  the real file-scoped emit + package-scoped build path (#117/#118) a
+  real MCP client sees. Pre-populate cost logs to stderr as
+  `[prepopulate] full emit for rename: Xs` and is UNTIMED — factor it
+  out when analyzing the wall.
+
+Delta between ceiling and `--in-place` = the win from file-scoped emit +
+package-scoped build.
+
+Set `DEFN_MEASURE_TIMING=1` for a per-phase breakdown inside emit
+(project-files / module-writes / goimports / refresh-file-sources /
+rebuild-loc-index).
+
+## Emit scoping (`Opts.TouchedFiles`)
+
+MCP mutation callers pass an `emit.Opts.TouchedFiles []string` of the
+project-relative source_files they actually touched. Emit uses it to:
+
+- Skip module files not in the set (write only the touched files).
+- Skip mod.Doc auto-attach (doc lives where it already lives on disk).
+- Skip the post-emit loc-index rebuild (only `defn lint` consumes it).
+- Scope `goimports` to those files (via `Opts.GoimportsFiles`).
+
+Project files (go.mod, go.sum) are ALWAYS written regardless of scope —
+scoped-emit into a fresh tempdir would otherwise leave the tree unbuildable.
+
+Companion: `autoEmitAndBuildWithOpts` also passes `TouchedFiles` to
+`buildTargetsForFiles` so `go build` targets just the touched packages
+(`go build ./cmd/x ./internal/y` instead of `./...`), avoiding cgo-heavy
+subtree drag.
+
 ## Self-Hosting Round-Trip
 
 ```bash
