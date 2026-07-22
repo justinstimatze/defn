@@ -1754,6 +1754,165 @@ func (s *DB) SetLiteralFields(defID int64, fields []LiteralField) error {
 // MySQL's default max_allowed_packet.
 const setLitFieldsBatchSize = 500
 
+// SetManyReferences replaces the outgoing refs for every def in `refsByDef`
+// with the provided ref slices, in ONE DELETE + one-or-more batched
+// INSERTs — regardless of how many defs are in the map. Contrast with
+// looping SetReferences per def, which pays one SELECT+DELETE+INSERT
+// per def (~280ms/stmt in a Dolt txn on winze). #111.
+//
+// Semantics per def: the outgoing edge set is replaced. Refs for defs
+// NOT in refsByDef are untouched. Empty ref slices and empty maps are
+// no-ops. Deduplication is per-def (matches SetReferences pre-existing
+// INSERT IGNORE semantics).
+//
+// The caller controls the txn: SetManyReferences uses s.execContext
+// which routes through the pinned conn (embedded) or pool (MySQL).
+// resolve.go wraps this + SetManyLiteralFields in one Begin/Commit.
+func (s *DB) SetManyReferences(refsByDef map[int64][]Reference) error {
+	if len(refsByDef) == 0 {
+		return nil
+	}
+	ctx := s.Ctx()
+
+	// One DELETE covering all defs. IN(...) with N placeholders — chunked
+	// for very large flushes (unlikely on a per-file resolve, but
+	// bounded for safety at 500 IDs/stmt).
+	defIDs := make([]int64, 0, len(refsByDef))
+	for id := range refsByDef {
+		defIDs = append(defIDs, id)
+	}
+	for start := 0; start < len(defIDs); start += 500 {
+		end := start + 500
+		if end > len(defIDs) {
+			end = len(defIDs)
+		}
+		chunk := defIDs[start:end]
+		placeholders := strings.Repeat("?,", len(chunk))
+		placeholders = placeholders[:len(placeholders)-1] // drop trailing comma
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		q := "DELETE FROM refs WHERE from_def IN (" + placeholders + ")"
+		if _, err := s.execContext(ctx, q, args...); err != nil {
+			return fmt.Errorf("SetManyReferences delete (defs %d..%d): %w", start, end, err)
+		}
+	}
+
+	// Collect all (fromDef, toDef, kind) rows across all defs, dedup, batch INSERT.
+	type rk struct {
+		from int64
+		to   int64
+		kind string
+	}
+	seen := make(map[rk]bool)
+	type row struct {
+		from int64
+		to   int64
+		kind string
+	}
+	var rows []row
+	for fromID, refs := range refsByDef {
+		for _, r := range refs {
+			k := rk{fromID, r.ToDef, r.Kind}
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+			rows = append(rows, row{fromID, r.ToDef, r.Kind})
+		}
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	for start := 0; start < len(rows); start += setRefsBatchSize {
+		end := start + setRefsBatchSize
+		if end > len(rows) {
+			end = len(rows)
+		}
+		chunk := rows[start:end]
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, 3*len(chunk))
+		for i, r := range chunk {
+			placeholders[i] = "(?, ?, ?)"
+			args = append(args, r.from, r.to, r.kind)
+		}
+		q := "INSERT IGNORE INTO refs (from_def, to_def, kind) VALUES " +
+			strings.Join(placeholders, ", ")
+		if _, err := s.execContext(ctx, q, args...); err != nil {
+			return fmt.Errorf("SetManyReferences insert (rows %d..%d of %d): %w", start, end, len(rows), err)
+		}
+	}
+	return nil
+}
+
+// SetManyLiteralFields is the SetManyReferences shape for literal_fields.
+// Same one-DELETE + batched-INSERT structure; caller-controlled txn.
+func (s *DB) SetManyLiteralFields(fieldsByDef map[int64][]LiteralField) error {
+	if len(fieldsByDef) == 0 {
+		return nil
+	}
+	ctx := s.Ctx()
+
+	defIDs := make([]int64, 0, len(fieldsByDef))
+	for id := range fieldsByDef {
+		defIDs = append(defIDs, id)
+	}
+	for start := 0; start < len(defIDs); start += 500 {
+		end := start + 500
+		if end > len(defIDs) {
+			end = len(defIDs)
+		}
+		chunk := defIDs[start:end]
+		placeholders := strings.Repeat("?,", len(chunk))
+		placeholders = placeholders[:len(placeholders)-1]
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		q := "DELETE FROM literal_fields WHERE def_id IN (" + placeholders + ")"
+		if _, err := s.execContext(ctx, q, args...); err != nil {
+			return fmt.Errorf("SetManyLiteralFields delete (defs %d..%d): %w", start, end, err)
+		}
+	}
+
+	type row struct {
+		defID     int64
+		typeName  string
+		fieldName string
+		value     string
+		line      int
+	}
+	var rows []row
+	for defID, fields := range fieldsByDef {
+		for _, f := range fields {
+			rows = append(rows, row{defID, f.TypeName, f.FieldName, f.FieldValue, f.Line})
+		}
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	for start := 0; start < len(rows); start += setLitFieldsBatchSize {
+		end := start + setLitFieldsBatchSize
+		if end > len(rows) {
+			end = len(rows)
+		}
+		chunk := rows[start:end]
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, 5*len(chunk))
+		for i, r := range chunk {
+			placeholders[i] = "(?, ?, ?, ?, ?)"
+			args = append(args, r.defID, r.typeName, r.fieldName, r.value, r.line)
+		}
+		q := `INSERT INTO literal_fields (def_id, type_name, field_name, field_value, line) VALUES ` +
+			strings.Join(placeholders, ", ")
+		if _, err := s.execContext(ctx, q, args...); err != nil {
+			return fmt.Errorf("SetManyLiteralFields insert (rows %d..%d of %d): %w", start, end, len(rows), err)
+		}
+	}
+	return nil
+}
+
 // SetMeta upserts a key/value pair into the defn_meta table.
 func (s *DB) SetMeta(key, value string) error {
 	ctx := s.Ctx()

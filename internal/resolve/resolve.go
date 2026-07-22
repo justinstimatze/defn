@@ -349,31 +349,30 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 	tPass = time.Now()
 
 	// #108 (winze finding): wrap the entire flush in ONE transaction
-	// instead of letting Dolt autocommit each SetReferences /
-	// SetLiteralFields call. On a 1.2GB Dolt working set each autocommit
-	// materializes noms chunks separately — winze measured ~1.5s PER
-	// statement × 72 statements = 109s. One txn amortizes that cost.
+	// instead of letting Dolt autocommit each write call. On a 1.2GB
+	// Dolt working set each autocommit materializes noms chunks
+	// separately — winze measured ~1.5s PER statement × 72 statements
+	// = 109s. One txn amortizes that cost. #111 collapses the per-def
+	// loop into set-based one-DELETE + batched-INSERT for each of refs
+	// and litfields, cutting ~75 statements to ~5 total for a typical
+	// 15-def flush.
+	//
 	// Fall back to the unwrapped path if Begin fails (embedded Dolt not
 	// ready, MySQL server rejects START TRANSACTION, etc.) — same shape
 	// as before, just slower on ref-dense flushes.
 	commit, rollback, txErr := db.Begin()
 	txWrapped := txErr == nil
-	// Flush accumulated refs once per def. SetReferences de-dupes internally.
-	for fromID, refs := range defRefs {
-		if err := db.SetReferences(fromID, refs); err != nil {
-			if txWrapped {
-				rollback()
-			}
-			return err
+	if err := db.SetManyReferences(defRefs); err != nil {
+		if txWrapped {
+			rollback()
 		}
+		return err
 	}
-	for fromID, fields := range defLitFields {
-		if err := db.SetLiteralFields(fromID, fields); err != nil {
-			if txWrapped {
-				rollback()
-			}
-			return err
+	if err := db.SetManyLiteralFields(defLitFields); err != nil {
+		if txWrapped {
+			rollback()
 		}
+		return err
 	}
 	if txWrapped {
 		if err := commit(); err != nil {
