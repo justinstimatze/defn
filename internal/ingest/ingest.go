@@ -88,6 +88,11 @@ func IngestPackages(db *store.DB, pkgs []*packages.Package, modulePath string) e
 		if err := ingestPackage(db, pkg, modulePath, state); err != nil {
 			return fmt.Errorf("ingest %s: %w", pkg.PkgPath, err)
 		}
+		// Flush buffered defs for this package via batched INSERT (#125).
+		// Per-package boundary — matches the per-package resolve/GC cadence.
+		if err := state.flushDefs(db); err != nil {
+			return fmt.Errorf("flush defs %s: %w", pkg.PkgPath, err)
+		}
 		if i+1 >= len(filtered) {
 			continue
 		}
@@ -447,13 +452,44 @@ func ingestComments(db *store.DB, fset *token.FileSet, file *ast.File, sourceFil
 // ingestState holds mutable state for a single ingest run.
 // Passed by pointer to avoid package-level mutable state.
 type ingestState struct {
-	initCounter map[int64]int  // tracks init functions per module
+	initCounter map[int64]int  // tracks all init functions per module
 	liveDefIDs  map[int64]bool // tracks all definition IDs seen
 	// liveFileSources tracks the (module_id, source_file) pairs written
 	// during this ingest. Used to prune file_sources rows for files
 	// that no longer exist on disk (e.g., orphan basename entries
 	// from pre-0.22.3 relative-modulePath ingests).
 	liveFileSources map[int64]map[string]bool
+	// pendingDefs buffers definitions for batched UpsertDefinitionsBulk.
+	// Flushed at each package boundary — winze profile 2026-07-22 showed
+	// per-row upsert = 105s of a 112s warm ingest; batched shape matches
+	// SetManyReferences (#108/#111) and closes the gap ~30x.
+	pendingDefs []*store.Definition
+}
+
+// enqueueDef buffers a definition for batched upsert. The def is written
+// on the next call to flushDefs (typically at end of ingestPackage).
+// state.liveDefIDs is populated after flush from the returned IDs.
+func (s *ingestState) enqueueDef(d *store.Definition) {
+	s.pendingDefs = append(s.pendingDefs, d)
+}
+
+// flushDefs writes all buffered defs via db.UpsertDefinitionsBulk, records
+// the returned IDs in liveDefIDs, and clears the buffer. Safe on empty
+// buffer. Called at package boundaries so any single ingest failure only
+// wastes one package's work (matches per-row failure semantics roughly).
+func (s *ingestState) flushDefs(db *store.DB) error {
+	if len(s.pendingDefs) == 0 {
+		return nil
+	}
+	ids, err := db.UpsertDefinitionsBulk(s.pendingDefs)
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		s.liveDefIDs[id] = true
+	}
+	s.pendingDefs = s.pendingDefs[:0]
+	return nil
 }
 
 func ingestFunc(db *store.DB, fset *token.FileSet, mod *store.Module, file *ast.File, fn *ast.FuncDecl, isTest bool, sourceFile string, state *ingestState) error {
@@ -500,11 +536,7 @@ func ingestFunc(db *store.DB, fset *token.FileSet, mod *store.Module, file *ast.
 		SourceFile: sourceFile,
 	}
 
-	id, err := db.UpsertDefinition(def)
-	if err != nil {
-		return err
-	}
-	state.liveDefIDs[id] = true
+	state.enqueueDef(def)
 	return nil
 }
 
@@ -552,11 +584,7 @@ func ingestGenDecl(db *store.DB, fset *token.FileSet, mod *store.Module, file *a
 			EndLine:    end.Line,
 			SourceFile: sourceFile,
 		}
-		id, err := db.UpsertDefinition(def)
-		if err != nil {
-			return err
-		}
-		state.liveDefIDs[id] = true
+		state.enqueueDef(def)
 		return nil
 	}
 
@@ -597,11 +625,7 @@ func ingestGenDecl(db *store.DB, fset *token.FileSet, mod *store.Module, file *a
 				EndLine:    end.Line,
 				SourceFile: sourceFile,
 			}
-			id, err := db.UpsertDefinition(def)
-			if err != nil {
-				return err
-			}
-			state.liveDefIDs[id] = true
+			state.enqueueDef(def)
 
 		case *ast.ValueSpec:
 			c := &valueSpecCtx{
@@ -666,11 +690,7 @@ func ingestValueSpec(c *valueSpecCtx, s *ast.ValueSpec) error {
 		EndLine:    specEnd.Line,
 		SourceFile: c.sourceFile,
 	}
-	id, err := c.db.UpsertDefinition(def)
-	if err != nil {
-		return err
-	}
-	c.state.liveDefIDs[id] = true
+	c.state.enqueueDef(def)
 	return nil
 }
 

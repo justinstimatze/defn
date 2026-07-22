@@ -2422,6 +2422,176 @@ func (s *DB) Traverse(startID int64, direction string, refKinds []string, maxDep
 	return results, nil
 }
 
+// upsertDefsBatchSize caps rows per UpsertDefinitionsBulk INSERT batch.
+// 500 matches setRefsBatchSize/setLitFieldsBatchSize (#108/#111).
+const upsertDefsBatchSize = 500
+
+// UpsertDefinitionsBulk is the batched partner to UpsertDefinition.
+// Winze profile 2026-07-22 msg-1769f322: 2284 defs took 105s per-row on
+// their corpus vs 3.6s for the batched SetReferences shape (~30x gap).
+// Same fix pattern that closed #108 (refs) and #111 (literal_fields):
+// bulk-lookup existing rows, split input into insert/update, batched
+// multi-row INSERT for the insert path with parallel body INSERTs.
+//
+// Semantics (mirrors per-row UpsertDefinition):
+//   - Computes Hash from Body for every input def.
+//   - Bulk SELECT by (module_id, name, kind, COALESCE(receiver,''), test) key.
+//   - New rows: batched INSERT into definitions + bodies. Dolt's AUTO_INCREMENT
+//     hands out consecutive IDs within a single multi-row INSERT, so the
+//     assigned IDs are LAST_INSERT_ID()..LAST_INSERT_ID()+N-1.
+//   - Existing rows, hash unchanged: fast-skip (matches per-row's no-op path).
+//   - Existing rows, hash changed: fall through to per-row UpsertDefinition
+//     (rare on cold ingest; batched update requires per-row logic anyway).
+//
+// Returns IDs aligned to the input slice. Caller controls txn (matches
+// SetManyReferences convention). Empty input is a no-op.
+func (s *DB) UpsertDefinitionsBulk(defs []*Definition) ([]int64, error) {
+	if len(defs) == 0 {
+		return nil, nil
+	}
+	ctx := s.Ctx()
+	ids := make([]int64, len(defs))
+
+	// Populate Hash for every input def (same as per-row UpsertDefinition).
+	for _, d := range defs {
+		d.Hash = HashBody(d.Body)
+	}
+
+	// Bulk lookup: build a map keyed by the natural unique tuple.
+	// Dolt's IN() with tuple keys is awkward — we chunk by module_id
+	// (most inputs share few module IDs) and match in-memory.
+	type natKey struct {
+		modID    int64
+		name     string
+		kind     string
+		receiver string
+		test     bool
+	}
+	keyOf := func(d *Definition) natKey {
+		return natKey{d.ModuleID, d.Name, d.Kind, d.Receiver, d.Test}
+	}
+	type existing struct {
+		id   int64
+		hash string
+	}
+	existingByKey := make(map[natKey]existing, len(defs))
+	modIDs := make(map[int64]bool)
+	for _, d := range defs {
+		modIDs[d.ModuleID] = true
+	}
+	// One SELECT per module — cheap and avoids IN-tuple gymnastics.
+	for modID := range modIDs {
+		rows, err := s.queryContext(ctx,
+			`SELECT id, name, kind, COALESCE(receiver,''), test, hash
+			 FROM definitions WHERE module_id = ?`, modID)
+		if err != nil {
+			return nil, fmt.Errorf("UpsertDefinitionsBulk lookup module %d: %w", modID, err)
+		}
+		for rows.Next() {
+			var e existing
+			var name, kind, receiver textCol
+			var hash textCol
+			var test bool
+			if err := rows.Scan(&e.id, &name, &kind, &receiver, &test, &hash); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("UpsertDefinitionsBulk scan: %w", err)
+			}
+			e.hash = string(hash)
+			existingByKey[natKey{modID, string(name), string(kind), string(receiver), test}] = e
+		}
+		rows.Close()
+	}
+
+	// Split input into insert-path vs update-path.
+	var toInsert []*Definition
+	var toInsertPos []int
+	for i, d := range defs {
+		if e, ok := existingByKey[keyOf(d)]; ok {
+			ids[i] = e.id
+			if e.hash == d.Hash {
+				// Fast-skip: same as per-row's no-op branch. Still update
+				// location fields if they differ — deferred to per-row for
+				// simplicity; the location UPDATE is a single conditional
+				// exec so N * cheap is tolerable here (rare on cold).
+				if _, err := s.execContext(ctx,
+					`UPDATE definitions SET start_line=?, end_line=?, source_file=?
+					 WHERE id=? AND (start_line != ? OR end_line != ? OR source_file != ?)`,
+					d.StartLine, d.EndLine, d.SourceFile,
+					e.id, d.StartLine, d.EndLine, d.SourceFile,
+				); err != nil {
+					return nil, fmt.Errorf("UpsertDefinitionsBulk location update id=%d: %w", e.id, err)
+				}
+				continue
+			}
+			// Hash changed — fall through to per-row for updates.
+			if _, err := s.UpsertDefinition(d); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		toInsert = append(toInsert, d)
+		toInsertPos = append(toInsertPos, i)
+	}
+	if len(toInsert) == 0 {
+		return ids, nil
+	}
+
+	// Batched INSERT INTO definitions. Track batch boundaries so we can
+	// recover the assigned IDs via LAST_INSERT_ID()+i.
+	for start := 0; start < len(toInsert); start += upsertDefsBatchSize {
+		end := start + upsertDefsBatchSize
+		if end > len(toInsert) {
+			end = len(toInsert)
+		}
+		chunk := toInsert[start:end]
+		placeholders := make([]string, len(chunk))
+		defArgs := make([]any, 0, 12*len(chunk))
+		for i, d := range chunk {
+			placeholders[i] = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+			defArgs = append(defArgs,
+				d.ModuleID, d.Name, d.Kind, d.Exported, d.Test, d.Receiver,
+				d.Signature, d.Doc, d.StartLine, d.EndLine, d.SourceFile, d.Hash)
+		}
+		q := `INSERT INTO definitions
+		      (module_id, name, kind, exported, test, receiver, signature, doc,
+		       start_line, end_line, source_file, hash) VALUES ` +
+			strings.Join(placeholders, ",")
+		res, err := s.execContext(ctx, q, defArgs...)
+		if err != nil {
+			return nil, fmt.Errorf("UpsertDefinitionsBulk insert defs (batch %d..%d): %w",
+				start, end, err)
+		}
+		firstID, err := res.LastInsertId()
+		if err != nil {
+			return nil, fmt.Errorf("UpsertDefinitionsBulk LastInsertId: %w", err)
+		}
+		// Dolt/MySQL AUTO_INCREMENT is consecutive within a multi-row INSERT
+		// — assign IDs by offset from LastInsertId.
+		for i, d := range chunk {
+			assignedID := firstID + int64(i)
+			pos := toInsertPos[start+i]
+			ids[pos] = assignedID
+			_ = d
+		}
+
+		// Batched INSERT INTO bodies for this chunk. Same alignment: def_id
+		// runs firstID..firstID+len-1 in the same order as chunk.
+		bodyPlaceholders := make([]string, len(chunk))
+		bodyArgs := make([]any, 0, 2*len(chunk))
+		for i, d := range chunk {
+			bodyPlaceholders[i] = "(?, ?)"
+			bodyArgs = append(bodyArgs, firstID+int64(i), d.Body)
+		}
+		bq := "INSERT INTO bodies (def_id, body) VALUES " + strings.Join(bodyPlaceholders, ",")
+		if _, err := s.execContext(ctx, bq, bodyArgs...); err != nil {
+			return nil, fmt.Errorf("UpsertDefinitionsBulk insert bodies (batch %d..%d): %w",
+				start, end, err)
+		}
+	}
+
+	return ids, nil
+}
+
 // UpsertDefinition inserts or updates a definition, returning its ID.
 // If the hash is unchanged, it's a no-op.
 func (s *DB) UpsertDefinition(d *Definition) (int64, error) {

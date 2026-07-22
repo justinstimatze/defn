@@ -101,6 +101,11 @@ func IngestFile(db *store.DB, modulePath string, filePath string) (int, error) {
 		}
 	}
 
+	// #125: flush buffered defs. Single-file ingest → single flush at end.
+	if err := state.flushDefs(db); err != nil {
+		return updated, fmt.Errorf("flush defs: %w", err)
+	}
+
 	return updated, nil
 }
 

@@ -131,3 +131,125 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// TestUpsertDefinitionsBulk covers #125's batched insert path: insert
+// path, hash-unchanged fast-skip, hash-changed fall-through, ID ordering
+// aligned to input, mixed-module input.
+func TestUpsertDefinitionsBulk(t *testing.T) {
+	db := testDB(t)
+	modA, _ := db.EnsureModule("example.com/a", "a", "")
+	modB, _ := db.EnsureModule("example.com/b", "b", "")
+
+	// Round 1: fresh insert of 6 defs across 2 modules.
+	defs := []*Definition{
+		{ModuleID: modA.ID, Name: "F1", Kind: "function", Body: "func F1() {}"},
+		{ModuleID: modA.ID, Name: "F2", Kind: "function", Body: "func F2() {}"},
+		{ModuleID: modA.ID, Name: "M", Kind: "method", Receiver: "*T", Body: "func (t *T) M() {}"},
+		{ModuleID: modB.ID, Name: "F1", Kind: "function", Body: "func F1() { /*B*/ }"},
+		{ModuleID: modB.ID, Name: "T", Kind: "type", Body: "type T struct{}"},
+		{ModuleID: modA.ID, Name: "F3", Kind: "function", Body: "func F3() {}"},
+	}
+	ids, err := db.UpsertDefinitionsBulk(defs)
+	if err != nil {
+		t.Fatalf("bulk insert: %v", err)
+	}
+	if len(ids) != len(defs) {
+		t.Fatalf("expected %d ids, got %d", len(defs), len(ids))
+	}
+	for i, id := range ids {
+		if id == 0 {
+			t.Errorf("ids[%d] is zero for %s", i, defs[i].Name)
+		}
+	}
+	// Every ID must be unique.
+	seen := map[int64]bool{}
+	for i, id := range ids {
+		if seen[id] {
+			t.Errorf("duplicate id %d at index %d", id, i)
+		}
+		seen[id] = true
+	}
+	// Verify bodies round-trip identically.
+	for i, d := range defs {
+		got, err := db.GetDefinition(ids[i])
+		if err != nil {
+			t.Fatalf("GetDefinition(%d): %v", ids[i], err)
+		}
+		if got.Body != d.Body {
+			t.Errorf("body mismatch for %s: got %q want %q", d.Name, got.Body, d.Body)
+		}
+	}
+
+	// Round 2: same input again — should hit fast-skip path (unchanged hash),
+	// return same IDs, not create duplicates.
+	ids2, err := db.UpsertDefinitionsBulk(defs)
+	if err != nil {
+		t.Fatalf("bulk re-insert: %v", err)
+	}
+	for i := range defs {
+		if ids2[i] != ids[i] {
+			t.Errorf("re-insert changed id for %s: %d → %d", defs[i].Name, ids[i], ids2[i])
+		}
+	}
+
+	// Round 3: change one body — should fall through to per-row update.
+	defs[1].Body = "func F2() { /* changed */ }"
+	ids3, err := db.UpsertDefinitionsBulk(defs)
+	if err != nil {
+		t.Fatalf("bulk update: %v", err)
+	}
+	if ids3[1] != ids[1] {
+		t.Errorf("update changed id for F2: %d → %d", ids[1], ids3[1])
+	}
+	got, _ := db.GetDefinition(ids[1])
+	if !strings.Contains(got.Body, "/* changed */") {
+		t.Errorf("update didn't persist: %q", got.Body)
+	}
+
+	// Round 4: mix new + existing. New rows get fresh IDs, existing keep theirs.
+	mixed := append([]*Definition{
+		{ModuleID: modA.ID, Name: "NEW", Kind: "function", Body: "func NEW() {}"},
+	}, defs...)
+	ids4, err := db.UpsertDefinitionsBulk(mixed)
+	if err != nil {
+		t.Fatalf("bulk mixed: %v", err)
+	}
+	if ids4[0] == 0 {
+		t.Errorf("NEW got no id")
+	}
+	for i := 1; i < len(mixed); i++ {
+		if ids4[i] != ids[i-1] {
+			t.Errorf("mixed changed id for %s at pos %d: %d → %d",
+				mixed[i].Name, i, ids[i-1], ids4[i])
+		}
+	}
+}
+
+// TestUpsertDefinitionsBulkLargeBodies is the batched-path equivalent of
+// TestLargeBodyRoundTrip — proves the bulk INSERT for bodies preserves
+// content across the Dolt TextStorage threshold, not just the per-row path.
+func TestUpsertDefinitionsBulkLargeBodies(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/big", "big", "")
+
+	defs := []*Definition{
+		{ModuleID: mod.ID, Name: "Small", Kind: "function", Body: makeGoBody(500)},
+		{ModuleID: mod.ID, Name: "AtThreshold", Kind: "function", Body: makeGoBody(1400)},
+		{ModuleID: mod.ID, Name: "OverThreshold", Kind: "function", Body: makeGoBody(2000)},
+		{ModuleID: mod.ID, Name: "Big", Kind: "function", Body: makeGoBody(10000)},
+	}
+	ids, err := db.UpsertDefinitionsBulk(defs)
+	if err != nil {
+		t.Fatalf("bulk insert: %v", err)
+	}
+	for i, d := range defs {
+		got, err := db.GetDefinition(ids[i])
+		if err != nil {
+			t.Fatalf("GetDefinition(%d): %v", ids[i], err)
+		}
+		if got.Body != d.Body {
+			t.Errorf("%s: body mismatch (got %d bytes want %d bytes)",
+				d.Name, len(got.Body), len(d.Body))
+		}
+	}
+}
