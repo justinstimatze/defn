@@ -65,6 +65,14 @@ func main() {
 			file = os.Args[2]
 		}
 		cmdSync(file)
+	case "measure-rename":
+		// #109 pass 2 measurement path — winze needs a way to time
+		// rename against a live .defn without spinning up serve + MCP.
+		if len(os.Args) < 4 {
+			fmt.Fprintln(os.Stderr, "usage: defn measure-rename <old-name> <new-name>")
+			os.Exit(1)
+		}
+		cmdMeasureRename(os.Args[2], os.Args[3])
 	case "search":
 		pattern, rank, jsonFlag, limit, err := parseSearchArgs(os.Args[2:])
 		if err != nil {

@@ -197,6 +197,31 @@ func mcpHTTPMux(mcpServer *sdkmcp.Server, projDir string) http.Handler {
 }
 
 // newMCPServer creates the internal server state and MCP server instance.
+// MeasureRename runs handleRename synchronously against `database` and
+// returns the elapsed wall clock + the raw text of the result. Exposed
+// for perf measurement (see cmd/defn measure-rename) so a caller can
+// time the same code path an MCP client would drive without spinning
+// up a full serve. Skips the async startup ingest.
+func MeasureRename(database *store.DB, projDir, oldName, newName string) (time.Duration, string, error) {
+	s := &server{db: database, projectDir: projDir}
+	s.idf = newIDF(database)
+	s.ready.Store(true) // caller-driven; skip the async ingest wait
+	start := time.Now()
+	result, _, err := s.handleRename(context.Background(), nil,
+		renameParam{OldName: oldName, NewName: newName})
+	elapsed := time.Since(start)
+	if err != nil {
+		return elapsed, "", err
+	}
+	if result == nil {
+		return elapsed, "", nil
+	}
+	if result.IsError {
+		return elapsed, resultTextRaw(result), fmt.Errorf("rename failed: %s", resultTextRaw(result))
+	}
+	return elapsed, resultTextRaw(result), nil
+}
+
 // Shared by both stdio and HTTP transports.
 func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*server, *sdkmcp.Server) {
 	s := &server{db: database, projectDir: projDir}

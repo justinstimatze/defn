@@ -833,6 +833,37 @@ func compactEmbedded(db *store.DB, dbPath string) {
 // The single-file path updates definitions/bodies/signatures but does
 // not rebuild the reference graph. Use full sync after structural
 // changes that affect cross-file calls.
+// cmdMeasureRename times a rename against the current .defn without
+// spinning up the full MCP serve. Winze uses this to compare pre/post
+// #109 pass 2 (the "faster than native" thesis lever) on their ref-
+// dense corpus. The projDir is the current working directory; the
+// rename fires on the pinned conn / pool path, same as MCP would.
+func cmdMeasureRename(oldName, newName string) {
+	dbPath := getDBPath()
+	checkEmbeddedAvailable(dbPath)
+	db, err := store.Open(dbPath)
+	if err != nil {
+		fatal(err)
+	}
+	defer db.Close()
+	projDir, err := os.Getwd()
+	if err != nil {
+		fatal(err)
+	}
+	elapsed, msg, err := mcpserver.MeasureRename(db, projDir, oldName, newName)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "rename failed after %s: %v\n", elapsed.Round(time.Millisecond), err)
+		if msg != "" {
+			fmt.Fprintln(os.Stderr, msg)
+		}
+		os.Exit(1)
+	}
+	fmt.Printf("rename %s → %s: %s\n", oldName, newName, elapsed.Round(time.Millisecond))
+	if msg != "" {
+		fmt.Println(msg)
+	}
+}
+
 func cmdSync(file string) {
 	if file == "" {
 		cmdIngest(".", false)
