@@ -875,6 +875,42 @@ func cmdMeasureRename(oldName, newName string) {
 	}
 }
 
+// cmdMeasureEdit is the symmetric partner to cmdMeasureRename. Reads the
+// new body from a file (keeps multi-line Go source shell-safe) and times
+// the same MCP handleEdit path a real client would drive — file-scoped
+// goimports + autoResolveFile (#109 pass 3). Same tempdir emit safety
+// story as measure-rename.
+func cmdMeasureEdit(name, bodyFile string) {
+	dbPath := getDBPath()
+	checkEmbeddedAvailable(dbPath)
+	body, err := os.ReadFile(bodyFile)
+	if err != nil {
+		fatal(fmt.Errorf("read body: %w", err))
+	}
+	db, err := store.Open(dbPath)
+	if err != nil {
+		fatal(err)
+	}
+	defer db.Close()
+	scratch, err := os.MkdirTemp("", "defn-measure-edit-*")
+	if err != nil {
+		fatal(fmt.Errorf("mktemp: %w", err))
+	}
+	defer os.RemoveAll(scratch)
+	elapsed, msg, err := mcpserver.MeasureEdit(db, scratch, name, string(body))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "edit failed after %s: %v\n", elapsed.Round(time.Millisecond), err)
+		if msg != "" {
+			fmt.Fprintln(os.Stderr, msg)
+		}
+		os.Exit(1)
+	}
+	fmt.Printf("edit %s: %s\n", name, elapsed.Round(time.Millisecond))
+	if msg != "" {
+		fmt.Println(msg)
+	}
+}
+
 func cmdSync(file string) {
 	if file == "" {
 		cmdIngest(".", false)

@@ -222,6 +222,30 @@ func MeasureRename(database *store.DB, projDir, oldName, newName string) (time.D
 	return elapsed, resultTextRaw(result), nil
 }
 
+// MeasureEdit is the symmetric measurement path for handleEdit. Winze
+// uses this to time the edit thesis on their reference-dense corpus —
+// same shape as MeasureRename but exercises the file-scoped goimports
+// + autoResolveFile lever (#109 pass 3) rather than rename's skip path.
+func MeasureEdit(database *store.DB, projDir, name, newBody string) (time.Duration, string, error) {
+	s := &server{db: database, projectDir: projDir}
+	s.idf = newIDF(database)
+	s.ready.Store(true)
+	start := time.Now()
+	result, _, err := s.handleEdit(context.Background(), nil,
+		editParam{Name: name, NewBody: newBody})
+	elapsed := time.Since(start)
+	if err != nil {
+		return elapsed, "", err
+	}
+	if result == nil {
+		return elapsed, "", nil
+	}
+	if result.IsError {
+		return elapsed, resultTextRaw(result), fmt.Errorf("edit failed: %s", resultTextRaw(result))
+	}
+	return elapsed, resultTextRaw(result), nil
+}
+
 // Shared by both stdio and HTTP transports.
 func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*server, *sdkmcp.Server) {
 	s := &server{db: database, projectDir: projDir}

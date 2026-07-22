@@ -73,6 +73,15 @@ func main() {
 			os.Exit(1)
 		}
 		cmdMeasureRename(os.Args[2], os.Args[3])
+	case "measure-edit":
+		// #115 symmetric measurement path for the edit thesis. The
+		// body-file argument keeps the CLI shell-safe (no need to
+		// escape multi-line Go source through argv).
+		if len(os.Args) < 4 {
+			fmt.Fprintln(os.Stderr, "usage: defn measure-edit <name> <body-file>")
+			os.Exit(1)
+		}
+		cmdMeasureEdit(os.Args[2], os.Args[3])
 	case "search":
 		pattern, rank, jsonFlag, limit, err := parseSearchArgs(os.Args[2:])
 		if err != nil {
