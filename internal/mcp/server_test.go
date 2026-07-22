@@ -1486,6 +1486,96 @@ func TestHandleRename(t *testing.T) {
 	}
 }
 
+// #105 winze ask #4.3: retarget-field-value rewrites a composite-literal
+// field's string value across every def whose body matches. Flagship
+// winze op: "change Object: A to Object: B across every claim" without
+// sed-across-files + praying no unrelated text collides.
+func TestHandleRetargetFieldValue_RewritesMatchingComposites(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "claims.go"), []byte(`package main
+
+type Claim struct {
+	Subject string
+	Object  string
+}
+
+var C1 = Claim{Subject: "s1", Object: "OldTarget"}
+var C2 = Claim{Subject: "s2", Object: "OldTarget"}
+var C3 = Claim{Subject: "s3", Object: "Different"}
+`), 0644)
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+	s := &server{db: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleRetargetFieldValue(context.Background(), nil, codeParam{
+		Name:  "Claim",
+		Field: "Object",
+		Old:   "OldTarget",
+		New:   "NewTarget",
+	})
+	text := resultText(t, result)
+	if result.IsError {
+		t.Fatalf("unexpected error: %s", text)
+	}
+	if !strings.Contains(text, "2 def(s)") {
+		t.Errorf("expected '2 def(s)' updated, got %q", text)
+	}
+
+	// C1 + C2 rewritten, C3 untouched.
+	for _, want := range []struct {
+		name, body string
+	}{
+		{"C1", "NewTarget"},
+		{"C2", "NewTarget"},
+		{"C3", "Different"},
+	} {
+		d, err := db.GetDefinitionByName(want.name, "")
+		if err != nil {
+			t.Fatalf("%s not found: %v", want.name, err)
+		}
+		if !strings.Contains(d.Body, want.body) {
+			t.Errorf("%s body should contain %q, got %s", want.name, want.body, d.Body)
+		}
+	}
+	// C1 must NOT still contain OldTarget.
+	d, _ := db.GetDefinitionByName("C1", "")
+	if strings.Contains(d.Body, "OldTarget") {
+		t.Errorf("C1 still has OldTarget: %s", d.Body)
+	}
+}
+
+func TestHandleRetargetFieldValue_RejectsMissingParams(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{db: db}
+	s.ready.Store(true)
+
+	// Missing field
+	r, _, _ := s.handleRetargetFieldValue(context.Background(), nil, codeParam{Name: "Foo", Old: "x", New: "y"})
+	if !r.IsError {
+		t.Error("expected error when field missing")
+	}
+	// Missing name
+	r, _, _ = s.handleRetargetFieldValue(context.Background(), nil, codeParam{Field: "F", Old: "x", New: "y"})
+	if !r.IsError {
+		t.Error("expected error when name missing")
+	}
+}
+
 // #105 winze ask #4: safe-delete refuses when references remain, unless
 // caller opts in via force:true. A KB where deletes leave dangling
 // references is worse than one where you must fix references first.

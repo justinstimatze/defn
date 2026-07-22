@@ -3,6 +3,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -18,9 +19,11 @@ import (
 	"regexp"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/justinstimatze/defn/internal/emit"
 	"github.com/justinstimatze/defn/internal/goload"
@@ -228,7 +231,7 @@ func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*ser
 		Name: "code",
 		Description: `Go code database. One tool, many ops. Orient before you read: overview (project shape) → outline (def shape) → impact (when you know which def matters). Only read whole bodies when you're about to edit them; whole-file reads on files you won't touch are pure wire cost — use outline or search instead.
 
-Ops: overview (project-wide shape when called with no args — one line per module with def counts + first exported names; pass file:"pkg-path" or file:"pkg-path/file.go" to drill in; the right first-touch when you don't know which def matters yet), outline (compact projection of a def — sig + doc + caller/callee summary, no body; use when body isn't needed), search, impact (blast radius of a known def — pass format:"json" for structured output; callers, transitives, test coverage in one call), read, read-and-verify (read a def AND run its covering tests in one call — use during bug triage so you see behavior alongside source and don't spiral into read-loops; pass name), read-file (all defs' bodies in one file — pass file:"path"; whole-file counterpart to read; prefer over N sequential read calls when scanning), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), replace-hunk (replace a byte-exact occurrence of 'old' inside a def body with 'new' — byte-exact PUTGET, content-addressed inside the def; pass name+old+new, plus index=1..N if 'old' occurs more than once; empty 'new' deletes the hunk. Send zero anchor context when the hunk is def-unique — the name argument does the file-level disambiguation), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create (single def from body; with file: set, body may hold multiple top-level decls to author a whole file in one call — the whole-file equivalent of files-mode Write), delete (safe by default — refuses when other defs still reference this def; pass force:true to delete anyway. Refusal message lists the callers so you can rewrite them first), rename, move, test (run ONLY tests that cover a given def — pass name; scoped subset, not the full suite; prefer over bash 'go test ./...' when you only need coverage for a specific change. Also accepts test:"TestX" to run one test by name — use this to REPRODUCE a bug from the issue BEFORE writing any code; a passing test means your hypothesis about which def is broken is wrong), apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 6 projection ops insert-precondition/replace-slice/replace-hunk/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (rarely needed — every edit op auto-syncs the DB; only use after external file changes outside the code tool), query (raw SQL escape hatch — for schema analytics only; NEVER use to look up a def by name, grep bodies, or list files/defs-in-file — use search/outline/read-file/file-defs/impact instead, which are far cheaper on the wire), patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
+Ops: overview (project-wide shape when called with no args — one line per module with def counts + first exported names; pass file:"pkg-path" or file:"pkg-path/file.go" to drill in; the right first-touch when you don't know which def matters yet), outline (compact projection of a def — sig + doc + caller/callee summary, no body; use when body isn't needed), search, impact (blast radius of a known def — pass format:"json" for structured output; callers, transitives, test coverage in one call), read, read-and-verify (read a def AND run its covering tests in one call — use during bug triage so you see behavior alongside source and don't spiral into read-loops; pass name), read-file (all defs' bodies in one file — pass file:"path"; whole-file counterpart to read; prefer over N sequential read calls when scanning), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), replace-hunk (replace a byte-exact occurrence of 'old' inside a def body with 'new' — byte-exact PUTGET, content-addressed inside the def; pass name+old+new, plus index=1..N if 'old' occurs more than once; empty 'new' deletes the hunk. Send zero anchor context when the hunk is def-unique — the name argument does the file-level disambiguation), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), explain, similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create (single def from body; with file: set, body may hold multiple top-level decls to author a whole file in one call — the whole-file equivalent of files-mode Write), delete (safe by default — refuses when other defs still reference this def; pass force:true to delete anyway. Refusal message lists the callers so you can rewrite them first), retarget-field-value (rewrite a composite-literal field's string value across every def whose body matches — pass name:"<StructType>" field:"<Field>" old:"<oldStr>" new:"<newStr>"; AST-safe, so unrelated occurrences of the string won't match), rename, move, test (run ONLY tests that cover a given def — pass name; scoped subset, not the full suite; prefer over bash 'go test ./...' when you only need coverage for a specific change. Also accepts test:"TestX" to run one test by name — use this to REPRODUCE a bug from the issue BEFORE writing any code; a passing test means your hypothesis about which def is broken is wrong), apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 6 projection ops insert-precondition/replace-slice/replace-hunk/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (rarely needed — every edit op auto-syncs the DB; only use after external file changes outside the code tool), query (raw SQL escape hatch — for schema analytics only; NEVER use to look up a def by name, grep bodies, or list files/defs-in-file — use search/outline/read-file/file-defs/impact instead, which are far cheaper on the wire), patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
 	}, s.handleCode)
 
 	return s, mcpServer
@@ -304,6 +307,7 @@ type codeParam struct {
 	Full        bool             `json:"full,omitempty"`
 	Include     []string         `json:"include,omitempty"` // expand op: which graph hops to fold in
 	Test        string           `json:"test,omitempty"`    // L11: op:test named-test reproduction (`-run <regex>` verbatim)
+	Field       string           `json:"field,omitempty"`   // retarget-field-value: composite-literal field name
 }
 
 type applyOp struct {
@@ -738,6 +742,8 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name, Full: args.Full}))
 	case "read-and-verify":
 		return wrapStale(s.handleReadAndVerify(ctx, req, args))
+	case "retarget-field-value":
+		return s.handleRetargetFieldValue(ctx, req, args)
 	case "outline":
 		return wrapStale(s.handleOutline(ctx, req, nameParam{Name: args.Name}))
 	case "slice":
@@ -850,7 +856,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "gc":
 		return s.handleGC(ctx, req, args)
 	default:
-		return errResult(fmt.Errorf("unknown op %q — valid: read, read-and-verify, outline, slice, insert-precondition, replace-slice, replace-hunk, wrap-in-defer, rename-param, add-import, search, impact, explain, similar, untested, edit, create, delete, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc", args.Op))
+		return errResult(fmt.Errorf("unknown op %q — valid: read, read-and-verify, outline, slice, insert-precondition, replace-slice, replace-hunk, wrap-in-defer, rename-param, add-import, search, impact, explain, similar, untested, edit, create, delete, retarget-field-value, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc", args.Op))
 	}
 }
 
@@ -2599,6 +2605,160 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	}
 
 	return textResult(sb.String()), nil, nil
+}
+
+// handleRetargetFieldValue rewrites composite-literal field values across
+// every def whose body contains a matching pattern. Winze use case: given
+// `Claim{Subject: "s", Object: "OldTarget"}` var-decls scattered across
+// many files, change every `Object: "OldTarget"` to `Object: "NewTarget"`
+// atomically. Native equivalent is `sed -i 's/Object: "OldTarget"/Object:
+// "NewTarget"/g'` + pray no unrelated occurrence collides — AST-safe here.
+//
+// MVP scope: matches Type{...Field: OLD...} where Field's value is a
+// string literal. Non-string values (idents, other composites) skipped;
+// return count reports affected defs so the model knows how much moved.
+func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	if args.Name == "" || args.Field == "" {
+		return errResult(fmt.Errorf("retarget-field-value: name (struct type) and field are required"))
+	}
+	if args.Old == "" && args.New == "" {
+		return errResult(fmt.Errorf("retarget-field-value: at least one of old, new must be non-empty"))
+	}
+	typeName := args.Name
+	field := args.Field
+
+	// Iterate all modules → all defs. Load once, filter AST-side.
+	mods, err := s.db.ListModules()
+	if err != nil {
+		return errResult(fmt.Errorf("list modules: %w", err))
+	}
+	updated := 0
+	var affectedNames []string
+	for _, m := range mods {
+		defs, err := s.db.GetModuleDefinitions(m.ID)
+		if err != nil {
+			continue
+		}
+		for _, d := range defs {
+			newBody, n, ok := retargetFieldInBody(d.Body, typeName, field, args.Old, args.New)
+			if !ok || n == 0 {
+				continue
+			}
+			d.Body = newBody
+			d.Signature = extractSignature(newBody)
+			if _, err := s.db.UpsertDefinition(&d); err != nil {
+				return errResult(fmt.Errorf("update %s: %w", d.Name, err))
+			}
+			updated++
+			if len(affectedNames) < 10 {
+				affectedNames = append(affectedNames, formatReceiver(d.Receiver)+d.Name)
+			}
+		}
+	}
+
+	buildResult := s.autoEmitAndBuildWithOpts(emit.Opts{})
+	s.autoResolve("")
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Retargeted %s.%s: %q → %q in %d def(s).\n",
+		typeName, field, args.Old, args.New, updated))
+	if len(affectedNames) > 0 {
+		suffix := ""
+		if updated > len(affectedNames) {
+			suffix = fmt.Sprintf(" (+%d more)", updated-len(affectedNames))
+		}
+		sb.WriteString("  Affected: " + strings.Join(affectedNames, ", ") + suffix + "\n")
+	}
+	if buildResult != "" {
+		sb.WriteString("\n" + buildResult)
+	}
+	return textResult(sb.String()), nil, nil
+}
+
+// retargetFieldInBody parses `body` as Go source (wrapped in a var decl
+// if it doesn't already parse as a top-level decl), walks composite
+// literals, and rewrites any `typeName{...field: "old"...}` to substitute
+// new for old on the field's string-literal value. Returns (newBody,
+// rewriteCount, ok) — ok is false only on unparseable bodies.
+//
+// Match rules:
+//   - Composite literal type is an *ast.Ident equal to typeName (bare or
+//     &Type{}), or *ast.SelectorExpr whose Sel matches (pkg.Type{}).
+//   - Key is *ast.Ident with Name == field.
+//   - Value is *ast.BasicLit STRING whose UNQUOTED value matches old.
+func retargetFieldInBody(body, typeName, field, old, new string) (string, int, bool) {
+	fset := token.NewFileSet()
+	// Try to parse as a full file first; fall back to wrapped expr.
+	src := body
+	wrapped := false
+	if !strings.HasPrefix(strings.TrimLeftFunc(src, unicode.IsSpace), "package ") {
+		// def bodies stored in the DB are single decls without package headers
+		src = "package p\n" + body
+		wrapped = true
+	}
+	file, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	if err != nil {
+		return body, 0, false
+	}
+	count := 0
+	ast.Inspect(file, func(n ast.Node) bool {
+		cl, ok := n.(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
+		if !compositeMatchesType(cl.Type, typeName) {
+			return true
+		}
+		for _, elt := range cl.Elts {
+			kv, ok := elt.(*ast.KeyValueExpr)
+			if !ok {
+				continue
+			}
+			keyIdent, ok := kv.Key.(*ast.Ident)
+			if !ok || keyIdent.Name != field {
+				continue
+			}
+			lit, ok := kv.Value.(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				continue
+			}
+			unquoted, err := strconv.Unquote(lit.Value)
+			if err != nil || unquoted != old {
+				continue
+			}
+			lit.Value = strconv.Quote(new)
+			count++
+		}
+		return true
+	})
+	if count == 0 {
+		return body, 0, true
+	}
+	var buf bytes.Buffer
+	if err := format.Node(&buf, fset, file); err != nil {
+		return body, 0, false
+	}
+	out := buf.String()
+	if wrapped {
+		out = strings.TrimPrefix(out, "package p\n")
+		out = strings.TrimPrefix(out, "package p\n\n") // gofmt adds a blank line
+	}
+	return out, count, true
+}
+
+// compositeMatchesType reports whether a CompositeLit.Type expression
+// names the target type — either bare Ident (Type{}) or SelectorExpr
+// where the Sel matches (pkg.Type{}). Pointers are stripped upstream.
+func compositeMatchesType(expr ast.Expr, typeName string) bool {
+	switch t := expr.(type) {
+	case *ast.Ident:
+		return t.Name == typeName
+	case *ast.SelectorExpr:
+		return t.Sel.Name == typeName
+	case *ast.StarExpr:
+		return compositeMatchesType(t.X, typeName)
+	}
+	return false
 }
 
 func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
