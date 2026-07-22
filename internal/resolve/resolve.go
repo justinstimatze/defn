@@ -362,24 +362,35 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 	// as before, just slower on ref-dense flushes.
 	commit, rollback, txErr := db.Begin()
 	txWrapped := txErr == nil
+	// Split the two flushes into separate timers — winze dispatch 2026-07-22
+	// msg-5c1eb8d6 saw 10-14s "flush SetReferences" on a 6-def sync and we
+	// need to know which of refs/litfields dominates on their shape before
+	// we can fix it. Also emit txn-commit time separately since Dolt's
+	// commit cost scales with dirty-chunk count.
+	tRefs := time.Now()
 	if err := db.SetManyReferences(defRefs); err != nil {
 		if txWrapped {
 			rollback()
 		}
 		return err
 	}
+	timeIt("flush SetManyReferences", tRefs)
+	tLit := time.Now()
 	if err := db.SetManyLiteralFields(defLitFields); err != nil {
 		if txWrapped {
 			rollback()
 		}
 		return err
 	}
+	timeIt("flush SetManyLiteralFields", tLit)
 	if txWrapped {
+		tCommit := time.Now()
 		if err := commit(); err != nil {
 			return fmt.Errorf("commit flush txn: %w", err)
 		}
+		timeIt("flush txn commit", tCommit)
 	}
-	timeIt("flush SetReferences", tPass)
+	timeIt("flush total", tPass)
 
 	// Release Dolt's accumulated chunk cache. Mirrors IngestPackages's
 	// end-GC: SetReferences/SetLiteralFields materialize noms chunks that

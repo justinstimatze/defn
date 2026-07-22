@@ -1691,13 +1691,31 @@ func (s *DB) SetFileComments(sourceFile string, comments []Comment) error {
 	if _, err := s.execContext(ctx, "DELETE FROM comments WHERE source_file = ?", sourceFile); err != nil {
 		return fmt.Errorf("clear comments: %w", err)
 	}
-	for _, c := range comments {
-		if _, err := s.execContext(ctx,
-			`INSERT INTO comments (def_id, source_file, line, text, kind, pragma_key, pragma_value)
-			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			c.DefID, sourceFile, c.Line, c.Text, c.Kind, c.PragmaKey, c.PragmaVal,
-		); err != nil {
-			return fmt.Errorf("insert comment: %w", err)
+	if len(comments) == 0 {
+		return nil
+	}
+	// #125 followup: batched multi-row INSERT (same pattern as
+	// SetManyReferences/SetManyLiteralFields). Winze's monolithic-package
+	// shape ingests comment-dense files where per-row Dolt cost dominated
+	// SetFileComments's contribution to the ~105s upsert phase.
+	for start := 0; start < len(comments); start += setRefsBatchSize {
+		end := start + setRefsBatchSize
+		if end > len(comments) {
+			end = len(comments)
+		}
+		chunk := comments[start:end]
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, 7*len(chunk))
+		for i, c := range chunk {
+			placeholders[i] = "(?, ?, ?, ?, ?, ?, ?)"
+			args = append(args,
+				c.DefID, sourceFile, c.Line, c.Text, c.Kind, c.PragmaKey, c.PragmaVal)
+		}
+		q := `INSERT INTO comments (def_id, source_file, line, text, kind, pragma_key, pragma_value) VALUES ` +
+			strings.Join(placeholders, ", ")
+		if _, err := s.execContext(ctx, q, args...); err != nil {
+			return fmt.Errorf("SetFileComments insert (rows %d..%d of %d): %w",
+				start, end, len(comments), err)
 		}
 	}
 	return nil
@@ -1766,12 +1784,30 @@ func (s *DB) SetImports(moduleID int64, imports []Import) error {
 	if _, err := s.execContext(ctx, "DELETE FROM imports WHERE module_id = ?", moduleID); err != nil {
 		return fmt.Errorf("clear imports: %w", err)
 	}
-	for _, imp := range imports {
-		if _, err := s.execContext(ctx,
-			"INSERT IGNORE INTO imports (module_id, imported_path, alias) VALUES (?, ?, ?)",
-			moduleID, imp.ImportedPath, imp.Alias,
-		); err != nil {
-			return fmt.Errorf("insert import: %w", err)
+	if len(imports) == 0 {
+		return nil
+	}
+	// #125 followup: batched multi-row INSERT (same pattern as
+	// SetManyReferences). Import counts per module are typically small
+	// (10-30) but multi-module projects paid one exec-per-import; the
+	// batched form collapses to one exec regardless of import count.
+	for start := 0; start < len(imports); start += setRefsBatchSize {
+		end := start + setRefsBatchSize
+		if end > len(imports) {
+			end = len(imports)
+		}
+		chunk := imports[start:end]
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, 3*len(chunk))
+		for i, imp := range chunk {
+			placeholders[i] = "(?, ?, ?)"
+			args = append(args, moduleID, imp.ImportedPath, imp.Alias)
+		}
+		q := "INSERT IGNORE INTO imports (module_id, imported_path, alias) VALUES " +
+			strings.Join(placeholders, ", ")
+		if _, err := s.execContext(ctx, q, args...); err != nil {
+			return fmt.Errorf("SetImports insert (rows %d..%d of %d): %w",
+				start, end, len(imports), err)
 		}
 	}
 	return nil
