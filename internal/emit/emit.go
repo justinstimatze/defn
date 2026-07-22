@@ -117,34 +117,33 @@ func emitWithOpts(db *store.DB, outDir string, opts Opts) ([]DefLocation, error)
 		touchedSet[filepath.ToSlash(clean)] = true
 	}
 
-	// Write project-level files (go.mod, go.sum). Scoped emit skips this
-	// loop entirely — singleton mutations (rename/edit/delete/add-import)
-	// never touch go.mod / go.sum, and re-writing them on every call is
-	// wasted disk + Dolt read cost. Full emit (empty TouchedFiles) still
-	// runs the loop so `defn emit /tmp/out` produces a buildable tree.
+	// Write project-level files (go.mod, go.sum). Kept unconditional even
+	// in scoped mode: a fresh tempdir needs go.mod to build, and the cost
+	// (2 small files, a few ms) is negligible vs the emit for the .go
+	// tree. #117 initially skipped these on scoped emit — that broke the
+	// ceiling measurement path (fresh tempdir → no go.mod → build fails)
+	// for a trivial optimization win.
 	t := time.Now()
-	if !scoped {
-		projectFiles, err := db.ListProjectFiles()
+	projectFiles, err := db.ListProjectFiles()
+	if err != nil {
+		return nil, fmt.Errorf("list project files: %w", err)
+	}
+	for _, pf := range projectFiles {
+		content, err := db.GetProjectFile(pf)
 		if err != nil {
-			return nil, fmt.Errorf("list project files: %w", err)
+			return nil, fmt.Errorf("get project file %s: %w", pf, err)
 		}
-		for _, pf := range projectFiles {
-			content, err := db.GetProjectFile(pf)
-			if err != nil {
-				return nil, fmt.Errorf("get project file %s: %w", pf, err)
-			}
-			// Sanitize path to prevent directory traversal.
-			clean := filepath.Clean(pf)
-			if filepath.IsAbs(clean) || strings.Contains(clean, "..") {
-				return nil, fmt.Errorf("invalid project file path: %s", pf)
-			}
-			dst := filepath.Join(outDir, clean)
-			if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
-				return nil, err
-			}
-			if err := os.WriteFile(dst, []byte(content), 0644); err != nil {
-				return nil, fmt.Errorf("write %s: %w", pf, err)
-			}
+		// Sanitize path to prevent directory traversal.
+		clean := filepath.Clean(pf)
+		if filepath.IsAbs(clean) || strings.Contains(clean, "..") {
+			return nil, fmt.Errorf("invalid project file path: %s", pf)
+		}
+		dst := filepath.Join(outDir, clean)
+		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(dst, []byte(content), 0644); err != nil {
+			return nil, fmt.Errorf("write %s: %w", pf, err)
 		}
 	}
 	timeIt("project-files", t)
@@ -183,13 +182,31 @@ func emitWithOpts(db *store.DB, outDir string, opts Opts) ([]DefLocation, error)
 	if len(opts.GoimportsFiles) > 0 {
 		for _, rel := range opts.GoimportsFiles {
 			// Sanitize as we do for project files above — no absolute paths,
-			// no traversal, but permit files that don't yet exist on disk
-			// (goimports just skips those).
+			// no traversal.
 			clean := filepath.Clean(rel)
 			if filepath.IsAbs(clean) || strings.Contains(clean, "..") {
 				continue
 			}
-			args = append(args, filepath.Join(outDir, clean))
+			// #117 followup: emit's output path for a source_file can diverge
+			// from the source_file's project-relative path (single-module
+			// projects where the module root == package root strip prefixes;
+			// cli/cli's "command/root.go" writes to outDir/root.go, not
+			// outDir/command/root.go). goimports does NOT tolerate missing
+			// paths — it errors "stat X: no such file". Stat before adding
+			// and try a Base-only fallback. If neither exists, silently
+			// skip: goimports has nothing to do for a file that isn't there,
+			// and correctness is preserved (the file was never written by
+			// this emit).
+			joined := filepath.Join(outDir, clean)
+			if _, err := os.Stat(joined); err == nil {
+				args = append(args, joined)
+				continue
+			}
+			// Fallback: emit may have written the basename at outDir root.
+			baseJoined := filepath.Join(outDir, filepath.Base(clean))
+			if _, err := os.Stat(baseJoined); err == nil {
+				args = append(args, baseJoined)
+			}
 		}
 	} else {
 		args = append(args, outDir)
