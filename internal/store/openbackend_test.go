@@ -43,3 +43,17 @@ func TestOpenBackendUnknown(t *testing.T) {
 		t.Fatal("OpenBackend(bogus): expected error, got nil")
 	}
 }
+
+// TestOpenBackendDefaultsToSQLite pins the Phase 3 default: unset
+// DEFN_BACKEND routes to SQLite, not Dolt.
+func TestOpenBackendDefaultsToSQLite(t *testing.T) {
+	t.Setenv("DEFN_BACKEND", "")
+	b, err := OpenBackend(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenBackend: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	if _, ok := b.(*SQLiteDB); !ok {
+		t.Errorf("unset DEFN_BACKEND: got %T, want *SQLiteDB", b)
+	}
+}

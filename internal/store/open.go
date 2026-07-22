@@ -30,16 +30,15 @@ func Open(path string) (*DB, error) {
 
 // OpenBackend opens whichever Backend the DEFN_BACKEND env var selects:
 //
-//   - "sqlite"          → *SQLiteDB at <path>/defn.db
-//   - "dolt" or unset   → *DB via Open(path)
+//   - "sqlite" or unset → *SQLiteDB at <path>/defn.db  (Phase 3 default)
+//   - "dolt"            → *DB via Open(path)           (legacy escape hatch)
 //
 // Category A ops (branch/checkout/commit/merge/log/diff/conflicts) only
-// exist on *DB, so callers that need them must type-assert or use Open()
-// directly. Phase 2 A/B seam — Phase 3 flips the default to sqlite; Phase 4
-// removes Dolt entirely.
+// exist on *DB, so callers that need them must use Open() directly. Phase 4
+// removes Dolt entirely and Category A goes with it.
 func OpenBackend(path string) (Backend, error) {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("DEFN_BACKEND"))) {
-	case "sqlite":
+	case "", "sqlite":
 		absPath, err := filepath.Abs(path)
 		if err != nil {
 			return nil, fmt.Errorf("abs path: %w", err)
@@ -48,7 +47,7 @@ func OpenBackend(path string) (Backend, error) {
 			return nil, fmt.Errorf("create db dir: %w", err)
 		}
 		return OpenSQLite(filepath.Join(absPath, "defn.db"))
-	case "", "dolt":
+	case "dolt":
 		return Open(path)
 	default:
 		return nil, fmt.Errorf("unknown DEFN_BACKEND=%q (want \"sqlite\" or \"dolt\")", os.Getenv("DEFN_BACKEND"))
