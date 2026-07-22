@@ -836,8 +836,18 @@ func compactEmbedded(db *store.DB, dbPath string) {
 // cmdMeasureRename times a rename against the current .defn without
 // spinning up the full MCP serve. Winze uses this to compare pre/post
 // #109 pass 2 (the "faster than native" thesis lever) on their ref-
-// dense corpus. The projDir is the current working directory; the
-// rename fires on the pinned conn / pool path, same as MCP would.
+// dense corpus.
+//
+// SAFETY: the rename triggers autoEmitAndBuild, which writes emitted
+// .go files to the project dir. Running against a workdir whose .defn
+// diverges from the on-disk source (e.g., winze's .defn/nosync mode)
+// would OVERWRITE the on-disk files with stale DB content. To keep
+// measure-rename non-destructive by construction, we emit into a
+// scratch tempdir; the timing includes the emit but disk-side is a
+// throwaway. Callers who want in-place emit can add --in-place later,
+// but the default is safe. Also produces measurement fidelity: real
+// MCP rename's autoEmit is a full-project emit + goimports, which we
+// still exercise; the only difference is where the bytes land.
 func cmdMeasureRename(oldName, newName string) {
 	dbPath := getDBPath()
 	checkEmbeddedAvailable(dbPath)
@@ -846,11 +856,12 @@ func cmdMeasureRename(oldName, newName string) {
 		fatal(err)
 	}
 	defer db.Close()
-	projDir, err := os.Getwd()
+	scratch, err := os.MkdirTemp("", "defn-measure-rename-*")
 	if err != nil {
-		fatal(err)
+		fatal(fmt.Errorf("mktemp: %w", err))
 	}
-	elapsed, msg, err := mcpserver.MeasureRename(db, projDir, oldName, newName)
+	defer os.RemoveAll(scratch)
+	elapsed, msg, err := mcpserver.MeasureRename(db, scratch, oldName, newName)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "rename failed after %s: %v\n", elapsed.Round(time.Millisecond), err)
 		if msg != "" {

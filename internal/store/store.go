@@ -572,9 +572,11 @@ func (s *DB) GetCommentsByPragma(pragmaKey string) ([]Comment, error) {
 	for rows.Next() {
 		var c Comment
 		var defID sql.NullInt64
-		if err := rows.Scan(&c.ID, &defID, &c.DefName, &c.SourceFile, &c.Line, &c.Text, &c.Kind, &c.PragmaKey, &c.PragmaVal); err != nil {
+		var text textCol
+		if err := rows.Scan(&c.ID, &defID, &c.DefName, &c.SourceFile, &c.Line, &text, &c.Kind, &c.PragmaKey, &c.PragmaVal); err != nil {
 			return nil, err
 		}
+		c.Text = string(text)
 		if defID.Valid {
 			c.DefID = &defID.Int64
 		}
@@ -599,9 +601,11 @@ func (s *DB) GetCommentsForDef(defID int64) ([]Comment, error) {
 	for rows.Next() {
 		var c Comment
 		var did sql.NullInt64
-		if err := rows.Scan(&c.ID, &did, &c.DefName, &c.SourceFile, &c.Line, &c.Text, &c.Kind, &c.PragmaKey, &c.PragmaVal); err != nil {
+		var text textCol
+		if err := rows.Scan(&c.ID, &did, &c.DefName, &c.SourceFile, &c.Line, &text, &c.Kind, &c.PragmaKey, &c.PragmaVal); err != nil {
 			return nil, err
 		}
+		c.Text = string(text)
 		if did.Valid {
 			c.DefID = &did.Int64
 		}
@@ -967,11 +971,11 @@ func (s *DB) GetModuleDefinitions(moduleID int64) ([]Definition, error) {
 
 // GetProjectFile retrieves a project-level file by path.
 func (s *DB) GetProjectFile(path string) (string, error) {
-	var content string
+	var content textCol
 	err := s.queryRowContext(s.Ctx(),
 		"SELECT content FROM project_files WHERE path = ?", path,
 	).Scan(&content)
-	return content, err
+	return string(content), err
 }
 
 func (s *DB) GetUntested() ([]Definition, error) {
@@ -1382,11 +1386,11 @@ func (s *DB) GetBodiesByDefIDs(ids []int64) (map[int64]string, error) {
 	out := make(map[int64]string, len(ids))
 	for rows.Next() {
 		var id int64
-		var body string
+		var body textCol
 		if err := rows.Scan(&id, &body); err != nil {
 			return nil, err
 		}
-		out[id] = body
+		out[id] = string(body)
 	}
 	return out, rows.Err()
 }
@@ -1411,11 +1415,11 @@ func (s *DB) SampleBodies(n int) ([]string, error) {
 	defer rows.Close()
 	out := make([]string, 0, n)
 	for rows.Next() {
-		var b string
+		var b textCol
 		if err := rows.Scan(&b); err != nil {
 			return nil, err
 		}
-		out = append(out, b)
+		out = append(out, string(b))
 	}
 	return out, rows.Err()
 }
@@ -1956,11 +1960,11 @@ func (s *DB) SetFileSource(moduleID int64, sourceFile, raw string) error {
 // GetFileSource returns the raw Go source for (moduleID, sourceFile).
 // Returns sql.ErrNoRows if there's no row yet (file has never been ingested).
 func (s *DB) GetFileSource(moduleID int64, sourceFile string) (string, error) {
-	var raw string
+	var raw textCol
 	err := s.queryRowContext(s.Ctx(),
 		`SELECT raw FROM file_sources WHERE module_id = ? AND source_file = ?`,
 		moduleID, sourceFile).Scan(&raw)
-	return raw, err
+	return string(raw), err
 }
 
 // ListFileSources returns all (source_file, raw) pairs for a module.
@@ -1973,11 +1977,12 @@ func (s *DB) ListFileSources(moduleID int64) (map[string]string, error) {
 	defer rows.Close()
 	out := map[string]string{}
 	for rows.Next() {
-		var sf, raw string
+		var sf string
+		var raw textCol
 		if err := rows.Scan(&sf, &raw); err != nil {
 			return nil, err
 		}
-		out[sf] = raw
+		out[sf] = string(raw)
 	}
 	return out, rows.Err()
 }
