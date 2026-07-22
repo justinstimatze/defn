@@ -78,14 +78,16 @@ func (s *DB) FindUpstreamMatch(modulePath, defName, kind, receiver, fingerprint 
 		LIMIT 1`,
 		modulePath, defName, kind, receiver, fingerprint)
 	var u UpstreamFingerprint
+	var sigCol, docCol textCol
 	err := row.Scan(&u.ModulePath, &u.Version, &u.DefName, &u.Kind,
-		&u.Receiver, &u.Fingerprint, &u.Signature, &u.Doc)
+		&u.Receiver, &u.Fingerprint, &sigCol, &docCol)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	u.Signature, u.Doc = string(sigCol), string(docCol)
 	return &u, nil
 }
 
@@ -108,10 +110,12 @@ func (s *DB) FindUpstreamVersions(modulePath, defName, kind, receiver string) ([
 	var out []UpstreamFingerprint
 	for rows.Next() {
 		var u UpstreamFingerprint
+		var sigCol, docCol textCol
 		if err := rows.Scan(&u.ModulePath, &u.Version, &u.DefName, &u.Kind,
-			&u.Receiver, &u.Fingerprint, &u.Signature, &u.Doc); err != nil {
+			&u.Receiver, &u.Fingerprint, &sigCol, &docCol); err != nil {
 			return nil, err
 		}
+		u.Signature, u.Doc = string(sigCol), string(docCol)
 		out = append(out, u)
 	}
 	return out, rows.Err()

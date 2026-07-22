@@ -23,16 +23,75 @@ func HashBody(body string) string {
 	return fmt.Sprintf("%x", h)
 }
 
+// textCol is a sql.Scanner that accepts any driver.Value representing
+// text — string, []byte, nil, or Dolt's out-of-band val.TextStorage
+// wrapper (which implements sql.StringWrapper). Use for scanning text
+// columns whose backing type may be wrapped for out-of-band storage
+// (typically the doc column on `definitions` / `modules`, which can
+// grow beyond Dolt's inline threshold).
+//
+// #110: newer Dolt (post-July-2026) returns *val.TextStorage from
+// COALESCE(text_col,'') expressions when the underlying value was
+// stored out of band; the raw *string destination can't take it.
+// This type-switches through the known cases; the AnyWrapper branch
+// covers TextStorage without importing Dolt's internal types.
+type textCol string
+
+func (t *textCol) Scan(src any) error {
+	switch x := src.(type) {
+	case nil:
+		*t = ""
+	case string:
+		*t = textCol(x)
+	case []byte:
+		*t = textCol(x)
+	case interface {
+		Unwrap(ctx context.Context) (string, error)
+	}:
+		s, err := x.Unwrap(context.Background())
+		if err != nil {
+			return fmt.Errorf("textCol unwrap: %w", err)
+		}
+		*t = textCol(s)
+	case interface {
+		UnwrapAny(ctx context.Context) (interface{}, error)
+	}:
+		v, err := x.UnwrapAny(context.Background())
+		if err != nil {
+			return fmt.Errorf("textCol unwrapAny: %w", err)
+		}
+		if s, ok := v.(string); ok {
+			*t = textCol(s)
+			return nil
+		}
+		if b, ok := v.([]byte); ok {
+			*t = textCol(b)
+			return nil
+		}
+		return fmt.Errorf("textCol unwrapAny returned %T", v)
+	default:
+		return fmt.Errorf("textCol: unsupported source type %T", src)
+	}
+	return nil
+}
+
 func scanDefinitions(rows *sql.Rows) ([]Definition, error) {
 	var defs []Definition
 	for rows.Next() {
 		var d Definition
+		// #110: text columns (receiver / signature / body / doc / source_file /
+		// hash) come back through textCol so we handle Dolt's out-of-band
+		// TextStorage wrapper alongside plain string/[]byte returns. Non-text
+		// destinations (ID, ints, bool) scan directly.
+		var recv, sig, body, doc, source, hash textCol
 		if err := rows.Scan(
-			&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &d.Receiver,
-			&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.SourceFile, &d.Hash,
+			&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &recv,
+			&sig, &body, &doc, &d.StartLine, &d.EndLine, &source, &hash,
 		); err != nil {
 			return nil, err
 		}
+		d.Receiver, d.Signature, d.Body, d.Doc, d.SourceFile, d.Hash =
+			string(recv), string(sig), string(body), string(doc), string(source), string(hash)
 		defs = append(defs, d)
 	}
 	return defs, rows.Err()
@@ -301,9 +360,11 @@ func (s *DB) DiffDefinitionsBetween(from, to string) ([]DefDiff, error) {
 // EnsureModule creates or returns an existing module.
 func (s *DB) EnsureModule(path, name, doc string) (*Module, error) {
 	var m Module
+	var docCol textCol
 	err := s.queryRowContext(s.Ctx(),
 		"SELECT id, path, name, COALESCE(doc,'') FROM modules WHERE path = ?", path,
-	).Scan(&m.ID, &m.Path, &m.Name, &m.Doc)
+	).Scan(&m.ID, &m.Path, &m.Name, &docCol)
+	m.Doc = string(docCol)
 	if err == sql.ErrNoRows {
 		res, err := s.execContext(s.Ctx(),
 			"INSERT INTO modules (path, name, doc) VALUES (?, ?, ?)", path, name, doc)
@@ -877,12 +938,14 @@ func (s *DB) GetMeta(key string) (string, error) {
 // GetModuleByPath returns a module by its path.
 func (s *DB) GetModuleByPath(path string) (*Module, error) {
 	var m Module
+	var docCol textCol
 	err := s.queryRowContext(s.Ctx(),
 		"SELECT id, path, name, COALESCE(doc,'') FROM modules WHERE path = ?", path,
-	).Scan(&m.ID, &m.Path, &m.Name, &m.Doc)
+	).Scan(&m.ID, &m.Path, &m.Name, &docCol)
 	if err != nil {
 		return nil, err
 	}
+	m.Doc = string(docCol)
 	return &m, nil
 }
 
@@ -958,9 +1021,11 @@ func (s *DB) ListModules() ([]Module, error) {
 	var modules []Module
 	for rows.Next() {
 		var m Module
-		if err := rows.Scan(&m.ID, &m.Path, &m.Name, &m.Doc); err != nil {
+		var docCol textCol
+		if err := rows.Scan(&m.ID, &m.Path, &m.Name, &docCol); err != nil {
 			return nil, err
 		}
+		m.Doc = string(docCol)
 		modules = append(modules, m)
 	}
 	return modules, rows.Err()
