@@ -9,17 +9,17 @@ import (
 )
 
 func (s *server) handleExplain(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.dolt.GetDefinitionByName(args.Name, "")
+	d, err := s.backend.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", args.Name))
 	}
 
-	impact, err := s.dolt.GetImpact(d.ID)
+	impact, err := s.backend.GetImpact(d.ID)
 	if err != nil {
 		return errResult(err)
 	}
 
-	callees, _ := s.dolt.GetCallees(d.ID) // best effort — nil is safe
+	callees, _ := s.backend.GetCallees(d.ID) // best effort — nil is safe
 
 	var sb strings.Builder
 	recv := formatReceiver(d.Receiver)
@@ -74,7 +74,7 @@ func (s *server) handleExplain(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 }
 
 func (s *server) handleMove(_ context.Context, _ *sdkmcp.CallToolRequest, args moveParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.dolt.GetDefinitionByName(args.Name, "")
+	d, err := s.backend.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", args.Name))
 	}
@@ -86,12 +86,12 @@ func (s *server) handleMove(_ context.Context, _ *sdkmcp.CallToolRequest, args m
 	}
 
 	// Delete from old module first, then create in new module.
-	if err := s.dolt.DeleteDefinition(d.ID); err != nil {
+	if err := s.backend.DeleteDefinition(d.ID); err != nil {
 		return errResult(err)
 	}
 	d.ModuleID = targetMod.ID
 	d.ID = 0 // force new insert
-	if _, err := s.dolt.UpsertDefinition(d); err != nil {
+	if _, err := s.backend.UpsertDefinition(d); err != nil {
 		return errResult(err)
 	}
 
