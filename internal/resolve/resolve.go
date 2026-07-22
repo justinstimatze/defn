@@ -9,8 +9,10 @@ import (
 	"go/format"
 	"go/token"
 	"go/types"
+	"os"
 	"runtime/debug"
 	"strings"
+	"time"
 
 	"github.com/justinstimatze/defn/internal/goload"
 	"github.com/justinstimatze/defn/internal/store"
@@ -78,7 +80,11 @@ func ResolveFile(db *store.DB, projectDir, filePath string) error {
 		// picks up the file's own package regardless of Tests).
 		Tests: false,
 	}
+	tPL := time.Now()
 	pkgs, err := packages.Load(cfg, "file="+filePath)
+	if os.Getenv("DEFN_SYNC_TIMING") == "1" {
+		fmt.Fprintf(os.Stderr, "  [inner] packages.Load: %s (%d pkgs)\n", time.Since(tPL).Round(time.Millisecond), len(pkgs))
+	}
 	if err != nil {
 		return err
 	}
@@ -120,6 +126,19 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 
 	filtered := goload.FilterPackages(pkgs)
 
+	// #107: preload per-pkgPath def indexes so the lookup* helpers do
+	// map hits instead of hundreds of GetDefinitionByName round trips
+	// across the passes below. Cache is per-resolve-call, not global.
+	cache := make(pkgIndexCache)
+
+	timing := os.Getenv("DEFN_SYNC_TIMING") == "1"
+	timeIt := func(name string, t0 time.Time) {
+		if timing {
+			fmt.Fprintf(os.Stderr, "  [inner] %s: %s\n", name, time.Since(t0).Round(time.Millisecond))
+		}
+	}
+	tPass := time.Now()
+
 	// Build a map from types.Object → definition ID (all packages).
 	objToDef := make(map[types.Object]int64)
 
@@ -128,16 +147,28 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 		if strings.HasSuffix(pkg.Name, "_test") {
 			pkgPath = strings.TrimSuffix(pkgPath, "_test")
 		}
+		pkgScope := pkg.Types.Scope()
 		for ident, obj := range pkg.TypesInfo.Defs {
 			if obj == nil || ident.Name == "_" {
 				continue
 			}
-			defID := lookupDefID(db, pkgPath, ident, obj)
+			// #107: skip identifiers that can't map to a top-level def
+			// in the DB — params, local vars, struct fields, etc. Without
+			// this filter every local var in the file triggers a
+			// GetDefinitionByName miss (7s on cli/cli's command package).
+			// A method is scoped to its receiver, not the package, so we
+			// keep those explicitly.
+			if !isPackageLevelOrMethod(obj, pkgScope) {
+				continue
+			}
+			defID := lookupDefID(db, pkgPath, ident, obj, cache)
 			if defID > 0 {
 				objToDef[obj] = defID
 			}
 		}
 	}
+	timeIt("pass1 objToDef", tPass)
+	tPass = time.Now()
 
 	// Accumulators: each fromID gets one final SetReferences call after all
 	// passes have contributed. Avoids the REPLACE-style wipes we used to
@@ -204,8 +235,8 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 				}
 
 				// Find defn IDs for the concrete type and interface.
-				concreteID := lookupTypeDefID(db, pkgPath, concrete.Obj().Name())
-				ifaceID := lookupTypeDefID(db, pkgPath, iface.Obj().Name())
+				concreteID := lookupTypeDefID(db, pkgPath, concrete.Obj().Name(), cache)
+				ifaceID := lookupTypeDefID(db, pkgPath, iface.Obj().Name(), cache)
 
 				// Stage "implements" edge: concrete type → interface. Apply
 				// at the end with all the other refs for concreteID so a
@@ -218,7 +249,7 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 				// Map interface method objects → concrete method def IDs.
 				for ifaceMethod := range ifaceType.Methods() {
 					ifaceMethod := ifaceMethod
-					concreteMethodID := lookupMethodDefID(db, pkgPath, concrete.Obj().Name(), ifaceMethod.Name())
+					concreteMethodID := lookupMethodDefID(db, pkgPath, concrete.Obj().Name(), ifaceMethod.Name(), cache)
 					if concreteMethodID > 0 {
 						ifaceMethodToImpls[ifaceMethod] = append(ifaceMethodToImpls[ifaceMethod], concreteMethodID)
 					}
@@ -226,6 +257,8 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 			}
 		}
 	}
+	timeIt("pass2 iface-satisfaction", tPass)
+	tPass = time.Now()
 
 	// Third pass: extract references from function bodies AND package-level
 	// var/const initializers and type definitions.
@@ -244,7 +277,7 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 					if d.Body == nil {
 						continue
 					}
-					fromID := lookupFuncDefID(db, pkgPath, d)
+					fromID := lookupFuncDefID(db, pkgPath, d, cache)
 					if fromID <= 0 {
 						continue
 					}
@@ -265,7 +298,7 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 								if name.Name == "_" {
 									continue
 								}
-								fromID := lookupVarDefID(db, pkgPath, name.Name)
+								fromID := lookupVarDefID(db, pkgPath, name.Name, cache)
 								if fromID <= 0 {
 									continue
 								}
@@ -294,7 +327,7 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 
 						case *ast.TypeSpec:
 							// Type definitions: struct fields, embedded types, interface methods.
-							fromID := lookupTypeDefID(db, pkgPath, s.Name.Name)
+							fromID := lookupTypeDefID(db, pkgPath, s.Name.Name, cache)
 							if fromID <= 0 {
 								continue
 							}
@@ -312,6 +345,9 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 		}
 	}
 
+	timeIt("pass3 body-refs", tPass)
+	tPass = time.Now()
+
 	// Flush accumulated refs once per def. SetReferences de-dupes internally.
 	for fromID, refs := range defRefs {
 		if err := db.SetReferences(fromID, refs); err != nil {
@@ -323,6 +359,7 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 			return err
 		}
 	}
+	timeIt("flush SetReferences", tPass)
 
 	// Release Dolt's accumulated chunk cache. Mirrors IngestPackages's
 	// end-GC: SetReferences/SetLiteralFields materialize noms chunks that
@@ -345,7 +382,83 @@ func resolve(db *store.DB, preloaded []*packages.Package, projectDir, onlyModule
 	return nil
 }
 
-func lookupTypeDefID(db *store.DB, pkgPath, typeName string) int64 {
+// defIndex is a name/receiver → def ID index for one package, built
+// once and consulted by lookup*DefID to spare hundreds of per-identifier
+// DB round trips in the resolve inner loops (#107 followup to #101).
+// pkgCache maps pkgPath → its defIndex; misses fall back to the DB.
+type defIndex struct {
+	byName   map[string]int64            // top-level defs (no receiver)
+	byMethod map[string]map[string]int64 // methodName → receiver → def ID
+}
+
+func (i *defIndex) lookupName(name string) int64 {
+	if i == nil {
+		return 0
+	}
+	return i.byName[name]
+}
+
+func (i *defIndex) lookupMethod(name, receiver string) int64 {
+	if i == nil {
+		return 0
+	}
+	if m, ok := i.byMethod[name]; ok {
+		if id, ok := m[receiver]; ok {
+			return id
+		}
+	}
+	return 0
+}
+
+func loadDefIndex(db *store.DB, pkgPath string) *defIndex {
+	if pkgPath == "" {
+		return nil
+	}
+	mod, err := db.GetModuleByPath(pkgPath)
+	if err != nil || mod == nil {
+		return nil
+	}
+	defs, err := db.GetModuleDefinitions(mod.ID)
+	if err != nil {
+		return nil
+	}
+	idx := &defIndex{
+		byName:   make(map[string]int64, len(defs)),
+		byMethod: make(map[string]map[string]int64),
+	}
+	for _, d := range defs {
+		if d.Receiver != "" {
+			m, ok := idx.byMethod[d.Name]
+			if !ok {
+				m = make(map[string]int64, 2)
+				idx.byMethod[d.Name] = m
+			}
+			m[d.Receiver] = d.ID
+		} else {
+			idx.byName[d.Name] = d.ID
+		}
+	}
+	return idx
+}
+
+// pkgIndexCache holds per-pkgPath preloaded defIndexes. Populated lazily
+// on first lookup for each pkgPath. Not concurrency-safe (resolve is
+// single-goroutine).
+type pkgIndexCache map[string]*defIndex
+
+func (c pkgIndexCache) get(db *store.DB, pkgPath string) *defIndex {
+	if idx, ok := c[pkgPath]; ok {
+		return idx
+	}
+	idx := loadDefIndex(db, pkgPath)
+	c[pkgPath] = idx
+	return idx
+}
+
+func lookupTypeDefID(db *store.DB, pkgPath, typeName string, cache pkgIndexCache) int64 {
+	if id := cache.get(db, pkgPath).lookupName(typeName); id > 0 {
+		return id
+	}
 	d, err := db.GetDefinitionByName(typeName, pkgPath)
 	if err != nil {
 		return 0
@@ -353,13 +466,19 @@ func lookupTypeDefID(db *store.DB, pkgPath, typeName string) int64 {
 	return d.ID
 }
 
-func lookupMethodDefID(db *store.DB, pkgPath, typeName, methodName string) int64 {
+func lookupMethodDefID(db *store.DB, pkgPath, typeName, methodName string, cache pkgIndexCache) int64 {
+	idx := cache.get(db, pkgPath)
 	// Try *Type first (most methods have pointer receivers).
+	if id := idx.lookupMethod(methodName, "*"+typeName); id > 0 {
+		return id
+	}
+	if id := idx.lookupMethod(methodName, typeName); id > 0 {
+		return id
+	}
 	d, err := db.GetDefinitionByNameAndReceiver(methodName, pkgPath, "*"+typeName)
 	if err == nil {
 		return d.ID
 	}
-	// Try value receiver.
 	d, err = db.GetDefinitionByNameAndReceiver(methodName, pkgPath, typeName)
 	if err == nil {
 		return d.ID
@@ -368,7 +487,10 @@ func lookupMethodDefID(db *store.DB, pkgPath, typeName, methodName string) int64
 }
 
 // lookupVarDefID finds the definition ID for a package-level var or const.
-func lookupVarDefID(db *store.DB, pkgPath, name string) int64 {
+func lookupVarDefID(db *store.DB, pkgPath, name string, cache pkgIndexCache) int64 {
+	if id := cache.get(db, pkgPath).lookupName(name); id > 0 {
+		return id
+	}
 	d, err := db.GetDefinitionByName(name, pkgPath)
 	if err != nil {
 		return 0
@@ -533,17 +655,39 @@ func classifyRef(obj types.Object) string {
 	}
 }
 
-func lookupDefID(db *store.DB, pkgPath string, ident *ast.Ident, obj types.Object) int64 {
+// isPackageLevelOrMethod reports whether obj can plausibly correspond to
+// a def in the DB — package-scoped identifiers (top-level funcs, vars,
+// consts, types) or methods (which are scoped to their receiver, not the
+// package scope). Filters out params, local vars, struct fields, and
+// interface method identifiers that would only ever miss the DB. Called
+// on every TypesInfo.Defs entry, so keep the check cheap.
+func isPackageLevelOrMethod(obj types.Object, pkgScope *types.Scope) bool {
+	if fn, ok := obj.(*types.Func); ok {
+		sig := fn.Signature()
+		if sig != nil && sig.Recv() != nil {
+			return true
+		}
+	}
+	return obj.Parent() == pkgScope
+}
+
+func lookupDefID(db *store.DB, pkgPath string, ident *ast.Ident, obj types.Object, cache pkgIndexCache) int64 {
 	// For methods, use receiver-qualified lookup to avoid ambiguity.
 	if fn, ok := obj.(*types.Func); ok {
 		sig := fn.Signature()
 		if sig != nil && sig.Recv() != nil {
 			recv := receiverName(sig.Recv().Type())
+			if id := cache.get(db, pkgPath).lookupMethod(ident.Name, recv); id > 0 {
+				return id
+			}
 			d, err := db.GetDefinitionByNameAndReceiver(ident.Name, pkgPath, recv)
 			if err == nil {
 				return d.ID
 			}
 		}
+	}
+	if id := cache.get(db, pkgPath).lookupName(ident.Name); id > 0 {
+		return id
 	}
 	d, err := db.GetDefinitionByName(ident.Name, pkgPath)
 	if err != nil {
@@ -552,14 +696,20 @@ func lookupDefID(db *store.DB, pkgPath string, ident *ast.Ident, obj types.Objec
 	return d.ID
 }
 
-func lookupFuncDefID(db *store.DB, pkgPath string, fn *ast.FuncDecl) int64 {
+func lookupFuncDefID(db *store.DB, pkgPath string, fn *ast.FuncDecl, cache pkgIndexCache) int64 {
 	// For methods, include receiver in lookup.
 	if fn.Recv != nil && len(fn.Recv.List) > 0 {
 		recv := types.ExprString(fn.Recv.List[0].Type)
+		if id := cache.get(db, pkgPath).lookupMethod(fn.Name.Name, recv); id > 0 {
+			return id
+		}
 		d, err := db.GetDefinitionByNameAndReceiver(fn.Name.Name, pkgPath, recv)
 		if err == nil {
 			return d.ID
 		}
+	}
+	if id := cache.get(db, pkgPath).lookupName(fn.Name.Name); id > 0 {
+		return id
 	}
 	d, err := db.GetDefinitionByName(fn.Name.Name, pkgPath)
 	if err != nil {
