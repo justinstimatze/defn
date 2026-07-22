@@ -64,7 +64,6 @@ func runWorkflowTests() {
 		fmt.Printf("FAIL: resolve: %v\n", err)
 		return
 	}
-	db.Commit("initial")
 
 	var results []workflowResult
 
@@ -257,26 +256,11 @@ func testRename(db *store.DB) workflowResult {
 	return workflowResult{"rename", true, "renamed OldName → NewName"}
 }
 
-func testVerify(db *store.DB) workflowResult {
-	// Diff: check for uncommitted changes.
-	status, _ := db.Diff() // may be empty or error if nothing changed
-
-	// Commit.
-	if err := db.Commit("workflow test changes"); err != nil {
-		// OK if nothing to commit.
-		_ = err
-	}
-
-	// Log: check history.
-	log, err := db.Log(5)
-	if err != nil {
-		return workflowResult{"verify: history", false, fmt.Sprintf("log failed: %v", err)}
-	}
-	if len(log) < 2 {
-		return workflowResult{"verify: history", false, fmt.Sprintf("expected >= 2 commits, got %d", len(log))}
-	}
-
-	return workflowResult{"verify (diff + commit + history)", true, fmt.Sprintf("diff: %d changes, log: %d commits", len(status), len(log))}
+func testVerify(_ *store.DB) workflowResult {
+	// diff/commit/log removed with Dolt Category A. The workflow harness
+	// keeps this step as a stub so the results table stays comparable
+	// across runs; delete when the harness is next rewritten.
+	return workflowResult{"verify (n/a — Dolt removed)", true, "skipped"}
 }
 
 func testUntested(db *store.DB) workflowResult {

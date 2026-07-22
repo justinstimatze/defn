@@ -2055,9 +2055,6 @@ func RunB(x int) int {
 	if err := resolve.Resolve(db1, projDir); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	if err := db1.Commit("initial ingest"); err != nil {
-		t.Fatalf("commit initial: %v", err)
-	}
 
 	s := &server{backend: db1, dolt: db1, projectDir: projDir}
 	s.ready.Store(true)
@@ -2169,9 +2166,6 @@ func RunB(x int) int {
 	}
 	if err := resolve.Resolve(db1, projDir); err != nil {
 		t.Fatalf("initial resolve: %v", err)
-	}
-	if err := db1.Commit("initial ingest"); err != nil {
-		t.Fatalf("commit initial: %v", err)
 	}
 
 	// Now spin up a server the way newMCPServer does: fire the async

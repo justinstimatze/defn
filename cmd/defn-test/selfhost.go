@@ -85,7 +85,6 @@ func runSelfhostTest() workflowResult {
 	if err := resolve.Resolve(db, repoRoot); err != nil {
 		return workflowResult{name: "selfhost", message: fmt.Sprintf("resolve: %v", err)}
 	}
-	db.Commit("selfhost")
 	fmt.Printf("  resolved (%.1fs)\n", time.Since(start).Seconds())
 
 	outDir := filepath.Join(tmp, "out")

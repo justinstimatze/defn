@@ -165,9 +165,6 @@ func testProject(p project) error {
 	}
 	fmt.Printf("  resolved\n")
 
-	// Commit.
-	db.Commit("test ingest")
-
 	// --- Assertions ---
 
 	// Module count.
@@ -256,19 +253,6 @@ func testProject(p project) error {
 		return fmt.Errorf("untested: got %d, want >= %d", len(untested), p.minUntested)
 	}
 	fmt.Printf("  untested: %d (>= %d) ✓\n", len(untested), p.minUntested)
-
-	// Dolt operations.
-	if err := db.Branch("test-branch"); err != nil {
-		return fmt.Errorf("branch: %w", err)
-	}
-	branches, err := db.ListBranches()
-	if err != nil {
-		return fmt.Errorf("list branches: %w", err)
-	}
-	if len(branches) < 2 {
-		return fmt.Errorf("branches: got %d, want >= 2", len(branches))
-	}
-	fmt.Printf("  dolt branch/commit/log ✓\n")
 
 	return nil
 }
