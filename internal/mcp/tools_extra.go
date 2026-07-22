@@ -10,17 +10,17 @@ import (
 )
 
 func (s *server) handleExplain(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.db.GetDefinitionByName(args.Name, "")
+	d, err := s.dolt.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", args.Name))
 	}
 
-	impact, err := s.db.GetImpact(d.ID)
+	impact, err := s.dolt.GetImpact(d.ID)
 	if err != nil {
 		return errResult(err)
 	}
 
-	callees, _ := s.db.GetCallees(d.ID) // best effort — nil is safe
+	callees, _ := s.dolt.GetCallees(d.ID) // best effort — nil is safe
 
 	var sb strings.Builder
 	recv := formatReceiver(d.Receiver)
@@ -75,7 +75,7 @@ func (s *server) handleExplain(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 }
 
 func (s *server) handleMove(_ context.Context, _ *sdkmcp.CallToolRequest, args moveParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.db.GetDefinitionByName(args.Name, "")
+	d, err := s.dolt.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", args.Name))
 	}
@@ -87,12 +87,12 @@ func (s *server) handleMove(_ context.Context, _ *sdkmcp.CallToolRequest, args m
 	}
 
 	// Delete from old module first, then create in new module.
-	if err := s.db.DeleteDefinition(d.ID); err != nil {
+	if err := s.dolt.DeleteDefinition(d.ID); err != nil {
 		return errResult(err)
 	}
 	d.ModuleID = targetMod.ID
 	d.ID = 0 // force new insert
-	if _, err := s.db.UpsertDefinition(d); err != nil {
+	if _, err := s.dolt.UpsertDefinition(d); err != nil {
 		return errResult(err)
 	}
 
@@ -108,7 +108,7 @@ func (s *server) handleMove(_ context.Context, _ *sdkmcp.CallToolRequest, args m
 }
 
 func (s *server) handleCodeDiff(_ context.Context, _ *sdkmcp.CallToolRequest, _ emptyParam) (*sdkmcp.CallToolResult, any, error) {
-	status, err := s.db.Diff()
+	status, err := s.dolt.Diff()
 	if err != nil {
 		return errResult(err)
 	}
@@ -125,7 +125,7 @@ func (s *server) handleCodeDiff(_ context.Context, _ *sdkmcp.CallToolRequest, _ 
 	}
 
 	// Try to get definition-level diff from Dolt.
-	defDiff, err := s.db.DiffDefinitions()
+	defDiff, err := s.dolt.DiffDefinitions()
 	if err == nil && len(defDiff) > 0 {
 		sb.WriteString("\n**Definition changes:**\n")
 		for _, d := range defDiff {
@@ -148,13 +148,13 @@ func (s *server) handleCodeDiff(_ context.Context, _ *sdkmcp.CallToolRequest, _ 
 func (s *server) handleHistory(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
 	// Query Dolt's diff history for a specific definition.
 	// We look at commit_defs across commits to see how the body changed.
-	d, err := s.db.GetDefinitionByName(args.Name, "")
+	d, err := s.dolt.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", args.Name))
 	}
 
 	// Get commit log.
-	log, err := s.db.Log(20)
+	log, err := s.dolt.Log(20)
 	if err != nil {
 		return errResult(err)
 	}
@@ -181,8 +181,8 @@ func (s *server) handleHistory(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 func (s *server) handleBranch(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	// No branch arg → list.
 	if strings.TrimSpace(args.Branch) == "" {
-		current, _ := s.db.GetCurrentBranch()
-		branches, err := s.db.ListBranches()
+		current, _ := s.dolt.GetCurrentBranch()
+		branches, err := s.dolt.ListBranches()
 		if err != nil {
 			return errResult(err)
 		}
@@ -200,7 +200,7 @@ func (s *server) handleBranch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 
 	// Delete mode.
 	if args.Force {
-		if err := s.db.DeleteBranch(args.Branch, true); err != nil {
+		if err := s.dolt.DeleteBranch(args.Branch, true); err != nil {
 			return errResult(err)
 		}
 		return textResult(fmt.Sprintf("Deleted branch %s.", args.Branch)), nil, nil
@@ -208,32 +208,32 @@ func (s *server) handleBranch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 
 	// Create mode. With or without `from`.
 	if args.From != "" {
-		if err := s.db.BranchFrom(args.Branch, args.From); err != nil {
+		if err := s.dolt.BranchFrom(args.Branch, args.From); err != nil {
 			return errResult(err)
 		}
 		return textResult(fmt.Sprintf("Created branch %s from %s.", args.Branch, args.From)), nil, nil
 	}
-	if err := s.db.Branch(args.Branch); err != nil {
+	if err := s.dolt.Branch(args.Branch); err != nil {
 		return errResult(err)
 	}
 	return textResult(fmt.Sprintf("Created branch %s.", args.Branch)), nil, nil
 }
 
 func (s *server) handleCheckout(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	if err := s.db.Checkout(args.Branch); err != nil {
+	if err := s.dolt.Checkout(args.Branch); err != nil {
 		return errResult(err)
 	}
 	return textResult(fmt.Sprintf("Switched to branch %s.", args.Branch)), nil, nil
 }
 
 func (s *server) handleMerge(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	current, _ := s.db.GetCurrentBranch()
-	if err := s.db.Merge(args.Branch); err != nil {
+	current, _ := s.dolt.GetCurrentBranch()
+	if err := s.dolt.Merge(args.Branch); err != nil {
 		return errResult(err)
 	}
 	// With dolt_allow_commit_conflicts=1 the merge succeeds even when
 	// conflicts exist — surface them instead of claiming success.
-	conflicts, _ := s.db.Conflicts()
+	conflicts, _ := s.dolt.Conflicts()
 	if len(conflicts) > 0 {
 		return textResult(fmt.Sprintf(
 			"Merged %s into %s with %d conflict(s). Run code(op:\"conflicts\") to inspect, "+
@@ -245,18 +245,18 @@ func (s *server) handleMerge(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 }
 
 func (s *server) handleCommit(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	if err := s.db.Commit(args.Message); err != nil {
+	if err := s.dolt.Commit(args.Message); err != nil {
 		return errResult(err)
 	}
 	return textResult(fmt.Sprintf("Committed: %s", args.Message)), nil, nil
 }
 
 func (s *server) handleStatus(_ context.Context, _ *sdkmcp.CallToolRequest, _ codeParam) (*sdkmcp.CallToolResult, any, error) {
-	current, err := s.db.GetCurrentBranch()
+	current, err := s.dolt.GetCurrentBranch()
 	if err != nil {
 		return errResult(err)
 	}
-	status, err := s.db.Diff()
+	status, err := s.dolt.Diff()
 	if err != nil {
 		return errResult(err)
 	}
@@ -274,7 +274,7 @@ func (s *server) handleStatus(_ context.Context, _ *sdkmcp.CallToolRequest, _ co
 }
 
 func (s *server) handleConflicts(_ context.Context, _ *sdkmcp.CallToolRequest, _ codeParam) (*sdkmcp.CallToolResult, any, error) {
-	conflicts, err := s.db.Conflicts()
+	conflicts, err := s.dolt.Conflicts()
 	if err != nil {
 		return errResult(err)
 	}
@@ -302,31 +302,31 @@ func (s *server) handleConflicts(_ context.Context, _ *sdkmcp.CallToolRequest, _
 func (s *server) handleResolve(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	// Bulk-pick path.
 	if args.Pick != "" {
-		if err := s.db.ResolveAll(args.Pick); err != nil {
+		if err := s.dolt.ResolveAll(args.Pick); err != nil {
 			return errResult(err)
 		}
 		return textResult(fmt.Sprintf("Resolved all conflicts (picked %s). Commit to finalize the merge.", args.Pick)), nil, nil
 	}
 	// Per-definition resolution: look up the def on the current branch.
-	d, err := s.db.GetDefinitionByName(args.Name, "")
+	d, err := s.dolt.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found: %w", args.Name, err))
 	}
-	if err := s.db.ResolveConflict(d.ID, args.Body); err != nil {
+	if err := s.dolt.ResolveConflict(d.ID, args.Body); err != nil {
 		return errResult(err)
 	}
 	return textResult(fmt.Sprintf("Resolved %s. Commit to finalize the merge.", args.Name)), nil, nil
 }
 
 func (s *server) handleMergeAbort(_ context.Context, _ *sdkmcp.CallToolRequest, _ codeParam) (*sdkmcp.CallToolResult, any, error) {
-	if err := s.db.MergeAbort(); err != nil {
+	if err := s.dolt.MergeAbort(); err != nil {
 		return errResult(err)
 	}
 	return textResult("Merge aborted; working state restored."), nil, nil
 }
 
 func (s *server) handleDiffDefs(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	diffs, err := s.db.DiffDefinitionsBetween(args.From, args.To)
+	diffs, err := s.dolt.DiffDefinitionsBetween(args.From, args.To)
 	if err != nil {
 		return errResult(err)
 	}

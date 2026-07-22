@@ -60,7 +60,16 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 }
 
 type server struct {
-	db              *store.DB
+	// backend is the storage-agnostic surface. Non-Dolt callers (Phase 1+
+	// SQLite backend) will populate this without dolt. In Phase 0, both
+	// fields point at the same *store.DB.
+	backend store.Backend
+	// dolt is the concrete Dolt-specific handle used only for Category A
+	// version-control ops (branch, checkout, commit, merge, diff, log,
+	// conflicts) in tools_extra.go, plus the autoCommit checkpoint path.
+	// Non-Dolt backends leave this nil; Category A op handlers must
+	// nil-check and return "op not supported" when so.
+	dolt            *store.DB
 	projectDir      string
 	lastResolved    atomic.Int64 // UnixNano timestamp of last resolve (to debounce watcher)
 	ready           atomic.Bool  // true after startup ingest+resolve completes
@@ -205,7 +214,7 @@ func mcpHTTPMux(mcpServer *sdkmcp.Server, projDir string) http.Handler {
 // time the same code path an MCP client would drive without spinning
 // up a full serve. Skips the async startup ingest.
 func MeasureRename(database *store.DB, projDir, oldName, newName string) (time.Duration, string, error) {
-	s := &server{db: database, projectDir: projDir}
+	s := &server{backend: database, dolt: database, projectDir: projDir}
 	s.idf = newIDF(database)
 	s.ready.Store(true) // caller-driven; skip the async ingest wait
 	start := time.Now()
@@ -229,7 +238,7 @@ func MeasureRename(database *store.DB, projDir, oldName, newName string) (time.D
 // same shape as MeasureRename but exercises the file-scoped goimports
 // + autoResolveFile lever (#109 pass 3) rather than rename's skip path.
 func MeasureEdit(database *store.DB, projDir, name, newBody string) (time.Duration, string, error) {
-	s := &server{db: database, projectDir: projDir}
+	s := &server{backend: database, dolt: database, projectDir: projDir}
 	s.idf = newIDF(database)
 	s.ready.Store(true)
 	start := time.Now()
@@ -250,7 +259,7 @@ func MeasureEdit(database *store.DB, projDir, name, newBody string) (time.Durati
 
 // Shared by both stdio and HTTP transports.
 func newMCPServer(ctx context.Context, database *store.DB, projDir string) (*server, *sdkmcp.Server) {
-	s := &server{db: database, projectDir: projDir}
+	s := &server{backend: database, dolt: database, projectDir: projDir}
 	s.idf = newIDF(database)
 
 	if projDir != "" {
@@ -466,7 +475,7 @@ func (s *server) fileAltBytes(d *store.Definition) int {
 	if d == nil || d.SourceFile == "" {
 		return 0
 	}
-	raw, err := s.db.GetFileSource(d.ModuleID, d.SourceFile)
+	raw, err := s.backend.GetFileSource(d.ModuleID, d.SourceFile)
 	if err != nil {
 		return 0
 	}
@@ -542,13 +551,13 @@ func (s *server) notFoundOrErr(name string, err error) (*sdkmcp.CallToolResult, 
 // zero-length arg or truly-absent name don't get noisy suggestions.
 func (s *server) notFoundResult(name string) (*sdkmcp.CallToolResult, any, error) {
 	msg := fmt.Sprintf("definition %q not found", name)
-	if name == "" || s.db == nil {
+	if name == "" || s.backend == nil {
 		return errResult(fmt.Errorf("%s", msg))
 	}
 	// Case-insensitive prefix/suffix contains — the common cases are
 	// "case wrong", "receiver missing", "prefix/suffix mismatch".
 	// FindDefinitions ORDER BY name so we get a stable head-of-list.
-	cands, err := s.db.FindDefinitions("%" + name + "%")
+	cands, err := s.backend.FindDefinitions("%" + name + "%")
 	if err != nil || len(cands) == 0 {
 		return errResult(fmt.Errorf("%s", msg))
 	}
@@ -591,7 +600,7 @@ func formatReceiver(recv string) string {
 }
 
 func (s *server) findModule(query string) *store.Module {
-	mods, _ := s.db.ListModules() // best effort — nil is safe
+	mods, _ := s.backend.ListModules() // best effort — nil is safe
 	for _, m := range mods {
 		if strings.EqualFold(m.Name, query) ||
 			strings.Contains(strings.ToLower(m.Path), strings.ToLower(query)) {
@@ -602,7 +611,7 @@ func (s *server) findModule(query string) *store.Module {
 }
 
 func (s *server) modulePath(moduleID int64) string {
-	mods, _ := s.db.ListModules() // best effort — nil is safe
+	mods, _ := s.backend.ListModules() // best effort — nil is safe
 	for _, m := range mods {
 		if m.ID == moduleID {
 			return m.Path
@@ -926,11 +935,11 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 }
 
 func (s *server) handleImpact(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.db.GetDefinitionByName(args.Name, "")
+	d, err := s.backend.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
-	impact, err := s.db.GetImpact(d.ID)
+	impact, err := s.backend.GetImpact(d.ID)
 	if err != nil {
 		return errResult(err)
 	}
@@ -1129,14 +1138,14 @@ func resultTextRaw(r *sdkmcp.CallToolResult) string {
 }
 
 func (s *server) handleGetDefinition(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.db.GetDefinitionByName(args.Name, "")
+	d, err := s.backend.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
 
 	// Look up module path for this definition.
 	var modulePath string
-	mods, _ := s.db.ListModules() // best effort — nil is safe
+	mods, _ := s.backend.ListModules() // best effort — nil is safe
 	for _, m := range mods {
 		if m.ID == d.ModuleID {
 			modulePath = m.Path
@@ -1150,13 +1159,13 @@ func (s *server) handleGetDefinition(_ context.Context, _ *sdkmcp.CallToolReques
 	if !args.Full && modulePath != "" {
 		upstreamName := upstreamDefName(d)
 		hash := store.HashBodyStructural(d.Body)
-		if match, _ := s.db.FindUpstreamMatch(modulePath, upstreamName, d.Kind, d.Receiver, hash); match != nil {
+		if match, _ := s.backend.FindUpstreamMatch(modulePath, upstreamName, d.Kind, d.Receiver, hash); match != nil {
 			return s.renderUpstreamMatch(d, match, modulePath)
 		}
 		// Miss: check whether any version of this def is known upstream.
 		// If yes, it means the local copy has diverged — annotate the
 		// body so the reader knows they're looking at patched code.
-		if versions, _ := s.db.FindUpstreamVersions(modulePath, upstreamName, d.Kind, d.Receiver); len(versions) > 0 {
+		if versions, _ := s.backend.FindUpstreamVersions(modulePath, upstreamName, d.Kind, d.Receiver); len(versions) > 0 {
 			return s.renderDivergedFromUpstream(d, versions, modulePath)
 		}
 	}
@@ -1249,13 +1258,13 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 
 	if strings.Contains(args.Pattern, "%") {
 		// SQL LIKE pattern (e.g., "%Auth%").
-		defs, err = s.db.FindDefinitions(args.Pattern)
+		defs, err = s.backend.FindDefinitions(args.Pattern)
 	} else {
 		// Search names/signatures first (indexed, fast).
-		defs, err = s.db.FindDefinitions("%" + args.Pattern + "%")
+		defs, err = s.backend.FindDefinitions("%" + args.Pattern + "%")
 		if err != nil || len(defs) == 0 {
 			// Fall back to body/doc search (LIKE scan, slower).
-			defs, err = s.db.SearchDefinitions(args.Pattern)
+			defs, err = s.backend.SearchDefinitions(args.Pattern)
 		}
 	}
 	if err != nil {
@@ -1324,7 +1333,7 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 // a message that names the fallback tried, distinguishing "no def named
 // X + no body containing X" from "search op failed silently."
 func (s *server) bodyScanResult(pattern string, limit int) (*sdkmcp.CallToolResult, any, error) {
-	hits, err := s.db.SearchBodiesLike(pattern, limit)
+	hits, err := s.backend.SearchBodiesLike(pattern, limit)
 	if err != nil {
 		return errResult(fmt.Errorf("search body-scan: %w", err))
 	}
@@ -1377,7 +1386,7 @@ func (s *server) rankDirectCallers(impact *store.Impact) error {
 	for i, c := range impact.DirectCallers {
 		ids[i] = c.ID
 	}
-	callers, tests, err := s.db.RefCountsByTarget(ids)
+	callers, tests, err := s.backend.RefCountsByTarget(ids)
 	if err != nil {
 		return err
 	}
@@ -1406,7 +1415,7 @@ func (s *server) rankedSearchResult(query string, defs []store.Definition, limit
 	for i, d := range defs {
 		ids[i] = d.ID
 	}
-	callers, tests, err := s.db.RefCountsByTarget(ids)
+	callers, tests, err := s.backend.RefCountsByTarget(ids)
 	if err != nil {
 		return errResult(fmt.Errorf("ref counts: %w", err))
 	}
@@ -1447,7 +1456,7 @@ func (s *server) rankedSearchResult(query string, defs []store.Definition, limit
 }
 
 func (s *server) handleUntested(_ context.Context, _ *sdkmcp.CallToolRequest, _ emptyParam) (*sdkmcp.CallToolResult, any, error) {
-	defs, err := s.db.GetUntested()
+	defs, err := s.backend.GetUntested()
 	if err != nil {
 		return errResult(err)
 	}
@@ -1461,7 +1470,7 @@ func (s *server) handleUntested(_ context.Context, _ *sdkmcp.CallToolRequest, _ 
 }
 
 func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args editParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.db.GetDefinitionByName(args.Name, "")
+	d, err := s.backend.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -1475,7 +1484,7 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 	d.Body = args.NewBody
 	d.Signature = extractSignature(args.NewBody)
 
-	id, err := s.db.UpsertDefinition(d)
+	id, err := s.backend.UpsertDefinition(d)
 	if err != nil {
 		return errResult(err)
 	}
@@ -1493,7 +1502,7 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 	}
 
 	// Impact nudge: show callers if this definition has any.
-	if impact, err := s.db.GetImpact(id); err == nil && len(impact.DirectCallers) > 0 {
+	if impact, err := s.backend.GetImpact(id); err == nil && len(impact.DirectCallers) > 0 {
 		prodCallers := 0
 		for _, c := range impact.DirectCallers {
 			if !c.Test {
@@ -1545,9 +1554,9 @@ func (s *server) autoResolve(modulePath string) {
 	}
 	// Best effort — don't fail the edit if resolve fails.
 	if modulePath != "" {
-		resolve.ResolveModule(s.db, s.projectDir, modulePath)
+		resolve.ResolveModule(s.backend, s.projectDir, modulePath)
 	} else {
-		resolve.Resolve(s.db, s.projectDir)
+		resolve.Resolve(s.backend, s.projectDir)
 	}
 	// Best effort — log to stderr if commit fails so the operator notices
 	// without breaking the edit they just made.
@@ -1582,7 +1591,7 @@ func (s *server) autoResolveFile(sourceFile, modulePath string) {
 		return
 	}
 	absFile := filepath.Join(s.projectDir, sourceFile)
-	_ = resolve.ResolveFile(s.db, s.projectDir, absFile) // best-effort
+	_ = resolve.ResolveFile(s.backend, s.projectDir, absFile) // best-effort
 	if err := s.autoCommit(); err != nil {
 		fmt.Fprintf(os.Stderr, "defn: auto-commit failed (post-resolve): %v\n", err)
 	}
@@ -1602,10 +1611,10 @@ func (s *server) autoResolveFile(sourceFile, modulePath string) {
 // can't be persisted (e.g. "database is read only" after GC). Earlier
 // versions swallowed this and left writes silently dropped.
 func (s *server) autoCommit() error {
-	err := s.db.Commit("auto-sync")
-	s.db.CleanTempFiles()
+	err := s.dolt.Commit("auto-sync")
+	s.backend.CleanTempFiles()
 	if n := s.autoCommitCount.Add(1); n%10 == 0 {
-		go s.db.GC() // background — GC can be slow on large databases
+		go s.backend.GC() // background — GC can be slow on large databases
 	}
 	return err
 }
@@ -1623,7 +1632,7 @@ func (s *server) startGCTicker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := s.db.GC(); err != nil {
+			if err := s.backend.GC(); err != nil {
 				fmt.Fprintf(os.Stderr, "defn: periodic GC failed: %v\n", err)
 			}
 		}
@@ -1649,10 +1658,10 @@ func (s *server) ingestAndResolve() error {
 	if err != nil {
 		return fmt.Errorf("load packages: %w", err)
 	}
-	if err := ingest.IngestPackages(s.db, pkgs, s.projectDir); err != nil {
+	if err := ingest.IngestPackages(s.backend, pkgs, s.projectDir); err != nil {
 		return fmt.Errorf("ingest: %w", err)
 	}
-	if err := resolve.ResolvePackages(s.db, pkgs, s.projectDir); err != nil {
+	if err := resolve.ResolvePackages(s.backend, pkgs, s.projectDir); err != nil {
 		return fmt.Errorf("resolve: %w", err)
 	}
 	if err := s.autoCommit(); err != nil {
@@ -1771,7 +1780,7 @@ func (s *server) autoEmitAndBuildWithOpts(opts emit.Opts) string {
 
 	// Emit to the actual project directory — keeps files in sync.
 	t := time.Now()
-	if err := emit.EmitWithOpts(s.db, s.projectDir, opts); err != nil {
+	if err := emit.EmitWithOpts(s.backend, s.projectDir, opts); err != nil {
 		return fmt.Sprintf("emit error: %v", err)
 	}
 	if timing {
@@ -1884,7 +1893,7 @@ func extractSignature(body string) string {
 }
 
 func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.db.GetDefinitionByName(args.Name, "")
+	d, err := s.backend.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -1924,7 +1933,7 @@ func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest
 	d.Signature = extractSignature(newBody)
 	recv := formatReceiver(d.Receiver)
 
-	id, err := s.db.UpsertDefinition(d)
+	id, err := s.backend.UpsertDefinition(d)
 	if err != nil {
 		return errResult(err)
 	}
@@ -1941,7 +1950,7 @@ func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest
 	if buildResult != "" {
 		sb.WriteString("\n" + buildResult)
 	}
-	if impact, err := s.db.GetImpact(id); err == nil && len(impact.DirectCallers) > 0 {
+	if impact, err := s.backend.GetImpact(id); err == nil && len(impact.DirectCallers) > 0 {
 		prodCallers := 0
 		for _, c := range impact.DirectCallers {
 			if !c.Test {
@@ -1954,7 +1963,7 @@ func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest
 }
 
 func (s *server) handleInsert(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.db.GetDefinitionByName(args.Name, "")
+	d, err := s.backend.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -1981,7 +1990,7 @@ func (s *server) handleInsert(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	d.Signature = extractSignature(newBody)
 	recv := formatReceiver(d.Receiver)
 
-	if _, err := s.db.UpsertDefinition(d); err != nil {
+	if _, err := s.backend.UpsertDefinition(d); err != nil {
 		return errResult(err)
 	}
 
@@ -2029,7 +2038,7 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		}
 	}
 	if mod == nil {
-		mods, _ := s.db.ListModules() // best effort — nil is safe
+		mods, _ := s.backend.ListModules() // best effort — nil is safe
 		if len(mods) > 0 {
 			mod = &mods[0]
 		}
@@ -2039,7 +2048,7 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	}
 
 	// Check if a definition with this name already exists in the target module.
-	if existing, err := s.db.GetDefinitionByName(name, mod.Path); err == nil {
+	if existing, err := s.backend.GetDefinitionByName(name, mod.Path); err == nil {
 		recv := formatReceiver(existing.Receiver)
 		return errResult(fmt.Errorf("definition %s%s already exists in %s (id=%d) — use code(op:\"edit\") to modify it", recv, name, mod.Path, existing.ID))
 	}
@@ -2056,7 +2065,7 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		Body:       args.Body,
 		SourceFile: args.File,
 	}
-	id, err := s.db.UpsertDefinition(d)
+	id, err := s.backend.UpsertDefinition(d)
 	if err != nil {
 		return errResult(err)
 	}
@@ -2237,7 +2246,7 @@ func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult
 		// fallback), which for a repo-rooted layout is the module root. Emit
 		// will place the file at args.File; the new package appears on next
 		// ingest.
-		mods, _ := s.db.ListModules()
+		mods, _ := s.backend.ListModules()
 		for i := range mods {
 			if mod == nil || len(mods[i].Path) < len(mod.Path) {
 				mod = &mods[i]
@@ -2250,13 +2259,13 @@ func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult
 
 	// Pre-check: no name collides with an existing def in the target module.
 	for _, d := range decls {
-		if existing, err := s.db.GetDefinitionByName(d.Name, mod.Path); err == nil {
+		if existing, err := s.backend.GetDefinitionByName(d.Name, mod.Path); err == nil {
 			recv := formatReceiver(existing.Receiver)
 			return errResult(fmt.Errorf("definition %s%s already exists in %s (id=%d) — use code(op:\"edit\") to modify it", recv, d.Name, mod.Path, existing.ID))
 		}
 	}
 
-	commit, rollback, txErr := s.db.Begin()
+	commit, rollback, txErr := s.backend.Begin()
 	if txErr != nil {
 		return errResult(txErr)
 	}
@@ -2276,7 +2285,7 @@ func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult
 			Body:       d.Body,
 			SourceFile: args.File,
 		}
-		id, err := s.db.UpsertDefinition(def)
+		id, err := s.backend.UpsertDefinition(def)
 		if err != nil {
 			return errResult(fmt.Errorf("upsert %s: %v", d.Name, err))
 		}
@@ -2307,7 +2316,7 @@ func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult
 // "github.com/x/y/internal/code"). Accepts repo-relative or absolute paths;
 // matches by suffix on the directory component.
 func (s *server) findModuleByFile(file string) *store.Module {
-	mods, _ := s.db.ListModules() // best effort — nil is safe
+	mods, _ := s.backend.ListModules() // best effort — nil is safe
 	if len(mods) == 0 {
 		return nil
 	}
@@ -2409,13 +2418,13 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 					sb.WriteString(fmt.Sprintf("+ would create %s (%s)\n", name, kind))
 				}
 			case "edit":
-				if _, err := s.db.GetDefinitionByName(op.Name, ""); err != nil {
+				if _, err := s.backend.GetDefinitionByName(op.Name, ""); err != nil {
 					errors = append(errors, fmt.Sprintf("edit %s: not found", op.Name))
 				} else {
 					sb.WriteString(fmt.Sprintf("~ would edit %s\n", op.Name))
 				}
 			case "delete":
-				if _, err := s.db.GetDefinitionByName(op.Name, ""); err != nil {
+				if _, err := s.backend.GetDefinitionByName(op.Name, ""); err != nil {
 					errors = append(errors, fmt.Sprintf("delete %s: not found", op.Name))
 				} else {
 					sb.WriteString(fmt.Sprintf("- would delete %s\n", op.Name))
@@ -2423,7 +2432,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			case "rename":
 				if op.Name == "" || op.NewName == "" {
 					errors = append(errors, "rename: both name and new_name are required")
-				} else if _, err := s.db.GetDefinitionByName(op.Name, ""); err != nil {
+				} else if _, err := s.backend.GetDefinitionByName(op.Name, ""); err != nil {
 					errors = append(errors, fmt.Sprintf("rename %s: not found", op.Name))
 				} else {
 					sb.WriteString(fmt.Sprintf("→ would rename %s → %s\n", op.Name, op.NewName))
@@ -2438,7 +2447,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 						name = inferred
 					}
 				}
-				if _, err := s.db.GetDefinitionByName(name, ""); err != nil {
+				if _, err := s.backend.GetDefinitionByName(name, ""); err != nil {
 					errors = append(errors, fmt.Sprintf("%s %s: not found", op.Op, name))
 				} else {
 					sb.WriteString(fmt.Sprintf("~ would %s on %s\n", op.Op, name))
@@ -2463,7 +2472,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		return textResult(sb.String()), nil, nil
 	}
 
-	commit, rollback, txErr := s.db.Begin()
+	commit, rollback, txErr := s.backend.Begin()
 	if txErr != nil {
 		return errResult(txErr)
 	}
@@ -2506,7 +2515,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			}
 			name = inferred
 		}
-		d, err := s.db.GetDefinitionByName(name, "")
+		d, err := s.backend.GetDefinitionByName(name, "")
 		if err != nil {
 			return "", fmt.Sprintf("%s %s: not found", op.Op, name)
 		}
@@ -2520,7 +2529,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		}
 		d.Body = newBody
 		d.Signature = extractSignature(newBody)
-		if _, err := s.db.UpsertDefinition(d); err != nil {
+		if _, err := s.backend.UpsertDefinition(d); err != nil {
 			return "", fmt.Sprintf("%s %s: %v", op.Op, name, err)
 		}
 		addTouched(d.SourceFile)
@@ -2556,7 +2565,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				}
 			}
 			if mod == nil {
-				mods, _ := s.db.ListModules()
+				mods, _ := s.backend.ListModules()
 				if len(mods) > 0 {
 					mod = &mods[0]
 				}
@@ -2571,7 +2580,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				Test: isTest, Receiver: receiver, Signature: extractSignature(op.Body), Body: op.Body,
 				SourceFile: op.File,
 			}
-			id, err := s.db.UpsertDefinition(d)
+			id, err := s.backend.UpsertDefinition(d)
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("create %s: %v", name, err))
 			} else {
@@ -2581,7 +2590,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			}
 
 		case "edit":
-			d, err := s.db.GetDefinitionByName(op.Name, "")
+			d, err := s.backend.GetDefinitionByName(op.Name, "")
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("edit %s: not found", op.Name))
 				continue
@@ -2614,7 +2623,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				continue
 			}
 			d.Signature = extractSignature(d.Body)
-			if _, err := s.db.UpsertDefinition(d); err != nil {
+			if _, err := s.backend.UpsertDefinition(d); err != nil {
 				errors = append(errors, fmt.Sprintf("edit %s: %v", op.Name, err))
 			} else {
 				addTouched(d.SourceFile)
@@ -2623,12 +2632,12 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			}
 
 		case "delete":
-			d, err := s.db.GetDefinitionByName(op.Name, "")
+			d, err := s.backend.GetDefinitionByName(op.Name, "")
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("delete %s: not found", op.Name))
 				continue
 			}
-			if err := s.db.DeleteDefinition(d.ID); err != nil {
+			if err := s.backend.DeleteDefinition(d.ID); err != nil {
 				errors = append(errors, fmt.Sprintf("delete %s: %v", op.Name, err))
 			} else {
 				addTouched(d.SourceFile)
@@ -2647,7 +2656,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				errors = append(errors, "rename: both name and new_name are required")
 				continue
 			}
-			d, err := s.db.GetDefinitionByName(op.Name, "")
+			d, err := s.backend.GetDefinitionByName(op.Name, "")
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("rename %s: not found", op.Name))
 				continue
@@ -2665,17 +2674,17 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			d.Name = op.NewName
 			d.Signature = extractSignature(d.Body)
 			d.Exported = len(op.NewName) > 0 && op.NewName[0] >= 'A' && op.NewName[0] <= 'Z'
-			if _, err := s.db.UpsertDefinition(d); err != nil {
+			if _, err := s.backend.UpsertDefinition(d); err != nil {
 				errors = append(errors, fmt.Sprintf("rename %s: %v", op.Name, err))
 				continue
 			}
-			callers, _ := s.db.GetCallers(d.ID)
+			callers, _ := s.backend.GetCallers(d.ID)
 			callerCount := 0
 			for _, caller := range callers {
 				if strings.Contains(caller.Body, op.Name) {
 					caller.Body, _ = astRename(caller.Body, op.Name, op.NewName)
 					caller.Signature = extractSignature(caller.Body)
-					if _, err := s.db.UpsertDefinition(&caller); err != nil {
+					if _, err := s.backend.UpsertDefinition(&caller); err != nil {
 						errors = append(errors, fmt.Sprintf("rename caller %s: %v", caller.Name, err))
 					} else {
 						addTouched(caller.SourceFile)
@@ -2751,7 +2760,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			}
 			file := op.File
 			if file == "" {
-				all, err := s.db.DistinctSourceFiles()
+				all, err := s.backend.DistinctSourceFiles()
 				if err != nil {
 					errors = append(errors, fmt.Sprintf("add-import: %v", err))
 					continue
@@ -2773,13 +2782,13 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			if idx := strings.LastIndex(dir, "/"); idx >= 0 {
 				dir = dir[:idx]
 			}
-			defs, err := s.db.FindDefinitionsByFile(dir, file, 0)
+			defs, err := s.backend.FindDefinitionsByFile(dir, file, 0)
 			if err != nil || len(defs) == 0 {
 				errors = append(errors, fmt.Sprintf("add-import: no defs in %q", file))
 				continue
 			}
 			moduleID := defs[0].ModuleID
-			existing, err := s.db.GetImports(moduleID)
+			existing, err := s.backend.GetImports(moduleID)
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("add-import: read imports: %v", err))
 				continue
@@ -2796,7 +2805,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				continue
 			}
 			updated := append(existing, store.Import{ModuleID: moduleID, ImportedPath: op.ImportPath, Alias: op.Alias})
-			if err := s.db.SetImports(moduleID, updated); err != nil {
+			if err := s.backend.SetImports(moduleID, updated); err != nil {
 				errors = append(errors, fmt.Sprintf("add-import %q: %v", op.ImportPath, err))
 			} else {
 				// add-import changes imports header only; body/refs untouched.
@@ -2871,7 +2880,7 @@ func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolR
 	field := args.Field
 
 	// Iterate all modules → all defs. Load once, filter AST-side.
-	mods, err := s.db.ListModules()
+	mods, err := s.backend.ListModules()
 	if err != nil {
 		return errResult(fmt.Errorf("list modules: %w", err))
 	}
@@ -2887,7 +2896,7 @@ func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolR
 	}
 	touched := make(map[filePkg]bool)
 	for _, m := range mods {
-		defs, err := s.db.GetModuleDefinitions(m.ID)
+		defs, err := s.backend.GetModuleDefinitions(m.ID)
 		if err != nil {
 			continue
 		}
@@ -2898,7 +2907,7 @@ func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolR
 			}
 			d.Body = newBody
 			d.Signature = extractSignature(newBody)
-			if _, err := s.db.UpsertDefinition(&d); err != nil {
+			if _, err := s.backend.UpsertDefinition(&d); err != nil {
 				return errResult(fmt.Errorf("update %s: %w", d.Name, err))
 			}
 			updated++
@@ -3037,7 +3046,7 @@ func compositeMatchesType(expr ast.Expr, typeName string) bool {
 }
 
 func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.db.GetDefinitionByName(args.Name, "")
+	d, err := s.backend.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -3048,7 +3057,7 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// references is worse than one where you have to fix references
 	// first. force:true preserves the pre-existing unsafe behavior.
 	if !args.Force {
-		callers, cerr := s.db.GetCallers(d.ID)
+		callers, cerr := s.backend.GetCallers(d.ID)
 		if cerr == nil && len(callers) > 0 {
 			var names []string
 			for i, c := range callers {
@@ -3068,7 +3077,7 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// Show what we're about to delete.
 	recv := formatReceiver(d.Receiver)
 
-	if err := s.db.DeleteDefinition(d.ID); err != nil {
+	if err := s.backend.DeleteDefinition(d.ID); err != nil {
 		return errResult(err)
 	}
 
@@ -3120,7 +3129,7 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// set is corrupted. Waiting for ready serializes them.
 	s.waitReady()
 
-	d, err := s.db.GetDefinitionByName(args.OldName, "")
+	d, err := s.backend.GetDefinitionByName(args.OldName, "")
 	if err != nil {
 		return s.notFoundOrErr(args.OldName, err)
 	}
@@ -3148,7 +3157,7 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// Do NOT use UpsertDefinition here: it looks up by (module,name,kind,recv,test)
 	// and would INSERT a new row for the new name, leaving the old row orphaned
 	// in the DB and both defs in the emitted file.
-	if err := s.db.RenameDefinition(originalID, args.NewName, newBody, newSig, exported); err != nil {
+	if err := s.backend.RenameDefinition(originalID, args.NewName, newBody, newSig, exported); err != nil {
 		return errResult(err)
 	}
 
@@ -3156,7 +3165,7 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// each touched file so goimports can scope to just those (#109 pass 3):
 	// rename touches the def's own file + every caller's file, typically a
 	// small handful vs the whole project tree.
-	callers, err := s.db.GetCallers(originalID)
+	callers, err := s.backend.GetCallers(originalID)
 	if err != nil {
 		return errResult(fmt.Errorf("get callers for rename: %w", err))
 	}
@@ -3171,7 +3180,7 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 			caller.Body, skipped = astRename(caller.Body, args.OldName, args.NewName)
 			totalSkipped += skipped
 			caller.Signature = extractSignature(caller.Body)
-			if _, err := s.db.UpsertDefinition(&caller); err != nil {
+			if _, err := s.backend.UpsertDefinition(&caller); err != nil {
 				return errResult(fmt.Errorf("update caller %s: %w", caller.Name, err))
 			}
 			if caller.SourceFile != "" {
@@ -3231,7 +3240,7 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 		return errResult(fmt.Errorf("test: pattern is empty"))
 	}
 	// Ensure files reflect any pending DB edits so the test sees them.
-	if err := emit.Emit(s.db, s.projectDir); err != nil {
+	if err := emit.Emit(s.backend, s.projectDir); err != nil {
 		return errResult(fmt.Errorf("emit: %w", err))
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
@@ -3252,12 +3261,12 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 }
 
 func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.db.GetDefinitionByName(args.Name, "")
+	d, err := s.backend.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
 
-	impact, err := s.db.GetImpact(d.ID)
+	impact, err := s.backend.GetImpact(d.ID)
 	if err != nil {
 		return errResult(err)
 	}
@@ -3271,7 +3280,7 @@ func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args n
 	}
 
 	// Ensure files are current.
-	if err := emit.Emit(s.db, s.projectDir); err != nil {
+	if err := emit.Emit(s.backend, s.projectDir); err != nil {
 		return errResult(fmt.Errorf("emit: %w", err))
 	}
 
@@ -3396,7 +3405,7 @@ func (s *server) handleQuery(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	if msg := searchShapedSQLRedirect(args.SQL); msg != "" {
 		return errResult(fmt.Errorf("%s", msg))
 	}
-	results, err := s.db.Query(args.SQL)
+	results, err := s.backend.Query(args.SQL)
 	if err != nil {
 		return errResult(err)
 	}
@@ -3418,7 +3427,7 @@ func (s *server) handleSync(_ context.Context, _ *sdkmcp.CallToolRequest, args c
 		if !filepath.IsAbs(filePath) {
 			filePath = filepath.Join(s.projectDir, filePath)
 		}
-		n, err := ingest.IngestFile(s.db, s.projectDir, filePath)
+		n, err := ingest.IngestFile(s.backend, s.projectDir, filePath)
 		if err != nil {
 			return errResult(fmt.Errorf("ingest file: %w", err))
 		}
@@ -3426,7 +3435,7 @@ func (s *server) handleSync(_ context.Context, _ *sdkmcp.CallToolRequest, args c
 		// (added/removed embeds, signature changes, new defs) keep the
 		// ref graph consistent. Without this, embed/implements/call refs
 		// silently drift away from source over many sync calls.
-		if err := resolve.ResolveFile(s.db, s.projectDir, filePath); err != nil {
+		if err := resolve.ResolveFile(s.backend, s.projectDir, filePath); err != nil {
 			return errResult(fmt.Errorf("resolve file: %w", err))
 		}
 		// Surface commit failures (e.g. read-only after GC) instead of
@@ -3463,7 +3472,7 @@ func (s *server) handleEmit(_ context.Context, _ *sdkmcp.CallToolRequest, args c
 	if err := os.MkdirAll(out, 0755); err != nil {
 		return errResult(fmt.Errorf("create out dir: %w", err))
 	}
-	locs, err := emit.EmitWithMap(s.db, out)
+	locs, err := emit.EmitWithMap(s.backend, out)
 	if err != nil {
 		return errResult(fmt.Errorf("emit: %w", err))
 	}
@@ -3477,7 +3486,7 @@ func (s *server) handleGC(_ context.Context, _ *sdkmcp.CallToolRequest, _ codePa
 	noms := filepath.Join(s.projectDir, ".defn", "defn", ".dolt", "noms")
 	before := nomsSize(noms)
 	start := time.Now()
-	if err := s.db.GC(); err != nil {
+	if err := s.backend.GC(); err != nil {
 		return errResult(fmt.Errorf("gc: %w", err))
 	}
 	after := nomsSize(noms)
@@ -3518,7 +3527,7 @@ func humanSize(n int64) string {
 }
 
 func (s *server) handleSimilar(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.db.GetDefinitionByName(args.Name, "")
+	d, err := s.backend.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -3536,7 +3545,7 @@ func (s *server) handleSimilar(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 	}
 
 	// Find definitions with similar param/return signatures.
-	sigDefs, _ := s.db.FindDefinitions("%" + sig + "%")
+	sigDefs, _ := s.backend.FindDefinitions("%" + sig + "%")
 
 	// Deduplicate, exclude self.
 	seen := map[string]bool{d.Name: true}
@@ -3580,7 +3589,7 @@ const projectOverviewModuleCap = 40
 const projectOverviewDefsPerModule = 3
 
 func (s *server) projectOverview() (*sdkmcp.CallToolResult, any, error) {
-	mods, err := s.db.ListModules()
+	mods, err := s.backend.ListModules()
 	if err != nil {
 		return errResult(fmt.Errorf("list modules: %w", err))
 	}
@@ -3596,7 +3605,7 @@ func (s *server) projectOverview() (*sdkmcp.CallToolResult, any, error) {
 			sb.WriteString(fmt.Sprintf("… (%d more modules omitted — pass file:\"path/to/pkg\" for a subtree)\n", len(mods)-shown))
 			break
 		}
-		defs, _ := s.db.GetModuleDefinitions(m.ID)
+		defs, _ := s.backend.GetModuleDefinitions(m.ID)
 		nExp := 0
 		var exemplars []string
 		for _, d := range defs {
@@ -3640,7 +3649,7 @@ func (s *server) handleOverview(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 		dir = strings.TrimSuffix(dir, ".go")
 	}
 
-	defs, err := s.db.FindDefinitionsByFile(dir, file, 0)
+	defs, err := s.backend.FindDefinitionsByFile(dir, file, 0)
 	if err != nil || len(defs) == 0 {
 		return errResult(fmt.Errorf("no definitions found for %s", file))
 	}
@@ -3668,13 +3677,13 @@ func (s *server) handleOverview(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 			sb.WriteString(fmt.Sprintf("- %s%s (%s)", recv, d.Name, d.Kind))
 
 			// Show caller/callee counts.
-			full, err := s.db.GetDefinition(d.ID)
+			full, err := s.backend.GetDefinition(d.ID)
 			if err != nil {
 				sb.WriteString("\n")
 				continue
 			}
-			callers, _ := s.db.GetCallers(full.ID)
-			callees, _ := s.db.GetCallees(full.ID)
+			callers, _ := s.backend.GetCallers(full.ID)
+			callees, _ := s.backend.GetCallees(full.ID)
 			prodCallers := 0
 			for _, c := range callers {
 				if !c.Test {
@@ -3700,7 +3709,7 @@ func (s *server) handlePatch(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		return errResult(fmt.Errorf("patch: old_name and new_name are required (the old and new text)"))
 	}
 
-	d, err := s.db.GetDefinitionByName(args.Name, "")
+	d, err := s.backend.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -3712,7 +3721,7 @@ func (s *server) handlePatch(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	d.Body = strings.Replace(d.Body, args.OldName, args.NewName, 1)
 	d.Signature = extractSignature(d.Body)
 
-	if _, err := s.db.UpsertDefinition(d); err != nil {
+	if _, err := s.backend.UpsertDefinition(d); err != nil {
 		return errResult(err)
 	}
 
@@ -3838,7 +3847,7 @@ func (s *server) handleFind(_ context.Context, _ *sdkmcp.CallToolRequest, args f
 		dir = strings.TrimSuffix(dir, ".go")
 	}
 
-	defs, err := s.db.FindDefinitionsByFile(dir, args.File, args.Line)
+	defs, err := s.backend.FindDefinitionsByFile(dir, args.File, args.Line)
 	if err != nil {
 		return errResult(err)
 	}
@@ -3863,7 +3872,7 @@ func (s *server) handleFind(_ context.Context, _ *sdkmcp.CallToolRequest, args f
 // by source order. It is the whole-file counterpart to `handleGetDefinition`
 // (which reads one def) and a body-bearing twin of `handleFileDefs` (which
 // returns just the metadata). See `.calque/registry.md`: both call
-// `s.db.FindDefinitionsByFile` — that's the single-source data layer;
+// `s.backend.FindDefinitionsByFile` — that's the single-source data layer;
 // this handler and file-defs project it differently.
 func (s *server) handleReadFile(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	file := args.File
@@ -3884,7 +3893,7 @@ func (s *server) handleReadFile(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 	if idx := strings.LastIndex(file, "/"); idx >= 0 {
 		dir = file[:idx]
 	}
-	defs, err := s.db.FindDefinitionsByFile(dir, file, 0)
+	defs, err := s.backend.FindDefinitionsByFile(dir, file, 0)
 	if err != nil {
 		return errResult(err)
 	}
@@ -3898,14 +3907,14 @@ func (s *server) handleReadFile(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 	for i, d := range defs {
 		ids[i] = d.ID
 	}
-	bodies, err := s.db.GetBodiesByDefIDs(ids)
+	bodies, err := s.backend.GetBodiesByDefIDs(ids)
 	if err != nil {
 		return errResult(fmt.Errorf("read-file: fetch bodies: %w", err))
 	}
 
 	// Look up module path once (all defs in this file share it).
 	var modulePath string
-	mods, _ := s.db.ListModules()
+	mods, _ := s.backend.ListModules()
 	for _, m := range mods {
 		if m.ID == defs[0].ModuleID {
 			modulePath = m.Path
@@ -3985,7 +3994,7 @@ func (s *server) handleExpand(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	if strings.TrimSpace(args.Name) == "" {
 		return errResult(fmt.Errorf("expand: name is required"))
 	}
-	d, err := s.db.GetDefinitionByName(args.Name, "")
+	d, err := s.backend.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -4001,7 +4010,7 @@ func (s *server) handleExpand(_ context.Context, _ *sdkmcp.CallToolRequest, args
 
 	// Look up module path (all sections share it).
 	var modulePath string
-	mods, _ := s.db.ListModules()
+	mods, _ := s.backend.ListModules()
 	for _, m := range mods {
 		if m.ID == d.ModuleID {
 			modulePath = m.Path
@@ -4028,7 +4037,7 @@ func (s *server) handleExpand(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	}
 
 	if want["callers"] {
-		impact, err := s.db.GetImpact(d.ID)
+		impact, err := s.backend.GetImpact(d.ID)
 		if err != nil {
 			return errResult(fmt.Errorf("expand: gather callers: %w", err))
 		}
@@ -4102,7 +4111,7 @@ func (s *server) handleFileDefs(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 	if idx := strings.LastIndex(file, "/"); idx >= 0 {
 		dir = file[:idx]
 	}
-	defs, err := s.db.FindDefinitionsByFile(dir, file, 0)
+	defs, err := s.backend.FindDefinitionsByFile(dir, file, 0)
 	if err != nil {
 		return errResult(err)
 	}
@@ -4131,7 +4140,7 @@ func (s *server) handleSimulate(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 	if len(args.Mutations) == 0 {
 		return errResult(fmt.Errorf("simulate: mutations is required"))
 	}
-	result, err := s.db.Simulate(args.Mutations)
+	result, err := s.backend.Simulate(args.Mutations)
 	if err != nil {
 		return errResult(fmt.Errorf("simulate: %w", err))
 	}
@@ -4143,7 +4152,7 @@ func (s *server) handleSimulate(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 }
 
 func (s *server) handleTraverse(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.db.GetDefinitionByName(args.Name, "")
+	d, err := s.backend.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found: %w", args.Name, err))
 	}
@@ -4153,7 +4162,7 @@ func (s *server) handleTraverse(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 		maxDepth = 10
 	}
 
-	results, err := s.db.Traverse(d.ID, args.Direction, args.RefKinds, maxDepth)
+	results, err := s.backend.Traverse(d.ID, args.Direction, args.RefKinds, maxDepth)
 	if err != nil {
 		return errResult(fmt.Errorf("traverse: %w", err))
 	}
@@ -4243,7 +4252,7 @@ func (s *server) handleLiterals(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 	} else if !strings.Contains(typeName, "%") {
 		typeName = "%" + typeName + "%" // convenience: partial match
 	}
-	fields, err := s.db.QueryLiteralFields(typeName, args.Name, args.Body, nil, 200)
+	fields, err := s.backend.QueryLiteralFields(typeName, args.Name, args.Body, nil, 200)
 	if err != nil {
 		return errResult(fmt.Errorf("query literals: %w", err))
 	}
@@ -4279,7 +4288,7 @@ func (s *server) handlePragmas(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 	if pragmaKey == "" {
 		pragmaKey = "%" // all pragmas
 	}
-	comments, err := s.db.GetCommentsByPragma(pragmaKey)
+	comments, err := s.backend.GetCommentsByPragma(pragmaKey)
 	if err != nil {
 		return errResult(fmt.Errorf("query pragmas: %w", err))
 	}
@@ -4345,14 +4354,14 @@ func (s *server) handleValidatePlan(_ context.Context, _ *sdkmcp.CallToolRequest
 	for _, m := range args.Mutations {
 		cr := changeResult{Name: m.Name, ChangeType: m.Type}
 
-		d, err := s.db.GetDefinitionByName(m.Name, "")
+		d, err := s.backend.GetDefinitionByName(m.Name, "")
 		if err != nil {
 			cr.Error = fmt.Sprintf("definition %q not found", m.Name)
 			results = append(results, cr)
 			continue
 		}
 
-		impact, err := s.db.GetImpact(d.ID)
+		impact, err := s.backend.GetImpact(d.ID)
 		if err != nil {
 			cr.Error = err.Error()
 			results = append(results, cr)
@@ -4416,11 +4425,11 @@ func (s *server) handleTestCoverage(_ context.Context, _ *sdkmcp.CallToolRequest
 	if strings.TrimSpace(args.Name) == "" {
 		return errResult(fmt.Errorf("test-coverage: name is required"))
 	}
-	d, err := s.db.GetDefinitionByName(args.Name, "")
+	d, err := s.backend.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
-	impact, err := s.db.GetImpact(d.ID)
+	impact, err := s.backend.GetImpact(d.ID)
 	if err != nil {
 		return errResult(err)
 	}
@@ -4460,12 +4469,12 @@ func (s *server) handleBatchImpact(_ context.Context, _ *sdkmcp.CallToolRequest,
 	var perDef []map[string]any
 
 	for _, name := range names {
-		d, err := s.db.GetDefinitionByName(name, "")
+		d, err := s.backend.GetDefinitionByName(name, "")
 		if err != nil {
 			perDef = append(perDef, map[string]any{"name": name, "error": "not found"})
 			continue
 		}
-		impact, err := s.db.GetImpact(d.ID)
+		impact, err := s.backend.GetImpact(d.ID)
 		if err != nil {
 			perDef = append(perDef, map[string]any{"name": name, "error": err.Error()})
 			continue
@@ -4623,7 +4632,7 @@ func truncateFlow(flow []string, cap int) string {
 // on >2000-char bodies (87% compression). See
 // [[project_putget_edit_vocab_design]] for the phase context.
 func (s *server) handleOutline(_ context.Context, req *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.db.GetDefinitionByName(args.Name, "")
+	d, err := s.backend.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -4635,7 +4644,7 @@ func (s *server) handleOutline(_ context.Context, req *sdkmcp.CallToolRequest, a
 	}
 
 	var modulePath string
-	mods, _ := s.db.ListModules()
+	mods, _ := s.backend.ListModules()
 	for _, m := range mods {
 		if m.ID == d.ModuleID {
 			modulePath = m.Path
@@ -4643,8 +4652,8 @@ func (s *server) handleOutline(_ context.Context, req *sdkmcp.CallToolRequest, a
 		}
 	}
 
-	callers, _ := s.db.GetCallers(d.ID)
-	callees, _ := s.db.GetCallees(d.ID)
+	callers, _ := s.backend.GetCallers(d.ID)
+	callees, _ := s.backend.GetCallees(d.ID)
 
 	var prodCallers, testCallers int
 	for _, c := range callers {
@@ -4721,7 +4730,7 @@ func (s *server) handleSlice(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		return errResult(fmt.Errorf("slice: kind is required — valid: %s", strings.Join(projection.SliceKindNames(), ", ")))
 	}
 
-	d, err := s.db.GetDefinitionByName(args.Name, "")
+	d, err := s.backend.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -4795,7 +4804,7 @@ func (s *server) handleInsertPrecondition(_ context.Context, _ *sdkmcp.CallToolR
 		}
 		name = inferred
 	}
-	d, err := s.db.GetDefinitionByName(name, "")
+	d, err := s.backend.GetDefinitionByName(name, "")
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", name))
 	}
@@ -4824,7 +4833,7 @@ func (s *server) handleAddImport(_ context.Context, _ *sdkmcp.CallToolRequest, a
 	}
 	file := strings.TrimSpace(args.File)
 	if file == "" {
-		all, err := s.db.DistinctSourceFiles()
+		all, err := s.backend.DistinctSourceFiles()
 		if err != nil {
 			return errResult(fmt.Errorf("add-import: list files: %w", err))
 		}
@@ -4853,7 +4862,7 @@ func (s *server) handleAddImport(_ context.Context, _ *sdkmcp.CallToolRequest, a
 	if idx := strings.LastIndex(file, "/"); idx >= 0 {
 		dir = file[:idx]
 	}
-	defs, err := s.db.FindDefinitionsByFile(dir, file, 0)
+	defs, err := s.backend.FindDefinitionsByFile(dir, file, 0)
 	if err != nil {
 		return errResult(fmt.Errorf("add-import: locate file: %w", err))
 	}
@@ -4861,7 +4870,7 @@ func (s *server) handleAddImport(_ context.Context, _ *sdkmcp.CallToolRequest, a
 		return errResult(fmt.Errorf("add-import: no definitions found in file %q — cannot resolve module", file))
 	}
 	moduleID := defs[0].ModuleID
-	existing, err := s.db.GetImports(moduleID)
+	existing, err := s.backend.GetImports(moduleID)
 	if err != nil {
 		return errResult(fmt.Errorf("add-import: read imports: %w", err))
 	}
@@ -4875,7 +4884,7 @@ func (s *server) handleAddImport(_ context.Context, _ *sdkmcp.CallToolRequest, a
 		ImportedPath: args.ImportPath,
 		Alias:        args.Alias,
 	})
-	if err := s.db.SetImports(moduleID, updated); err != nil {
+	if err := s.backend.SetImports(moduleID, updated); err != nil {
 		return errResult(fmt.Errorf("add-import: set imports: %w", err))
 	}
 	buildResult := s.autoEmitAndBuildForFile(file)
@@ -4922,7 +4931,7 @@ func (s *server) handleRenameParam(_ context.Context, _ *sdkmcp.CallToolRequest,
 		}
 		name = inferred
 	}
-	d, err := s.db.GetDefinitionByName(name, "")
+	d, err := s.backend.GetDefinitionByName(name, "")
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", name))
 	}
@@ -4956,7 +4965,7 @@ func (s *server) handleWrapInDefer(_ context.Context, _ *sdkmcp.CallToolRequest,
 		}
 		name = inferred
 	}
-	d, err := s.db.GetDefinitionByName(name, "")
+	d, err := s.backend.GetDefinitionByName(name, "")
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", name))
 	}
@@ -5005,7 +5014,7 @@ func (s *server) handleReplaceSlice(_ context.Context, _ *sdkmcp.CallToolRequest
 		}
 		name = inferred
 	}
-	d, err := s.db.GetDefinitionByName(name, "")
+	d, err := s.backend.GetDefinitionByName(name, "")
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", name))
 	}
@@ -5048,7 +5057,7 @@ func (s *server) handleReplaceHunk(_ context.Context, _ *sdkmcp.CallToolRequest,
 		}
 		name = inferred
 	}
-	d, err := s.db.GetDefinitionByName(name, "")
+	d, err := s.backend.GetDefinitionByName(name, "")
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", name))
 	}
@@ -5078,7 +5087,7 @@ func (s *server) handleReplaceHunk(_ context.Context, _ *sdkmcp.CallToolRequest,
 // Snippet is truncated to ~200 chars / ~6 lines. Skips the caller-count
 // FYI nudge that handleEdit prints (agents can ask for impact if they want).
 func (s *server) applyEditTerse(name, action, snippet, newBody string) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.db.GetDefinitionByName(name, "")
+	d, err := s.backend.GetDefinitionByName(name, "")
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", name))
 	}
@@ -5088,7 +5097,7 @@ func (s *server) applyEditTerse(name, action, snippet, newBody string) (*sdkmcp.
 	}
 	d.Body = newBody
 	d.Signature = extractSignature(newBody)
-	if _, err := s.db.UpsertDefinition(d); err != nil {
+	if _, err := s.backend.UpsertDefinition(d); err != nil {
 		return errResult(err)
 	}
 	buildResult := s.autoEmitAndBuildForFile(d.SourceFile)
@@ -5130,7 +5139,7 @@ func (s *server) applyEditTerse(name, action, snippet, newBody string) (*sdkmcp.
 // more than one candidate exists, listing the candidates so the caller
 // can retry with an explicit name.
 func (s *server) inferSingleTargetName() (string, error) {
-	defs, err := s.db.FilterDefinitions("", "", "", 0)
+	defs, err := s.backend.FilterDefinitions("", "", "", 0)
 	if err != nil {
 		return "", fmt.Errorf("infer name: list definitions: %w", err)
 	}

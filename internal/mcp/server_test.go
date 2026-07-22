@@ -251,7 +251,7 @@ func TestFormatReceiver(t *testing.T) {
 }
 
 func TestHandleCodeValidation(t *testing.T) {
-	s := &server{db: nil} // handlers will fail on DB access but validation runs first
+	s := &server{backend: nil, dolt: nil} // handlers will fail on DB access but validation runs first
 
 	tests := []struct {
 		name    string
@@ -353,7 +353,7 @@ func TestFarewell(t *testing.T) {
 func TestHandleReadAndVerify_CombinesReadAndTest(t *testing.T) {
 	db, projDir := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db, projectDir: projDir}
+	s := &server{backend: db, dolt: db, projectDir: projDir}
 
 	result, _, _ := s.handleReadAndVerify(context.Background(), nil,
 		codeParam{Name: "Greet"})
@@ -374,7 +374,7 @@ func TestHandleReadAndVerify_CombinesReadAndTest(t *testing.T) {
 func TestHandleReadAndVerify_NotFoundBubbles(t *testing.T) {
 	db, projDir := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db, projectDir: projDir}
+	s := &server{backend: db, dolt: db, projectDir: projDir}
 
 	result, _, _ := s.handleReadAndVerify(context.Background(), nil,
 		codeParam{Name: "NoSuchDefXyz"})
@@ -389,7 +389,7 @@ func TestHandleReadAndVerify_NotFoundBubbles(t *testing.T) {
 func TestHandleImpact_ListsTestNamesAndCoherenceHint(t *testing.T) {
 	db, projDir := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db, projectDir: projDir}
+	s := &server{backend: db, dolt: db, projectDir: projDir}
 
 	// TestGreet covers Greet — name mentions the def; no coherence warning.
 	result, _, _ := s.handleImpact(context.Background(), nil, codeParam{Name: "Greet"})
@@ -406,7 +406,7 @@ func TestHandleImpact_ListsTestNamesAndCoherenceHint(t *testing.T) {
 func TestHandleOverview_EmptyReturnsProjectSummary(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, _ := s.handleOverview(context.Background(), nil, codeParam{})
 	text := resultText(t, result)
@@ -424,7 +424,7 @@ func TestHandleOverview_EmptyReturnsProjectSummary(t *testing.T) {
 func TestHandleTestByName_RunsNamedTest(t *testing.T) {
 	db, projDir := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db, projectDir: projDir}
+	s := &server{backend: db, dolt: db, projectDir: projDir}
 
 	// Setup DB seeds TestGreet + TestFarewell as passing tests. Run just one.
 	result, _, _ := s.handleTestByName(context.Background(), nil, "TestGreet")
@@ -443,7 +443,7 @@ func TestHandleTestByName_RunsNamedTest(t *testing.T) {
 func TestHandleTestByName_EmptyPatternRejected(t *testing.T) {
 	db, projDir := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db, projectDir: projDir}
+	s := &server{backend: db, dolt: db, projectDir: projDir}
 
 	result, _, _ := s.handleTestByName(context.Background(), nil, "")
 	text := resultText(t, result)
@@ -455,7 +455,7 @@ func TestHandleTestByName_EmptyPatternRejected(t *testing.T) {
 func TestHandleEmit(t *testing.T) {
 	db, projDir := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db, projectDir: projDir}
+	s := &server{backend: db, dolt: db, projectDir: projDir}
 
 	// Relative path resolves against projDir.
 	outRel := filepath.Join("out-rel")
@@ -490,7 +490,7 @@ func TestHandleEmit(t *testing.T) {
 func TestHandleEmitRequiresOut(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "emit"})
 	text := resultText(t, result)
@@ -502,7 +502,7 @@ func TestHandleEmitRequiresOut(t *testing.T) {
 func TestHandleImpact(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, _ := s.handleImpact(context.Background(), nil, codeParam{Name: "Greet"})
 	text := resultText(t, result)
@@ -521,7 +521,7 @@ func TestHandleImpact_Rank(t *testing.T) {
 	// directly in internal/rank — here we just verify the wire-up.
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 	s.idf = newIDF(db)
 
 	result, _, err := s.handleImpact(context.Background(), nil, codeParam{Name: "Greet", Rank: true})
@@ -540,7 +540,7 @@ func TestHandleImpact_Rank(t *testing.T) {
 func TestHandleRead(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Greet"})
 	text := resultText(t, result)
@@ -560,7 +560,7 @@ func TestHandleRead(t *testing.T) {
 func TestNotFoundResult_SuggestsClosest(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	// "reet" is a substring of Greet; case-preserved LIKE should surface it.
 	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "reet"})
@@ -581,7 +581,7 @@ func TestNotFoundResult_SuggestsClosest(t *testing.T) {
 func TestNotFoundResult_NoSuggestionsWhenAbsent(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Xylophone123"})
 	text := resultText(t, result)
@@ -599,7 +599,7 @@ func TestNotFoundResult_NoSuggestionsWhenAbsent(t *testing.T) {
 func TestHandleRead_UpstreamMatch(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	// Pull the local Greet so we can hash its exact body.
 	d, err := db.GetDefinitionByName("Greet", "")
@@ -652,7 +652,7 @@ func TestHandleRead_UpstreamMatch(t *testing.T) {
 func TestHandleRead_UpstreamDivergence(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	if err := db.InsertUpstreamFingerprint(store.UpstreamFingerprint{
 		ModulePath:  "testproj",
@@ -687,7 +687,7 @@ func TestHandleRead_UpstreamDivergence(t *testing.T) {
 func TestHandleRead_UnknownModule(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Greet"})
 	text := resultText(t, result)
@@ -706,7 +706,7 @@ func TestHandleRead_UnknownModule(t *testing.T) {
 func TestHandleReadFile(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, err := s.handleReadFile(context.Background(), nil, codeParam{File: "main.go"})
 	if err != nil {
@@ -767,7 +767,7 @@ func TestCompactReadFile(t *testing.T) {
 func TestHandleReadFile_MissingFile(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, _ := s.handleReadFile(context.Background(), nil, codeParam{File: "does-not-exist.go"})
 	text := resultText(t, result)
@@ -782,7 +782,7 @@ func TestHandleReadFile_MissingFile(t *testing.T) {
 func TestHandleExpand_BodyAndCallers(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, err := s.handleExpand(context.Background(), nil, codeParam{
 		Name:    "Greet",
@@ -818,7 +818,7 @@ func TestHandleExpand_BodyAndCallers(t *testing.T) {
 func TestHandleExpand_DefaultInclude(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, err := s.handleExpand(context.Background(), nil, codeParam{Name: "Greet"})
 	if err != nil {
@@ -839,7 +839,7 @@ func TestHandleExpand_DefaultInclude(t *testing.T) {
 func TestHandleExpand_UnknownIncludeKind(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, err := s.handleExpand(context.Background(), nil, codeParam{
 		Name:    "Greet",
@@ -866,7 +866,7 @@ func TestHandleExpand_UnknownIncludeKind(t *testing.T) {
 func TestHandleFileDefs_RootLevelFile(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, err := s.handleFileDefs(context.Background(), nil, codeParam{File: "main.go"})
 	if err != nil {
@@ -891,7 +891,7 @@ func TestHandleFileDefs_RootLevelFile(t *testing.T) {
 func TestHandleAddImportRootFile(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, _ := s.handleAddImport(context.Background(), nil, codeParam{
 		File:       "main.go",
@@ -909,7 +909,7 @@ func TestHandleAddImportRootFile(t *testing.T) {
 func TestHandleEdit(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	newBody := `func Greet(name string) string {
 	return "Hi, " + name
@@ -934,7 +934,7 @@ func TestHandleEdit(t *testing.T) {
 func TestHandleEditSyntaxValidation(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, _ := s.handleEdit(context.Background(), nil, editParam{
 		Name:    "Greet",
@@ -950,7 +950,7 @@ func TestHandleEditSyntaxValidation(t *testing.T) {
 func TestHandleFragmentEdit(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, _ := s.handleFragmentEdit(context.Background(), nil, codeParam{
 		Name:        "Greet",
@@ -972,7 +972,7 @@ func TestHandleFragmentEdit(t *testing.T) {
 func TestHandleFragmentEditNotFound(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, _ := s.handleFragmentEdit(context.Background(), nil, codeParam{
 		Name:        "Greet",
@@ -989,7 +989,7 @@ func TestHandleFragmentEditNotFound(t *testing.T) {
 func TestHandleFragmentEditEmpty(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, _ := s.handleFragmentEdit(context.Background(), nil, codeParam{
 		Name:        "Greet",
@@ -1006,7 +1006,7 @@ func TestHandleFragmentEditEmpty(t *testing.T) {
 func TestHandleInsert(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, _ := s.handleInsert(context.Background(), nil, codeParam{
 		Name:  "Greet",
@@ -1028,7 +1028,7 @@ func TestHandleInsert(t *testing.T) {
 func TestHandleSearch(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, _ := s.handleSearch(context.Background(), nil, codeParam{Pattern: "%Greet%"})
 	text := resultText(t, result)
@@ -1109,7 +1109,7 @@ func TestSearchBodiesLike_EscapesLikeMetachars(t *testing.T) {
 func TestBodyScanResult_Empty(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, err := s.bodyScanResult("no-such-string-anywhere", 100)
 	if err != nil {
@@ -1124,7 +1124,7 @@ func TestBodyScanResult_Empty(t *testing.T) {
 func TestBodyScanResult_Hits(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, err := s.bodyScanResult("Hello", 100)
 	if err != nil {
@@ -1147,7 +1147,7 @@ func TestBodyScanResult_Hits(t *testing.T) {
 func TestHandleSearch_Stage3FallsBackToBodyScan(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	// "Hello" is not a def name and unlikely to be an FTS match (short-ish
 	// and inside a string literal). Stage-3 body-scan should catch it.
@@ -1165,7 +1165,7 @@ func TestHandleSearch_Stage3FallsBackToBodyScan(t *testing.T) {
 func TestHandleSearch_Stage3StripsWildcards(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, _ := s.handleSearch(context.Background(), nil, codeParam{Pattern: "%Hello%"})
 	text := resultText(t, result)
@@ -1184,7 +1184,7 @@ func TestHandleSearch_Stage3StripsWildcards(t *testing.T) {
 func TestHandleSearch_Stage3SkipsUnderscore(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	// _ is SQL LIKE's single-char wildcard. `Hell_` is a name-LIKE query
 	// that finds nothing here — we should NOT then body-scan "Hell_".
@@ -1198,7 +1198,7 @@ func TestHandleSearch_Stage3SkipsUnderscore(t *testing.T) {
 func TestHandleCreate(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
 		Body: "func NewHelper() string { return \"help\" }",
@@ -1215,7 +1215,7 @@ func TestHandleCreate(t *testing.T) {
 func TestHandleCreateRejectsMultiDeclWithoutFile(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	body := `const Limit = 10
 
@@ -1244,7 +1244,7 @@ func Other() int { return 0 }`
 func TestHandleCreateMultiDeclWithFile(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	body := `// Limit is the max requests per second.
 const Limit = 10
@@ -1314,7 +1314,7 @@ func (b *Bucket) Take() bool {
 func TestHandleCreateMultiDeclRejectsNameCollision(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	// Seed one def whose name will collide.
 	if _, _, err := s.handleCreate(context.Background(), nil, createParam{
@@ -1348,7 +1348,7 @@ func Existing() int { return 3 }`
 func TestHandleCreateMultiDeclStripsLeadingPackage(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	body := `package multitest
 
@@ -1383,7 +1383,7 @@ func Gamma() int { return 3 }`
 func TestHandleCreateMultiDeclSkipsImportBlock(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	body := `package middleware
 
@@ -1424,7 +1424,7 @@ func (r *RateLimiter) Allow(req *http.Request) bool {
 func TestHandleCreateMultiDeclImportsOnlyFails(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	body := `package middleware
 
@@ -1449,7 +1449,7 @@ import (
 func TestHandleCreateHonorsFileParam(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
 		Body: "func PlacedHere() int { return 1 }",
@@ -1477,7 +1477,7 @@ func TestHandleCreateHonorsFileParam(t *testing.T) {
 func TestHandleCreateRejectsUnknownFile(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
 		Body: "func Nope() int { return 0 }",
@@ -1495,7 +1495,7 @@ func TestHandleCreateRejectsUnknownFile(t *testing.T) {
 func TestHandleRename(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 	s.ready.Store(true) // setupTestDB ingest+resolve is synchronous; skip the wait
 
 	result, _, _ := s.handleRename(context.Background(), nil, renameParam{
@@ -1547,7 +1547,7 @@ var C3 = Claim{Subject: "s3", Object: "Different"}
 	if err := resolve.Resolve(db, projDir); err != nil {
 		t.Fatal("resolve:", err)
 	}
-	s := &server{db: db, projectDir: projDir}
+	s := &server{backend: db, dolt: db, projectDir: projDir}
 	s.ready.Store(true)
 
 	result, _, _ := s.handleRetargetFieldValue(context.Background(), nil, codeParam{
@@ -1590,7 +1590,7 @@ var C3 = Claim{Subject: "s3", Object: "Different"}
 func TestHandleRetargetFieldValue_RejectsMissingParams(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 	s.ready.Store(true)
 
 	// Missing field
@@ -1611,7 +1611,7 @@ func TestHandleRetargetFieldValue_RejectsMissingParams(t *testing.T) {
 func TestHandleDelete_SafeRefusesWhenReferenced(t *testing.T) {
 	db, projDir := setupTestDBWithVars(t)
 	defer db.Close()
-	s := &server{db: db, projectDir: projDir}
+	s := &server{backend: db, dolt: db, projectDir: projDir}
 	s.ready.Store(true)
 
 	// OriginalClaim is referenced by Reference1 + Reference2. Delete must refuse.
@@ -1636,7 +1636,7 @@ func TestHandleDelete_SafeRefusesWhenReferenced(t *testing.T) {
 func TestHandleDelete_ForceBypassesSafetyCheck(t *testing.T) {
 	db, projDir := setupTestDBWithVars(t)
 	defer db.Close()
-	s := &server{db: db, projectDir: projDir}
+	s := &server{backend: db, dolt: db, projectDir: projDir}
 	s.ready.Store(true)
 
 	// force:true — deletes even with live references. Legacy escape hatch.
@@ -1657,7 +1657,7 @@ func TestHandleDelete_ForceBypassesSafetyCheck(t *testing.T) {
 func TestHandleDelete_SucceedsWhenNoReferences(t *testing.T) {
 	db, projDir := setupTestDBWithVars(t)
 	defer db.Close()
-	s := &server{db: db, projectDir: projDir}
+	s := &server{backend: db, dolt: db, projectDir: projDir}
 	s.ready.Store(true)
 
 	// Reference2 has no callers — safe delete without force.
@@ -1675,7 +1675,7 @@ func TestHandleDelete_SucceedsWhenNoReferences(t *testing.T) {
 func TestHandleRename_PackageLevelVar(t *testing.T) {
 	db, projDir := setupTestDBWithVars(t)
 	defer db.Close()
-	s := &server{db: db, projectDir: projDir}
+	s := &server{backend: db, dolt: db, projectDir: projDir}
 	s.ready.Store(true)
 
 	result, _, _ := s.handleRename(context.Background(), nil, renameParam{
@@ -1825,7 +1825,7 @@ func TestTopLevelFlow(t *testing.T) {
 func TestHandleOutline_SmallBodyFallsBackToRead(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	// Greet's body is well under outlineBodyThreshold (300 bytes) so
 	// the size-aware fallback should return the read view — which
@@ -1893,7 +1893,7 @@ func main() {}
 		t.Fatal("re-ingest:", err)
 	}
 
-	s := &server{db: db, projectDir: projDir}
+	s := &server{backend: db, dolt: db, projectDir: projDir}
 	result, _, _ := s.handleOutline(context.Background(), nil, nameParam{Name: "Chunky"})
 	text := resultText(t, result)
 
@@ -1923,7 +1923,7 @@ func main() {}
 func TestHandleSlice_MissingArgs(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	// Missing name.
 	result, _, _ := s.handleSlice(context.Background(), nil, codeParam{Slice: "return"})
@@ -1941,7 +1941,7 @@ func TestHandleSlice_MissingArgs(t *testing.T) {
 func TestHandleSlice_ReturnStmt(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db}
+	s := &server{backend: db, dolt: db}
 
 	// Greet has one return statement.
 	result, _, _ := s.handleSlice(context.Background(), nil, codeParam{Name: "Greet", Slice: "return"})
@@ -1967,7 +1967,7 @@ func TestHandleSlice_ReturnStmt(t *testing.T) {
 func TestHandleRename_EmitsOnlyNewName(t *testing.T) {
 	db, projDir := setupTestDB(t)
 	defer db.Close()
-	s := &server{db: db, projectDir: projDir}
+	s := &server{backend: db, dolt: db, projectDir: projDir}
 	s.ready.Store(true) // setupTestDB ingest+resolve is synchronous; skip the wait
 
 	result, _, _ := s.handleRename(context.Background(), nil, renameParam{
@@ -2059,7 +2059,7 @@ func RunB(x int) int {
 		t.Fatalf("commit initial: %v", err)
 	}
 
-	s := &server{db: db1, projectDir: projDir}
+	s := &server{backend: db1, dolt: db1, projectDir: projDir}
 	s.ready.Store(true)
 	result, _, _ := s.handleRename(context.Background(), nil, renameParam{
 		OldName: "ProcessData",
@@ -2176,7 +2176,7 @@ func RunB(x int) int {
 
 	// Now spin up a server the way newMCPServer does: fire the async
 	// startup ingest+resolve, then serve requests.
-	s := &server{db: db1, projectDir: projDir}
+	s := &server{backend: db1, dolt: db1, projectDir: projDir}
 	go func() {
 		if err := s.ingestAndResolve(); err != nil {
 			t.Logf("startup ingestAndResolve: %v", err)
