@@ -1709,17 +1709,26 @@ func (s *server) autoEmitAndBuildWithOpts(opts emit.Opts) string {
 	if s.projectDir == "" || os.Getenv("DEFN_LEGACY") == "1" {
 		return "Saved to database."
 	}
+	timing := os.Getenv("DEFN_MEASURE_TIMING") == "1"
 
 	// Emit to the actual project directory — keeps files in sync.
+	t := time.Now()
 	if err := emit.EmitWithOpts(s.db, s.projectDir, opts); err != nil {
 		return fmt.Sprintf("emit error: %v", err)
 	}
+	if timing {
+		fmt.Fprintf(os.Stderr, "  [emit] emit.EmitWithOpts: %s\n", time.Since(t).Round(time.Millisecond))
+	}
 
+	t = time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), buildTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "go", "build", "./...")
 	cmd.Dir = s.projectDir
 	out, err := cmd.CombinedOutput()
+	if timing {
+		fmt.Fprintf(os.Stderr, "  [emit] go build ./...: %s\n", time.Since(t).Round(time.Millisecond))
+	}
 	if err != nil {
 		return fmt.Sprintf("BUILD FAILED:\n%s", string(out))
 	}
@@ -2951,10 +2960,17 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		return errResult(err)
 	}
 
-	// Update all callers' bodies that reference the old name.
+	// Update all callers' bodies that reference the old name. Also collect
+	// each touched file so goimports can scope to just those (#109 pass 3):
+	// rename touches the def's own file + every caller's file, typically a
+	// small handful vs the whole project tree.
 	callers, err := s.db.GetCallers(originalID)
 	if err != nil {
 		return errResult(fmt.Errorf("get callers for rename: %w", err))
+	}
+	touchedFiles := map[string]bool{}
+	if d.SourceFile != "" {
+		touchedFiles[d.SourceFile] = true
 	}
 	updated := 0
 	for _, caller := range callers {
@@ -2966,11 +2982,21 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 			if _, err := s.db.UpsertDefinition(&caller); err != nil {
 				return errResult(fmt.Errorf("update caller %s: %w", caller.Name, err))
 			}
+			if caller.SourceFile != "" {
+				touchedFiles[caller.SourceFile] = true
+			}
 			updated++
 		}
 	}
+	goimportsFiles := make([]string, 0, len(touchedFiles))
+	for f := range touchedFiles {
+		goimportsFiles = append(goimportsFiles, f)
+	}
 
-	buildResult := s.autoEmitAndBuildWithOpts(emit.Opts{AllowedRemovals: []string{qualifiedOld}})
+	buildResult := s.autoEmitAndBuildWithOpts(emit.Opts{
+		AllowedRemovals: []string{qualifiedOld},
+		GoimportsFiles:  goimportsFiles,
+	})
 	// #109: rename is a name-preserving semantic transform — every from_def
 	// → to_def edge in the refs table is ID-based, and no def IDs change
 	// on rename. Caller bodies were already rewritten via astRename so

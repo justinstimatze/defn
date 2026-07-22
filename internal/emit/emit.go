@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/justinstimatze/defn/internal/store"
 )
@@ -39,6 +40,18 @@ type Opts struct {
 	// exists to prevent *accidental* loss. Names are compared against
 	// topLevelDeclNames on the pre-emit file bytes.
 	AllowedRemovals []string
+
+	// GoimportsFiles optionally restricts goimports's scope to a specific
+	// set of files (module-relative paths under outDir). Empty (default)
+	// runs `goimports -w outDir` recursively — the whole tree. Non-empty
+	// runs `goimports -w <path1> <path2> ...` on only those files. #109
+	// pass 3: on cli/cli's tree the recursive form was 707ms of a 797ms
+	// warm-rename wall (89%); scoping to touched files collapses this to
+	// per-file cost. Callers who know which files their mutation touched
+	// (rename: def's file + all caller files; edit: def's file only)
+	// should populate this. Non-existent paths are silently skipped by
+	// goimports so it's safe to over-list.
+	GoimportsFiles []string
 }
 
 // Emit writes all definitions from the database as .go files into outDir.
@@ -69,8 +82,15 @@ func EmitWithMapAndOpts(db *store.DB, outDir string, opts Opts) ([]DefLocation, 
 
 func emitWithOpts(db *store.DB, outDir string, opts Opts) ([]DefLocation, error) {
 	var allLocs []DefLocation
+	timing := os.Getenv("DEFN_MEASURE_TIMING") == "1"
+	timeIt := func(name string, t0 time.Time) {
+		if timing {
+			fmt.Fprintf(os.Stderr, "    [emit-inner] %s: %s\n", name, time.Since(t0).Round(time.Millisecond))
+		}
+	}
 
 	// Write project-level files (go.mod, go.sum).
+	t := time.Now()
 	projectFiles, err := db.ListProjectFiles()
 	if err != nil {
 		return nil, fmt.Errorf("list project files: %w", err)
@@ -93,7 +113,9 @@ func emitWithOpts(db *store.DB, outDir string, opts Opts) ([]DefLocation, error)
 			return nil, fmt.Errorf("write %s: %w", pf, err)
 		}
 	}
+	timeIt("project-files", t)
 
+	t = time.Now()
 	modules, err := db.ListModules()
 	if err != nil {
 		return nil, fmt.Errorf("list modules: %w", err)
@@ -112,15 +134,36 @@ func emitWithOpts(db *store.DB, outDir string, opts Opts) ([]DefLocation, error)
 		allLocs = append(allLocs, locs...)
 		writtenFiles = append(writtenFiles, written...)
 	}
+	timeIt("module-writes", t)
 
 	// Run goimports to fix unused imports and formatting.
+	t = time.Now()
 	goimports, err := exec.LookPath("goimports")
 	if err != nil {
 		return nil, fmt.Errorf("goimports not found — install with: go install golang.org/x/tools/cmd/goimports@latest")
 	}
-	if out, err := exec.Command(goimports, "-w", outDir).CombinedOutput(); err != nil {
+	// #109 pass 3: prefer scoped goimports when the caller has named
+	// touched files. Falls back to the full recursive walk when the
+	// list is empty (existing behavior).
+	args := []string{"-w"}
+	if len(opts.GoimportsFiles) > 0 {
+		for _, rel := range opts.GoimportsFiles {
+			// Sanitize as we do for project files above — no absolute paths,
+			// no traversal, but permit files that don't yet exist on disk
+			// (goimports just skips those).
+			clean := filepath.Clean(rel)
+			if filepath.IsAbs(clean) || strings.Contains(clean, "..") {
+				continue
+			}
+			args = append(args, filepath.Join(outDir, clean))
+		}
+	} else {
+		args = append(args, outDir)
+	}
+	if out, err := exec.Command(goimports, args...).CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("goimports: %s", out)
 	}
+	timeIt("goimports", t)
 
 	// Refresh file_sources with the post-goimports bytes so it stays in
 	// sync with disk. Without this, the authoritative raw source drifts
@@ -135,6 +178,7 @@ func emitWithOpts(db *store.DB, outDir string, opts Opts) ([]DefLocation, error)
 	// next merge will use this refreshed base, so hand-edited decls
 	// that tripped the safety net are now carried forward rather than
 	// lost on the following emit.
+	t = time.Now()
 	for _, wf := range writtenFiles {
 		if wf.SourceFile == "" {
 			continue
@@ -147,6 +191,8 @@ func emitWithOpts(db *store.DB, outDir string, opts Opts) ([]DefLocation, error)
 			return nil, fmt.Errorf("refresh file_sources for %s: %w", wf.SourceFile, err)
 		}
 	}
+	timeIt("refresh-file-sources", t)
+	t = time.Now()
 
 	// Rebuild location index after goimports (it may shift line numbers).
 	allLocs = nil
@@ -181,6 +227,7 @@ func emitWithOpts(db *store.DB, outDir string, opts Opts) ([]DefLocation, error)
 			allLocs = append(allLocs, buildLocIndex(testFile, mod.Path, testDefs)...)
 		}
 	}
+	timeIt("rebuild-loc-index", t)
 
 	return allLocs, nil
 }
