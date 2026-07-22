@@ -39,6 +39,12 @@ func TestNoRawStringTextColumnScans(t *testing.T) {
 		if strings.HasSuffix(e, "_test.go") {
 			continue
 		}
+		// The TextStorage-wrapper concern is Dolt-specific — modernc.org/sqlite
+		// returns plain strings, so raw *string scans in the SQLite backend
+		// are safe. Exclude sqlite.go from the audit.
+		if e == "sqlite.go" {
+			continue
+		}
 		files = append(files, e)
 	}
 	fset := token.NewFileSet()
