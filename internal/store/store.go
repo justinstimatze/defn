@@ -75,23 +75,42 @@ func (t *textCol) Scan(src any) error {
 	return nil
 }
 
+// rowScanner is the intersection of *sql.Row and *sql.Rows scan surface —
+// scanDefRow accepts either. Used by every path that projects the 14-column
+// Definition shape (see scanDefinitions and its single-row peers).
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+// scanDefRow scans a single Definition row using textCol for every TEXT
+// column so Dolt's out-of-band val.TextStorage wrapper never crashes a
+// raw *string Scan. Query column order MUST match:
+//
+//	id, module_id, name, kind, exported, test, receiver,
+//	signature, body, doc, start_line, end_line, source_file, hash
+//
+// #110/#113: extracted so the audit lives in exactly one place. Any
+// helper that scans this shape should call this.
+func scanDefRow(sc rowScanner, d *Definition) error {
+	var recv, sig, body, doc, source, hash textCol
+	if err := sc.Scan(
+		&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &recv,
+		&sig, &body, &doc, &d.StartLine, &d.EndLine, &source, &hash,
+	); err != nil {
+		return err
+	}
+	d.Receiver, d.Signature, d.Body, d.Doc, d.SourceFile, d.Hash =
+		string(recv), string(sig), string(body), string(doc), string(source), string(hash)
+	return nil
+}
+
 func scanDefinitions(rows *sql.Rows) ([]Definition, error) {
 	var defs []Definition
 	for rows.Next() {
 		var d Definition
-		// #110: text columns (receiver / signature / body / doc / source_file /
-		// hash) come back through textCol so we handle Dolt's out-of-band
-		// TextStorage wrapper alongside plain string/[]byte returns. Non-text
-		// destinations (ID, ints, bool) scan directly.
-		var recv, sig, body, doc, source, hash textCol
-		if err := rows.Scan(
-			&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &recv,
-			&sig, &body, &doc, &d.StartLine, &d.EndLine, &source, &hash,
-		); err != nil {
+		if err := scanDefRow(rows, &d); err != nil {
 			return nil, err
 		}
-		d.Receiver, d.Signature, d.Body, d.Doc, d.SourceFile, d.Hash =
-			string(recv), string(sig), string(body), string(doc), string(source), string(hash)
 		defs = append(defs, d)
 	}
 	return defs, rows.Err()
@@ -229,9 +248,13 @@ func (s *DB) Conflicts() ([]Conflict, error) {
 	var out []Conflict
 	for rows.Next() {
 		var c Conflict
-		if err := rows.Scan(&c.DefID, &c.Base, &c.Ours, &c.Theirs, &c.Name, &c.Receiver, &c.Kind); err != nil {
+		// #110/#113: dolt_conflicts_bodies.{base,our,their}_body are LONGTEXT
+		// and can come back wrapped as *val.TextStorage. Scan through textCol.
+		var base, ours, theirs textCol
+		if err := rows.Scan(&c.DefID, &base, &ours, &theirs, &c.Name, &c.Receiver, &c.Kind); err != nil {
 			return nil, fmt.Errorf("scan conflict row: %w", err)
 		}
+		c.Base, c.Ours, c.Theirs = string(base), string(ours), string(theirs)
 		out = append(out, c)
 	}
 	return out, rows.Err()
@@ -475,10 +498,14 @@ func (s *DB) FindDefinitionsByFile(fileSuffix string, sourceFile string, line in
 	var defs []Definition
 	for rows.Next() {
 		var d Definition
+		// #110/#113: signature is TEXT; receiver is VARCHAR but COALESCE
+		// can surface via TextStorage — scan both through textCol.
+		var recv, sig textCol
 		if err := rows.Scan(&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test,
-			&d.Receiver, &d.Signature, &d.StartLine, &d.EndLine); err != nil {
+			&recv, &sig, &d.StartLine, &d.EndLine); err != nil {
 			return nil, err
 		}
+		d.Receiver, d.Signature = string(recv), string(sig)
 		defs = append(defs, d)
 	}
 	return defs, rows.Err()
@@ -572,11 +599,12 @@ func (s *DB) GetCommentsByPragma(pragmaKey string) ([]Comment, error) {
 	for rows.Next() {
 		var c Comment
 		var defID sql.NullInt64
-		var text textCol
-		if err := rows.Scan(&c.ID, &defID, &c.DefName, &c.SourceFile, &c.Line, &text, &c.Kind, &c.PragmaKey, &c.PragmaVal); err != nil {
+		var text, pragmaVal textCol
+		if err := rows.Scan(&c.ID, &defID, &c.DefName, &c.SourceFile, &c.Line, &text, &c.Kind, &c.PragmaKey, &pragmaVal); err != nil {
 			return nil, err
 		}
 		c.Text = string(text)
+		c.PragmaVal = string(pragmaVal)
 		if defID.Valid {
 			c.DefID = &defID.Int64
 		}
@@ -601,11 +629,12 @@ func (s *DB) GetCommentsForDef(defID int64) ([]Comment, error) {
 	for rows.Next() {
 		var c Comment
 		var did sql.NullInt64
-		var text textCol
-		if err := rows.Scan(&c.ID, &did, &c.DefName, &c.SourceFile, &c.Line, &text, &c.Kind, &c.PragmaKey, &c.PragmaVal); err != nil {
+		var text, pragmaVal textCol
+		if err := rows.Scan(&c.ID, &did, &c.DefName, &c.SourceFile, &c.Line, &text, &c.Kind, &c.PragmaKey, &pragmaVal); err != nil {
 			return nil, err
 		}
 		c.Text = string(text)
+		c.PragmaVal = string(pragmaVal)
 		if did.Valid {
 			c.DefID = &did.Int64
 		}
@@ -624,15 +653,13 @@ func (s *DB) GetCurrentBranch() (string, error) {
 // GetDefinition returns a definition by ID, including its body.
 func (s *DB) GetDefinition(id int64) (*Definition, error) {
 	d := &Definition{}
-	err := s.queryRowContext(s.Ctx(),
+	row := s.queryRowContext(s.Ctx(),
 		`SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
 		        d.signature, COALESCE(b.body, ''), COALESCE(d.doc,''), COALESCE(d.start_line,0), COALESCE(d.end_line,0), COALESCE(d.source_file,''), d.hash
 		 FROM definitions d
 		 LEFT JOIN bodies b ON b.def_id = d.id
-		 WHERE d.id = ?`, id,
-	).Scan(&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &d.Receiver,
-		&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.SourceFile, &d.Hash)
-	if err != nil {
+		 WHERE d.id = ?`, id)
+	if err := scanDefRow(row, d); err != nil {
 		return nil, err
 	}
 	return d, nil
@@ -718,22 +745,14 @@ func (s *DB) GetDefinitionByName(name, modulePath string) (*Definition, error) {
 		// Try exact match first.
 		query := baseQuery + " JOIN modules m ON d.module_id = m.id WHERE d.name = ? AND m.path = ?"
 		d := &Definition{}
-		err := s.queryRowContext(s.Ctx(), query, name, modulePath).Scan(
-			&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &d.Receiver,
-			&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.SourceFile, &d.Hash,
-		)
-		if err == nil {
+		if err := scanDefRow(s.queryRowContext(s.Ctx(), query, name, modulePath), d); err == nil {
 			return d, nil
 		}
 		// Fuzzy match: module path contains the search term.
 		query = baseQuery + " JOIN modules m ON d.module_id = m.id WHERE d.name = ? AND m.path LIKE ?" +
 			` ORDER BY (SELECT COUNT(*) FROM refs r WHERE r.to_def = d.id) DESC LIMIT 1`
 		d = &Definition{}
-		err = s.queryRowContext(s.Ctx(), query, name, "%"+modulePath+"%").Scan(
-			&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &d.Receiver,
-			&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.SourceFile, &d.Hash,
-		)
-		if err == nil {
+		if err := scanDefRow(s.queryRowContext(s.Ctx(), query, name, "%"+modulePath+"%"), d); err == nil {
 			return d, nil
 		}
 		// Fall through to name-only lookup if module didn't match anything.
@@ -749,11 +768,7 @@ func (s *DB) GetDefinitionByName(name, modulePath string) (*Definition, error) {
 	args = append(args, name)
 
 	d := &Definition{}
-	err := s.queryRowContext(s.Ctx(), query, args...).Scan(
-		&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &d.Receiver,
-		&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.SourceFile, &d.Hash,
-	)
-	if err != nil {
+	if err := scanDefRow(s.queryRowContext(s.Ctx(), query, args...), d); err != nil {
 		return nil, err
 	}
 	return d, nil
@@ -783,10 +798,7 @@ func (s *DB) GetDefinitionByNameAndReceiver(name, modulePath, receiver string) (
 		  WHERE r.to_def = d.id) DESC LIMIT 1`
 		args = []any{name, receiver}
 	}
-	err := s.queryRowContext(s.Ctx(), query, args...).Scan(
-		&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &d.Receiver,
-		&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.SourceFile, &d.Hash)
-	if err != nil {
+	if err := scanDefRow(s.queryRowContext(s.Ctx(), query, args...), d); err != nil {
 		return nil, err
 	}
 	return d, nil
@@ -927,7 +939,8 @@ func (s *DB) Ping(ctx context.Context) error {
 // GetMeta returns the value for a key, or "" if not set.
 func (s *DB) GetMeta(key string) (string, error) {
 	ctx := s.Ctx()
-	var value string
+	// #110/#113: defn_meta.value is TEXT — scan through textCol.
+	var value textCol
 	err := s.queryRowContext(ctx,
 		"SELECT `value` FROM defn_meta WHERE `key` = ?", key).Scan(&value)
 	if err == sql.ErrNoRows {
@@ -936,7 +949,7 @@ func (s *DB) GetMeta(key string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return value, nil
+	return string(value), nil
 }
 
 // GetModuleByPath returns a module by its path.
@@ -1063,12 +1076,14 @@ func (s *DB) Log(limit int) ([]map[string]any, error) {
 	defer rows.Close()
 	var results []map[string]any
 	for rows.Next() {
-		var hash, committer, message, date string
+		var hash, committer, date string
+		// #110/#113: dolt_log.message can be arbitrarily long; scan via textCol.
+		var message textCol
 		if err := rows.Scan(&hash, &committer, &message, &date); err != nil {
 			return nil, err
 		}
 		results = append(results, map[string]any{
-			"hash": hash, "committer": committer, "message": message, "date": date,
+			"hash": hash, "committer": committer, "message": string(message), "date": date,
 		})
 	}
 	return results, rows.Err()
@@ -1264,9 +1279,12 @@ func (s *DB) QueryLiteralFields(typeName, fieldName, fieldValue string, fieldNam
 	var result []LiteralField
 	for rows.Next() {
 		var f LiteralField
-		if err := rows.Scan(&f.ID, &f.DefID, &f.DefName, &f.TypeName, &f.FieldName, &f.FieldValue, &f.Line); err != nil {
+		// #110/#113: literal_fields.field_value is TEXT — scan via textCol.
+		var fv textCol
+		if err := rows.Scan(&f.ID, &f.DefID, &f.DefName, &f.TypeName, &f.FieldName, &fv, &f.Line); err != nil {
 			return nil, err
 		}
+		f.FieldValue = string(fv)
 		result = append(result, f)
 	}
 	return result, rows.Err()
@@ -1532,30 +1550,35 @@ func (s *DB) SearchBodiesLike(pattern string, limit int) ([]BodyMatch, error) {
 	needle := strings.ToLower(pattern)
 	for rows.Next() {
 		var m BodyMatch
-		var body string
-		if err := rows.Scan(&m.Name, &m.Kind, &m.Receiver, &m.SourceFile, &m.Line, &body); err != nil {
+		// #110/#113: bodies.body is LONGTEXT — scan via textCol. Receiver is
+		// VARCHAR(255) but COALESCE(receiver,'') can surface as TextStorage
+		// too; scan through textCol to be uniform.
+		var body, recv textCol
+		if err := rows.Scan(&m.Name, &m.Kind, &recv, &m.SourceFile, &m.Line, &body); err != nil {
 			return nil, err
 		}
-		idx := strings.Index(strings.ToLower(body), needle)
+		m.Receiver = string(recv)
+		bodyStr := string(body)
+		idx := strings.Index(strings.ToLower(bodyStr), needle)
 		if idx < 0 {
 			continue
 		}
-		lineOffset := strings.Count(body[:idx], "\n")
+		lineOffset := strings.Count(bodyStr[:idx], "\n")
 		m.Line += lineOffset
 		start := idx - 30
 		if start < 0 {
 			start = 0
 		}
 		end := idx + len(pattern) + 30
-		if end > len(body) {
-			end = len(body)
+		if end > len(bodyStr) {
+			end = len(bodyStr)
 		}
-		snip := body[start:end]
+		snip := bodyStr[start:end]
 		snip = strings.ReplaceAll(snip, "\n", " ")
 		if start > 0 {
 			snip = "…" + snip
 		}
-		if end < len(body) {
+		if end < len(bodyStr) {
 			snip = snip + "…"
 		}
 		m.Snippet = snip
@@ -2304,12 +2327,17 @@ func (s *DB) Traverse(startID int64, direction string, refKinds []string, maxDep
 		for rows.Next() {
 			var d Definition
 			var parentID int64
+			// #110/#113: definitions.{signature,doc} are TEXT — scan via textCol.
+			// body column is projected as literal '' here but scan through textCol
+			// too so the destination stays consistent regardless of column source.
+			var recv, sig, body, doc, hash textCol
 			if err := rows.Scan(&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test,
-				&d.Receiver, &d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine,
-				&d.SourceFile, &d.Hash, &parentID); err != nil {
+				&recv, &sig, &body, &doc, &d.StartLine, &d.EndLine,
+				&d.SourceFile, &hash, &parentID); err != nil {
 				rows.Close()
 				return results, err
 			}
+			d.Receiver, d.Signature, d.Body, d.Doc, d.Hash = string(recv), string(sig), string(body), string(doc), string(hash)
 			if visited[d.ID] {
 				continue
 			}
@@ -2429,7 +2457,8 @@ func (s *DB) UpsertDefinition(d *Definition) (int64, error) {
 // "auto-sync", replacing it with the given message. Returns nil if the
 // last commit isn't an auto-sync (nothing to amend).
 func (s *DB) amendLastAutoSync(ctx context.Context, message string) error {
-	var lastMsg string
+	// #110/#113: dolt_log.message can wrap as TextStorage — scan via textCol.
+	var lastMsg textCol
 	if err := s.queryRowContext(ctx,
 		"SELECT message FROM dolt_log LIMIT 1",
 	).Scan(&lastMsg); err != nil {
@@ -2474,10 +2503,7 @@ func (s *DB) fuzzyReceiverLookup(name, modulePath, bareRecv, prefix string) (*De
 		pattern = prefix + "%" + bareRecv
 	}
 	d := &Definition{}
-	err := s.queryRowContext(s.Ctx(), query, name, pattern).Scan(
-		&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test, &d.Receiver,
-		&d.Signature, &d.Body, &d.Doc, &d.StartLine, &d.EndLine, &d.SourceFile, &d.Hash)
-	if err != nil {
+	if err := scanDefRow(s.queryRowContext(s.Ctx(), query, name, pattern), d); err != nil {
 		return nil, err
 	}
 	return d, nil
