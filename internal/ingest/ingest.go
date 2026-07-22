@@ -84,15 +84,27 @@ func IngestPackages(db *store.DB, pkgs []*packages.Package, modulePath string) e
 	const midLoopGCThresholdBytes = 1 << 30 // 1 GB
 	filtered := goload.FilterPackages(pkgs)
 	var m runtime.MemStats
+
+	// #125 winze methodology: split the walk timer from the flush timer so
+	// batched-upsert wins are unambiguous vs Go build-cache noise. Guarded
+	// by DEFN_SYNC_TIMING to match resolve's convention.
+	timing := os.Getenv("DEFN_SYNC_TIMING") == "1"
+	var tWalk, tFlush time.Duration
+	tPhaseStart := time.Now()
+
 	for i, pkg := range filtered {
+		t0 := time.Now()
 		if err := ingestPackage(db, pkg, modulePath, state); err != nil {
 			return fmt.Errorf("ingest %s: %w", pkg.PkgPath, err)
 		}
+		tWalk += time.Since(t0)
 		// Flush buffered defs for this package via batched INSERT (#125).
 		// Per-package boundary — matches the per-package resolve/GC cadence.
+		t0 = time.Now()
 		if err := state.flushDefs(db); err != nil {
 			return fmt.Errorf("flush defs %s: %w", pkg.PkgPath, err)
 		}
+		tFlush += time.Since(t0)
 		if i+1 >= len(filtered) {
 			continue
 		}
@@ -106,6 +118,11 @@ func IngestPackages(db *store.DB, pkgs []*packages.Package, modulePath string) e
 		if err := db.GC(); err != nil {
 			return fmt.Errorf("checkpoint gc: %w", err)
 		}
+	}
+	if timing {
+		fmt.Fprintf(os.Stderr, "    [inner] walk+enqueue: %s\n", tWalk.Round(time.Millisecond))
+		fmt.Fprintf(os.Stderr, "    [inner] upsert defs+bodies (bulk): %s\n", tFlush.Round(time.Millisecond))
+		fmt.Fprintf(os.Stderr, "    [inner] IngestPackages total: %s\n", time.Since(tPhaseStart).Round(time.Millisecond))
 	}
 
 	// Release Dolt's accumulated chunk cache before downstream work. Cheap

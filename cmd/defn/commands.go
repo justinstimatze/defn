@@ -752,9 +752,16 @@ func cmdIngest(modulePath string, serverMode bool) {
 	announceStaleIngest(db, modulePath)
 	fmt.Fprintf(os.Stderr, "ingesting %s...\n", modulePath)
 	logMem("before packages.Load")
+	// #125 winze methodology: time packages.Load separately so before/after
+	// comparisons of bulk-upsert wins aren't drowned by Go build-cache noise.
+	timing := os.Getenv("DEFN_SYNC_TIMING") == "1"
+	tLoad := time.Now()
 	pkgs, err := goload.LoadAll(modulePath)
 	if err != nil {
 		fatal(err)
+	}
+	if timing {
+		fmt.Fprintf(os.Stderr, "    [inner] packages.Load: %s\n", time.Since(tLoad).Round(time.Millisecond))
 	}
 	logMem("after packages.Load")
 	if err := ingest.IngestPackages(db, pkgs, modulePath); err != nil {
@@ -763,8 +770,12 @@ func cmdIngest(modulePath string, serverMode bool) {
 	logMem("after IngestPackages")
 
 	fmt.Fprintf(os.Stderr, "resolving references...\n")
+	tResolve := time.Now()
 	if err := resolve.ResolvePackages(db, pkgs, modulePath); err != nil {
 		fatal(err)
+	}
+	if timing {
+		fmt.Fprintf(os.Stderr, "    [inner] ResolvePackages: %s\n", time.Since(tResolve).Round(time.Millisecond))
 	}
 	logMem("after ResolvePackages")
 
