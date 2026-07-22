@@ -190,7 +190,7 @@ Usage:
   defn clean                   Remove all defn files from project
   defn repair [path]           Delete .defn and re-ingest (recovers from corruption)
   defn ingest <path> [--server]  Parse Go source → Dolt database (--server: use running sql-server)
-  defn sync [file]             Re-ingest (full or single file ~10ms)
+  defn sync [file]             Re-ingest (single file: fast path via IngestFile+ResolveFile; falls back to full ingest above 50 stale files)
   defn serve                   MCP server for Claude Code
   defn emit <output-dir>       Dolt → .go files
   defn impact <name>           Blast radius + test coverage
