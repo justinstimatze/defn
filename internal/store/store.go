@@ -1798,16 +1798,57 @@ func (s *DB) SetReferences(fromDef int64, refs []Reference) error {
 	if _, err := s.execContext(ctx, "DELETE FROM refs WHERE from_def = ?", fromDef); err != nil {
 		return fmt.Errorf("clear refs: %w", err)
 	}
+	// #108: batch INSERTs. The old per-row loop was 99.7% of sync
+	// wall clock on ref-dense KB nodes (winze measured 1m49s for one
+	// def with ~200 outgoing edges). Chunk at setRefsBatchSize to stay
+	// below MySQL's default max_allowed_packet (~1 MB) — each row is
+	// ~30 bytes of placeholder+args, so 500/batch is well within limits.
+	if len(refs) == 0 {
+		return nil
+	}
+	// Deduplicate before batching. INSERT IGNORE handles it too, but
+	// caller-side dedup shrinks the payload and matches the old
+	// per-row-INSERT IGNORE semantics (same k=(to_def,kind) collapses).
+	type rk struct {
+		to   int64
+		kind string
+	}
+	dedup := make(map[rk]bool, len(refs))
+	deduped := make([]Reference, 0, len(refs))
 	for _, r := range refs {
-		if _, err := s.execContext(ctx,
-			"INSERT IGNORE INTO refs (from_def, to_def, kind) VALUES (?, ?, ?)",
-			fromDef, r.ToDef, r.Kind,
-		); err != nil {
-			return fmt.Errorf("insert ref: %w", err)
+		k := rk{r.ToDef, r.Kind}
+		if dedup[k] {
+			continue
+		}
+		dedup[k] = true
+		deduped = append(deduped, r)
+	}
+	for start := 0; start < len(deduped); start += setRefsBatchSize {
+		end := start + setRefsBatchSize
+		if end > len(deduped) {
+			end = len(deduped)
+		}
+		chunk := deduped[start:end]
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, 3*len(chunk))
+		for i, r := range chunk {
+			placeholders[i] = "(?, ?, ?)"
+			args = append(args, fromDef, r.ToDef, r.Kind)
+		}
+		q := "INSERT IGNORE INTO refs (from_def, to_def, kind) VALUES " +
+			strings.Join(placeholders, ", ")
+		if _, err := s.execContext(ctx, q, args...); err != nil {
+			return fmt.Errorf("insert refs (batch %d..%d of %d): %w", start, end, len(deduped), err)
 		}
 	}
 	return nil
 }
+
+// setRefsBatchSize caps rows per SetReferences INSERT batch. 500 keeps
+// each statement under MySQL's default max_allowed_packet with plenty
+// of headroom; larger batches don't materially reduce round-trip count
+// past this size and risk driver-level packet errors on tight configs.
+const setRefsBatchSize = 500
 
 // Simulate creates a throwaway branch, applies mutations, queries impact, and discards.
 // All operations happen on a single connection to maintain branch context.
