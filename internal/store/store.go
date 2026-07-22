@@ -116,12 +116,6 @@ func scanDefinitions(rows *sql.Rows) ([]Definition, error) {
 	return defs, rows.Err()
 }
 
-// AddRemote adds a named remote pointing to a file path or URL.
-func (s *DB) AddRemote(name, url string) error {
-	_, err := s.execContext(s.Ctx(), "CALL DOLT_REMOTE('add', ?, ?)", name, url)
-	return err
-}
-
 // Begin starts a transaction. Returns a function to commit or rollback.
 func (s *DB) Begin() (commit func() error, rollback func(), err error) {
 	_, err = s.execContext(s.Ctx(), "START TRANSACTION")
@@ -136,24 +130,6 @@ func (s *DB) Begin() (commit func() error, rollback func(), err error) {
 		s.execContext(s.Ctx(), "ROLLBACK")
 	}
 	return commit, rollback, nil
-}
-
-// Branch creates a new branch at the current HEAD.
-func (s *DB) Branch(name string) error {
-	_, err := s.execContext(s.Ctx(), "CALL DOLT_BRANCH(?)", name)
-	return err
-}
-
-// BranchFrom creates a new branch starting from the given source branch or commit.
-func (s *DB) BranchFrom(name, from string) error {
-	_, err := s.execContext(s.Ctx(), "CALL DOLT_BRANCH(?, ?)", name, from)
-	return err
-}
-
-// Checkout switches to a branch.
-func (s *DB) Checkout(name string) error {
-	_, err := s.execContext(s.Ctx(), "CALL DOLT_CHECKOUT(?)", name)
-	return err
 }
 
 // CleanTempFiles removes Dolt's accumulated temp files. The embedded Dolt
@@ -174,30 +150,6 @@ func (s *DB) Close() error {
 	err := s.db.Close()
 	tempfiles.MovableTempFileProvider.Clean()
 	return err
-}
-
-// Commit stages all changes and creates a Dolt commit.
-// Returns nil if there's nothing to commit. If there's nothing new to
-// commit but the last commit was an auto-sync, amends it with the
-// user's message so labeled commits aren't silently swallowed.
-func (s *DB) Commit(message string) error {
-	ctx := s.Ctx()
-	if _, err := s.execContext(ctx, "CALL DOLT_ADD('-A')"); err != nil {
-		return fmt.Errorf("dolt add: %w", err)
-	}
-	if _, err := s.execContext(ctx, "CALL DOLT_COMMIT('-m', ?)", message); err != nil {
-		if strings.Contains(err.Error(), "nothing to commit") {
-			// If the caller provided a real message and the last commit
-			// was an auto-sync, amend it with the user's message.
-			if message != "auto-sync" {
-				return s.amendLastAutoSync(ctx, message)
-			}
-			return nil
-		}
-		return fmt.Errorf("dolt commit: %w", err)
-	}
-	s.CleanTempFiles()
-	return nil
 }
 
 // ComputeRootHash computes a merkle-like root hash of all definitions.
@@ -225,56 +177,11 @@ func (s *DB) ComputeRootHash() (string, error) {
 	return fmt.Sprintf("%x", combined), nil
 }
 
-// Conflicts returns all unresolved conflicts from the most recent merge.
-// Currently focuses on body-level conflicts (the common case); schema and
-// metadata conflicts are not surfaced.
-func (s *DB) Conflicts() ([]Conflict, error) {
-	rows, err := s.queryContext(s.Ctx(), `
-		SELECT COALESCE(c.our_def_id, c.their_def_id, c.base_def_id) AS def_id,
-		       COALESCE(c.base_body, '') AS base_body,
-		       COALESCE(c.our_body, '')  AS our_body,
-		       COALESCE(c.their_body,'') AS their_body,
-		       d.name, COALESCE(d.receiver, '') AS receiver, d.kind
-		FROM dolt_conflicts_bodies c
-		LEFT JOIN definitions d
-		  ON d.id = COALESCE(c.our_def_id, c.their_def_id, c.base_def_id)
-	`)
-	if err != nil {
-		// Table may not exist when there are no conflicts — treat as empty.
-		return nil, nil
-	}
-	defer rows.Close()
-
-	var out []Conflict
-	for rows.Next() {
-		var c Conflict
-		// #110/#113: dolt_conflicts_bodies.{base,our,their}_body are LONGTEXT
-		// and can come back wrapped as *val.TextStorage. Scan through textCol.
-		var base, ours, theirs textCol
-		if err := rows.Scan(&c.DefID, &base, &ours, &theirs, &c.Name, &c.Receiver, &c.Kind); err != nil {
-			return nil, fmt.Errorf("scan conflict row: %w", err)
-		}
-		c.Base, c.Ours, c.Theirs = string(base), string(ours), string(theirs)
-		out = append(out, c)
-	}
-	return out, rows.Err()
-}
-
 // Ctx returns a background context for database operations.
 // All DB methods use this rather than accepting context parameters,
 // since the MCP server is single-threaded and cancellation isn't needed.
 func (s *DB) Ctx() context.Context {
 	return context.Background()
-}
-
-// DeleteBranch removes a branch. If force is true, deletes even if unmerged.
-func (s *DB) DeleteBranch(name string, force bool) error {
-	flag := "-d"
-	if force {
-		flag = "-D"
-	}
-	_, err := s.execContext(s.Ctx(), "CALL DOLT_BRANCH(?, ?)", flag, name)
-	return err
 }
 
 // DeleteDefinition removes a definition and associated data.
@@ -290,94 +197,6 @@ func (s *DB) DeleteDefinition(id int64) error {
 		return fmt.Errorf("delete definition %d: %w", id, err)
 	}
 	return nil
-}
-
-// Diff returns changes in the working set (uncommitted changes).
-func (s *DB) Diff() ([]map[string]any, error) {
-	rows, err := s.queryContext(s.Ctx(),
-		`SELECT table_name, staged, status FROM dolt_status`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var results []map[string]any
-	for rows.Next() {
-		var table, status string
-		var staged bool
-		if err := rows.Scan(&table, &staged, &status); err != nil {
-			return nil, err
-		}
-		results = append(results, map[string]any{
-			"table": table, "status": status, "staged": staged,
-		})
-	}
-	return results, rows.Err()
-}
-
-// DiffDefinitions returns definitions that changed since the last commit.
-func (s *DB) DiffDefinitions() ([]map[string]any, error) {
-	rows, err := s.queryContext(s.Ctx(),
-		`SELECT diff_type, from_name, from_kind, to_name, to_kind, from_hash, to_hash
-		 FROM dolt_diff_definitions
-		 WHERE from_commit = HASHOF('HEAD') AND to_commit = 'WORKING'`)
-	if err != nil {
-		// Table might not have changes.
-		return nil, nil
-	}
-	defer rows.Close()
-	var results []map[string]any
-	for rows.Next() {
-		var diffType string
-		var fromName, fromKind, toName, toKind, fromHash, toHash sql.NullString
-		if err := rows.Scan(&diffType, &fromName, &fromKind, &toName, &toKind, &fromHash, &toHash); err != nil {
-			return nil, err
-		}
-		results = append(results, map[string]any{
-			"diff_type": diffType,
-			"from_name": fromName.String, "from_kind": fromKind.String,
-			"to_name": toName.String, "to_kind": toKind.String,
-			"from_hash": fromHash.String, "to_hash": toHash.String,
-		})
-	}
-	return results, rows.Err()
-}
-
-// DiffDefinitionsBetween returns definitions that differ between two refs
-// (branch names or commit hashes). If to is "" it defaults to WORKING.
-func (s *DB) DiffDefinitionsBetween(from, to string) ([]DefDiff, error) {
-	if from == "" {
-		return nil, fmt.Errorf("DiffDefinitionsBetween: from is required")
-	}
-	toExpr := "HASHOF(?)"
-	qArgs := []any{from, to}
-	if to == "" {
-		toExpr = "'WORKING'"
-		qArgs = []any{from}
-	}
-	q := fmt.Sprintf(`
-		SELECT diff_type,
-		       COALESCE(to_name, from_name) AS name,
-		       COALESCE(to_kind, from_kind) AS kind,
-		       COALESCE(to_receiver, from_receiver, '') AS receiver,
-		       COALESCE(from_hash, '') AS from_hash,
-		       COALESCE(to_hash, '')   AS to_hash
-		FROM dolt_diff_definitions
-		WHERE from_commit = HASHOF(?) AND to_commit = %s
-	`, toExpr)
-	rows, err := s.queryContext(s.Ctx(), q, qArgs...)
-	if err != nil {
-		return nil, fmt.Errorf("query dolt_diff_definitions: %w", err)
-	}
-	defer rows.Close()
-	var out []DefDiff
-	for rows.Next() {
-		var d DefDiff
-		if err := rows.Scan(&d.DiffType, &d.Name, &d.Kind, &d.Receiver, &d.FromHash, &d.ToHash); err != nil {
-			return nil, err
-		}
-		out = append(out, d)
-	}
-	return out, rows.Err()
 }
 
 // EnsureModule creates or returns an existing module.
@@ -409,12 +228,6 @@ func (s *DB) EnsureModule(path, name, doc string) (*Module, error) {
 		m.Doc = doc
 	}
 	return &m, nil
-}
-
-// Fetch fetches from a remote without merging.
-func (s *DB) Fetch(remote string) error {
-	_, err := s.execContext(s.Ctx(), "CALL DOLT_FETCH(?)", remote)
-	return err
 }
 
 // FilterDefinitions returns definitions matching optional filters.
@@ -641,13 +454,6 @@ func (s *DB) GetCommentsForDef(defID int64) ([]Comment, error) {
 		result = append(result, c)
 	}
 	return result, rows.Err()
-}
-
-// GetCurrentBranch returns the active branch name.
-func (s *DB) GetCurrentBranch() (string, error) {
-	var branch string
-	err := s.queryRowContext(s.Ctx(), "SELECT active_branch()").Scan(&branch)
-	return branch, err
 }
 
 // GetDefinition returns a definition by ID, including its body.
@@ -1010,24 +816,6 @@ func (s *DB) GetUntested() ([]Definition, error) {
 	return scanDefinitions(rows)
 }
 
-// ListBranches returns all branch names.
-func (s *DB) ListBranches() ([]string, error) {
-	rows, err := s.queryContext(s.Ctx(), "SELECT name FROM dolt_branches ORDER BY name")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var names []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, err
-		}
-		names = append(names, name)
-	}
-	return names, rows.Err()
-}
-
 // ListModules returns all modules.
 func (s *DB) ListModules() ([]Module, error) {
 	rows, err := s.queryContext(s.Ctx(), "SELECT id, path, name, COALESCE(doc,'') FROM modules ORDER BY path")
@@ -1064,45 +852,6 @@ func (s *DB) ListProjectFiles() ([]string, error) {
 		paths = append(paths, p)
 	}
 	return paths, rows.Err()
-}
-
-// Log returns recent commits.
-func (s *DB) Log(limit int) ([]map[string]any, error) {
-	rows, err := s.queryContext(s.Ctx(),
-		"SELECT commit_hash, committer, message, date FROM dolt_log LIMIT ?", limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var results []map[string]any
-	for rows.Next() {
-		var hash, committer, date string
-		// #110/#113: dolt_log.message can be arbitrarily long; scan via textCol.
-		var message textCol
-		if err := rows.Scan(&hash, &committer, &message, &date); err != nil {
-			return nil, err
-		}
-		results = append(results, map[string]any{
-			"hash": hash, "committer": committer, "message": string(message), "date": date,
-		})
-	}
-	return results, rows.Err()
-}
-
-// Merge merges a branch into the current branch. If a merge conflict
-// occurs, the error is returned but conflict state persists (because
-// we enabled dolt_allow_commit_conflicts at session start). Callers can
-// inspect Conflicts() and ResolveConflict() to reconcile, or MergeAbort().
-func (s *DB) Merge(branchName string) error {
-	_, err := s.execContext(s.Ctx(), "CALL DOLT_MERGE(?)", branchName)
-	s.CleanTempFiles()
-	return err
-}
-
-// MergeAbort cancels an in-progress merge and restores the pre-merge state.
-func (s *DB) MergeAbort() error {
-	_, err := s.execContext(s.Ctx(), "CALL DOLT_MERGE('--abort')")
-	return err
 }
 
 // Path returns the filesystem path of this database.
@@ -1180,18 +929,6 @@ func (s *DB) PruneStaleDefinitions(liveIDs map[int64]bool) (int, error) {
 		}
 	}
 	return len(staleIDs), nil
-}
-
-// Pull pulls from a remote into the current branch.
-func (s *DB) Pull(remote, branch string) error {
-	_, err := s.execContext(s.Ctx(), "CALL DOLT_PULL(?, ?)", remote, branch)
-	return err
-}
-
-// Push pushes the current branch to a remote.
-func (s *DB) Push(remote, branch string) error {
-	_, err := s.execContext(s.Ctx(), "CALL DOLT_PUSH(?, ?)", remote, branch)
-	return err
 }
 
 // Query executes a read-only SQL query and returns results as maps.
@@ -1367,46 +1104,6 @@ func (s *DB) QueryRefs(fromName, toName, kind string, limit int) ([]Reference, e
 		refs = append(refs, r)
 	}
 	return refs, rows.Err()
-}
-
-// ResolveAll picks a side for every outstanding conflict in bodies and
-// definitions. side must be "ours" or "theirs".
-func (s *DB) ResolveAll(side string) error {
-	if side != "ours" && side != "theirs" {
-		return fmt.Errorf("ResolveAll: side must be 'ours' or 'theirs', got %q", side)
-	}
-	flag := "--" + side
-	ctx := s.Ctx()
-	if _, err := s.execContext(ctx, "CALL DOLT_CONFLICTS_RESOLVE(?, 'bodies')", flag); err != nil {
-		return fmt.Errorf("resolve bodies: %w", err)
-	}
-	if _, err := s.execContext(ctx, "CALL DOLT_CONFLICTS_RESOLVE(?, 'definitions')", flag); err != nil {
-		return fmt.Errorf("resolve definitions: %w", err)
-	}
-	return nil
-}
-
-// ResolveConflict writes body as the resolution for def_id, updates the
-// definition's hash, and clears the conflict row. Caller must still Commit
-// to finalize the merge.
-func (s *DB) ResolveConflict(defID int64, body string) error {
-	ctx := s.Ctx()
-	if _, err := s.execContext(ctx, "UPDATE bodies SET body = ? WHERE def_id = ?", body, defID); err != nil {
-		return fmt.Errorf("update body: %w", err)
-	}
-	if _, err := s.execContext(ctx, "UPDATE definitions SET hash = ? WHERE id = ?", HashBody(body), defID); err != nil {
-		return fmt.Errorf("update hash: %w", err)
-	}
-	if _, err := s.execContext(ctx,
-		"DELETE FROM dolt_conflicts_bodies WHERE our_def_id = ? OR their_def_id = ? OR base_def_id = ?",
-		defID, defID, defID); err != nil {
-		return fmt.Errorf("clear body conflict: %w", err)
-	}
-	// Best-effort: any definitions-level conflict row for the same id.
-	_, _ = s.execContext(ctx,
-		"DELETE FROM dolt_conflicts_definitions WHERE our_id = ? OR their_id = ? OR base_id = ?",
-		defID, defID, defID)
-	return nil
 }
 
 // CountDefinitions returns the total number of non-test definitions. Used
@@ -2696,27 +2393,6 @@ func (s *DB) UpsertDefinition(d *Definition) (int64, error) {
 	return existingID, nil
 }
 
-// amendLastAutoSync amends the most recent commit if its message is
-// "auto-sync", replacing it with the given message. Returns nil if the
-// last commit isn't an auto-sync (nothing to amend).
-func (s *DB) amendLastAutoSync(ctx context.Context, message string) error {
-	// #110/#113: dolt_log.message can wrap as TextStorage — scan via textCol.
-	var lastMsg textCol
-	if err := s.queryRowContext(ctx,
-		"SELECT message FROM dolt_log LIMIT 1",
-	).Scan(&lastMsg); err != nil {
-		return nil // can't read log — not critical
-	}
-	if lastMsg != "auto-sync" {
-		return nil
-	}
-	if _, err := s.execContext(ctx,
-		"CALL DOLT_COMMIT('--amend', '-m', ?)", message); err != nil {
-		return fmt.Errorf("amend commit: %w", err)
-	}
-	return nil
-}
-
 // execContext runs ExecContext on the pinned connection (embedded) or pool (MySQL).
 //
 // Writes are NOT retried automatically on GC-invalidation: if the call landed
@@ -2806,19 +2482,6 @@ type Comment struct {
 	PragmaVal  string // rest of line after pragma directive
 }
 
-// Conflict describes one definition whose body differs between the
-// current branch (ours) and the branch being merged (theirs), with the
-// common-ancestor body (base).
-type Conflict struct {
-	DefID    int64
-	Name     string
-	Receiver string
-	Kind     string
-	Base     string
-	Ours     string
-	Theirs   string
-}
-
 // DB wraps a Dolt connection with code-database operations.
 // DB is NOT safe for concurrent use from multiple goroutines.
 type DB struct {
@@ -2895,18 +2558,6 @@ func (s *DB) reacquirePinnedConn(ctx context.Context) error {
 	s.conn = newConn
 	old.Close() // old conn was invalidated; closing is a no-op on the server side
 	return nil
-}
-
-// DefDiff is a single changed definition between two refs. Bodies are
-// omitted (callers can fetch via code(op:"read") after a checkout, or
-// via SELECT body FROM bodies AS OF HASHOF(...)).
-type DefDiff struct {
-	DiffType string // "added", "removed", "modified"
-	Name     string
-	Kind     string
-	Receiver string
-	FromHash string
-	ToHash   string
 }
 
 // Definition represents a single Go definition (function, type, method, etc.).

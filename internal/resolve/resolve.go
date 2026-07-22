@@ -402,14 +402,6 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 	// sub-second fast paths used after a single-def edit, and DOLT_GC
 	// costs seconds.
 	if onlyModule == "" {
-		// Dolt-only: checkpoint + GC to release the chunk cache. Non-Dolt
-		// backends implement Backend without Commit; the type assertion
-		// makes this a no-op for them.
-		if committer, ok := db.(interface{ Commit(string) error }); ok {
-			if err := committer.Commit("resolve-checkpoint"); err != nil {
-				return fmt.Errorf("post-resolve commit: %w", err)
-			}
-		}
 		if err := db.GC(); err != nil {
 			return fmt.Errorf("post-resolve gc: %w", err)
 		}

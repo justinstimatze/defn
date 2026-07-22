@@ -112,11 +112,6 @@ func IngestPackages(db store.Backend, pkgs []*packages.Package, modulePath strin
 		if m.HeapAlloc < midLoopGCThresholdBytes {
 			continue
 		}
-		if committer, ok := db.(interface{ Commit(string) error }); ok {
-			if err := committer.Commit("ingest-checkpoint"); err != nil {
-				return fmt.Errorf("checkpoint commit: %w", err)
-			}
-		}
 		if err := db.GC(); err != nil {
 			return fmt.Errorf("checkpoint gc: %w", err)
 		}
@@ -127,16 +122,6 @@ func IngestPackages(db store.Backend, pkgs []*packages.Package, modulePath strin
 		fmt.Fprintf(os.Stderr, "    [inner] IngestPackages total: %s\n", time.Since(tPhaseStart).Round(time.Millisecond))
 	}
 
-	// Release Dolt's accumulated chunk cache before downstream work. Cheap
-	// on a fresh ingest's worth of chunks; would otherwise sit until the
-	// next DOLT_GC. cmdIngest's compactEmbedded covers the same ground for
-	// the CLI path but serve's per-edit re-ingest does NOT — adding the GC
-	// here means every ingest cycle releases, regardless of caller.
-	if committer, ok := db.(interface{ Commit(string) error }); ok {
-		if err := committer.Commit("ingest-checkpoint"); err != nil {
-			return fmt.Errorf("post-ingest commit: %w", err)
-		}
-	}
 	if err := db.GC(); err != nil {
 		return fmt.Errorf("post-ingest gc: %w", err)
 	}

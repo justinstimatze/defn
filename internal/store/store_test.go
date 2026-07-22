@@ -189,9 +189,6 @@ func TestGCSurvivesConnInvalidation(t *testing.T) {
 		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true,
 		Body: "func Foo() {}",
 	})
-	if err := db.Commit("seed"); err != nil {
-		t.Fatalf("commit: %v", err)
-	}
 
 	if err := db.GC(); err != nil {
 		t.Fatalf("gc: %v", err)
@@ -225,64 +222,11 @@ func TestPingSurvivesGCInvalidation(t *testing.T) {
 		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true,
 		Body: "func Foo() {}",
 	})
-	if err := db.Commit("seed"); err != nil {
-		t.Fatal(err)
-	}
 	if err := db.GC(); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Ping(context.Background()); err != nil {
 		t.Fatalf("Ping after GC: %v", err)
-	}
-}
-
-func TestDoltBranch(t *testing.T) {
-	db := testDB(t)
-	mod, _ := db.EnsureModule("example.com/test", "test", "")
-	db.UpsertDefinition(&Definition{
-		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true, Body: "func Foo() {}",
-	})
-	db.Commit("initial")
-
-	if err := db.Branch("feature"); err != nil {
-		t.Fatal(err)
-	}
-
-	branches, err := db.ListBranches()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(branches) < 2 {
-		t.Fatalf("expected at least 2 branches, got %d: %v", len(branches), branches)
-	}
-
-	current, err := db.GetCurrentBranch()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if current != "main" {
-		t.Fatalf("expected main, got %s", current)
-	}
-}
-
-func TestDoltCommitAndLog(t *testing.T) {
-	db := testDB(t)
-	mod, _ := db.EnsureModule("example.com/test", "test", "")
-	db.UpsertDefinition(&Definition{
-		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true, Body: "func Foo() {}",
-	})
-
-	if err := db.Commit("test commit"); err != nil {
-		t.Fatal(err)
-	}
-
-	entries, err := db.Log(5)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Should have at least 2 commits: init + our commit.
-	if len(entries) < 2 {
-		t.Fatalf("expected at least 2 log entries, got %d", len(entries))
 	}
 }
 
