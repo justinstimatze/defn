@@ -79,6 +79,35 @@ func TestIdentityEndpoint(t *testing.T) {
 	}
 }
 
+func TestBuildTargetsForFiles(t *testing.T) {
+	cases := []struct {
+		name  string
+		files []string
+		want  []string
+	}{
+		{"empty → full tree", nil, []string{"./..."}},
+		{"root file → .", []string{"main.go"}, []string{"."}},
+		{"single subdir", []string{"internal/mcp/server.go"}, []string{"./internal/mcp"}},
+		{"dedup same dir", []string{"internal/mcp/a.go", "internal/mcp/b.go"}, []string{"./internal/mcp"}},
+		{"multi dir sorted", []string{"internal/store/a.go", "cmd/defn/main.go"}, []string{"./cmd/defn", "./internal/store"}},
+		{"root + subdir", []string{"root.go", "internal/mcp/x.go"}, []string{".", "./internal/mcp"}},
+		{"bad paths skipped", []string{"/abs/path.go", "../up.go"}, []string{"./..."}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := buildTargetsForFiles(c.files)
+			if len(got) != len(c.want) {
+				t.Fatalf("got %v, want %v", got, c.want)
+			}
+			for i := range got {
+				if got[i] != c.want[i] {
+					t.Errorf("got[%d]=%q, want[%d]=%q", i, got[i], i, c.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestExtractSignature(t *testing.T) {
 	tests := []struct {
 		name string

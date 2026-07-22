@@ -1765,16 +1765,60 @@ func (s *server) autoEmitAndBuildWithOpts(opts emit.Opts) string {
 	t = time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), buildTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "build", "./...")
+	// #118 winze dispatch 2026-07-22: `go build ./...` on winze's corpus
+	// drags in cmd/ cgo Dolt subtrees (seconds); the corpus itself gates
+	// with `go build .` (25ms). When TouchedFiles is set, scope the build
+	// to just the packages containing those files. Empty TouchedFiles
+	// (full-tree emit) keeps the old ./... behavior for correctness on
+	// broad changes.
+	buildTargets := buildTargetsForFiles(opts.TouchedFiles)
+	args := append([]string{"build"}, buildTargets...)
+	cmd := exec.CommandContext(ctx, "go", args...)
 	cmd.Dir = s.projectDir
 	out, err := cmd.CombinedOutput()
 	if timing {
-		fmt.Fprintf(os.Stderr, "  [emit] go build ./...: %s\n", time.Since(t).Round(time.Millisecond))
+		fmt.Fprintf(os.Stderr, "  [emit] go %s: %s\n", strings.Join(args, " "), time.Since(t).Round(time.Millisecond))
 	}
 	if err != nil {
 		return fmt.Sprintf("BUILD FAILED:\n%s", string(out))
 	}
 	return "Build: OK"
+}
+
+// buildTargetsForFiles derives the minimal `go build` target list from
+// the set of touched project-relative files. Empty input → ["./..."]
+// (full-tree, safe default). Non-empty → sorted unique "./<dir>"
+// entries (or "." for root-package files). Directory is the parent of
+// each file, mapped to a package path Go understands.
+func buildTargetsForFiles(files []string) []string {
+	if len(files) == 0 {
+		return []string{"./..."}
+	}
+	seen := map[string]bool{}
+	var targets []string
+	for _, f := range files {
+		clean := filepath.Clean(f)
+		if filepath.IsAbs(clean) || strings.Contains(clean, "..") {
+			continue
+		}
+		dir := filepath.ToSlash(filepath.Dir(clean))
+		var target string
+		if dir == "" || dir == "." {
+			target = "."
+		} else {
+			target = "./" + dir
+		}
+		if seen[target] {
+			continue
+		}
+		seen[target] = true
+		targets = append(targets, target)
+	}
+	if len(targets) == 0 {
+		return []string{"./..."}
+	}
+	sort.Strings(targets)
+	return targets
 }
 
 // extractSignature pulls the signature from a Go definition body.
