@@ -192,12 +192,19 @@ func Dropped() {}
 }
 
 func TestEmitOptsAllowedRemovalsDoesNotWhitelistOtherLosses(t *testing.T) {
-	// Complement to the previous test: whitelisting Dropped must NOT
-	// allow an unlisted decl (here: init(), which the schema can't
-	// round-trip) to be silently lost. Force the regenerate path by
-	// adding a DB def with no on-disk counterpart so mergeDeclsIntoSource
-	// bails; then safeWriteGoFile has to make the call. Its filtered-lost
-	// check must still fire on init because init is not whitelisted.
+	// After the #163 fix, mergeDeclsIntoSource no longer bails on
+	// unmatched wants that aren't in AllowedAdds — it silently skips
+	// them, leaving on-disk decls untouched. So the safety-net path
+	// no longer triggers on "DB has drift" alone. The real data-loss
+	// safety (safeWriteGoFile) still runs and refuses if any actual
+	// on-disk decl would be dropped without whitelist coverage.
+	//
+	// Under this contract: DB has Keep + NewInDB (drift), disk has
+	// [init, Keep, Dropped], AllowedRemovals=[Dropped]. Expected
+	// merge behavior: replace Keep in place, remove Dropped (allowed),
+	// leave init untouched (not in wants), skip NewInDB (drift). Net
+	// result: [init, Keep]. init survived — the invariant this test
+	// really cares about.
 	db := testDB(t)
 	mod, _ := db.EnsureModule("example.com/test", "test", "")
 	db.UpsertDefinition(&store.Definition{
@@ -230,11 +237,18 @@ func Dropped() {}
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Regenerate path was taken. Safety net saw lost = [init, Dropped],
-	// filtered to [init] (Dropped is whitelisted), refused the write.
-	// File should be unchanged from "existing."
-	if string(data) != string(existing) {
-		t.Fatalf("safety net let a non-whitelisted decl (init) get dropped:\nwant:\n%s\ngot:\n%s", existing, data)
+	got := string(data)
+	if !strings.Contains(got, "func init()") {
+		t.Fatalf("init() dropped — safety net failed on the real data-loss case:\n%s", got)
+	}
+	if !strings.Contains(got, "func Keep()") {
+		t.Fatalf("Keep dropped unexpectedly:\n%s", got)
+	}
+	if strings.Contains(got, "func Dropped()") {
+		t.Fatalf("Dropped survived despite AllowedRemovals=[Dropped]:\n%s", got)
+	}
+	if strings.Contains(got, "func NewInDB()") {
+		t.Fatalf("NewInDB leaked to disk despite not being in AllowedAdds (drift):\n%s", got)
 	}
 }
 
@@ -431,23 +445,18 @@ type Baz int
 }
 
 func TestEmitMergeFallsBackToRegenerateForNewDefs(t *testing.T) {
-	// Regression: merge can only REPLACE existing on-disk decls; it has
-	// no path to ADD a new one. If the DB has a newly-created def that
-	// doesn't appear on disk, merge must bail so regeneration builds
-	// the file from the full def set. Without this, new defs created
-	// via the MCP `create` op never land in the emitted file — the
-	// safety net doesn't catch it either (on-disk decls all survive;
-	// only the new def is missing).
+	// After #163: new defs land via Opts.AllowedAdds on the merge
+	// path — no regen fallback needed for the common create case.
+	// This test now asserts that intent, and also protects the
+	// long-lived invariant: a newly-created DB def must reach disk.
 	db := testDB(t)
 	mod, _ := db.EnsureModule("example.com/test", "test", "")
 
-	// file_sources represents the pre-creation state: Foo only.
 	seed := "package test\n\nfunc Foo() {}\n"
 	if err := db.SetFileSource(mod.ID, "test.go", seed); err != nil {
 		t.Fatal(err)
 	}
 
-	// DB now has Foo AND Bar (Bar is newly created).
 	db.UpsertDefinition(&store.Definition{
 		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true,
 		Body: "func Foo() {}", SourceFile: "test.go",
@@ -458,7 +467,7 @@ func TestEmitMergeFallsBackToRegenerateForNewDefs(t *testing.T) {
 	})
 
 	outDir := t.TempDir()
-	if err := Emit(db, outDir); err != nil {
+	if err := EmitWithOpts(db, outDir, Opts{AllowedAdds: []string{"Bar"}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -471,7 +480,7 @@ func TestEmitMergeFallsBackToRegenerateForNewDefs(t *testing.T) {
 		t.Fatalf("newly-created Bar def missing from emitted file:\n%s", s)
 	}
 	if !strings.Contains(s, "func Foo()") {
-		t.Fatalf("Foo dropped during regenerate fallback:\n%s", s)
+		t.Fatalf("Foo dropped during emit:\n%s", s)
 	}
 }
 
@@ -486,11 +495,14 @@ func TestEmitRegeneratePreservesFilePrefixAndDeclOrder(t *testing.T) {
 	// when ingest never captured the comment (file.Doc only catches
 	// comments IMMEDIATELY before `package X`) — and reordered decls
 	// alphabetically because GetModuleDefinitions sorts by name.
+	//
+	// After #163: the merge path handles new defs via AllowedAdds and
+	// preserves everything by byte-splice. Test still declares the new
+	// def (Gamma) via AllowedAdds so the create-add case succeeds and
+	// the prefix + original order all survive naturally.
 	db := testDB(t)
 	mod, _ := db.EnsureModule("example.com/test", "test", "")
 
-	// Seed file_sources with a comment NOT bound to `package X` (blank
-	// line between), plus decls in a non-alphabetical order.
 	seed := `//go:build linux
 
 // Package test demonstrates a free-floating file-level comment that
@@ -516,15 +528,13 @@ func Alpha() {}
 		ModuleID: mod.ID, Name: "Alpha", Kind: "function", Exported: true,
 		Body: "func Alpha() {}", SourceFile: "test.go",
 	})
-	// Newly-created def with no on-disk counterpart — forces merge to
-	// fall through to regenerate.
 	db.UpsertDefinition(&store.Definition{
 		ModuleID: mod.ID, Name: "Gamma", Kind: "function", Exported: true,
 		Body: "func Gamma() int { return 7 }", SourceFile: "test.go",
 	})
 
 	outDir := t.TempDir()
-	if err := Emit(db, outDir); err != nil {
+	if err := EmitWithOpts(db, outDir, Opts{AllowedAdds: []string{"Gamma"}}); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(outDir, "test.go"))
@@ -534,16 +544,16 @@ func Alpha() {}
 	got := string(data)
 
 	if !strings.Contains(got, "//go:build linux") {
-		t.Fatalf("//go:build constraint was lost in regenerate:\n%s", got)
+		t.Fatalf("//go:build constraint was lost:\n%s", got)
 	}
 	if !strings.Contains(got, "Package test demonstrates a free-floating") {
-		t.Fatalf("file-level doc comment (not bound to package X) was lost in regenerate:\n%s", got)
+		t.Fatalf("file-level doc comment (not bound to package X) was lost:\n%s", got)
 	}
 	zetaIdx := strings.Index(got, "func Zeta")
 	alphaIdx := strings.Index(got, "func Alpha")
 	gammaIdx := strings.Index(got, "func Gamma")
 	if zetaIdx < 0 || alphaIdx < 0 || gammaIdx < 0 {
-		t.Fatalf("missing decl in regenerated output:\n%s", got)
+		t.Fatalf("missing decl in output:\n%s", got)
 	}
 	if zetaIdx > alphaIdx {
 		t.Fatalf("on-disk decl order not preserved: Alpha should appear AFTER Zeta:\n%s", got)
@@ -1426,5 +1436,110 @@ func Existing() int { return X + Y }
 	// New def appended.
 	if !strings.Contains(got, "func New() string") {
 		t.Errorf("New def not appended to merged output")
+	}
+}
+
+// TestMergeDeclsIntoSource_FloatingCommentSurvivesGroupedSpecReplacement
+// isolates the #163 regression: even with AllowedAdds set, floating
+// comments above a grouped var(...) or const(...) block get lost
+// when there's ALSO a per-spec replacement inside that block. Prior
+// #162 test only exercised untouched grouped blocks; this covers the
+// case where the merge patches inside the block too.
+//
+// Failing shape mirrors internal/mcp/server.go: floating comment
+// above `var (` block whose specs are individually stored in the DB.
+// When a new def is added elsewhere in the file AND the specs get
+// replaced (even with identical content), the floating comment above
+// the block disappears.
+func TestMergeDeclsIntoSource_FloatingCommentSurvivesGroupedSpecReplacement(t *testing.T) {
+	existing := []byte(`package p
+
+// FloatingDocAboveVarBlock — this comment is separated from the var
+// by a blank line, so parser.ParseComments leaves it in f.Comments
+// rather than attaching it to VarBlock's Doc.
+var (
+	X = 1
+	Y = 2
+)
+
+func Existing() int { return X + Y }
+`)
+
+	// DB has 3 defs — the two grouped-spec vars X and Y, and Existing.
+	// Plus one NEW def (New) being added via code op:create.
+	defs := []store.Definition{
+		{Name: "X", Kind: "var", Body: "X = 1"},
+		{Name: "Y", Kind: "var", Body: "Y = 2"},
+		{Name: "Existing", Kind: "function", Body: "func Existing() int { return X + Y }"},
+		{Name: "New", Kind: "function", Body: "func New() string { return \"new\" }"},
+	}
+
+	merged, ok := mergeDeclsIntoSource(existing, defs, nil, []string{"New"})
+	if !ok {
+		t.Fatalf("mergeDeclsIntoSource returned ok=false")
+	}
+	got := string(merged)
+
+	if !strings.Contains(got, "FloatingDocAboveVarBlock") {
+		t.Errorf("floating comment above var block lost — this is #163\n\nmerged output:\n%s", got)
+	}
+	if !strings.Contains(got, "func New()") {
+		t.Errorf("New def not appended")
+	}
+}
+
+// TestMergeDeclsIntoSource_OrphanDefTriggersRegenDropsComment is the
+// #163 root cause. The failing scenario in the real workflow:
+//
+//   - DB accumulates an "orphan" def (recorded via UpsertDefinition but
+//     the emit that would have written it to disk failed/rolled back
+//     for some earlier op).
+//   - A LATER code(op:"create") for a DIFFERENT new def declares
+//     AllowedAdds=[newName] — orphan name isn't in there.
+//   - mergeDeclsIntoSource sees the orphan as an unmatched want with
+//     no AllowedAdds entry → returns false → writeFile falls to regen
+//     → regen drops floating comments.
+//
+// The fix: mergeDeclsIntoSource should treat unmatched-and-not-allowed
+// as "the caller doesn't own this def; leave it alone" rather than
+// bailing. Skip the orphan (don't try to add or remove it) and let
+// the merge succeed with the caller's actual intent — the disk file
+// stays consistent with what the user asked for.
+func TestMergeDeclsIntoSource_OrphanDefTriggersRegenDropsComment(t *testing.T) {
+	existing := []byte(`package p
+
+// FloatingDoc above the var block.
+var (
+	X = 1
+)
+
+func Existing() int { return X }
+`)
+
+	// DB has 3 defs — X and Existing (both on disk) PLUS Orphan
+	// (a def someone earlier upsert'd but never got written to disk).
+	// Now a NEW def is being added via code op:create.
+	defs := []store.Definition{
+		{Name: "X", Kind: "var", Body: "X = 1"},
+		{Name: "Existing", Kind: "function", Body: "func Existing() int { return X }"},
+		{Name: "Orphan", Kind: "function", Body: "func Orphan() {}"},
+		{Name: "New", Kind: "function", Body: "func New() {}"},
+	}
+	// AllowedAdds only declares the CURRENT caller's intent (New);
+	// Orphan is drift and shouldn't be added.
+	merged, ok := mergeDeclsIntoSource(existing, defs, nil, []string{"New"})
+	if !ok {
+		t.Fatalf("mergeDeclsIntoSource returned ok=false when orphan Present — this is #163: fix should skip orphan, not bail")
+	}
+	got := string(merged)
+	if !strings.Contains(got, "FloatingDoc above the var block") {
+		t.Errorf("floating comment lost when orphan def in DB\n\nmerged:\n%s", got)
+	}
+	if !strings.Contains(got, "func New()") {
+		t.Errorf("New def not appended")
+	}
+	// Orphan MUST NOT appear — it wasn't allowed-add, and disk didn't have it.
+	if strings.Contains(got, "func Orphan()") {
+		t.Errorf("Orphan def leaked into disk despite not being in AllowedAdds")
 	}
 }

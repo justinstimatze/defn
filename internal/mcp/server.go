@@ -3087,6 +3087,8 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				continue
 			}
 			s.enqueueSummary(d)
+			// #163: rename creates a new-named def from the emit path's POV.
+			allowedAdds = append(allowedAdds, op.NewName)
 			s.enqueueSummary(d)
 			callers, _ := s.backend.GetCallers(d.ID)
 			callerCount := 0
@@ -3618,8 +3620,12 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// are preserved regardless of build outcome. Skip the build gate;
 	// this is the biggest single win of #148 (rename was 187ms wall on
 	// winze with 148ms in go build; drops to ~40ms).
+	// #163: rename = delete-old + create-new to the emit path. Declare
+	// both so the merge can splice in-place (old name removed, new
+	// name spliced) instead of leaving the new name behind as drift.
 	buildResult := s.autoEmitOnlyWithOpts(emit.Opts{
 		AllowedRemovals: []string{qualifiedOld},
+		AllowedAdds:     []string{args.NewName},
 		GoimportsFiles:  goimportsFiles,
 		TouchedFiles:    goimportsFiles,
 	})

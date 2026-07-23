@@ -1164,13 +1164,15 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 	// Deterministic order so successive emits are stable.
 	sort.Strings(appendBodies)
 
-	// After allowlist filtering, anything still in the want* maps is
-	// unmatched AND not declared as an intentional add. That's the
-	// drift signal — bail so writeFile falls through to regenerate
-	// and safeWriteGoFile catches the data-loss case.
-	if len(wantFuncs)+len(wantTypes)+len(wantConsts)+len(wantVars)+len(wantGrouped) > 0 {
-		return nil, false
-	}
+	// #163 fix: unmatched wants not in AllowedAdds are drift the caller
+	// didn't declare intent for. Skip them silently — the disk file
+	// stays consistent with what the caller ASKED for (patched existing
+	// decls, appended allowed adds), and the orphan DB entries neither
+	// land on disk nor cause the merge to fall through to regen (which
+	// would drop floating comments the merge path preserves). The real
+	// data-loss safety net is safeWriteGoFile, which still runs after
+	// this returns and refuses any write that would silently drop an
+	// on-disk decl the DB doesn't know about.
 
 	// Apply in reverse offset order so earlier splices don't invalidate
 	// later offsets. Byte ranges for distinct decls never overlap (Go
