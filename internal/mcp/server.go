@@ -66,6 +66,7 @@ type server struct {
 	ready           atomic.Bool  // true after startup ingest+resolve completes
 	autoCommitCount atomic.Int64 // counts auto-commits; triggers GC every 10
 	idf             *rank.LazyIDF
+	respCache       *respCache // #77/#152: per-session dedup of read-side responses
 }
 
 // Run starts the MCP server over stdio. projDir is the project root where
@@ -252,6 +253,7 @@ func MeasureEdit(database store.Backend, projDir, name, newBody string) (time.Du
 func newMCPServer(ctx context.Context, database store.Backend, projDir string) (*server, *sdkmcp.Server) {
 	s := &server{backend: database, projectDir: projDir}
 	s.idf = newIDF(database)
+	s.respCache = newRespCache()
 
 	if projDir != "" {
 		// Reconcile changes made while defn was not running (file moves,
@@ -614,6 +616,23 @@ func (s *server) modulePath(moduleID int64) string {
 // handleCode is the single entry point for all operations.
 // It dispatches based on the "op" field to the appropriate handler.
 func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, args codeParam) (result *sdkmcp.CallToolResult, structured any, err error) {
+	// #77/#152: post-dispatch dedup. Read ops that return byte-identical
+	// content on repeat get replaced with a compact "already served" stub;
+	// write ops invalidate the session cache so the next read is a clean
+	// miss. See internal/mcp/dedup.go.
+	defer func() {
+		if err != nil || result == nil || result.IsError || req == nil {
+			return
+		}
+		if op, argKey, ok := dedupOpKey(args); ok {
+			result = s.respCache.dedup(req.Session, op, argKey, result)
+			return
+		}
+		if isWriteOp(args.Op) {
+			s.respCache.invalidate(req.Session)
+		}
+	}()
+
 	// Validate required params per op (fail fast with clear error).
 	need := func(field, label string) (*sdkmcp.CallToolResult, any, error) {
 		if strings.TrimSpace(field) == "" {
