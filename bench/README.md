@@ -82,6 +82,18 @@ Three things every citation of a number here should carry:
    per-case cost is dominated by the 25k floor. Multi-op chains and
    read-side retrieval are where the delta actually shows.
 
+4. **Measure tokens, not bytes.** Tokenizers are trained on code
+   corpora and collapse common identifiers into 1-2 tokens (`Authenticate`
+   = 1 token, `handleImpact` = 2). Short "compressed" placeholders like
+   `[47]` expand to 3 tokens (`[`, `47`, `]`). A byte-based analysis
+   of the #155 session codebook said +2% savings; the token-based
+   analysis said **−6%** — the wire format actively cost tokens on
+   nearly every substitution. Use `bench/tokens.py`'s `count_tokens()`
+   and `require_tokens()` helpers, and run via
+   `uv run --with tiktoken python3 <script>` on machines where system
+   pip is blocked. Any claim shipped without a paired token number is
+   suspect.
+
 ## The five moves
 
 1. **Show your receipts.** Every claim links to a re-runnable script
