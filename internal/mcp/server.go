@@ -513,19 +513,17 @@ func (s *server) fileAltBytes(d *store.Definition) int {
 	return len(raw)
 }
 
-// withUsage optionally appends a one-line savings footer to r's text
-// content when the alt-Read savings are dramatic (≥50%) and non-trivial
-// (alt ≥ 512 bytes). No-op on nil / error results.
+// withUsage emits a per-op stats line to stderr and returns r
+// unchanged. Previously appended a "_— returned XB vs ~YB —_" footer
+// to the tool-result text; that put human-facing telemetry into the
+// model's context and cached prefix for zero model-behavior value
+// (#165). Bench harnesses now read stderr JSON lines instead of
+// grepping the text response.
 //
-// Historical note: this function previously ALSO set r.StructuredContent
-// = u for bench harnesses. Claude's tool_result serialization treats
-// structuredContent as a replacement for text content when both are set,
-// so every read/read-file/outline/slice/file-defs/expand response
-// silently reached the model as a JSON usage envelope — no body text
-// at all. Detected 2026-07-20 via bench trajectories where the model
-// literally complained "content stripped for the whole session." The
-// StructuredContent write is removed; the footer stays because it's
-// visible in-band and useful signal.
+// Historical note: an even earlier version of this function set
+// r.StructuredContent = u. Claude's tool_result serialization treated
+// structuredContent as a replacement for text content, silently
+// stripping bodies (#96, detected 2026-07-20). That write is gone.
 func withUsage(r *sdkmcp.CallToolResult, u usageStats) *sdkmcp.CallToolResult {
 	if r == nil || r.IsError {
 		return r
@@ -537,15 +535,7 @@ func withUsage(r *sdkmcp.CallToolResult, u usageStats) *sdkmcp.CallToolResult {
 		}
 		u.SavingsPct = 100 * saved / u.BytesAltRead
 	}
-	if u.BytesAltRead >= 512 && u.SavingsPct >= 50 {
-		footer := fmt.Sprintf("\n_— returned %dB vs ~%dB for full-file Read (-%d%%)_\n",
-			u.BytesReturned, u.BytesAltRead, u.SavingsPct)
-		for _, c := range r.Content {
-			if tc, ok := c.(*sdkmcp.TextContent); ok {
-				tc.Text += footer
-			}
-		}
-	}
+	emitUsageLog(u)
 	return r
 }
 
@@ -1353,6 +1343,9 @@ func resultTextRaw(r *sdkmcp.CallToolResult) string {
 }
 
 func (s *server) handleGetDefinition(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
+	if args.Mode == "" && os.Getenv("DEFN_SUMMARY_READ_DEFAULT") == "1" {
+		args.Mode = "summary"
+	}
 	d, err := s.backend.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
@@ -3802,13 +3795,6 @@ func truncateTestOutput(out string) string {
 	return sb.String()
 }
 
-// searchShapedSQLRedirects detects `query` op SQL that is really trying to
-// do work the model should route through a first-class op. Returns a
-// non-empty redirect message when the SQL matches a known anti-pattern
-// (grepping bodies, direct name lookups, schema introspection), else "".
-// The intercept exists because raw SQL for these shapes is a wire-cost
-// disaster: the model burns turns re-discovering the schema and returns
-// blob rows when a compact projection would do.
 var (
 	sqlBodyGrep    = regexp.MustCompile(`(?i)\bbody\s+LIKE\s+'`)
 	sqlFileScoped  = regexp.MustCompile(`(?i)\b(?:d\.)?source_file\s*(?:LIKE\b|=|\bIN\b)`)
@@ -5189,14 +5175,6 @@ func stmtKind(s ast.Stmt) string {
 	return ""
 }
 
-// outlineCalleeCap and outlineFlowCap bound the caller/flow lists in
-// outline output. Bench trajectories showed some outlines pushing 7 kB
-// entirely from unbounded callee lists; head-of-list is enough for the
-// model to orient, and the total count is still reported.
-//
-// impactCallerCap bounds the markdown caller list in handleImpact.
-// Model rarely acts on more than the top 10-15; full list is still
-// available via the structured field.
 const (
 	impactCallerCap  = 15
 	outlineCalleeCap = 15
@@ -6260,4 +6238,19 @@ func (s *server) handleCreateScaffoldFile(args createParam) (*sdkmcp.CallToolRes
 	sb.WriteString("emit: " + strings.ToLower(strings.SplitN(buildResult, "\n", 2)[0]) + "\n")
 	sb.WriteString("_add defs with follow-up `code(op:\"create\", file:\"" + args.File + "\", body:\"...\")` calls._\n")
 	return textResult(sb.String()), nil, nil
+}
+
+// emitUsageLog writes a single JSON line per op stats event to
+// defn's stderr. Bench harnesses redirect stderr (2>usage.log) and
+// parse the JSONL. No-op when DEFN_USAGE_LOG=off — keeps quiet
+// invocations quiet without conditionalizing every callsite.
+func emitUsageLog(u usageStats) {
+	if os.Getenv("DEFN_USAGE_LOG") == "off" {
+		return
+	}
+	b, err := json.Marshal(u)
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "defn-usage %s\n", b)
 }

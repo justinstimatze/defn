@@ -3,16 +3,17 @@ module github.com/justinstimatze/defn
 go 1.26.2
 
 require (
+	github.com/anthropics/anthropic-sdk-go v1.59.0
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/modelcontextprotocol/go-sdk v1.6.1
 	golang.org/x/tools v0.47.0
+	gopkg.in/yaml.v2 v2.2.8
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.54.0
 )
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
-	github.com/anthropics/anthropic-sdk-go v1.59.0 // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/buger/jsonparser v1.1.2 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
