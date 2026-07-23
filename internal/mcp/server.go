@@ -66,7 +66,8 @@ type server struct {
 	ready           atomic.Bool  // true after startup ingest+resolve completes
 	autoCommitCount atomic.Int64 // counts auto-commits; triggers GC every 10
 	idf             *rank.LazyIDF
-	respCache       *respCache // #77/#152: per-session dedup of read-side responses
+	respCache       *respCache  // #77/#152: per-session dedup of read-side responses
+	reach           *reachCache // #154: in-memory reverse-refs cache for fast batch impact
 }
 
 // Run starts the MCP server over stdio. projDir is the project root where
@@ -254,6 +255,7 @@ func newMCPServer(ctx context.Context, database store.Backend, projDir string) (
 	s := &server{backend: database, projectDir: projDir}
 	s.idf = newIDF(database)
 	s.respCache = newRespCache()
+	s.reach = newReachCache()
 
 	if projDir != "" {
 		// Reconcile changes made while defn was not running (file moves,
@@ -636,6 +638,14 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		}
 		if isWriteOp(args.Op) {
 			s.respCache.invalidate(req.Session)
+			// #154: reachability cache is a graph snapshot; any
+			// mutation invalidates. Next impact/batch-impact will
+			// scan refs to rebuild. Nil-safe for Measure* paths
+			// that construct servers without going through
+			// newMCPServer.
+			if s.reach != nil {
+				s.reach.invalidate()
+			}
 		}
 	}()
 
@@ -4618,7 +4628,49 @@ func (s *server) handleTestCoverage(_ context.Context, _ *sdkmcp.CallToolRequest
 	return textResult(text), nil, nil
 }
 
-func (s *server) handleBatchImpact(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+// transitiveTestsByIDs filters `ids` (typically the output of a
+// reachability BFS) to those that are test defs. One bulk SELECT via
+// the ad-hoc Query surface — no per-id round trips. Safe against SQL
+// injection because IDs are int64 and formatted directly. #154.
+func (s *server) transitiveTestsByIDs(ids []int64) ([]store.Definition, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var b strings.Builder
+	for i, id := range ids {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, "%d", id)
+	}
+	sql := fmt.Sprintf(
+		`SELECT id, name, kind, exported, test, COALESCE(receiver,'') as receiver
+		 FROM definitions WHERE test = 1 AND id IN (%s)`, b.String())
+	rows, err := s.backend.Query(sql)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]store.Definition, 0, len(rows))
+	for _, row := range rows {
+		d := store.Definition{Test: true}
+		if v, ok := row["id"].(int64); ok {
+			d.ID = v
+		}
+		if v, ok := row["name"].(string); ok {
+			d.Name = v
+		}
+		if v, ok := row["kind"].(string); ok {
+			d.Kind = v
+		}
+		if v, ok := row["receiver"].(string); ok {
+			d.Receiver = v
+		}
+		out = append(out, d)
+	}
+	return out, nil
+}
+
+func (s *server) handleBatchImpact(ctx context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	names := args.Names
 	if len(names) == 0 && args.Name != "" {
 		names = []string{args.Name}
@@ -4627,6 +4679,12 @@ func (s *server) handleBatchImpact(_ context.Context, _ *sdkmcp.CallToolRequest,
 		return errResult(fmt.Errorf("batch-impact: names is required"))
 	}
 
+	// #154 fast path: use the in-memory reverse-refs cache for
+	// transitive counts. Prior code did N × GetImpact (each N × 46ms
+	// on winze via recursive CTE); with the cache, one rebuild scan
+	// + N in-memory BFSes. For 10 names on winze: ~460ms → ~15ms.
+	// Direct callers + tests still come from backend queries — they
+	// need name/receiver/test formatting the raw cache can't give.
 	allCallers := map[string]bool{}
 	allTests := map[string]bool{}
 	var perDef []map[string]any
@@ -4637,22 +4695,55 @@ func (s *server) handleBatchImpact(_ context.Context, _ *sdkmcp.CallToolRequest,
 			perDef = append(perDef, map[string]any{"name": name, "error": "not found"})
 			continue
 		}
-		impact, err := s.backend.GetImpact(d.ID)
+		directCallers, err := s.backend.GetCallers(d.ID)
 		if err != nil {
 			perDef = append(perDef, map[string]any{"name": name, "error": err.Error()})
 			continue
 		}
-		for _, c := range impact.DirectCallers {
+		// Transitive via in-memory BFS if cache is warm; else
+		// fall back to backend's GetImpact (CTE path).
+		var transCount int
+		var tests []store.Definition
+		if s.reach != nil {
+			if reach, ok := s.reach.reachableCallers(ctx, s.backend, d.ID); ok {
+				transCount = len(reach)
+				// Collect tests via the direct-callers list plus
+				// backend lookup for transitive test-defs. For
+				// batch-impact we only need the count + names —
+				// direct+transitive test set via one query.
+				for _, c := range directCallers {
+					if c.Test {
+						tests = append(tests, c)
+					}
+				}
+				// Add transitive-only tests via one bulk lookup.
+				if len(reach) > 0 {
+					testDefs, _ := s.transitiveTestsByIDs(reach)
+					tests = append(tests, testDefs...)
+				}
+			}
+		}
+		if transCount == 0 && len(tests) == 0 {
+			// Cache miss or unpopulated — fall back to CTE.
+			impact, err := s.backend.GetImpact(d.ID)
+			if err != nil {
+				perDef = append(perDef, map[string]any{"name": name, "error": err.Error()})
+				continue
+			}
+			transCount = impact.TransitiveCount
+			tests = impact.Tests
+		}
+		for _, c := range directCallers {
 			allCallers[formatReceiver(c.Receiver)+c.Name] = true
 		}
-		for _, t := range impact.Tests {
+		for _, t := range tests {
 			allTests[t.Name] = true
 		}
 		perDef = append(perDef, map[string]any{
 			"name":               formatReceiver(d.Receiver) + d.Name,
-			"direct_callers":     len(impact.DirectCallers),
-			"transitive_callers": impact.TransitiveCount,
-			"tests":              len(impact.Tests),
+			"direct_callers":     len(directCallers),
+			"transitive_callers": transCount,
+			"tests":              len(tests),
 		})
 	}
 
