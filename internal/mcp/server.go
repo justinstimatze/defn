@@ -2454,6 +2454,8 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	if err != nil {
 		return errResult(err)
 	}
+	d.ID = id
+	s.enqueueSummary(d)
 
 	buildResult := s.autoEmitAndBuildForCreate(args.File, []string{name})
 	s.autoResolveFile(args.File, mod.Path)
@@ -2674,6 +2676,8 @@ func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult
 		if err != nil {
 			return errResult(fmt.Errorf("upsert %s: %v", d.Name, err))
 		}
+		def.ID = id
+		s.enqueueSummary(def)
 		ids = append(ids, id)
 	}
 
@@ -2974,6 +2978,8 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("create %s: %v", name, err))
 			} else {
+				d.ID = id
+				s.enqueueSummary(d)
 				addTouched(op.File)
 				addResolve(op.File, mod.ID)
 				allowedAdds = append(allowedAdds, name)
@@ -3069,6 +3075,8 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				errors = append(errors, fmt.Sprintf("rename %s: %v", op.Name, err))
 				continue
 			}
+			s.enqueueSummary(d)
+			s.enqueueSummary(d)
 			callers, _ := s.backend.GetCallers(d.ID)
 			callerCount := 0
 			for _, caller := range callers {
@@ -3552,6 +3560,14 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	if err := s.backend.RenameDefinition(originalID, args.NewName, newBody, newSig, exported); err != nil {
 		return errResult(err)
 	}
+	// #160: renamed def has new intent (name is a strong signal in the
+	// summary prompt) — regenerate. Body/receiver/kind stay the same
+	// otherwise; enqueue uses the post-rename shape.
+	d.Name = args.NewName
+	d.Body = newBody
+	d.Signature = newSig
+	d.Exported = exported
+	s.enqueueSummary(d)
 
 	// Update all callers' bodies that reference the old name. Also collect
 	// each touched file so goimports can scope to just those (#109 pass 3):

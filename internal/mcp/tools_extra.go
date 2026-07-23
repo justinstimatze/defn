@@ -91,9 +91,15 @@ func (s *server) handleMove(_ context.Context, _ *sdkmcp.CallToolRequest, args m
 	}
 	d.ModuleID = targetMod.ID
 	d.ID = 0 // force new insert
-	if _, err := s.backend.UpsertDefinition(d); err != nil {
+	newID, err := s.backend.UpsertDefinition(d)
+	if err != nil {
 		return errResult(err)
 	}
+	// #160: module changed → summary prompt now sees the new module
+	// path, so intent may read differently. Enqueue against the fresh
+	// row (new ID after delete+insert).
+	d.ID = newID
+	s.enqueueSummary(d)
 
 	buildResult := s.autoEmitAndBuild()
 	s.autoResolve("") // full resolve — move changes module membership
