@@ -1,0 +1,19 @@
+project,question,mode,tool_calls,input_tokens,output_tokens,cached_tokens,duration_ms,correct
+chi,What does the NewMux function do? Be concise.,files,2,25752,48,78232,15815,true
+chi,What does the NewMux function do? Be concise.,defn,7,25791,127,486306,26904,false
+chi,Who calls NewMux?,files,2,25690,14,117538,14328,true
+chi,Who calls NewMux?,defn,10,27573,245,649618,42019,true
+chi,What's the blast radius of changing InsertRoute? How many functions call it directly or transitively?,files,8,41116,68,725805,70195,true
+chi,What's the blast radius of changing InsertRoute? How many functions call it directly or transitively?,defn,5,37839,121,396609,61317,true
+gin,What does the Render method on Context do? Be concise.,files,2,25752,73,78309,13448,true
+gin,What does the Render method on Context do? Be concise.,defn,9,25856,232,526636,36847,true
+gin,List all the methods on Context that call Render.,files,3,39352,31,153267,24209,true
+gin,List all the methods on Context that call Render.,defn,16,27472,217,1429135,78697,true
+gin,What's the blast radius of changing the Render method on Context?,files,6,64941,47,281060,40488,false
+gin,What's the blast radius of changing the Render method on Context?,defn,17,39957,330,1633127,102315,false
+mux,What does NewRouter do?,files,2,25686,48,78161,15693,true
+mux,What does NewRouter do?,defn,7,39562,54,635554,40896,true
+mux,Who calls HandleFunc on Router?,files,4,48668,23,75158,52091,true
+mux,Who calls HandleFunc on Router?,defn,9,27494,126,689273,58911,true
+toml,What does the Decode function do? Be concise.,files,2,25752,66,78447,12301,true
+toml,What does the Decode function do? Be concise.,defn,12,27645,305,767510,48719,true

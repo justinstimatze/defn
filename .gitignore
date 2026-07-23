@@ -19,3 +19,20 @@
 .codex/
 .plancheck-debug.json
 .venv-bench/
+
+# Session scratch — design memos, prototypes, tempfiles from Claude Code
+# sessions. Never tracked; move receipts to bench/ or a real doc if
+# they need to survive.
+scratchpad/
+
+# Python bytecode cache (bench harnesses in Python)
+__pycache__/
+*.pyc
+
+# Bench receipts convention: default-untracked so exploratory runs
+# don't clutter the repo. Files here become RECEIPTS (trustable,
+# referenceable) only when explicitly `git add`ed — mirroring the
+# tracked bench/mutations/ + bench/session-cumulative/ pattern. See
+# bench/README.md for the "receipts are the source of truth" rule.
+# These dirs stay visible in git status when they contain data;
+# add specific files with `git add path/to/receipt.md` to promote.

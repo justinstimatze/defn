@@ -1,0 +1,51 @@
+project,kind,question,mode,tool_calls,input_tokens,output_tokens,cached_tokens,duration_ms,correct
+chi,lookup,What does the NewMux function do? Be concise.,files,2,25752,48,78237,20455,true
+chi,lookup,What does the NewMux function do? Be concise.,defn,6,25721,98,429582,48494,true
+chi,lookup,What does the Mux.ServeHTTP method do? Be concise.,files,2,25752,73,82090,24258,true
+chi,lookup,What does the Mux.ServeHTTP method do? Be concise.,defn,11,26122,338,758848,60163,true
+chi,lookup,What does the Router.Route method do? Be concise.,files,2,37906,11,117325,24599,true
+chi,lookup,What does the Router.Route method do? Be concise.,defn,8,25920,206,535028,53413,true
+chi,graph,Who calls NewMux?,files,2,25754,15,99798,20637,true
+chi,graph,Who calls NewMux?,defn,7,39524,147,451952,54689,true
+chi,graph,What's the blast radius of changing InsertRoute? How many functions call it directly or transitively?,files,10,41118,162,768968,80346,true
+chi,graph,What's the blast radius of changing InsertRoute? How many functions call it directly or transitively?,defn,3,39381,66,203193,32253,true
+chi,graph,List every function that calls Mux.Handle directly.,files,5,27118,44,334218,48415,true
+chi,graph,List every function that calls Mux.Handle directly.,defn,11,27583,70,916491,145388,true
+chi,graph,Who calls the routeContext method?,files,4,30096,22,252656,31303,true
+chi,graph,Who calls the routeContext method?,defn,9,40987,302,629840,65233,true
+gin,lookup,What does the Render method on Context do? Be concise.,files,2,25686,73,78273,12285,true
+gin,lookup,What does the Render method on Context do? Be concise.,defn,5,39292,69,371815,26106,true
+gin,lookup,What does the Engine.Run method do? Be concise.,files,2,25686,71,82174,20448,true
+gin,lookup,What does the Engine.Run method do? Be concise.,defn,5,27166,54,292143,22857,true
+gin,lookup,What does the Context.JSON method do? Be concise.,files,2,25686,79,82034,12378,true
+gin,lookup,What does the Context.JSON method do? Be concise.,defn,5,25779,92,272038,19671,true
+gin,graph,List all the methods on Context that call Render.,files,2,27200,18,130960,15976,true
+gin,graph,List all the methods on Context that call Render.,defn,19,27411,475,1370326,106534,true
+gin,graph,What's the blast radius of changing the Render method on Context?,files,6,63497,35,265211,35609,true
+gin,graph,What's the blast radius of changing the Render method on Context?,defn,12,39812,143,1101051,81558,true
+gin,graph,Who calls Engine.handleHTTPRequest?,files,2,25752,49,82097,15331,true
+gin,graph,Who calls Engine.handleHTTPRequest?,defn,3,37926,75,142388,14809,true
+gin,graph,List every function that calls Context.Next directly.,files,4,40804,30,273013,31004,true
+gin,graph,List every function that calls Context.Next directly.,defn,19,40366,132,1707734,95022,true
+mux,lookup,What does NewRouter do? Be concise.,files,2,25752,53,78189,10930,true
+mux,lookup,What does NewRouter do? Be concise.,defn,9,25991,211,637250,41964,true
+mux,lookup,What does the Router.HandleFunc method do? Be concise.,files,2,25686,48,81914,11175,true
+mux,lookup,What does the Router.HandleFunc method do? Be concise.,defn,13,26001,265,837194,53619,true
+mux,lookup,What does the Route.PathPrefix method do? Be concise.,files,2,25752,48,81959,15169,true
+mux,lookup,What does the Route.PathPrefix method do? Be concise.,defn,11,27599,308,693741,48209,true
+mux,graph,Who calls HandleFunc on Router?,files,2,25690,11,118260,27650,true
+mux,graph,Who calls HandleFunc on Router?,defn,11,25932,275,763682,112193,true
+mux,graph,Who calls the setMatch function?,files,1,36460,12,86654,13101,true
+mux,graph,Who calls the setMatch function?,defn,2,25701,54,84809,15915,true
+mux,graph,List every function that calls Router.NewRoute directly.,files,5,37403,24,105833,80876,true
+mux,graph,List every function that calls Router.NewRoute directly.,defn,13,27528,86,1067501,67040,true
+toml,lookup,What does the Decode function do? Be concise.,files,2,25752,48,78374,13966,true
+toml,lookup,What does the Decode function do? Be concise.,defn,7,27176,79,468836,33055,true
+toml,lookup,What does the Encoder.Encode method do? Be concise.,files,2,25686,47,81954,11172,true
+toml,lookup,What does the Encoder.Encode method do? Be concise.,defn,12,26126,250,787856,48149,true
+toml,lookup,What does the DecodeFile function do? Be concise.,files,2,25752,78,82002,12162,true
+toml,lookup,What does the DecodeFile function do? Be concise.,defn,4,27162,96,220940,16096,true
+toml,graph,Who calls the Decode function?,files,2,36361,16,86717,19785,true
+toml,graph,Who calls the Decode function?,defn,10,26188,325,783989,83130,true
+toml,graph,List every function that calls unify directly.,files,5,27144,33,265465,29420,true
+toml,graph,List every function that calls unify directly.,defn,5,27220,32,346383,21349,true
