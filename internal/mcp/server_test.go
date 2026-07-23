@@ -515,6 +515,101 @@ func TestHandleImpact(t *testing.T) {
 	}
 }
 
+// TestHandleImpact_ModuleBreakdown seeds a target def called by two
+// separate modules and asserts the "by module: ..." line appears
+// with both module paths. #156 workspace-aware impact.
+func TestHandleImpact_ModuleBreakdown(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := &server{backend: db}
+
+	// Target module + its Def T.
+	m1, _ := db.EnsureModule("example.com/lib", "lib", "")
+	target := &store.Definition{
+		ModuleID: m1.ID, Name: "T", Kind: "function", Exported: true,
+		Body: "func T() {}", Signature: "func T()",
+	}
+	target.Hash = store.HashBody(target.Body)
+	targetID, _ := db.UpsertDefinition(target)
+
+	// Two caller modules with 2 and 1 callers respectively.
+	m2, _ := db.EnsureModule("example.com/svc/handler", "handler", "")
+	m3, _ := db.EnsureModule("example.com/svc/worker", "worker", "")
+	callers := []*store.Definition{
+		{ModuleID: m2.ID, Name: "H1", Kind: "function", Body: "func H1() { T() }"},
+		{ModuleID: m2.ID, Name: "H2", Kind: "function", Body: "func H2() { T() }"},
+		{ModuleID: m3.ID, Name: "W1", Kind: "function", Body: "func W1() { T() }"},
+	}
+	for _, c := range callers {
+		c.Hash = store.HashBody(c.Body)
+		id, _ := db.UpsertDefinition(c)
+		_ = db.SetReferences(id, []store.Reference{{FromDef: id, ToDef: targetID, Kind: "call"}})
+	}
+
+	result, _, err := s.handleImpact(context.Background(), nil, codeParam{Name: "T"})
+	if err != nil {
+		t.Fatalf("handleImpact: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "by module:") {
+		t.Errorf("expected 'by module:' breakdown line\n---\n%s", text)
+	}
+	// Handler module (2 callers) should sort before worker (1 caller).
+	iH := strings.Index(text, "handler")
+	iW := strings.Index(text, "worker")
+	if iH < 0 || iW < 0 || iH > iW {
+		t.Errorf("expected handler (2) before worker (1); got:\n%s", text)
+	}
+}
+
+// TestHandleImpact_QueryFilter validates the #157 query-context on
+// impact: callers whose name/receiver/source_file doesn't contain
+// any query token are hidden with a "filtered by query" line.
+func TestHandleImpact_QueryFilter(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := &server{backend: db}
+
+	m, _ := db.EnsureModule("example.com/svc", "svc", "")
+	target := &store.Definition{ModuleID: m.ID, Name: "Handle", Kind: "function", Body: "func Handle() {}"}
+	target.Hash = store.HashBody(target.Body)
+	targetID, _ := db.UpsertDefinition(target)
+	// 3 callers: two match "auth", one doesn't.
+	callers := []*store.Definition{
+		{ModuleID: m.ID, Name: "authenticate", Kind: "function", Body: "func authenticate() { Handle() }"},
+		{ModuleID: m.ID, Name: "authorize", Kind: "function", Body: "func authorize() { Handle() }"},
+		{ModuleID: m.ID, Name: "logRequest", Kind: "function", Body: "func logRequest() { Handle() }"},
+	}
+	for _, c := range callers {
+		c.Hash = store.HashBody(c.Body)
+		id, _ := db.UpsertDefinition(c)
+		_ = db.SetReferences(id, []store.Reference{{FromDef: id, ToDef: targetID, Kind: "call"}})
+	}
+
+	result, _, err := s.handleImpact(context.Background(), nil, codeParam{Name: "Handle", Query: "auth"})
+	if err != nil {
+		t.Fatalf("handleImpact query: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "filtered by query=\"auth\": 1 callers hidden") {
+		t.Errorf("expected 'filtered by query' hint w/ 1 hidden; got:\n%s", text)
+	}
+	if strings.Contains(text, "logRequest") {
+		t.Errorf("logRequest should be filtered out; got:\n%s", text)
+	}
+	if !strings.Contains(text, "authenticate") || !strings.Contains(text, "authorize") {
+		t.Errorf("expected authenticate + authorize to survive filter; got:\n%s", text)
+	}
+}
+
 func TestHandleImpact_Rank(t *testing.T) {
 	// rank=true must not panic, must not lose callers, and must keep
 	// the formatted output coherent. Score ordering is exercised
@@ -2487,6 +2582,58 @@ func TestHandleMethods(t *testing.T) {
 	result4, _, _ := s.handleMethods(context.Background(), nil, nameParam{Name: ""})
 	if !strings.Contains(resultText(t, result4), "name is required") {
 		t.Errorf("expected 'name is required' error, got: %q", resultText(t, result4))
+	}
+}
+
+// TestHandleMethods_QueryFilter validates #157: query filters method
+// list to those whose name/doc/signature contains any query token.
+func TestHandleMethods_QueryFilter(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := &server{backend: db}
+
+	mod, _ := db.EnsureModule("example.com/svc", "svc", "")
+	typeDef := &store.Definition{
+		ModuleID: mod.ID, Name: "Server", Kind: "type", Exported: true,
+		Body: "type Server struct{}",
+	}
+	typeDef.Hash = store.HashBody(typeDef.Body)
+	_, _ = db.UpsertDefinition(typeDef)
+	methods := []*store.Definition{
+		{ModuleID: mod.ID, Name: "Start", Kind: "method", Exported: true, Receiver: "*Server",
+			Body: "func (s *Server) Start() {}", Signature: "func (s *Server) Start()",
+			Doc: "// Start binds the listener and blocks."},
+		{ModuleID: mod.ID, Name: "Stop", Kind: "method", Exported: true, Receiver: "*Server",
+			Body: "func (s *Server) Stop() {}", Signature: "func (s *Server) Stop()",
+			Doc: "// Stop shuts down gracefully."},
+		{ModuleID: mod.ID, Name: "Ping", Kind: "method", Exported: true, Receiver: "*Server",
+			Body: "func (s *Server) Ping() error { return nil }", Signature: "func (s *Server) Ping() error",
+			Doc: "// Ping returns nil if healthy."},
+	}
+	for _, m := range methods {
+		m.Hash = store.HashBody(m.Body)
+		_, _ = db.UpsertDefinition(m)
+	}
+
+	// Query "listener" — only Start's doc matches.
+	result, _, err := s.handleMethods(context.Background(), nil,
+		nameParam{Name: "Server", Query: "listener"})
+	if err != nil {
+		t.Fatalf("handleMethods query: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "[query=\"listener\"]") {
+		t.Errorf("expected [query=...] header on filtered listing\n---\n%s", text)
+	}
+	if !strings.Contains(text, "Start") {
+		t.Errorf("expected Start (matches 'listener' in doc)\n---\n%s", text)
+	}
+	if strings.Contains(text, "Ping") {
+		t.Errorf("Ping should NOT appear (no 'listener' match)\n---\n%s", text)
 	}
 }
 

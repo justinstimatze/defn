@@ -906,7 +906,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "overview":
 		return wrapStale(s.handleOverview(ctx, req, args))
 	case "methods":
-		return wrapStale(s.handleMethods(ctx, req, nameParam{Name: args.Name}))
+		return wrapStale(s.handleMethods(ctx, req, nameParam{Name: args.Name, Query: args.Query}))
 	case "patch":
 		return s.handlePatch(ctx, req, args)
 	case "sync":
@@ -975,6 +975,17 @@ func (s *server) handleImpact(_ context.Context, _ *sdkmcp.CallToolRequest, args
 			prodCallers = append(prodCallers, c)
 		}
 	}
+	// #157 query-context: filter callers to those whose name/
+	// receiver/source_file matches any query token. Matching first,
+	// non-matching hidden with a "N others" line.
+	var queryHiddenProd, queryHiddenTest int
+	if strings.TrimSpace(args.Query) != "" {
+		tokens := extractQueryTokensLower(args.Query)
+		if len(tokens) > 0 {
+			prodCallers, queryHiddenProd = filterCallersByQuery(prodCallers, tokens)
+			testCallers, queryHiddenTest = filterCallersByQuery(testCallers, tokens)
+		}
+	}
 	// MDL surprise-first: if the safety-relevant signal is abnormal,
 	// lead with it. A def with production callers but zero test
 	// coverage is the highest-info bit for "is it safe to change?"
@@ -987,7 +998,24 @@ func (s *server) handleImpact(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		sb.WriteString(fmt.Sprintf("⚠ WARNING: %d production callers, 0 tests covering this def. Ship-blocking risk on any semantic change.\n\n",
 			len(prodCallers)))
 	}
-	sb.WriteString(fmt.Sprintf("Direct callers: %d (%d production, %d test)\n", len(impact.DirectCallers), len(prodCallers), len(testCallers)))
+	sb.WriteString(fmt.Sprintf("Direct callers: %d (%d production, %d test)\n", len(impact.DirectCallers), len(prodCallers)+queryHiddenProd, len(testCallers)+queryHiddenTest))
+	if queryHiddenProd+queryHiddenTest > 0 {
+		sb.WriteString(fmt.Sprintf("  filtered by query=%q: %d callers hidden (%d production, %d test)\n",
+			args.Query, queryHiddenProd+queryHiddenTest, queryHiddenProd, queryHiddenTest))
+	}
+	// #156: workspace-aware breakdown. On multi-module trees (winze:
+	// 20 go.mod files under one repo) the model can't see the shape
+	// of the blast without file-path inspection. Group callers by
+	// module path so "10 callers in winze/, 3 in polecats/quartz"
+	// is legible at a glance. Only emitted when callers span >1
+	// module — no noise on single-module projects.
+	if len(impact.DirectCallers) > 0 {
+		if byMod := callerBreakdownByModule(s, impact.DirectCallers, impact.Module); len(byMod) > 1 {
+			sb.WriteString("  by module: ")
+			sb.WriteString(byMod)
+			sb.WriteString("\n")
+		}
+	}
 	for i, c := range prodCallers {
 		if i >= impactCallerCap {
 			sb.WriteString(fmt.Sprintf("  … (%d more production callers omitted; pass format:\"json\" for full list)\n", len(prodCallers)-impactCallerCap))
@@ -1020,6 +1048,143 @@ func (s *server) handleImpact(_ context.Context, _ *sdkmcp.CallToolRequest, args
 }
 
 const impactTestNameCap = 10
+
+// extractQueryTokensLower splits a free-form query into ≥2-char
+// case-folded tokens. Non-identifier chars are separators. Mirror of
+// internal/projection's version but kept inline to avoid exporting.
+// #157.
+func extractQueryTokensLower(query string) []string {
+	if strings.TrimSpace(query) == "" {
+		return nil
+	}
+	low := strings.ToLower(query)
+	var out []string
+	var cur strings.Builder
+	flush := func() {
+		if cur.Len() >= 2 {
+			out = append(out, cur.String())
+		}
+		cur.Reset()
+	}
+	for _, r := range low {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+			cur.WriteRune(r)
+		} else {
+			flush()
+		}
+	}
+	flush()
+	return out
+}
+
+// filterCallersByQuery partitions callers into (matching, hiddenCount)
+// based on whether their name/receiver/source_file contains any
+// query token (case-insensitive substring). Order preserved among
+// matching entries. #157.
+func filterCallersByQuery(callers []store.Definition, tokens []string) ([]store.Definition, int) {
+	if len(tokens) == 0 {
+		return callers, 0
+	}
+	var kept []store.Definition
+	hidden := 0
+	for _, c := range callers {
+		hay := strings.ToLower(c.Name + " " + c.Receiver + " " + c.SourceFile)
+		matched := false
+		for _, t := range tokens {
+			if strings.Contains(hay, t) {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			kept = append(kept, c)
+		} else {
+			hidden++
+		}
+	}
+	return kept, hidden
+}
+
+// callerBreakdownByModule groups callers by their module path and
+// returns a compact "modA (12), modB (3), modC (1)" string, or ""
+// if there's only one module represented (in which case the flat
+// caller list already tells the story). #156.
+//
+// Returns a map of module→count as the string body; callers use
+// len(...) via the returned display string's semicolon count
+// approximation — actually just return the count as a second value.
+func callerBreakdownByModule(s *server, callers []store.Definition, selfModule string) string {
+	if len(callers) == 0 {
+		return ""
+	}
+	mods, err := s.backend.ListModules()
+	if err != nil {
+		return ""
+	}
+	// module_id → path
+	pathByID := make(map[int64]string, len(mods))
+	for _, m := range mods {
+		pathByID[m.ID] = m.Path
+	}
+	// count per module
+	counts := make(map[string]int)
+	for _, c := range callers {
+		p := pathByID[c.ModuleID]
+		if p == "" {
+			p = "(unknown module)"
+		}
+		counts[p]++
+	}
+	// Distinct modules? If only one, and it's the target's own,
+	// caller has no cross-module info — skip.
+	if len(counts) < 2 {
+		return ""
+	}
+	// Sort by count desc, then path asc for stability.
+	type modCount struct {
+		Path  string
+		Count int
+	}
+	entries := make([]modCount, 0, len(counts))
+	for p, c := range counts {
+		entries = append(entries, modCount{p, c})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Count != entries[j].Count {
+			return entries[i].Count > entries[j].Count
+		}
+		return entries[i].Path < entries[j].Path
+	})
+	// Trim overly-long paths for display (keep last 2 segments if long).
+	shorten := func(p string) string {
+		if len(p) < 40 {
+			return p
+		}
+		segs := strings.Split(p, "/")
+		if len(segs) <= 2 {
+			return p
+		}
+		return ".../" + strings.Join(segs[len(segs)-2:], "/")
+	}
+	var out []string
+	const cap = 6
+	for i, e := range entries {
+		if i >= cap {
+			remaining := 0
+			for _, r := range entries[cap:] {
+				remaining += r.Count
+			}
+			out = append(out, fmt.Sprintf("+%d more modules (%d callers)", len(entries)-cap, remaining))
+			break
+		}
+		marker := ""
+		if e.Path == selfModule {
+			marker = "*" // caller is in the target's own module
+		}
+		out = append(out, fmt.Sprintf("%s%s (%d)", marker, shorten(e.Path), e.Count))
+	}
+	return strings.Join(out, ", ")
+}
 
 // testNames returns up to `cap` test names, in the order impact.Tests
 // arrived (which is source-file order). Used by the markdown formatter.
@@ -4938,7 +5103,33 @@ func (s *server) handleMethods(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 		return errResult(fmt.Errorf("methods: no methods found for type %q (check spelling, or try code(op:\"search\", pattern:%q))", name, name))
 	}
 
-	return s.formatMethodList(name, "type", mine, "")
+	// #157 query-context: filter methods by name+doc substring.
+	if strings.TrimSpace(args.Query) != "" {
+		if tokens := extractQueryTokensLower(args.Query); len(tokens) > 0 {
+			mine = filterMethodsByQuery(mine, tokens)
+			if len(mine) == 0 {
+				return errResult(fmt.Errorf("methods: no methods on %q match query=%q (try dropping the query for the full set)", name, args.Query))
+			}
+		}
+	}
+
+	return s.formatMethodList(name, "type", mine, args.Query)
+}
+
+// filterMethodsByQuery keeps only methods whose name or doc contains
+// any query token. Case-insensitive substring match. #157.
+func filterMethodsByQuery(methods []store.Definition, tokens []string) []store.Definition {
+	var out []store.Definition
+	for _, m := range methods {
+		hay := strings.ToLower(m.Name + " " + m.Doc + " " + m.Signature)
+		for _, t := range tokens {
+			if strings.Contains(hay, t) {
+				out = append(out, m)
+				break
+			}
+		}
+	}
+	return out
 }
 
 // methodsFromInterfaceBody handles the interface case: parse the
@@ -4992,7 +5183,7 @@ func (s *server) methodsFromInterfaceBody(d *store.Definition) (*sdkmcp.CallTool
 // formatMethodList renders a method set as compact text: exported
 // group first, then unexported, one line each with signature + first
 // line of doc.
-func (s *server) formatMethodList(typeName, kind string, methods []store.Definition, _ string) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) formatMethodList(typeName, kind string, methods []store.Definition, query string) (*sdkmcp.CallToolResult, any, error) {
 	sort.Slice(methods, func(i, j int) bool {
 		if methods[i].Exported != methods[j].Exported {
 			return methods[i].Exported // exported first
@@ -5014,6 +5205,9 @@ func (s *server) formatMethodList(typeName, kind string, methods []store.Definit
 	}
 	if exp > 0 && unexp > 0 {
 		sb.WriteString(fmt.Sprintf(" (%d exported, %d unexported)", exp, unexp))
+	}
+	if query != "" {
+		sb.WriteString(fmt.Sprintf(" [query=%q]", query))
 	}
 	sb.WriteString("\n\n")
 
