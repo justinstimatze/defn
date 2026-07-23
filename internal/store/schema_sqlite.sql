@@ -192,7 +192,19 @@ CREATE TABLE IF NOT EXISTS defn_meta (
 -- more precomputed columns here as follow-ups (one_line_summary,
 -- ast_kinds_bag, cyclomatic, etc.) without touching definitions.
 CREATE TABLE IF NOT EXISTS def_summaries (
-    def_id  INTEGER PRIMARY KEY,
-    minhash BLOB,
+    def_id            INTEGER PRIMARY KEY,
+    minhash           BLOB,
+    -- #160: model-generated one-line intent summary of the def body.
+    -- NULL when no summary has been generated yet (fire-and-forget
+    -- worker fills these asynchronously after ingest).
+    one_line          TEXT,
+    -- Body hash the summary was generated from. Compare against the
+    -- current body hash on read to detect staleness (edit invalidates
+    -- the summary, worker regenerates).
+    summary_body_hash TEXT,
+    -- Model that generated the summary (e.g. "claude-haiku-4-5-...").
+    -- Provenance for A/B experiments and forced regeneration on model
+    -- upgrade.
+    summary_model     TEXT,
     FOREIGN KEY (def_id) REFERENCES definitions(id) ON DELETE CASCADE
 );

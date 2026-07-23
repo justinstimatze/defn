@@ -39,12 +39,10 @@ var sqliteSchemaSQL string
 // ErrNotImplemented marks Backend methods not yet ported to SQLite.
 var ErrNotImplemented = errors.New("sqlite: not yet implemented")
 
-// Batch sizes for bulk inserts. Kept generous — SQLite parameter limit is
-// 32k, so up to ~500 rows of 14 columns fits comfortably.
 const (
-	upsertDefsBatchSize    = 500
-	setRefsBatchSize       = 1000
-	setLitFieldsBatchSize  = 500
+	setLitFieldsBatchSize = 500
+	setRefsBatchSize      = 1000
+	upsertDefsBatchSize   = 500
 )
 
 // rowScanner is the common Scan surface of *sql.Row and *sql.Rows.
@@ -89,6 +87,14 @@ func OpenSQLite(path string) (*SQLiteDB, error) {
 	if _, err := db.ExecContext(context.Background(), sqliteSchemaSQL); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("sqlite: apply schema: %w", err)
+	}
+
+	// Idempotent ALTER TABLE for existing DBs predating #160 (fresh DBs
+	// already have these columns from the CREATE TABLE above). Must run
+	// before any code touches the new columns.
+	if err := migrateAddSummaryColumns(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("sqlite: migrate: %w", err)
 	}
 
 	// Backfill FTS if this is an existing DB predating the FTS5 addition
@@ -194,8 +200,6 @@ func backfillFTS(db *sql.DB) error {
 	return nil
 }
 
-// --- Lifecycle ---
-
 func (s *SQLiteDB) Close() error {
 	s.closeOnce.Do(func() {
 		s.closeErr = s.db.Close()
@@ -203,10 +207,13 @@ func (s *SQLiteDB) Close() error {
 	return s.closeErr
 }
 
-func (s *SQLiteDB) Path() string                   { return s.path }
+func (s *SQLiteDB) Path() string { return s.path }
+
 func (s *SQLiteDB) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
-func (s *SQLiteDB) Ctx() context.Context           { return context.Background() }
-func (s *SQLiteDB) CleanTempFiles()                {}
+
+func (s *SQLiteDB) Ctx() context.Context { return context.Background() }
+
+func (s *SQLiteDB) CleanTempFiles() {}
 
 func (s *SQLiteDB) Begin() (commit func() error, rollback func(), err error) {
 	tx, err := s.db.BeginTx(context.Background(), nil)
@@ -249,8 +256,6 @@ func (s *SQLiteDB) ComputeRootHash() (string, error) {
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
-
-// --- Modules ---
 
 func (s *SQLiteDB) EnsureModule(path, name, doc string) (*Module, error) {
 	if _, err := s.db.ExecContext(s.Ctx(),
@@ -296,8 +301,6 @@ func (s *SQLiteDB) ListModules() ([]Module, error) {
 	return mods, rows.Err()
 }
 
-// --- Definitions: shared row projection ---
-
 // sqliteFullDefSelect is the 14-column definition projection that
 // scanSQLiteDef expects. Mirrors scanDefRow's column order on the Dolt side.
 const sqliteFullDefSelect = `SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test, COALESCE(d.receiver,''),
@@ -323,8 +326,6 @@ func scanSQLiteDefinitions(rows *sql.Rows) ([]Definition, error) {
 	}
 	return defs, rows.Err()
 }
-
-// --- Definitions: reads ---
 
 func (s *SQLiteDB) GetModuleDefinitions(moduleID int64) ([]Definition, error) {
 	rows, err := s.db.QueryContext(s.Ctx(),
@@ -775,8 +776,6 @@ func (s *SQLiteDB) GetUntested() ([]Definition, error) {
 	return scanSQLiteDefinitions(rows)
 }
 
-// --- Definitions: writes ---
-
 func (s *SQLiteDB) UpsertDefinition(d *Definition) (int64, error) {
 	d.Hash = HashBody(d.Body)
 	ctx := s.Ctx()
@@ -903,6 +902,19 @@ func (s *SQLiteDB) UpsertDefinitionsBulk(defs []*Definition) ([]int64, error) {
 
 	var toInsert []*Definition
 	var toInsertPos []int
+	// pendingByKey guards against a caller passing two Definitions with the
+	// same natural key in one batch. That happens when the ingest layer
+	// enqueues defs from a package variant that shares files with another
+	// variant (packages.Load Tests:true can produce overlapping pkg.Syntax
+	// under some layouts — FilterPackages catches the common case but not
+	// every one). Without this guard the batch INSERT hits the unique
+	// constraint on (module_id, name, kind, receiver, test) and the whole
+	// flush fails. Last-write-wins semantics: the later Definition value
+	// replaces the earlier one in the INSERT, and both input positions
+	// receive the same row ID after the insert.
+	pendingByKey := make(map[natKey]int) // key → index into toInsert
+	type dupPos struct{ inputPos, canonicalToInsertIdx int }
+	var dupes []dupPos
 	for i, d := range defs {
 		if e, ok := existingByKey[keyOf(d)]; ok {
 			ids[i] = e.id
@@ -922,6 +934,15 @@ func (s *SQLiteDB) UpsertDefinitionsBulk(defs []*Definition) ([]int64, error) {
 			}
 			continue
 		}
+		if canonical, ok := pendingByKey[keyOf(d)]; ok {
+			// Later occurrence supersedes: overwrite the canonical slot with
+			// this Definition, remember the earlier input position needs the
+			// canonical row ID copied over.
+			dupes = append(dupes, dupPos{inputPos: i, canonicalToInsertIdx: canonical})
+			toInsert[canonical] = d
+			continue
+		}
+		pendingByKey[keyOf(d)] = len(toInsert)
 		toInsert = append(toInsert, d)
 		toInsertPos = append(toInsertPos, i)
 	}
@@ -990,6 +1011,13 @@ func (s *SQLiteDB) UpsertDefinitionsBulk(defs []*Definition) ([]int64, error) {
 		mhq := "INSERT OR REPLACE INTO def_summaries(def_id, minhash) VALUES " + strings.Join(mhPlaceholders, ",")
 		_, _ = s.db.ExecContext(ctx, mhq, mhArgs...)
 	}
+	// Backfill row IDs for input positions whose natural key was a
+	// duplicate of another in the same batch (see pendingByKey above).
+	// The canonical position received the freshly-assigned id during the
+	// batch loop; duplicates copy from there.
+	for _, dp := range dupes {
+		ids[dp.inputPos] = ids[toInsertPos[dp.canonicalToInsertIdx]]
+	}
 	return ids, nil
 }
 
@@ -1052,8 +1080,6 @@ func (s *SQLiteDB) PruneStaleDefinitions(liveIDs map[int64]bool) (int, error) {
 	}
 	return len(staleIDs), nil
 }
-
-// --- References ---
 
 func (s *SQLiteDB) QueryRefs(fromName, toName, kind string, limit int) ([]Reference, error) {
 	q := `SELECT r.from_def, r.to_def, r.kind
@@ -1596,8 +1622,6 @@ func (s *SQLiteDB) Traverse(startID int64, direction string, refKinds []string, 
 	return results, nil
 }
 
-// --- Imports ---
-
 func (s *SQLiteDB) GetImports(moduleID int64) ([]Import, error) {
 	rows, err := s.db.QueryContext(s.Ctx(),
 		"SELECT module_id, imported_path, COALESCE(alias, '') FROM imports WHERE module_id = ? ORDER BY imported_path",
@@ -1695,8 +1719,6 @@ func (s *SQLiteDB) SetImports(moduleID int64, imports []Import) error {
 	}
 	return nil
 }
-
-// --- LiteralFields ---
 
 func (s *SQLiteDB) QueryLiteralFields(typeName, fieldName, fieldValue string, fieldNames []string, limit int) ([]LiteralField, error) {
 	ctx := s.Ctx()
@@ -1838,8 +1860,6 @@ func (s *SQLiteDB) SetManyLiteralFields(fieldsByDef map[int64][]LiteralField) er
 	return nil
 }
 
-// --- Comments ---
-
 func (s *SQLiteDB) GetCommentsByPragma(pragmaKey string) ([]Comment, error) {
 	ctx := s.Ctx()
 	q := `SELECT c.id, c.def_id, COALESCE(d.name,''), c.source_file, c.line, c.text, c.kind, COALESCE(c.pragma_key,''), COALESCE(c.pragma_value,'')
@@ -1920,8 +1940,6 @@ func (s *SQLiteDB) SetFileComments(sourceFile string, comments []Comment) error 
 	}
 	return nil
 }
-
-// --- File sources ---
 
 func (s *SQLiteDB) SetFileSource(moduleID int64, sourceFile, raw string) error {
 	ctx := s.Ctx()
@@ -2045,8 +2063,6 @@ func (s *SQLiteDB) DeleteFile(sourceFile string) error {
 	return nil
 }
 
-// --- Project files ---
-
 func (s *SQLiteDB) GetProjectFile(path string) (string, error) {
 	var content string
 	err := s.db.QueryRowContext(s.Ctx(),
@@ -2079,8 +2095,6 @@ func (s *SQLiteDB) ListProjectFiles() ([]string, error) {
 	return out, rows.Err()
 }
 
-// --- Meta (key-value) ---
-
 func (s *SQLiteDB) GetMeta(key string) (string, error) {
 	var v string
 	err := s.db.QueryRowContext(s.Ctx(),
@@ -2106,8 +2120,6 @@ func (s *SQLiteDB) SetMeta(key, value string) error {
 	}
 	return nil
 }
-
-// --- Upstream fingerprints ---
 
 func (s *SQLiteDB) InsertUpstreamFingerprint(u UpstreamFingerprint) error {
 	_, err := s.db.ExecContext(s.Ctx(), `
@@ -2201,8 +2213,6 @@ func (s *SQLiteDB) CountUpstreamFingerprints() (int, error) {
 	return n, nil
 }
 
-// --- Ad-hoc SQL ---
-
 // Query is the read-only op:query surface. SQLite doesn't parse SHOW/DESCRIBE
 // (those are MySQL) — we accept SELECT, WITH (CTE), EXPLAIN, and PRAGMA.
 func (s *SQLiteDB) Query(query string) ([]map[string]any, error) {
@@ -2289,5 +2299,27 @@ func (s *SQLiteDB) AllDefSummaryMinHashes() (map[int64][]byte, error) {
 	return out, rows.Err()
 }
 
-// Compile-time assertion: *SQLiteDB satisfies the Backend interface.
-var _ Backend = (*SQLiteDB)(nil)
+// migrateAddSummaryColumns idempotently adds the #160 columns
+// (one_line, summary_body_hash, summary_model) to def_summaries for
+// existing DBs. Fresh DBs already have them from CREATE TABLE; this
+// only matters when opening a DB created before this change.
+//
+// SQLite has no ALTER TABLE ... ADD COLUMN IF NOT EXISTS, so we swallow
+// the "duplicate column name" error on each call. Any other error is
+// fatal.
+func migrateAddSummaryColumns(db *sql.DB) error {
+	stmts := []string{
+		`ALTER TABLE def_summaries ADD COLUMN one_line TEXT`,
+		`ALTER TABLE def_summaries ADD COLUMN summary_body_hash TEXT`,
+		`ALTER TABLE def_summaries ADD COLUMN summary_model TEXT`,
+	}
+	for _, stmt := range stmts {
+		if _, err := db.ExecContext(context.Background(), stmt); err != nil {
+			if strings.Contains(err.Error(), "duplicate column name") {
+				continue
+			}
+			return fmt.Errorf("migrate summary columns: %w", err)
+		}
+	}
+	return nil
+}

@@ -4,6 +4,8 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+
+	_ "modernc.org/sqlite"
 )
 
 // TestSQLiteSmoke exercises the Phase 1 milestone-1 surface end-to-end:
@@ -176,13 +178,13 @@ func TestSearchDefinitions_FTS5Trigram(t *testing.T) {
 		query   string
 		wantHit string // one name we expect in the result set
 	}{
-		{"handleEdit", "handleEdit"},        // full identifier
-		{"handle", "handleEdit"},            // camelCase prefix (unicode61 misses this)
-		{"Edit", "handleEdit"},              // camelCase suffix
-		{"handle_snake", "handle_snake"},    // underscore literal (Chunk C bug)
-		{"snake", "handle_snake"},           // substring across snake_case
-		{"pkg.Method", "PkgMethod"},         // dotted path in doc comment
-		{"authentication", "Authenticate"},  // doc comment substring
+		{"handleEdit", "handleEdit"},         // full identifier
+		{"handle", "handleEdit"},             // camelCase prefix (unicode61 misses this)
+		{"Edit", "handleEdit"},               // camelCase suffix
+		{"handle_snake", "handle_snake"},     // underscore literal (Chunk C bug)
+		{"snake", "handle_snake"},            // substring across snake_case
+		{"pkg.Method", "PkgMethod"},          // dotted path in doc comment
+		{"authentication", "Authenticate"},   // doc comment substring
 		{"CamelCase", "CamelCaseIdentifier"}, // camelCase middle
 	}
 	for _, tc := range cases {
@@ -288,5 +290,62 @@ func TestSearchDefinitions_FTSBackfill(t *testing.T) {
 	}
 	if len(defs) == 0 {
 		t.Error("backfill did not populate FTS (search for existing body returned 0)")
+	}
+}
+
+// TestUpsertDefinitionsBulk_WithinBatchDuplicate exercises the guard
+// added in this change: when the caller passes two Definitions with
+// the same natural key (module_id, name, kind, receiver, test) in one
+// batch, the bulk INSERT must NOT hit the unique constraint. The
+// caller-visible contract is last-write-wins, and both input positions
+// receive the same row ID.
+//
+// The pre-fix failure was "duplicate unique key given: [modID,Name,
+// kind,,0]" from the SQLite driver — surfaced whenever the ingest
+// layer's package variants overlapped and enqueued shared files' defs
+// twice within one flushDefs call.
+func TestUpsertDefinitionsBulk_WithinBatchDuplicate(t *testing.T) {
+	dir := t.TempDir()
+	db, err := OpenSQLite(filepath.Join(dir, "defn.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	mod, err := db.EnsureModule("example.com/dup", "dup", "")
+	if err != nil {
+		t.Fatalf("EnsureModule: %v", err)
+	}
+
+	// Two Definitions sharing the natural key (mod.ID, "Target", "type",
+	// "", false). Different bodies so we can verify last-write-wins.
+	first := &Definition{
+		ModuleID: mod.ID, Name: "Target", Kind: "type",
+		Body: "type Target struct{ A int }",
+	}
+	second := &Definition{
+		ModuleID: mod.ID, Name: "Target", Kind: "type",
+		Body: "type Target struct{ B int }", // last-write-wins expects this
+	}
+	ids, err := db.UpsertDefinitionsBulk([]*Definition{first, second})
+	if err != nil {
+		t.Fatalf("UpsertDefinitionsBulk with within-batch duplicate: %v", err)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("ids len: got %d, want 2", len(ids))
+	}
+	if ids[0] != ids[1] {
+		t.Errorf("duplicate natural key must yield same row id: got ids[0]=%d ids[1]=%d",
+			ids[0], ids[1])
+	}
+	if ids[0] == 0 {
+		t.Errorf("row id must be assigned, got 0")
+	}
+	got, err := db.GetDefinition(ids[0])
+	if err != nil || got == nil {
+		t.Fatalf("GetDefinition(%d): %v (nil=%v)", ids[0], err, got == nil)
+	}
+	if got.Body != second.Body {
+		t.Errorf("last-write-wins violated: body=%q, want %q", got.Body, second.Body)
 	}
 }
