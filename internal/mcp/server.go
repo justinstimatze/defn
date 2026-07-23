@@ -2402,6 +2402,17 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		return s.handleCreateMultiDecl(args)
 	}
 
+	// Scaffold-file case: body is `package X` + imports (or comments)
+	// with no user-defined decls yet. Route to the file_sources-only
+	// path so callers can seed a new file before adding decls to it.
+	// Requires file: — without it there's no target to write.
+	if isImportsOnlyBody(args.Body) {
+		if args.File == "" {
+			return errResult(fmt.Errorf("body has no top-level declarations (imports only) — pass file: to scaffold a new file, or add a func/type/const/var body"))
+		}
+		return s.handleCreateScaffoldFile(args)
+	}
+
 	// Infer name, kind, and test flag from the body.
 	name, kind, receiver, isTest := s.inferFromBody(args.Body)
 	if name == "" {
@@ -6151,4 +6162,96 @@ func (s *server) autoEmitAndBuildForCreate(sourceFile string, addNames []string)
 		TouchedFiles:   []string{sourceFile},
 		AllowedAdds:    addNames,
 	})
+}
+
+// isImportsOnlyBody reports whether the body parses as a valid Go
+// file with zero user-defined decls (funcs/types/consts/vars) and
+// zero or more import blocks. Used by handleCreate to route
+// "scaffold this new file with just package + imports" through a
+// separate no-def path instead of erroring on "couldn't infer name".
+// Comment-only and package-only bodies also count — the intent is
+// the same: create the file, defs will land in future calls.
+func isImportsOnlyBody(body string) bool {
+	src := "package x\n" + stripLeadingPackageDecl(strings.TrimSpace(body))
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	if err != nil {
+		return false
+	}
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.IMPORT {
+			return false
+		}
+	}
+	return true
+}
+
+// handleCreateScaffoldFile authors an imports-only (or package-only /
+// comment-only) file when handleCreate detects a body with no
+// user-defined decls. The body is stored verbatim in file_sources so
+// emit reproduces it byte-for-byte; on the next full sync any decls
+// added by future ops will replace it. Requires args.File to be set —
+// with no file target there's nowhere to write.
+//
+// Package name is derived from the body's `package X` declaration if
+// present, else from the directory containing args.File. Module is
+// resolved the same way as handleCreate (file → module → fallback to
+// shortest-path).
+func (s *server) handleCreateScaffoldFile(args createParam) (*sdkmcp.CallToolResult, any, error) {
+	// Ensure the body has a package clause; if the caller wrote just
+	// imports without one, prepend `package X` derived from the target
+	// dir. Anything below the package clause stays verbatim.
+	body := strings.TrimSpace(args.Body)
+	pkgName := ""
+	if strings.HasPrefix(body, "package ") {
+		nl := strings.IndexByte(body, '\n')
+		if nl < 0 {
+			nl = len(body)
+		}
+		pkgName = strings.TrimSpace(strings.TrimPrefix(body[:nl], "package "))
+	}
+	if pkgName == "" {
+		pkgName = filepath.Base(filepath.Dir(args.File))
+		body = "package " + pkgName + "\n\n" + body
+	}
+	if !strings.HasSuffix(body, "\n") {
+		body += "\n"
+	}
+
+	// Resolve module by file, then by explicit --module, then shortest
+	// path. Same as handleCreateMultiDecl's new-package fallback.
+	mod := s.findModuleByFile(args.File)
+	if mod == nil && args.Module != "" {
+		mod = s.findModule(args.Module)
+	}
+	if mod == nil {
+		mods, _ := s.backend.ListModules()
+		for i := range mods {
+			if mod == nil || len(mods[i].Path) < len(mod.Path) {
+				mod = &mods[i]
+			}
+		}
+	}
+	if mod == nil {
+		return errResult(fmt.Errorf("no modules found — run defn ingest first, or pass module: explicitly"))
+	}
+
+	if err := s.backend.SetFileSource(mod.ID, args.File, body); err != nil {
+		return errResult(fmt.Errorf("write file source: %w", err))
+	}
+
+	// Emit + goimports the touched file. No defs changed, but the
+	// file_sources row is the emit-side truth so a scoped emit lands
+	// this content on disk. Skip build gate — no def graph changed.
+	buildResult := s.autoEmitOnly(args.File)
+	if buildResult == "" {
+		buildResult = "ok"
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Scaffolded %s (%s) — %d bytes, no defs yet\n", args.File, mod.Path, len(body)))
+	sb.WriteString("emit: " + strings.ToLower(strings.SplitN(buildResult, "\n", 2)[0]) + "\n")
+	sb.WriteString("_add defs with follow-up `code(op:\"create\", file:\"" + args.File + "\", body:\"...\")` calls._\n")
+	return textResult(sb.String()), nil, nil
 }

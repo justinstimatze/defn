@@ -1604,8 +1604,11 @@ func (r *RateLimiter) Allow(req *http.Request) bool {
 	}
 }
 
-// If the body contains ONLY an import block (no code decls), sliceDecls
-// must error out with a helpful message rather than silently succeeding.
+// TestHandleCreateScaffoldsImportsOnlyBody: imports-only body with
+// file: set is a valid scaffold — writes the file to file_sources
+// so subsequent create ops can append decls into it. Prior behavior
+// (error) blocked a common real workflow (author a new package by
+// seeding the file first, then filling defs).
 func TestHandleCreateMultiDeclImportsOnlyFails(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
@@ -1623,9 +1626,11 @@ import (
 		File: "middleware/ratelimit.go",
 	})
 	text := resultText(t, result)
-	if !strings.Contains(text, "no top-level declarations found") &&
-		!strings.Contains(text, "couldn't infer definition name") {
-		t.Fatalf("expected error about no decls, got: %s", text)
+	if !strings.Contains(text, "Scaffolded") {
+		t.Fatalf("expected scaffold success, got: %s", text)
+	}
+	if !strings.Contains(text, "middleware/ratelimit.go") {
+		t.Fatalf("scaffold response should mention target file, got: %s", text)
 	}
 }
 
