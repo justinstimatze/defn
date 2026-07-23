@@ -141,40 +141,34 @@ func cmdInit(modulePath string) {
 	fmt.Fprintln(os.Stderr, "start a new AI coding session in this directory to use defn.")
 }
 
+// defnClaudeMDSection returns the sentinel-bracketed defn block
+// written into a project's CLAUDE.md by init/ingest. Sentinel markers
+// let re-invocation replace this block in place. Content is
+// deliberately assertive: the chi-explore bench (#168) measured that
+// a passive "here's a tool" framing produced 0 defn calls per
+// session, while a "use this, not Read/Bash/Grep for Go" framing
+// produced 30-45 defn calls and 18% cost savings vs files-mode.
 func defnClaudeMDSection() string {
 	return `<!-- defn:begin -->
-## Code Navigation and Editing
+## Go code: use defn, not Read/Bash/Grep/Edit
 
-**The database is authoritative. Files are an I/O projection.** This project
-is indexed in defn. For **Go code**, use the ` + "`code`" + ` MCP tool — **not**
-Read, Edit, Write, or Grep. Reserve those built-in tools for non-Go files
-(YAML, JSON, Markdown, shell, ` + "`go.mod`" + `).
+This project is indexed in defn (` + "`.defn/`" + `). For any ` + "`.go`" + ` file, use the ` + "`code`" + ` MCP tool — **not** Read, Bash, Grep, or Edit. Those built-ins are reserved for non-Go files (yaml, json, md, sh, ` + "`go.mod`" + `, Dockerfile).
 
-` + "```" + `
-code(op: "read", name: "handleEdit")           -- full source by name
-code(op: "read", name: "server.go:272")        -- or by file:line
-code(op: "read", name: "chi.Mux.ServeHTTP", full: true) -- force body when def is upstream-tagged
-code(op: "expand", name: "F", include: ["body","callers"]) -- body + callers in one call (kills read→impact→read)
-code(op: "impact", name: "Render")             -- blast radius + test coverage
-code(op: "edit", name: "Foo", new_body: "...") -- edit, auto-emit + build
-code(op: "search", pattern: "%Auth%")          -- name pattern (% wildcard)
-code(op: "search", pattern: "authentication")  -- body text search
-code(op: "test", name: "Render")               -- run affected tests only
-` + "```" + `
+**Do not ` + "`ls`" + ` and ` + "`Read`" + ` files by hand.** Start any Go task with ` + "`code(op:\"overview\")`" + ` to see the project shape, then drill in with ` + "`search`" + ` / ` + "`outline`" + ` / ` + "`impact`" + `. Read a whole body only when you're about to edit it.
 
-All ops: read, expand, search, impact, explain, untested, edit, create, delete, rename, move, test, apply, diff, history, find, sync, query, overview, patch.
+### By intent
 
-### Why defn for Go, not Read/Edit/Grep
+- **Explore**: ` + "`code(op:\"overview\")`" + `, ` + "`code(op:\"outline\", name:\"F\")`" + `, ` + "`code(op:\"search\", pattern:\"...\")`" + `, ` + "`code(op:\"impact\", name:\"F\")`" + `
+- **Read a def**: ` + "`code(op:\"read\", name:\"F\")`" + ` — one function/type/method by name; much cheaper than Read + scroll. Add ` + "`full:true`" + ` to force the body when defn returns an upstream provenance tag.
+- **Multi-file understanding**: ` + "`code(op:\"expand\", name:\"F\", include:[\"body\",\"callers\"])`" + ` in ONE call instead of read → impact → read.
+- **Edit a def**: ` + "`code(op:\"edit\", name:\"F\", new_body:\"...\")`" + `, ` + "`code(op:\"rename\", name:\"F\", new_name:\"G\")`" + ` — updates every reference across the repo atomically. ` + "`Edit`" + ` on a ` + "`.go`" + ` file leaves defn's graph stale.
+- **New def / whole file**: ` + "`code(op:\"create\", name:\"F\", file:\"pkg/x.go\", body:\"...\")`" + `.
+- **Batch changes**: ` + "`code(op:\"apply\", operations:[...])`" + ` — atomic, one emit+build for the whole batch.
+- **Test**: ` + "`code(op:\"test\", name:\"F\")`" + ` — runs only tests covering that def, not the whole suite.
 
-- ` + "`code(op:\"read\")`" + ` returns a whole definition by name — no line-number guessing, no reading a file to find one function.
-- ` + "`code(op:\"edit\")`" + ` updates one definition, emits the file, and rebuilds the reference graph in one call. A raw file Edit leaves defn's graph stale until a ` + "`sync`" + `.
-- ` + "`code(op:\"rename\")`" + ` / ` + "`move`" + ` update every reference and import site across the repo in one call — many fragile Edits otherwise.
-- ` + "`code(op:\"impact\")`" + ` gives callers + transitive blast radius + test coverage before you touch anything.
-- ` + "`code(op:\"read\")`" + ` on a symbol from a well-known library (chi, gin, etc.) returns a compact provenance tag instead of the body when the local copy matches a tagged upstream release — signature + doc + version, no body. Pass ` + "`full: true`" + ` to see the body.
+### Rule of thumb
 
-If you do edit a ` + "`.go`" + ` file with a built-in tool, call ` + "`code(op:\"sync\", file:\"path\")`" + ` afterward so the graph stays correct.
-
-**Rule of thumb:** run ` + "`impact`" + ` before modifying an existing definition; skip it for brand-new ones.
+Run ` + "`code(op:\"impact\", name:\"F\")`" + ` before modifying an existing def; skip it for brand-new ones. If you must edit a ` + "`.go`" + ` file with a built-in tool, follow up with ` + "`code(op:\"sync\", file:\"path\")`" + ` so the graph stays correct.
 <!-- defn:end -->
 `
 }
