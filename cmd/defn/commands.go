@@ -144,31 +144,35 @@ func cmdInit(modulePath string) {
 // defnClaudeMDSection returns the sentinel-bracketed defn block
 // written into a project's CLAUDE.md by init/ingest. Sentinel markers
 // let re-invocation replace this block in place. Content is
-// deliberately assertive: the chi-explore bench (#168) measured that
-// a passive "here's a tool" framing produced 0 defn calls per
-// session, while a "use this, not Read/Bash/Grep for Go" framing
-// produced 30-45 defn calls and 18% cost savings vs files-mode.
+// deliberately assertive: chi-explore gap-decomp (#170) showed that
+// each byte of accumulated tool_output costs ~30-50 tokens of
+// downstream cache_read, so making outline the default reflex — not
+// read — is the single biggest cost lever.
 func defnClaudeMDSection() string {
 	return `<!-- defn:begin -->
 ## Go code: use defn, not Read/Bash/Grep/Edit
 
 This project is indexed in defn (` + "`.defn/`" + `). For any ` + "`.go`" + ` file, use the ` + "`code`" + ` MCP tool — **not** Read, Bash, Grep, or Edit. Those built-ins are reserved for non-Go files (yaml, json, md, sh, ` + "`go.mod`" + `, Dockerfile).
 
-**Do not ` + "`ls`" + ` and ` + "`Read`" + ` files by hand.** Start any Go task with ` + "`code(op:\"overview\")`" + ` to see the project shape, then drill in with ` + "`search`" + ` / ` + "`outline`" + ` / ` + "`impact`" + `. Read a whole body only when you're about to edit it.
+**Do not ` + "`ls`" + ` and ` + "`Read`" + ` files by hand.** Start any Go task with ` + "`code(op:\"overview\")`" + ` to see the project shape, then drill in with ` + "`search`" + ` / ` + "`outline`" + ` / ` + "`impact`" + `.
+
+**Reach for ` + "`outline`" + ` before ` + "`read`" + `.** ` + "`outline`" + ` returns the signature, doc, refs, and control-flow of a def — 5-10× smaller than the full body. It's enough to answer almost every "what does X do / how does Y work / where does Z fit" question. Only escalate to ` + "`read`" + ` (full body) when you're about to edit the def, or when outline was genuinely insufficient. A follow-up ` + "`read`" + ` costs nothing you haven't already committed to.
 
 ### By intent
 
-- **Explore**: ` + "`code(op:\"overview\")`" + `, ` + "`code(op:\"outline\", name:\"F\")`" + `, ` + "`code(op:\"search\", pattern:\"...\")`" + `, ` + "`code(op:\"impact\", name:\"F\")`" + `
-- **Read a def**: ` + "`code(op:\"read\", name:\"F\")`" + ` — one function/type/method by name; much cheaper than Read + scroll. Add ` + "`full:true`" + ` to force the body when defn returns an upstream provenance tag.
-- **Multi-file understanding**: ` + "`code(op:\"expand\", name:\"F\", include:[\"body\",\"callers\"])`" + ` in ONE call instead of read → impact → read.
+- **Explore / understand**: ` + "`code(op:\"overview\")`" + `, ` + "`code(op:\"outline\", name:\"F\")`" + `, ` + "`code(op:\"search\", pattern:\"...\")`" + `, ` + "`code(op:\"impact\", name:\"F\")`" + `. These answer most Go questions on their own.
+- **Saturate context in one call**: ` + "`code(op:\"expand\", name:\"F\", include:[\"outline\",\"callers\",\"refs\"])`" + ` — one round-trip instead of read → impact → read. Prefer ` + "`expand`" + ` over multiple sequential ` + "`code`" + ` calls whenever you'd otherwise chain them.
+- **Read the full body**: ` + "`code(op:\"read\", name:\"F\")`" + ` — use when you're about to edit the def, or when ` + "`outline`" + ` was insufficient (you need to see how the branches actually flow). Add ` + "`full:true`" + ` to force the body when defn returns an upstream provenance tag.
 - **Edit a def**: ` + "`code(op:\"edit\", name:\"F\", new_body:\"...\")`" + `, ` + "`code(op:\"rename\", name:\"F\", new_name:\"G\")`" + ` — updates every reference across the repo atomically. ` + "`Edit`" + ` on a ` + "`.go`" + ` file leaves defn's graph stale.
 - **New def / whole file**: ` + "`code(op:\"create\", name:\"F\", file:\"pkg/x.go\", body:\"...\")`" + `.
 - **Batch changes**: ` + "`code(op:\"apply\", operations:[...])`" + ` — atomic, one emit+build for the whole batch.
 - **Test**: ` + "`code(op:\"test\", name:\"F\")`" + ` — runs only tests covering that def, not the whole suite.
 
-### Rule of thumb
+### Rules of thumb
 
-Run ` + "`code(op:\"impact\", name:\"F\")`" + ` before modifying an existing def; skip it for brand-new ones. If you must edit a ` + "`.go`" + ` file with a built-in tool, follow up with ` + "`code(op:\"sync\", file:\"path\")`" + ` so the graph stays correct.
+- **outline first, read only if you're editing** (or if outline genuinely wasn't enough — but check first). This is the single biggest lever for session cost.
+- Run ` + "`code(op:\"impact\", name:\"F\")`" + ` before modifying an existing def; skip it for brand-new ones.
+- If you must edit a ` + "`.go`" + ` file with a built-in tool, follow up with ` + "`code(op:\"sync\", file:\"path\")`" + ` so the graph stays correct.
 <!-- defn:end -->
 `
 }
