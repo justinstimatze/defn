@@ -2455,7 +2455,7 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		return errResult(err)
 	}
 
-	buildResult := s.autoEmitAndBuildForFile(args.File)
+	buildResult := s.autoEmitAndBuildForCreate(args.File, []string{name})
 	s.autoResolveFile(args.File, mod.Path)
 
 	var sb strings.Builder
@@ -2681,7 +2681,11 @@ func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult
 		return errResult(fmt.Errorf("commit: %v", err))
 	}
 
-	buildResult := s.autoEmitAndBuildForFile(args.File)
+	addNames := make([]string, len(decls))
+	for i, d := range decls {
+		addNames[i] = d.Name
+	}
+	buildResult := s.autoEmitAndBuildForCreate(args.File, addNames)
 	s.autoResolveFile(args.File, mod.Path)
 
 	var sb strings.Builder
@@ -2872,6 +2876,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	touchedFiles := map[string]bool{}
 	resolveSet := map[filePkg]bool{}
 	var allowedRemovals []string
+	var allowedAdds []string
 	addTouched := func(f string) {
 		if f != "" {
 			touchedFiles[f] = true
@@ -2971,6 +2976,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			} else {
 				addTouched(op.File)
 				addResolve(op.File, mod.ID)
+				allowedAdds = append(allowedAdds, name)
 				sb.WriteString(fmt.Sprintf("+ created %s (id=%d)\n", name, id))
 			}
 
@@ -3220,13 +3226,14 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	// tracking came up empty (every op had empty SourceFile, edge case),
 	// fall back to full autoEmitAndBuild + autoResolve for correctness.
 	var buildResult string
-	if len(touchedFiles) > 0 || len(allowedRemovals) > 0 {
+	if len(touchedFiles) > 0 || len(allowedRemovals) > 0 || len(allowedAdds) > 0 {
 		goimportsFiles := make([]string, 0, len(touchedFiles))
 		for f := range touchedFiles {
 			goimportsFiles = append(goimportsFiles, f)
 		}
 		buildResult = s.autoEmitAndBuildWithOpts(emit.Opts{
 			AllowedRemovals: allowedRemovals,
+			AllowedAdds:     allowedAdds,
 			GoimportsFiles:  goimportsFiles,
 			TouchedFiles:    goimportsFiles,
 		})
@@ -6110,4 +6117,22 @@ func (s *server) handleResummarize(_ context.Context, _ *sdkmcp.CallToolRequest,
 		sb.WriteString("\n_note: ANTHROPIC_API_KEY is not set — the Stub backend is generating\n\"TODO: <Name>\" placeholders that the read path treats as no summary.\nSet ANTHROPIC_API_KEY (Haiku 4.5) for real summaries; see #160._\n")
 	}
 	return textResult(sb.String()), nil, nil
+}
+
+// autoEmitAndBuildForCreate is the create-op variant of
+// autoEmitAndBuildForFile: same file-scoping, PLUS Opts.AllowedAdds
+// tells mergeDeclsIntoSource that the named defs are intentional
+// new additions (not drift), so it may splice them in place instead
+// of falling through to full regeneration. Preserves floating
+// comments in files that already had existing decls plus a
+// code(op:"create") added a new one. #162.
+func (s *server) autoEmitAndBuildForCreate(sourceFile string, addNames []string) string {
+	if sourceFile == "" {
+		return s.autoEmitAndBuild()
+	}
+	return s.autoEmitAndBuildWithOpts(emit.Opts{
+		GoimportsFiles: []string{sourceFile},
+		TouchedFiles:   []string{sourceFile},
+		AllowedAdds:    addNames,
+	})
 }

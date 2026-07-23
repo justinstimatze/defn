@@ -1360,3 +1360,71 @@ func TestEmitSingleModulePreservesSourceFilePath(t *testing.T) {
 	}
 }
 
+// TestMergeDeclsIntoSource_PreservesFloatingCommentsOnNewDefAdd is the
+// regression test for #162. When a new def is added to a file whose
+// existing source has floating (blank-line-separated) comments between
+// top-level decls, those comments must survive the merge. Prior
+// behavior: any unmatched want (i.e., new-def add) forced fall-through
+// to full-file regen, which discarded floating comments. Fix: merge
+// splices existing decls in place AND appends new-def bodies at end
+// of file, so floating-comment byte positions between existing decls
+// are outside every replacement range and survive intact.
+//
+// This reproduces the exact shape hit three times in the #160 arc
+// (searchShapedSQLRedirects / outlineCalleeCap / impactCallerCap):
+// a floating comment sits above a var/const block, and a new
+// unrelated function is added via `code op:create`.
+func TestMergeDeclsIntoSource_PreservesFloatingCommentsOnNewDefAdd(t *testing.T) {
+	existing := []byte(`package p
+
+// FloatingDocForVarBlock describes what the following block is for,
+// separated from it by a blank line so parser.ParseComments leaves it
+// in f.Comments rather than attaching it as VarBlock's Doc.
+var (
+	X = 1
+	Y = 2
+)
+
+// FloatingDocForConstBlock — same shape, different kind.
+const (
+	A = "a"
+	B = "b"
+)
+
+func Existing() int { return X + Y }
+`)
+
+	// One existing def (Existing) with an updated body, plus one NEW
+	// def (New) with no on-disk counterpart. Before the fix, the New
+	// addition triggered regen and dropped both floating comments.
+	defs := []store.Definition{
+		{Name: "Existing", Kind: "function", Body: "func Existing() int {\n\treturn X + Y + 1\n}"},
+		{Name: "New", Kind: "function", Body: "// New was added via code op:create.\nfunc New() string { return \"new\" }"},
+	}
+
+	merged, ok := mergeDeclsIntoSource(existing, defs, nil, []string{"New"})
+	if !ok {
+		t.Fatalf("mergeDeclsIntoSource returned ok=false (expected true — fix should handle new-def add without falling through to regen)")
+	}
+	got := string(merged)
+
+	// Floating comments must survive.
+	for _, want := range []string{
+		"FloatingDocForVarBlock describes what the following block is for",
+		"FloatingDocForConstBlock — same shape",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("floating comment lost: %q not in merged output", want)
+		}
+	}
+
+	// Existing def's new body was patched.
+	if !strings.Contains(got, "return X + Y + 1") {
+		t.Errorf("Existing body not patched: merged does not contain updated body")
+	}
+
+	// New def appended.
+	if !strings.Contains(got, "func New() string") {
+		t.Errorf("New def not appended to merged output")
+	}
+}

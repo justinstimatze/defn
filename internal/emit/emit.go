@@ -41,6 +41,17 @@ type Opts struct {
 	// topLevelDeclNames on the pre-emit file bytes.
 	AllowedRemovals []string
 
+	// AllowedAdds whitelists top-level decl names that the AST-merge path
+	// is permitted to append to disk when they exist in the DB but not on
+	// disk. Symmetric with AllowedRemovals — expresses caller intent for
+	// a code(op:"create") so mergeDeclsIntoSource can splice the new def
+	// in place, preserving floating comments and layout, instead of
+	// falling through to full-file regeneration (which loses them, per
+	// #162). Names without an on-disk counterpart AND without a matching
+	// AllowedAdds entry are treated as drift signals and force the merge
+	// to bail — same fail-safe as before this option existed.
+	AllowedAdds []string
+
 	// GoimportsFiles optionally restricts goimports's scope to a specific
 	// set of files (module-relative paths under outDir). Empty (default)
 	// runs `goimports -w outDir` recursively — the whole tree. Non-empty
@@ -160,7 +171,7 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, er
 
 	var writtenFiles []writtenFile
 	for _, mod := range modules {
-		locs, written, err := emitModule(db, &mod, outDir, moduleRoot, opts.AllowedRemovals, touchedSet)
+		locs, written, err := emitModule(db, &mod, outDir, moduleRoot, opts.AllowedRemovals, opts.AllowedAdds, touchedSet)
 		if err != nil {
 			return nil, fmt.Errorf("emit %s: %w", mod.Path, err)
 		}
@@ -323,7 +334,7 @@ type writtenFile struct {
 	SourceFile string // project-relative; empty means don't refresh file_sources
 }
 
-func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, allowedRemovals []string, touchedSet map[string]bool) ([]DefLocation, []writtenFile, error) {
+func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, allowedRemovals, allowedAdds []string, touchedSet map[string]bool) ([]DefLocation, []writtenFile, error) {
 	scoped := len(touchedSet) > 0
 	defs, err := db.GetModuleDefinitions(mod.ID)
 	if err != nil {
@@ -527,7 +538,7 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 		if file == docTarget {
 			pkgDoc = mod.Doc
 		}
-		locs, err := writeFile(path, mod.Name, mod.Path, pkgDoc, imports, byFile[file], rawByFile[file], allowedRemovals)
+		locs, err := writeFile(path, mod.Name, mod.Path, pkgDoc, imports, byFile[file], rawByFile[file], allowedRemovals, allowedAdds)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -542,7 +553,7 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 	return allLocs, written, nil
 }
 
-func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import, defs []store.Definition, rawFromDB []byte, allowedRemovals []string) ([]DefLocation, error) {
+func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import, defs []store.Definition, rawFromDB []byte, allowedRemovals, allowedAdds []string) ([]DefLocation, error) {
 	// Pick the merge base. Prefer disk when it exists and parses: a
 	// user's built-in Edit lands on disk before file_sources knows about
 	// it (built-in tools bypass defn's sync), so disk is the post-Edit
@@ -567,7 +578,7 @@ func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import,
 	// everything defn's schema doesn't represent (package doc, build
 	// constraints, per-file imports, init() names, floating comments).
 	if len(existingSrc) > 0 {
-		if merged, ok := mergeDeclsIntoSource(existingSrc, defs, allowedRemovals); ok {
+		if merged, ok := mergeDeclsIntoSource(existingSrc, defs, allowedRemovals, allowedAdds); ok {
 			wrote, lost, err := safeWriteGoFile(path, merged, allowedRemovals)
 			if err != nil {
 				return nil, err
@@ -911,7 +922,7 @@ func groupKeyword(d store.Definition) string {
 // Ok=false means the caller should fall back to regenerating — the
 // source doesn't parse, the result after splicing doesn't parse, or
 // nothing in defs matched an on-disk decl.
-func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemovals []string) ([]byte, bool) {
+func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemovals, allowedAdds []string) ([]byte, bool) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "", existing, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
@@ -1000,12 +1011,14 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 				reps = append(reps, replacement{s, e, ""})
 				continue
 			}
-			body, ok := wantFuncs[funcIdentity(d.Name.Name, recv)]
+			ident := funcIdentity(d.Name.Name, recv)
+			body, ok := wantFuncs[ident]
 			if !ok {
 				continue
 			}
 			s, e := declRange(d.Pos(), d.End(), d.Doc, true)
 			reps = append(reps, replacement{s, e, body})
+			delete(wantFuncs, ident)
 		case *ast.GenDecl:
 			// Whole-decl removal via allowedRemovals: matches on the
 			// first spec name (same key as whole-decl replacement).
@@ -1026,6 +1039,7 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 				if body, ok := wantGrouped[name]; ok {
 					sp, ep := declRange(d.Pos(), d.End(), d.Doc, true)
 					reps = append(reps, replacement{sp, ep, body})
+					delete(wantGrouped, name)
 					continue
 				}
 			}
@@ -1047,6 +1061,7 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 						sp, ep := declRange(d.Pos(), d.End(), d.Doc, true)
 						reps = append(reps, replacement{sp, ep, body})
 					}
+					delete(wantTypes, s.Name.Name)
 				case *ast.ValueSpec:
 					// Multi-name specs (var a, b = 1, 2) share a single
 					// DB def under the first name; partial patching
@@ -1074,6 +1089,12 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 						sp, ep := declRange(d.Pos(), d.End(), d.Doc, true)
 						reps = append(reps, replacement{sp, ep, body})
 					}
+					switch d.Tok {
+					case token.CONST:
+						delete(wantConsts, name)
+					case token.VAR:
+						delete(wantVars, name)
+					}
 				}
 			}
 		}
@@ -1093,13 +1114,61 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 		}
 	}
 
-	// If any DB def has no on-disk counterpart to patch, fall through
-	// to regeneration. Merge can only *replace* existing decls — it has
-	// no path to *add* missing ones. A newly-created DB def would be
-	// silently dropped if we kept merging here. Regeneration rebuilds
-	// from the full def set and safeWriteGoFile's check still prevents
-	// losing any on-disk decls that aren't tracked in the database.
-	if nonRemovalReps < totalWants {
+	// #162 fix: when the DB has NEW defs with no on-disk counterpart,
+	// AND the caller explicitly declared them via Opts.AllowedAdds,
+	// append their bodies at end of file instead of falling through to
+	// full regeneration. Regen rebuilds from defs alone and drops
+	// floating (blank-line-separated) comments between top-level decls;
+	// the append path leaves the interior byte layout untouched so
+	// those comments survive.
+	//
+	// The AllowedAdds gate mirrors AllowedRemovals — only whitelisted
+	// names count as intentional adds. Un-whitelisted unmatched wants
+	// are drift signals (external file edit, stale DB) and still fall
+	// through to regen + safeWriteGoFile's data-loss check.
+	allowAdd := make(map[string]bool, len(allowedAdds))
+	for _, n := range allowedAdds {
+		allowAdd[n] = true
+	}
+	var appendBodies []string
+	for name, body := range wantFuncs {
+		if allowAdd[name] {
+			appendBodies = append(appendBodies, body)
+			delete(wantFuncs, name)
+		}
+	}
+	for name, body := range wantTypes {
+		if allowAdd[name] {
+			appendBodies = append(appendBodies, body)
+			delete(wantTypes, name)
+		}
+	}
+	for name, body := range wantConsts {
+		if allowAdd[name] {
+			appendBodies = append(appendBodies, body)
+			delete(wantConsts, name)
+		}
+	}
+	for name, body := range wantVars {
+		if allowAdd[name] {
+			appendBodies = append(appendBodies, body)
+			delete(wantVars, name)
+		}
+	}
+	for name, body := range wantGrouped {
+		if allowAdd[name] {
+			appendBodies = append(appendBodies, body)
+			delete(wantGrouped, name)
+		}
+	}
+	// Deterministic order so successive emits are stable.
+	sort.Strings(appendBodies)
+
+	// After allowlist filtering, anything still in the want* maps is
+	// unmatched AND not declared as an intentional add. That's the
+	// drift signal — bail so writeFile falls through to regenerate
+	// and safeWriteGoFile catches the data-loss case.
+	if len(wantFuncs)+len(wantTypes)+len(wantConsts)+len(wantVars)+len(wantGrouped) > 0 {
 		return nil, false
 	}
 
@@ -1118,6 +1187,25 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 		buf.WriteString(r.body)
 		buf.Write(result[r.end:])
 		result = buf.Bytes()
+	}
+
+	// Append new-def bodies at end of file. Each body already ends
+	// with the trailing newline that renderNode emits; sandwich a
+	// blank line between existing content and the appends so they
+	// don't collide with the last on-disk decl's trailing comment.
+	if len(appendBodies) > 0 {
+		var tail bytes.Buffer
+		if len(result) > 0 && result[len(result)-1] != '\n' {
+			tail.WriteByte('\n')
+		}
+		for _, body := range appendBodies {
+			tail.WriteByte('\n')
+			tail.WriteString(body)
+			if !strings.HasSuffix(body, "\n") {
+				tail.WriteByte('\n')
+			}
+		}
+		result = append(result, tail.Bytes()...)
 	}
 
 	// Validate the spliced result parses. DB bodies are trusted, but a
