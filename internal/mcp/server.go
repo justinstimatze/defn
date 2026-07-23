@@ -39,6 +39,15 @@ import (
 
 const maxSearchResults = 20
 
+// #159: search inline-preview knobs. Set searchPreviewCount to 0 to
+// disable previews entirely (fallback if a workload proves they inflate
+// tokens). 3-hits × 5-lines was chosen from the Multi-SWE-bench Go
+// corpus: 867 grep→view bigrams collapse into one call if the top hit's
+// body head is inline, and the model rarely reads beyond the top-3
+// results of a targeted search.
+const searchPreviewCount = 3
+const searchPreviewLines = 5
+
 // Version is the running defn build's semver string. Kept as a package
 // constant so the CLI can compare its own version against what a
 // running serve reports via the /version HTTP endpoint, surfacing
@@ -1514,15 +1523,23 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		Name     string `json:"name"`
 		Kind     string `json:"kind"`
 		Receiver string `json:"receiver,omitempty"`
+		Preview  string `json:"preview,omitempty"`
 	}
 	var results []summary
 	for _, d := range defs {
 		if len(results) >= limit {
 			break
 		}
-		results = append(results, summary{
-			Name: d.Name, Kind: d.Kind, Receiver: d.Receiver,
-		})
+		// #159: inline body preview for the top-N hits collapses the
+		// grep→view bigram (867 occurrences in the Multi-SWE-bench Go
+		// corpus). Cap at 3 previews per response so it doesn't inflate
+		// on name-browse queries; cap each preview at 5 lines. Model can
+		// still call read for the full body.
+		s := summary{Name: d.Name, Kind: d.Kind, Receiver: d.Receiver}
+		if len(results) < searchPreviewCount {
+			s.Preview = topLinesOfBody(d.Body, searchPreviewLines)
+		}
+		results = append(results, s)
 	}
 	truncated := ""
 	if len(defs) > limit {
@@ -1536,6 +1553,21 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		text += truncated
 	}
 	return textResult(text), nil, nil
+}
+
+// topLinesOfBody returns the first n lines of body with a "…" marker
+// appended if the body was truncated. Empty body → empty string.
+// Used by handleSearch (#159) to give each top hit a body preview so
+// the model doesn't need a follow-up read on the winning result.
+func topLinesOfBody(body string, n int) string {
+	if body == "" || n <= 0 {
+		return ""
+	}
+	lines := strings.SplitN(body, "\n", n+1)
+	if len(lines) <= n {
+		return body
+	}
+	return strings.Join(lines[:n], "\n") + "\n…"
 }
 
 // bodyScanResult formats stage-3 search results (substring-in-body hits)
@@ -1645,16 +1677,23 @@ func (s *server) rankedSearchResult(query string, defs []store.Definition, limit
 		Kind     string  `json:"kind"`
 		Receiver string  `json:"receiver,omitempty"`
 		Score    float64 `json:"score"`
+		Preview  string  `json:"preview,omitempty"`
 	}
 	out := make([]rankedSummary, 0, limit)
 	for i, r := range scored {
 		if i >= limit {
 			break
 		}
-		out = append(out, rankedSummary{
+		rs := rankedSummary{
 			Name: r.Def.Name, Kind: r.Def.Kind, Receiver: r.Def.Receiver,
 			Score: r.Score,
-		})
+		}
+		// #159: preview the top-N ranked hits — model can identify the
+		// winner from body head without a follow-up read.
+		if i < searchPreviewCount {
+			rs.Preview = topLinesOfBody(r.Def.Body, searchPreviewLines)
+		}
+		out = append(out, rs)
 	}
 	text, err := toJSON(out)
 	if err != nil {
