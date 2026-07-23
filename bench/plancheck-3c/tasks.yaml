@@ -1,0 +1,342 @@
+# plancheck-3c task fixtures — mined from git log via mine-tasks.sh.
+# Each task: subject line of a merged commit as the objective, changed
+# non-test Go files (1-4) as ground truth. Ground truth = files that
+# a correct plan should have declared it would read/modify/create.
+
+tasks:
+- id: 2d3cecd
+  repo: .
+  objective: '#163 fix: skip unmatched-and-not-allowed wants instead of bailing to regen'
+  ground_truth_files:
+  - internal/emit/emit.go
+  - internal/mcp/server.go
+  difficulty: unknown
+- id: dab2333
+  repo: .
+  objective: "mcp: allow imports-only body in code(op:\"create\") \u2014 scaffold new file"
+  ground_truth_files:
+  - internal/mcp/server.go
+  difficulty: unknown
+- id: 8dad125
+  repo: .
+  objective: '#160 stage 3b: enqueue summaries on rename/move/create/delete write paths'
+  ground_truth_files:
+  - internal/mcp/server.go
+  - internal/mcp/tools_extra.go
+  difficulty: unknown
+- id: '2595835'
+  repo: .
+  objective: "emit: Opts.AllowedAdds \u2014 splice new defs in place, preserve floating comments (#162)"
+  ground_truth_files:
+  - internal/emit/emit.go
+  - internal/mcp/server.go
+  difficulty: unknown
+- id: bdb1bc5
+  repo: .
+  objective: '#160 stage 3a: code(op:"resummarize") backfill op'
+  ground_truth_files:
+  - internal/mcp/server.go
+  - internal/store/backend.go
+  - internal/store/sqlite.go
+  difficulty: unknown
+- id: 8aaf8e1
+  repo: .
+  objective: '#160 stage 2: Haiku backend + enqueue on writes + large-body preamble nudge'
+  ground_truth_files:
+  - internal/mcp/server.go
+  - internal/summary/haiku.go
+  difficulty: unknown
+- id: a290980
+  repo: .
+  objective: 'store: within-batch dedup in UpsertDefinitionsBulk (dogfood fix) + #160 schema groundwork'
+  ground_truth_files:
+  - internal/store/sqlite.go
+  difficulty: unknown
+- id: 355ce30
+  repo: .
+  objective: 'mcp: inline body preview on top-N search hits (#159)'
+  ground_truth_files:
+  - internal/mcp/server.go
+  difficulty: unknown
+- id: b379b09
+  repo: .
+  objective: 'mcp: apply-batching hint on serial mutations to one file (#158)'
+  ground_truth_files:
+  - internal/mcp/mutation_hint.go
+  - internal/mcp/server.go
+  difficulty: unknown
+- id: db929d4
+  repo: .
+  objective: "mcp: finish #157 \u2014 query-context on outline + overview"
+  ground_truth_files:
+  - internal/mcp/server.go
+  difficulty: unknown
+- id: 1c6198c
+  repo: .
+  objective: 'mcp: workspace-aware impact + query-context on impact/methods (#156 + #157)'
+  ground_truth_files:
+  - internal/mcp/server.go
+  difficulty: unknown
+- id: 6d6daf4
+  repo: .
+  objective: "mcp: MDL surprise-first in handleImpact (#155 \u2014 item 1 of info-theory ship)"
+  ground_truth_files:
+  - internal/mcp/server.go
+  difficulty: unknown
+- id: e25fc4e
+  repo: .
+  objective: "mcp: reachability cache \u2014 batch-impact O(N) via in-memory BFS (#154)"
+  ground_truth_files:
+  - internal/mcp/reach_cache.go
+  - internal/mcp/server.go
+  difficulty: unknown
+- id: 598035a
+  repo: .
+  objective: "mcp+projection: query-adaptive read (#153) \u2014 top-5 complete"
+  ground_truth_files:
+  - internal/mcp/server.go
+  - internal/projection/query_filter.go
+  difficulty: unknown
+- id: c35a7a3
+  repo: .
+  objective: "mcp: session-aware read-response dedup \u2014 extended scope (#152)"
+  ground_truth_files:
+  - internal/mcp/dedup.go
+  - internal/mcp/server.go
+  difficulty: unknown
+- id: 140baa7
+  repo: .
+  objective: 'store: def_summaries + MinHash-32 for `similar` v2 (#151)'
+  ground_truth_files:
+  - internal/mcp/server.go
+  - internal/store/backend.go
+  - internal/store/minhash.go
+  - internal/store/sqlite.go
+  difficulty: unknown
+- id: b553d12
+  repo: .
+  objective: 'mcp: defer autoResolveFile for sig-stable edits (#150)'
+  ground_truth_files:
+  - internal/mcp/server.go
+  difficulty: unknown
+- id: 8b5640a
+  repo: .
+  objective: "store: recursive-CTE impact \u2014 one SQL round-trip for transitive callers (#149)"
+  ground_truth_files:
+  - internal/store/sqlite.go
+  difficulty: unknown
+- id: cb281ca
+  repo: .
+  objective: "mcp: code(op:\"methods\") \u2014 compact method-group projection (#79)"
+  ground_truth_files:
+  - internal/mcp/server.go
+  difficulty: unknown
+- id: b97fac7
+  repo: .
+  objective: 'mcp: skip go build after safe mutations (#148)'
+  ground_truth_files:
+  - internal/mcp/server.go
+  difficulty: unknown
+- id: adbdde5
+  repo: .
+  objective: 'store: FTS5 trigram search over doc+body (task #137)'
+  ground_truth_files:
+  - internal/mcp/server.go
+  - internal/store/sqlite.go
+  difficulty: unknown
+- id: 95947dc
+  repo: .
+  objective: 'cli: measure-rename/edit copy DB to scratch (safety fix)'
+  ground_truth_files:
+  - cmd/defn/commands.go
+  difficulty: unknown
+- id: e9344a8
+  repo: .
+  objective: 'cli: strip Dolt-server management (Phase 4 cleanup)'
+  ground_truth_files:
+  - cmd/defn/commands.go
+  - cmd/defn/main.go
+  difficulty: unknown
+- id: 530f3dc
+  repo: .
+  objective: 'store: delete Category A methods from *DB (Phase 4 chunk B)'
+  ground_truth_files:
+  - internal/ingest/ingest.go
+  - internal/resolve/resolve.go
+  - internal/store/store.go
+  difficulty: unknown
+- id: f3c0089
+  repo: .
+  objective: 'defn-test+mcp tests: strip remaining Category A calls (Phase 4 chunk A)'
+  ground_truth_files:
+  - cmd/defn-test/main.go
+  - cmd/defn-test/selfhost.go
+  - cmd/defn-test/workflows.go
+  difficulty: unknown
+- id: 5a5bece
+  repo: .
+  objective: 'mcp: switch remaining s.dolt.X calls in tools_extra.go to s.backend'
+  ground_truth_files:
+  - internal/mcp/tools_extra.go
+  difficulty: unknown
+- id: f24ee27
+  repo: .
+  objective: 'cli+mcp: delete Category A callers (Phase 4 chunk A)'
+  ground_truth_files:
+  - cmd/defn/commands.go
+  - cmd/defn/main.go
+  - internal/mcp/server.go
+  - internal/mcp/tools_extra.go
+  difficulty: unknown
+- id: b164961
+  repo: .
+  objective: 'store: OpenBackend defaults to SQLite (Phase 3 default flip)'
+  ground_truth_files:
+  - internal/store/open.go
+  difficulty: unknown
+- id: b6a8774
+  repo: .
+  objective: 'store: DEFN_BACKEND env flag for backend A/B (Phase 2)'
+  ground_truth_files:
+  - internal/store/open.go
+  difficulty: unknown
+- id: ba618f7
+  repo: .
+  objective: 'store: SQLite backend method surface complete (Phase 1 milestone 2)'
+  ground_truth_files:
+  - internal/store/sqlite.go
+  difficulty: unknown
+- id: 8dd9f5e
+  repo: .
+  objective: 'store: SQLite backend scaffold (Phase 1 milestone 1)'
+  ground_truth_files:
+  - internal/store/sqlite.go
+  difficulty: unknown
+- id: 5bc1296
+  repo: .
+  objective: 'mcp: split server.db into backend + dolt fields (Phase 0)'
+  ground_truth_files:
+  - internal/mcp/ranking.go
+  - internal/mcp/server.go
+  - internal/mcp/tools_extra.go
+  difficulty: unknown
+- id: 99af909
+  repo: .
+  objective: 'emit/resolve/ingest: depend on store.Backend, not *store.DB (Phase 0)'
+  ground_truth_files:
+  - internal/emit/emit.go
+  - internal/ingest/ingest_file.go
+  - internal/ingest/ingest.go
+  - internal/resolve/resolve.go
+  difficulty: unknown
+- id: cb683d2
+  repo: .
+  objective: 'store: introduce Backend interface alongside *DB (Phase 0 milestone 1)'
+  ground_truth_files:
+  - internal/store/backend.go
+  difficulty: unknown
+- id: 5a27843
+  repo: .
+  objective: 'resolve: collapse BinaryExpr string-literal chains to prose'
+  ground_truth_files:
+  - internal/resolve/resolve.go
+  difficulty: unknown
+- id: 575b4c5
+  repo: .
+  objective: 'store+resolve: proactive per-row batch audit + flush timer split'
+  ground_truth_files:
+  - internal/resolve/resolve.go
+  - internal/store/store.go
+  difficulty: unknown
+- id: 6fe1a1d
+  repo: .
+  objective: 'ingest: DEFN_SYNC_TIMING per-phase split (winze methodology ask)'
+  ground_truth_files:
+  - cmd/defn/commands.go
+  - internal/ingest/ingest.go
+  difficulty: unknown
+- id: ca8548b
+  repo: .
+  objective: 'store+ingest: batched UpsertDefinition (#125 winze 30x ingest lever)'
+  ground_truth_files:
+  - internal/ingest/ingest_file.go
+  - internal/ingest/ingest.go
+  - internal/store/store.go
+  difficulty: unknown
+- id: 5ca9305
+  repo: .
+  objective: 'store: unwrap TextStorage in generic Query + large-body test (#123)'
+  ground_truth_files:
+  - internal/store/store.go
+  difficulty: unknown
+- id: 1ddfec9
+  repo: .
+  objective: 'docs: measure-rename/edit + Opts.TouchedFiles + perf-measurement section (#122)'
+  ground_truth_files:
+  - cmd/defn/main.go
+  difficulty: unknown
+- id: 0b40836
+  repo: .
+  objective: 'emit: use source_file as authoritative output path (#120)'
+  ground_truth_files:
+  - internal/emit/emit.go
+  difficulty: unknown
+- id: 2ab7c43
+  repo: .
+  objective: 'mcp: distinguish not-found from real getter errors (#116)'
+  ground_truth_files:
+  - internal/mcp/server.go
+  difficulty: unknown
+- id: 71d4726
+  repo: .
+  objective: 'emit: two #117 followup fixes surfaced by local measure-rename'
+  ground_truth_files:
+  - internal/emit/emit.go
+  difficulty: unknown
+- id: 48d6886
+  repo: .
+  objective: 'defn: --in-place flag on measure-rename/edit (#119)'
+  ground_truth_files:
+  - cmd/defn/commands.go
+  - cmd/defn/main.go
+  difficulty: unknown
+- id: 5ed1272
+  repo: .
+  objective: 'mcp: package-scoped go build for scoped-emit callers (#118)'
+  ground_truth_files:
+  - internal/mcp/server.go
+  difficulty: unknown
+- id: 742cd04
+  repo: .
+  objective: 'emit: file-scoped emit (#117) + product-rule doc'
+  ground_truth_files:
+  - internal/emit/emit.go
+  - internal/mcp/server.go
+  difficulty: unknown
+- id: f8e6a04
+  repo: .
+  objective: 'store: full textCol audit + AST-based lint test (#113)'
+  ground_truth_files:
+  - internal/store/store.go
+  difficulty: unknown
+- id: '7249424'
+  repo: .
+  objective: 'defn: measure-edit CLI symmetric to measure-rename (#115)'
+  ground_truth_files:
+  - cmd/defn/commands.go
+  - cmd/defn/main.go
+  - internal/mcp/server.go
+  difficulty: unknown
+- id: 8d13962
+  repo: .
+  objective: 'mcp: scope handleApply emit+resolve to touched files (#114)'
+  ground_truth_files:
+  - internal/mcp/server.go
+  difficulty: unknown
+- id: 72d0a04
+  repo: .
+  objective: 'store+cmd: textCol audit for all raw-text scan sites + measure-rename safety'
+  ground_truth_files:
+  - cmd/defn/commands.go
+  - internal/store/store.go
+  difficulty: unknown
