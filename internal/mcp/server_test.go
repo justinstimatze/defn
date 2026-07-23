@@ -555,6 +555,96 @@ func TestHandleRead(t *testing.T) {
 	// footer only.
 }
 
+// TestHandleRead_QueryAdaptive locks in the #153 wire-through: a
+// read with a non-empty query filters top-level body statements to
+// those touching the query, and annotates the response.
+func TestHandleRead_QueryAdaptive(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := &server{backend: db}
+
+	mod, _ := db.EnsureModule("example.com/svc", "svc", "")
+	// Body needs to be substantial — the query-adaptive filter has a
+	// net-savings gate: hint header (~140 bytes) must be cheaper than
+	// the elided bytes, else the filter no-ops. This body is 700+
+	// bytes with 5 distinct branches so filtering pays off.
+	body := `func handleRequest(w http.ResponseWriter, r *http.Request) {
+	if !authenticated(r) {
+		w.Header().Set("WWW-Authenticate", "Bearer realm=\"api\"")
+		w.WriteHeader(401)
+		w.Write([]byte("{\"error\":\"unauthorized\"}"))
+		return
+	}
+	if r.Method == "POST" {
+		body, err := io.ReadAll(r.Body)
+		if err != nil { http.Error(w, err.Error(), 500); return }
+		handlePost(w, r, body)
+		return
+	}
+	if r.Method == "GET" {
+		handleGet(w, r)
+		w.Header().Set("Cache-Control", "no-store")
+		return
+	}
+	if r.Method == "DELETE" {
+		if err := checkAdmin(r); err != nil { http.Error(w, err.Error(), 403); return }
+		handleDelete(w, r)
+		return
+	}
+	w.Header().Set("Allow", "GET, POST, DELETE")
+	w.WriteHeader(405)
+	w.Write([]byte("method not allowed"))
+}`
+	d := &store.Definition{
+		ModuleID: mod.ID, Name: "handleRequest", Kind: "function",
+		Exported: false, Body: body, Signature: "func handleRequest(w http.ResponseWriter, r *http.Request)",
+	}
+	d.Hash = store.HashBody(d.Body)
+	if _, err := db.UpsertDefinition(d); err != nil {
+		t.Fatal(err)
+	}
+
+	// Full read: everything present.
+	full, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "handleRequest"})
+	fullTxt := resultText(t, full)
+	for _, tok := range []string{"401", "POST", "GET", "405"} {
+		if !strings.Contains(fullTxt, tok) {
+			t.Errorf("full read missing %q", tok)
+		}
+	}
+
+	// Query-adaptive read for "401": only the auth branch survives.
+	q, _, _ := s.handleGetDefinition(context.Background(), nil,
+		nameParam{Name: "handleRequest", Query: "401"})
+	qTxt := resultText(t, q)
+	if !strings.Contains(qTxt, "401") {
+		t.Errorf("query-adaptive read should retain the 401 branch\n---\n%s", qTxt)
+	}
+	for _, dropped := range []string{"handlePost(", "handleGet(", "405"} {
+		if strings.Contains(qTxt, dropped) {
+			t.Errorf("query-adaptive read should NOT contain %q\n---\n%s", dropped, qTxt)
+		}
+	}
+	if !strings.Contains(qTxt, "query-adaptive read") {
+		t.Errorf("expected query-adaptive header hint\n---\n%s", qTxt)
+	}
+	if len(qTxt) >= len(fullTxt) {
+		t.Errorf("query-adaptive should be smaller: got %d, full %d", len(qTxt), len(fullTxt))
+	}
+
+	// Query that matches nothing → no elision (all-match path returns
+	// full body). Also: still no hint header.
+	noMatch, _, _ := s.handleGetDefinition(context.Background(), nil,
+		nameParam{Name: "handleRequest", Query: "zzznonexistent"})
+	if strings.Contains(resultText(t, noMatch), "query-adaptive read") {
+		t.Errorf("no-match query should skip hint header (all elided → falls back to full body)")
+	}
+}
+
 // L10: not-found errors should attach a "Did you mean" list drawn from
 // name-LIKE candidates so the model can retry without a round-trip.
 func TestNotFoundResult_SuggestsClosest(t *testing.T) {

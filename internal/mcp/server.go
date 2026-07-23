@@ -361,6 +361,7 @@ type codeParam struct {
 	Include     []string         `json:"include,omitempty"` // expand op: which graph hops to fold in
 	Test        string           `json:"test,omitempty"`    // L11: op:test named-test reproduction (`-run <regex>` verbatim)
 	Field       string           `json:"field,omitempty"`   // retarget-field-value: composite-literal field name
+	Query       string           `json:"query,omitempty"`   // #153: query-adaptive read — keep only body branches touching the query
 }
 
 type applyOp struct {
@@ -404,6 +405,11 @@ type nameParam struct {
 	// caller-count refusal). Ignored by ops that don't have a safety
 	// gate. Default false — safe delete refuses on any references.
 	Force bool `json:"force,omitempty"`
+	// Query, when non-empty, activates #153 query-adaptive read:
+	// return only body statements whose source contains any token
+	// from the query. Elided runs collapse to a single comment stub.
+	// No-op if the body has <2 statements or all statements match.
+	Query string `json:"query,omitempty"`
 }
 
 type editParam struct {
@@ -823,7 +829,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 
 	switch args.Op {
 	case "read":
-		return wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name, Full: args.Full}))
+		return wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name, Full: args.Full, Query: args.Query}))
 	case "read-and-verify":
 		return wrapStale(s.handleReadAndVerify(ctx, req, args))
 	case "retarget-field-value":
@@ -1160,15 +1166,42 @@ func (s *server) handleGetDefinition(_ context.Context, _ *sdkmcp.CallToolReques
 		}
 	}
 
+	// #153: query-adaptive read. When args.Query is set, filter body
+	// statements to those containing any query token. Elided statements
+	// collapse to a single "…" comment; runs of elided stmts share one
+	// stub. No-op when body has <2 stmts, all match, nothing matches,
+	// or the hint header would exceed the byte savings.
+	body := d.Body
+	var queryHint string
+	if strings.TrimSpace(args.Query) != "" {
+		filtered, kept, elided := projection.FilterBodyByQuery(d.Body, args.Query)
+		if elided > 0 && kept > 0 {
+			candidateHint := fmt.Sprintf(
+				"[query-adaptive read: query=%q, %d/%d statements kept, %d elided. Pass query=\"\" for the full body.]\n\n",
+				args.Query, kept, kept+elided, elided,
+			)
+			// Only apply when the filter is a net win — the hint
+			// header costs ~140 bytes; on tiny bodies it can dwarf
+			// the elision savings.
+			if len(filtered)+len(candidateHint) < len(d.Body) {
+				body = filtered
+				queryHint = candidateHint
+			}
+		}
+	}
+
 	var sb strings.Builder
 	recv := formatReceiver(d.Receiver)
 	sb.WriteString(fmt.Sprintf("## %s%s (%s)\n", recv, d.Name, d.Kind))
 	sb.WriteString(fmt.Sprintf("Module: %s\n\n", modulePath))
+	if queryHint != "" {
+		sb.WriteString(queryHint)
+	}
 	if d.Doc != "" {
 		sb.WriteString(d.Doc + "\n\n")
 	}
 	sb.WriteString("```go\n")
-	sb.WriteString(d.Body)
+	sb.WriteString(body)
 	sb.WriteString("\n```\n")
 
 	out := sb.String()
