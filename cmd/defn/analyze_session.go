@@ -14,6 +14,16 @@ import (
 // turnMetrics captures the cost and tool-use signal for a single
 // claude -p turn as parsed from a stream-json file. Populated by
 // parseTurnStreamJSON.
+//
+// #183 batch-efficiency additions: DefnOpsByName histograms the `op`
+// values inside mcp__defn__code calls (read/outline/expand/apply/...)
+// so we can see whether the model actually uses expand/apply or just
+// chains sequential reads. ApplyBatchSizes tracks how many ops each
+// apply call bundled — a large mean means the model is genuinely
+// batching, a mean near 1 means apply is misused. SequentialReadChainMax
+// is the longest run of consecutive read-family calls with no batch or
+// non-defn tool interspersed — a high value flags adoption failure
+// even when read counts look reasonable.
 type turnMetrics struct {
 	Turn                     int            `json:"turn"`
 	CacheCreationInputTokens int            `json:"cache_creation_input_tokens"`
@@ -24,6 +34,11 @@ type turnMetrics struct {
 	ToolOutputBytes          int            `json:"tool_output_bytes"`
 	ToolCallsByName          map[string]int `json:"tool_calls_by_name"`
 	DurationMS               int            `json:"duration_ms"`
+
+	// #183 batch-efficiency signal.
+	DefnOpsByName          map[string]int `json:"defn_ops_by_name,omitempty"`
+	ApplyBatchSizes        []int          `json:"apply_batch_sizes,omitempty"`
+	SequentialReadChainMax int            `json:"sequential_read_chain_max,omitempty"`
 }
 
 // analyzeArm is one arm of a session-cumulative bench ("files" or
@@ -57,6 +72,10 @@ func analyzeIntField(m map[string]any, k string) int {
 // from user.content[].type == "tool_result" content. Usage totals
 // come from the terminal result event, NOT from summing per-iteration
 // assistant.usage events (those carry deltas that would double-count).
+//
+// #183: also inspects mcp__defn__code call inputs to build a defn-op
+// histogram, capture per-apply batch sizes, and compute the longest
+// run of consecutive read-family calls (adoption-failure signal).
 func parseTurnStreamJSON(path string) (turnMetrics, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -64,7 +83,15 @@ func parseTurnStreamJSON(path string) (turnMetrics, error) {
 	}
 	defer f.Close()
 
-	m := turnMetrics{ToolCallsByName: map[string]int{}}
+	m := turnMetrics{ToolCallsByName: map[string]int{}, DefnOpsByName: map[string]int{}}
+	// #183 sequential-read chain: track streak length across the ordered
+	// tool_use blocks of THIS turn. Reset on any non-read-family call.
+	// Read family = read/read-file/outline/expand/impact/search/overview.
+	readFamily := map[string]bool{
+		"read": true, "read-file": true, "outline": true, "expand": true,
+		"impact": true, "search": true, "overview": true,
+	}
+	curStreak := 0
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 1<<20), 1<<24)
 	for scanner.Scan() {
@@ -78,10 +105,31 @@ func parseTurnStreamJSON(path string) (turnMetrics, error) {
 			content, _ := msg["content"].([]any)
 			for _, c := range content {
 				cb, _ := c.(map[string]any)
-				if cb["type"] == "tool_use" {
-					name, _ := cb["name"].(string)
-					m.ToolCallCount++
-					m.ToolCallsByName[name]++
+				if cb["type"] != "tool_use" {
+					continue
+				}
+				name, _ := cb["name"].(string)
+				m.ToolCallCount++
+				m.ToolCallsByName[name]++
+				var defnOp string
+				if name == "mcp__defn__code" {
+					inp, _ := cb["input"].(map[string]any)
+					defnOp, _ = inp["op"].(string)
+					if defnOp != "" {
+						m.DefnOpsByName[defnOp]++
+					}
+					if defnOp == "apply" {
+						ops, _ := inp["operations"].([]any)
+						m.ApplyBatchSizes = append(m.ApplyBatchSizes, len(ops))
+					}
+				}
+				if name == "mcp__defn__code" && readFamily[defnOp] {
+					curStreak++
+					if curStreak > m.SequentialReadChainMax {
+						m.SequentialReadChainMax = curStreak
+					}
+				} else {
+					curStreak = 0
 				}
 			}
 		case "user":
@@ -147,7 +195,10 @@ func loadArm(name, dir string) (analyzeArm, error) {
 	if err != nil {
 		return analyzeArm{}, err
 	}
-	arm := analyzeArm{Name: name, Path: dir, Totals: turnMetrics{ToolCallsByName: map[string]int{}}}
+	arm := analyzeArm{Name: name, Path: dir, Totals: turnMetrics{
+		ToolCallsByName: map[string]int{},
+		DefnOpsByName:   map[string]int{},
+	}}
 	var turnFiles []string
 	for _, e := range entries {
 		if e.IsDir() {
@@ -176,13 +227,22 @@ func loadArm(name, dir string) (analyzeArm, error) {
 		for k, v := range m.ToolCallsByName {
 			arm.Totals.ToolCallsByName[k] += v
 		}
+		for k, v := range m.DefnOpsByName {
+			arm.Totals.DefnOpsByName[k] += v
+		}
+		arm.Totals.ApplyBatchSizes = append(arm.Totals.ApplyBatchSizes, m.ApplyBatchSizes...)
+		if m.SequentialReadChainMax > arm.Totals.SequentialReadChainMax {
+			arm.Totals.SequentialReadChainMax = m.SequentialReadChainMax
+		}
 	}
 	return arm, nil
 }
 
 // renderMarkdownReport writes an at-a-glance summary followed by a
-// per-arm per-turn table and tool-call breakdown. Format designed to
-// paste into gap-decomp memos.
+// per-arm per-turn table, tool-call breakdown, and (#183) batch-
+// efficiency KPIs so adoption failures ("35 defn calls, 0 apply
+// calls, sequential-read chain of 12") jump out visually.
+// Format designed to paste into gap-decomp memos.
 func renderMarkdownReport(w io.Writer, arms []analyzeArm) {
 	fmt.Fprintln(w, "# analyze-session")
 	fmt.Fprintln(w)
@@ -232,6 +292,7 @@ func renderMarkdownReport(w io.Writer, arms []analyzeArm) {
 				fmt.Fprintf(w, "- %s × %d\n", p.K, p.V)
 			}
 		}
+		renderBatchEfficiency(w, a)
 	}
 }
 
@@ -339,4 +400,51 @@ func discoverArms(dir string) ([]analyzeArm, error) {
 	}
 	sort.Slice(arms, func(i, j int) bool { return arms[i].Name < arms[j].Name })
 	return arms, nil
+}
+
+// renderBatchEfficiency emits the #183 batch-efficiency KPIs for one
+// arm: defn op histogram, apply batch stats, longest sequential-read
+// chain. Suppressed for arms that never called mcp__defn__code so the
+// files baseline stays clean.
+func renderBatchEfficiency(w io.Writer, a analyzeArm) {
+	if len(a.Totals.DefnOpsByName) == 0 && a.Totals.SequentialReadChainMax == 0 && len(a.Totals.ApplyBatchSizes) == 0 {
+		return
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "batch efficiency (#183):")
+	if len(a.Totals.DefnOpsByName) > 0 {
+		type kv struct {
+			K string
+			V int
+		}
+		var pairs []kv
+		for k, v := range a.Totals.DefnOpsByName {
+			pairs = append(pairs, kv{k, v})
+		}
+		sort.Slice(pairs, func(i, j int) bool { return pairs[i].V > pairs[j].V })
+		parts := make([]string, 0, len(pairs))
+		for _, p := range pairs {
+			parts = append(parts, fmt.Sprintf("%s×%d", p.K, p.V))
+		}
+		fmt.Fprintf(w, "- defn ops: %s\n", strings.Join(parts, ", "))
+	}
+	fmt.Fprintf(w, "- apply calls: %d", len(a.Totals.ApplyBatchSizes))
+	if len(a.Totals.ApplyBatchSizes) > 0 {
+		sum := 0
+		maxBatch := 0
+		for _, n := range a.Totals.ApplyBatchSizes {
+			sum += n
+			if n > maxBatch {
+				maxBatch = n
+			}
+		}
+		mean := float64(sum) / float64(len(a.Totals.ApplyBatchSizes))
+		fmt.Fprintf(w, " (mean batch=%.1f, max=%d, total ops batched=%d)", mean, maxBatch, sum)
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "- longest sequential-read chain: %d", a.Totals.SequentialReadChainMax)
+	if a.Totals.SequentialReadChainMax >= 5 {
+		fmt.Fprintf(w, " ⚠ adoption failure — expand/apply would collapse this")
+	}
+	fmt.Fprintln(w)
 }
