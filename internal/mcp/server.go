@@ -3586,23 +3586,84 @@ func (s *server) handleSimilar(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
-	if d.Signature == "" {
-		return errResult(fmt.Errorf("definition %q has no signature", args.Name))
+
+	// #151 v2: MinHash-based body similarity, not sig-token overlap.
+	// The prior sig-only implementation ("defs with the same param
+	// types") missed the more useful question — "defs whose BODIES
+	// do similar work." MinHash-32 approximates Jaccard of 5-char
+	// body shingles; sub-linear-friendly (though we scan naively at
+	// defn's scale — LSH later if needed).
+	//
+	// Falls back to the old sig-token search when the target def has
+	// no body (kind=type/interface/const with no source text to hash)
+	// or the summaries table is empty (upgrade race).
+	summaries, err := s.backend.AllDefSummaryMinHashes()
+	if err != nil || len(summaries) == 0 || len(d.Body) < 8 {
+		return s.handleSimilarBySignature(d)
+	}
+	target, ok := summaries[d.ID]
+	if !ok {
+		// Not yet computed for this def; compute on the fly and
+		// backfill for future queries.
+		target = store.ComputeMinHash(d.Body)
+		_ = s.backend.SetDefSummaryMinHash(d.ID, target)
 	}
 
-	// Find definitions with similar signatures by searching for shared type tokens.
-	// Extract type names from the signature (e.g., "func Foo(ctx context.Context, id int) error"
-	// → search for "context.Context" and "error").
+	type scored struct {
+		id    int64
+		score float64
+	}
+	scores := make([]scored, 0, len(summaries))
+	for id, mh := range summaries {
+		if id == d.ID {
+			continue
+		}
+		if j := store.MinHashJaccard(target, mh); j > 0.15 {
+			scores = append(scores, scored{id, j})
+		}
+	}
+	sort.Slice(scores, func(i, j int) bool { return scores[i].score > scores[j].score })
+	if len(scores) > 20 {
+		scores = scores[:20]
+	}
+	if len(scores) == 0 {
+		return textResult(fmt.Sprintf("No definitions structurally similar to %s (MinHash Jaccard > 0.15 on 5-char body shingles).", args.Name)), nil, nil
+	}
+
+	type match struct {
+		Name       string  `json:"name"`
+		Kind       string  `json:"kind"`
+		Receiver   string  `json:"receiver,omitempty"`
+		Signature  string  `json:"signature"`
+		Similarity float64 `json:"similarity"`
+	}
+	matches := make([]match, 0, len(scores))
+	for _, sc := range scores {
+		def, err := s.backend.GetDefinition(sc.id)
+		if err != nil || def == nil {
+			continue
+		}
+		matches = append(matches, match{
+			Name: def.Name, Kind: def.Kind, Receiver: def.Receiver,
+			Signature: oneLineSignature(def.Signature), Similarity: sc.score,
+		})
+	}
+	text, _ := toJSON(matches)
+	return textResult(fmt.Sprintf("Definitions with similar bodies to %s (MinHash Jaccard, 5-char shingles):\n\n%s", args.Name, text)), nil, nil
+}
+
+// handleSimilarBySignature is the pre-#151 signature-token search,
+// kept as a fallback for defs without body text (interface/type/const
+// declarations) or when the summaries table is empty.
+func (s *server) handleSimilarBySignature(d *store.Definition) (*sdkmcp.CallToolResult, any, error) {
+	if d.Signature == "" {
+		return errResult(fmt.Errorf("definition %q has no signature or body to compare on", d.Name))
+	}
 	sig := d.Signature
-	// Strip func keyword, receiver, and name to get just the params/returns.
 	if idx := strings.Index(sig, "("); idx >= 0 {
 		sig = sig[idx:]
 	}
-
-	// Find definitions with similar param/return signatures.
 	sigDefs, _ := s.backend.FindDefinitions("%" + sig + "%")
-
-	// Deduplicate, exclude self.
 	seen := map[string]bool{d.Name: true}
 	type match struct {
 		Name      string `json:"name"`
@@ -3624,16 +3685,11 @@ func (s *server) handleSimilar(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 			break
 		}
 	}
-
 	if len(matches) == 0 {
-		return textResult(fmt.Sprintf("No definitions with similar signatures to %s", args.Name)), nil, nil
+		return textResult(fmt.Sprintf("No definitions with similar signatures to %s", d.Name)), nil, nil
 	}
-
-	text, err := toJSON(matches)
-	if err != nil {
-		return errResult(err)
-	}
-	return textResult(fmt.Sprintf("Definitions with similar signatures to %s:\n\n%s", args.Name, text)), nil, nil
+	text, _ := toJSON(matches)
+	return textResult(fmt.Sprintf("Definitions with similar signatures to %s (body-less fallback):\n\n%s", d.Name, text)), nil, nil
 }
 
 // projectOverview returns a compact module-level summary: package path,

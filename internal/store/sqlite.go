@@ -100,7 +100,67 @@ func OpenSQLite(path string) (*SQLiteDB, error) {
 		return nil, fmt.Errorf("sqlite: backfill fts: %w", err)
 	}
 
-	return &SQLiteDB{db: db, path: path}, nil
+	sq := &SQLiteDB{db: db, path: path}
+	// Backfill def summaries if this is an existing DB predating #151.
+	// Same pattern as backfillFTS: skip when already populated. Cost
+	// on winze's 2378 defs is ~50-100ms one-shot; amortized on next
+	// open it's a no-op.
+	if err := sq.backfillDefSummaries(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("sqlite: backfill def summaries: %w", err)
+	}
+	return sq, nil
+}
+
+// backfillDefSummaries computes MinHash signatures for any def missing
+// from def_summaries. Task #151. Skips work when everything's present.
+func (s *SQLiteDB) backfillDefSummaries() error {
+	ctx := context.Background()
+	var missing int64
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM bodies b
+		LEFT JOIN def_summaries ds ON ds.def_id = b.def_id
+		WHERE ds.def_id IS NULL`).Scan(&missing); err != nil {
+		return fmt.Errorf("count missing summaries: %w", err)
+	}
+	if missing == 0 {
+		return nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT b.def_id, b.body FROM bodies b
+		LEFT JOIN def_summaries ds ON ds.def_id = b.def_id
+		WHERE ds.def_id IS NULL`)
+	if err != nil {
+		return fmt.Errorf("select missing summaries: %w", err)
+	}
+	defer rows.Close()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.PrepareContext(ctx, `INSERT OR REPLACE INTO def_summaries(def_id, minhash) VALUES (?, ?)`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer stmt.Close()
+	for rows.Next() {
+		var id int64
+		var body string
+		if err := rows.Scan(&id, &body); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if _, err := stmt.ExecContext(ctx, id, ComputeMinHash(body)); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
 func backfillFTS(db *sql.DB) error {
@@ -746,6 +806,9 @@ func (s *SQLiteDB) UpsertDefinition(d *Definition) (int64, error) {
 		); err != nil {
 			return 0, fmt.Errorf("sqlite: insert body: %w", err)
 		}
+		// #151: precompute minhash. Best-effort — error here shouldn't
+		// fail the ingest.
+		_ = s.SetDefSummaryMinHash(id, ComputeMinHash(d.Body))
 		return id, nil
 	}
 	if err != nil {
@@ -778,6 +841,8 @@ func (s *SQLiteDB) UpsertDefinition(d *Definition) (int64, error) {
 	); err != nil {
 		return 0, fmt.Errorf("sqlite: update body: %w", err)
 	}
+	// #151: body changed → recompute minhash. Best-effort.
+	_ = s.SetDefSummaryMinHash(existingID, ComputeMinHash(d.Body))
 	return existingID, nil
 }
 
@@ -910,6 +975,20 @@ func (s *SQLiteDB) UpsertDefinitionsBulk(defs []*Definition) ([]int64, error) {
 			return nil, fmt.Errorf("sqlite: UpsertDefinitionsBulk insert bodies (batch %d..%d): %w",
 				start, end, err)
 		}
+
+		// #151: precompute minhashes for the newly-inserted defs. One
+		// multi-row INSERT per chunk keeps the per-def overhead low —
+		// hashing dominates, but that's ~microseconds per def for
+		// typical Go bodies. Best-effort; a failure here shouldn't
+		// abort the ingest.
+		mhPlaceholders := make([]string, len(chunk))
+		mhArgs := make([]any, 0, 2*len(chunk))
+		for i, d := range chunk {
+			mhPlaceholders[i] = "(?, ?)"
+			mhArgs = append(mhArgs, firstID+int64(i), ComputeMinHash(d.Body))
+		}
+		mhq := "INSERT OR REPLACE INTO def_summaries(def_id, minhash) VALUES " + strings.Join(mhPlaceholders, ",")
+		_, _ = s.db.ExecContext(ctx, mhq, mhArgs...)
 	}
 	return ids, nil
 }
@@ -2174,6 +2253,40 @@ func (s *SQLiteDB) Query(query string) ([]map[string]any, error) {
 // op:simulate MCP tool is rarely used and can degrade gracefully.
 func (s *SQLiteDB) Simulate(mutations []Mutation) (*SimulationResult, error) {
 	return nil, ErrNotImplemented
+}
+
+// SetDefSummaryMinHash stores a precomputed MinHash signature for defID.
+// Idempotent — INSERT OR REPLACE keys off def_id. Called at UpsertDefinition
+// time (below) and by the backfill pass on OpenSQLite.
+func (s *SQLiteDB) SetDefSummaryMinHash(defID int64, minhash []byte) error {
+	_, err := s.db.ExecContext(s.Ctx(),
+		`INSERT OR REPLACE INTO def_summaries(def_id, minhash) VALUES (?, ?)`,
+		defID, minhash)
+	if err != nil {
+		return fmt.Errorf("sqlite: set def summary %d: %w", defID, err)
+	}
+	return nil
+}
+
+// AllDefSummaryMinHashes loads every stored MinHash keyed by def_id.
+// Used by the `similar` op's O(N) Jaccard scan.
+func (s *SQLiteDB) AllDefSummaryMinHashes() (map[int64][]byte, error) {
+	rows, err := s.db.QueryContext(s.Ctx(),
+		`SELECT def_id, minhash FROM def_summaries WHERE minhash IS NOT NULL`)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: all def summaries: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[int64][]byte)
+	for rows.Next() {
+		var id int64
+		var mh []byte
+		if err := rows.Scan(&id, &mh); err != nil {
+			return nil, fmt.Errorf("sqlite: scan def summary: %w", err)
+		}
+		out[id] = mh
+	}
+	return out, rows.Err()
 }
 
 // Compile-time assertion: *SQLiteDB satisfies the Backend interface.

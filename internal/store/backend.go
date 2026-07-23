@@ -98,5 +98,12 @@ type Backend interface {
 
 	// Simulation (op:simulate speculative apply)
 	Simulate(mutations []Mutation) (*SimulationResult, error)
+
+	// Def summaries — precomputed MinHash signatures for approximate
+	// similarity. Task #151. Set is idempotent; All returns everything
+	// present as (def_id → minhash) map for the O(N) similarity scan
+	// in handleSimilar.
+	SetDefSummaryMinHash(defID int64, minhash []byte) error
+	AllDefSummaryMinHashes() (map[int64][]byte, error)
 }
 

@@ -183,3 +183,16 @@ CREATE TABLE IF NOT EXISTS defn_meta (
     "key"   TEXT PRIMARY KEY,
     "value" TEXT NOT NULL
 );
+
+-- Precomputed def summaries — task #151. One row per definition,
+-- keyed by def_id. minhash is a fixed-width blob (numHashes × 4 bytes)
+-- storing MinHash-32 signatures over 5-char body shingles. Enables
+-- sub-linear approximate similarity ("similar" op) without recomputing
+-- from bodies at read time. Sparse to keep the schema readable — add
+-- more precomputed columns here as follow-ups (one_line_summary,
+-- ast_kinds_bag, cyclomatic, etc.) without touching definitions.
+CREATE TABLE IF NOT EXISTS def_summaries (
+    def_id  INTEGER PRIMARY KEY,
+    minhash BLOB,
+    FOREIGN KEY (def_id) REFERENCES definitions(id) ON DELETE CASCADE
+);
