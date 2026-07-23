@@ -26,16 +26,57 @@ OUT_DIR=${OUT_DIR:-./out/$ARM}
 mkdir -p "$OUT_DIR"
 
 # #180 / #174 plumbing: capture defn serve's stderr JSONL for this arm.
-# The MCP config spawns a per-arm defn serve as a child of claude, which
-# inherits our env — so exporting DEFN_USAGE_LOG_FILE here reaches the
-# right process. No need to bounce anything: we're not talking to the
-# ambient serve.
+# Two things are needed for the JSONL to actually get written:
+# 1. The binary at /home/justin/go/bin/defn must know about
+#    DEFN_USAGE_LOG_FILE — reinstall from source below.
+# 2. The HTTP serve for this bench's DB must be started with our env
+#    in scope — kill any stale serve for this DB so claude's first
+#    MCP spawn actually starts a fresh one instead of proxying to a
+#    long-lived one that predates our exports (#185 root cause).
 DEFN_CAPTURE_USAGE=${DEFN_CAPTURE_USAGE:-$([[ "$ARM" == *defn* ]] && echo 1 || echo 0)}
 if [ "$DEFN_CAPTURE_USAGE" = "1" ]; then
     USAGE_LOG="$(realpath "$OUT_DIR")/defn-usage.jsonl"
     : > "$USAGE_LOG"
     export DEFN_USAGE_LOG_FILE="$USAGE_LOG"
     echo "[$ARM] capturing defn usage to $USAGE_LOG"
+
+    # #185: bench's mcp-defn.json points at /home/justin/go/bin/defn.
+    # If that binary is stale, env-var plumbing / new server features
+    # are silently absent — the 2026-07-23 chi-explore rerun had an
+    # empty usage log for exactly this reason. Reinstall from the
+    # source tree here so the bench always spawns a matching binary.
+    # Repo root is inferred from this script's location so this works
+    # from any cwd; skip with DEFN_SKIP_INSTALL=1 if the caller has
+    # already installed.
+    if [ "${DEFN_SKIP_INSTALL:-0}" != "1" ]; then
+        REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+        echo "[$ARM] installing fresh defn from $REPO_ROOT"
+        (cd "$REPO_ROOT" && go install ./cmd/defn) || {
+            echo "[$ARM] WARNING: go install ./cmd/defn failed; bench will use stale binary" >&2
+        }
+    fi
+
+    # #185 root cause: `defn serve` auto-shares HTTP endpoints across
+    # processes with the same DB path. When claude MCP spawns a child
+    # `defn serve`, the child either starts a fresh HTTP serve (which
+    # inherits our exported env, including DEFN_USAGE_LOG_FILE) OR
+    # becomes a lightweight stdio proxy to an existing HTTP serve. If
+    # a stale HTTP serve is still running for this bench's DB from a
+    # prior test, turn-1's env never reaches the handler process and
+    # the usage log stays empty. Kill any such stale serve here so
+    # claude's first spawn starts fresh with our env in scope.
+    LOCKFILE="$WORKDIR/.defn/serve.pid"
+    if [ -f "$LOCKFILE" ]; then
+        STALE_PID=$(python3 -c "import json,sys; d=json.load(open('$LOCKFILE')); print(d.get('PID') or d.get('pid') or '')" 2>/dev/null || echo "")
+        if [ -n "$STALE_PID" ] && kill -0 "$STALE_PID" 2>/dev/null; then
+            echo "[$ARM] killing stale defn serve PID $STALE_PID for $WORKDIR/.defn"
+            kill "$STALE_PID" 2>/dev/null || true
+            for i in 1 2 3 4 5 6 7 8; do
+                sleep 0.25
+                kill -0 "$STALE_PID" 2>/dev/null || break
+            done
+        fi
+    fi
 fi
 
 # Pre-generate a session ID (UUID v4)
