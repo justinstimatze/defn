@@ -870,6 +870,8 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return wrapStale(s.handleFind(ctx, req, findParam{File: args.File, Line: args.Line}))
 	case "overview":
 		return wrapStale(s.handleOverview(ctx, req, args))
+	case "methods":
+		return wrapStale(s.handleMethods(ctx, req, nameParam{Name: args.Name}))
 	case "patch":
 		return s.handlePatch(ctx, req, args)
 	case "sync":
@@ -4647,6 +4649,208 @@ func truncateFlow(flow []string, cap int) string {
 		return strings.Join(flow, " → ")
 	}
 	return strings.Join(flow[:cap], " → ") + fmt.Sprintf(" → … (%d more)", len(flow)-cap)
+}
+
+// handleMethods returns a compact projection of every method whose
+// receiver is (or points to) the given type. Task #79: browsing a
+// type's method set is one of the most common exploration patterns
+// (agents ask "what can I do with this thing?") and the alternatives
+// today are all bad: `read` on every method (N×full-body tokens),
+// `overview` on the file (mixes methods with unrelated defs and
+// includes bodies), or grep (misses interface dispatch, no signatures).
+//
+// Response shape: header line ("TypeName — N methods"), exported
+// methods grouped first (alphabetical), then unexported, each on one
+// line as `Method(args) return  // first-line doc`. Ends with a
+// pointer at `code(op:"read")` for full body access.
+//
+// Also handles interfaces by parsing the interface body's inline
+// method declarations — those live in the type body, not as separate
+// method rows.
+func (s *server) handleMethods(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
+	name := strings.TrimSpace(args.Name)
+	if name == "" {
+		return errResult(fmt.Errorf("methods: name is required (a type or interface name)"))
+	}
+	// Strip leading '*' — callers often paste "*Mux" from a receiver.
+	name = strings.TrimPrefix(name, "*")
+
+	// Interface path: methods live inline in the interface body, not
+	// as separate method rows. If we find a type/interface def by
+	// this name and its kind is 'interface', parse its body.
+	if typeDef, err := s.backend.GetDefinitionByName(name, ""); err == nil && typeDef != nil && typeDef.Kind == "interface" {
+		return s.methodsFromInterfaceBody(typeDef)
+	}
+
+	// Type path: scan all methods, keep those whose receiver matches.
+	// Handles pointer receivers (*T), value receivers (T), and
+	// generic receivers (T[X], *T[X]) — we compare against T after
+	// stripping the pointer prefix and generic bracket suffix.
+	allMethods, err := s.backend.FilterDefinitions("", "method", "", 0)
+	if err != nil {
+		return errResult(fmt.Errorf("methods: list: %w", err))
+	}
+	var mine []store.Definition
+	for _, m := range allMethods {
+		recv := strings.TrimPrefix(m.Receiver, "*")
+		if idx := strings.Index(recv, "["); idx > 0 {
+			recv = recv[:idx]
+		}
+		if recv == name {
+			mine = append(mine, m)
+		}
+	}
+	if len(mine) == 0 {
+		return errResult(fmt.Errorf("methods: no methods found for type %q (check spelling, or try code(op:\"search\", pattern:%q))", name, name))
+	}
+
+	return s.formatMethodList(name, "type", mine, "")
+}
+
+// methodsFromInterfaceBody handles the interface case: parse the
+// interface's stored body, extract each method signature + preceding
+// doc comment, format compactly.
+func (s *server) methodsFromInterfaceBody(d *store.Definition) (*sdkmcp.CallToolResult, any, error) {
+	src := "package x\n" + d.Body
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	if err != nil || len(f.Decls) == 0 {
+		return errResult(fmt.Errorf("methods: interface %q body did not parse: %v", d.Name, err))
+	}
+	gen, ok := f.Decls[0].(*ast.GenDecl)
+	if !ok || len(gen.Specs) == 0 {
+		return errResult(fmt.Errorf("methods: interface %q: unexpected decl shape", d.Name))
+	}
+	ts, ok := gen.Specs[0].(*ast.TypeSpec)
+	if !ok {
+		return errResult(fmt.Errorf("methods: interface %q: type spec missing", d.Name))
+	}
+	iface, ok := ts.Type.(*ast.InterfaceType)
+	if !ok {
+		return errResult(fmt.Errorf("methods: %q is not an interface (kind=%s)", d.Name, d.Kind))
+	}
+	var out []store.Definition
+	for _, field := range iface.Methods.List {
+		if len(field.Names) == 0 {
+			continue // embedded interface — skip, list as "embeds" in header if we wanted
+		}
+		for _, ident := range field.Names {
+			sig := "func " + ident.Name + types.ExprString(field.Type)[len("func"):] // "func(x int) error" — trim leading "func"
+			doc := ""
+			if field.Doc != nil {
+				doc = strings.TrimSpace(field.Doc.Text())
+			}
+			out = append(out, store.Definition{
+				Name:      ident.Name,
+				Kind:      "method",
+				Exported:  len(ident.Name) > 0 && ident.Name[0] >= 'A' && ident.Name[0] <= 'Z',
+				Signature: sig,
+				Doc:       doc,
+			})
+		}
+	}
+	if len(out) == 0 {
+		return errResult(fmt.Errorf("methods: interface %q has no method declarations", d.Name))
+	}
+	return s.formatMethodList(d.Name, "interface", out, "")
+}
+
+// formatMethodList renders a method set as compact text: exported
+// group first, then unexported, one line each with signature + first
+// line of doc.
+func (s *server) formatMethodList(typeName, kind string, methods []store.Definition, _ string) (*sdkmcp.CallToolResult, any, error) {
+	sort.Slice(methods, func(i, j int) bool {
+		if methods[i].Exported != methods[j].Exported {
+			return methods[i].Exported // exported first
+		}
+		return methods[i].Name < methods[j].Name
+	})
+	var exp, unexp int
+	for _, m := range methods {
+		if m.Exported {
+			exp++
+		} else {
+			unexp++
+		}
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("%s (%s) — %d method", typeName, kind, len(methods)))
+	if len(methods) != 1 {
+		sb.WriteString("s")
+	}
+	if exp > 0 && unexp > 0 {
+		sb.WriteString(fmt.Sprintf(" (%d exported, %d unexported)", exp, unexp))
+	}
+	sb.WriteString("\n\n")
+
+	var lastGroup string
+	for _, m := range methods {
+		group := "Unexported"
+		if m.Exported {
+			group = "Exported"
+		}
+		// Only emit group headers when both groups present.
+		if exp > 0 && unexp > 0 && group != lastGroup {
+			if lastGroup != "" {
+				sb.WriteString("\n")
+			}
+			sb.WriteString(group + ":\n")
+			lastGroup = group
+		}
+		sig := oneLineSignature(m.Signature)
+		if sig == "" {
+			sig = m.Name + "(…)"
+		}
+		sb.WriteString("  ")
+		sb.WriteString(sig)
+		if doc := firstDocLine(m.Doc); doc != "" {
+			sb.WriteString("  // ")
+			sb.WriteString(doc)
+		}
+		sb.WriteString("\n")
+	}
+	sb.WriteString(fmt.Sprintf("\nFetch a full body: code(op:\"read\", name:\"%s.MethodName\")\n", typeName))
+
+	out := sb.String()
+	return textResult(out), nil, nil
+}
+
+// oneLineSignature collapses a multi-line signature (params split
+// across lines, doc-prefixed) to a single line for the methods
+// listing. Strips leading doc-comment prefixes and joins wrapped
+// param lists back into one line.
+func oneLineSignature(sig string) string {
+	// Skip leading `// ...` doc lines; take the first non-doc line
+	// and collapse continuation whitespace.
+	lines := strings.Split(sig, "\n")
+	var out []string
+	for _, ln := range lines {
+		t := strings.TrimSpace(ln)
+		if strings.HasPrefix(t, "//") {
+			continue
+		}
+		out = append(out, t)
+	}
+	joined := strings.Join(out, " ")
+	// Collapse runs of whitespace.
+	fields := strings.Fields(joined)
+	return strings.Join(fields, " ")
+}
+
+func firstDocLine(doc string) string {
+	for _, ln := range strings.Split(doc, "\n") {
+		t := strings.TrimSpace(ln)
+		t = strings.TrimPrefix(t, "//")
+		t = strings.TrimSpace(t)
+		if t != "" {
+			// Cap length so a novella doc doesn't blow up the listing.
+			if len(t) > 100 {
+				t = t[:100] + "…"
+			}
+			return t
+		}
+	}
+	return ""
 }
 
 // handleOutline returns a compact projection of a definition: header +

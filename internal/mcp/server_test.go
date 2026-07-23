@@ -2315,3 +2315,126 @@ func TestSearchShapedSQLRedirect(t *testing.T) {
 		})
 	}
 }
+
+// TestHandleMethods locks in task #79's projection contract: for a
+// struct/named type, list every method's compact signature (grouped
+// exported first, alphabetical within), one line each. For an
+// interface, parse the body's inline method decls.
+func TestHandleMethods(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := &server{backend: db}
+
+	mod, err := db.EnsureModule("example.com/svc", "svc", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed a type + methods on both value and pointer receivers,
+	// exported and unexported, so we exercise the grouping + sort.
+	typeDef := &store.Definition{
+		ModuleID: mod.ID, Name: "Server", Kind: "type", Exported: true,
+		Body: "type Server struct { addr string }",
+	}
+	typeDef.Hash = store.HashBody(typeDef.Body)
+	if _, err := db.UpsertDefinition(typeDef); err != nil {
+		t.Fatal(err)
+	}
+	methods := []*store.Definition{
+		{ModuleID: mod.ID, Name: "Start", Kind: "method", Exported: true,
+			Receiver: "*Server", Body: "func (s *Server) Start(addr string) error { return nil }",
+			Signature: "func (s *Server) Start(addr string) error", Doc: "// Start binds the listener and blocks."},
+		{ModuleID: mod.ID, Name: "Stop", Kind: "method", Exported: true,
+			Receiver: "*Server", Body: "func (s *Server) Stop() { }",
+			Signature: "func (s *Server) Stop()", Doc: ""},
+		{ModuleID: mod.ID, Name: "Addr", Kind: "method", Exported: true,
+			Receiver: "Server", Body: "func (s Server) Addr() string { return s.addr }",
+			Signature: "func (s Server) Addr() string", Doc: ""},
+		{ModuleID: mod.ID, Name: "reset", Kind: "method", Exported: false,
+			Receiver: "*Server", Body: "func (s *Server) reset() { s.addr = \"\" }",
+			Signature: "func (s *Server) reset()", Doc: "// reset zeros internal state."},
+	}
+	for _, m := range methods {
+		m.Hash = store.HashBody(m.Body)
+		if _, err := db.UpsertDefinition(m); err != nil {
+			t.Fatalf("upsert %s: %v", m.Name, err)
+		}
+	}
+
+	// Basic call.
+	result, _, err := s.handleMethods(context.Background(), nil, nameParam{Name: "Server"})
+	if err != nil {
+		t.Fatalf("handleMethods err: %v", err)
+	}
+	text := resultText(t, result)
+	for _, want := range []string{"Server", "4 methods", "3 exported", "1 unexported", "Start", "Stop", "Addr", "reset", "binds the listener", "zeros internal state"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("output missing %q\n---\n%s", want, text)
+		}
+	}
+	// Exported group must come before unexported (Start appears before reset).
+	if strings.Index(text, "Start") > strings.Index(text, "reset") {
+		t.Errorf("expected exported methods before unexported\n---\n%s", text)
+	}
+
+	// Pointer-receiver call — same result.
+	result2, _, _ := s.handleMethods(context.Background(), nil, nameParam{Name: "*Server"})
+	if resultText(t, result2) != text {
+		t.Errorf("'*Server' should produce same output as 'Server'")
+	}
+
+	// Missing type → helpful error.
+	result3, _, _ := s.handleMethods(context.Background(), nil, nameParam{Name: "NoSuchType"})
+	if !strings.Contains(resultText(t, result3), "no methods found") {
+		t.Errorf("expected 'no methods found' error, got: %q", resultText(t, result3))
+	}
+
+	// Empty name → error.
+	result4, _, _ := s.handleMethods(context.Background(), nil, nameParam{Name: ""})
+	if !strings.Contains(resultText(t, result4), "name is required") {
+		t.Errorf("expected 'name is required' error, got: %q", resultText(t, result4))
+	}
+}
+
+// TestHandleMethods_Interface exercises the interface body-parsing
+// path (methods live inline, not as separate rows).
+func TestHandleMethods_Interface(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := &server{backend: db}
+
+	mod, _ := db.EnsureModule("example.com/svc", "svc", "")
+	ifaceBody := `type Handler interface {
+	// Handle processes one request.
+	Handle(req Request) error
+	// Close releases resources.
+	Close() error
+}`
+	iface := &store.Definition{
+		ModuleID: mod.ID, Name: "Handler", Kind: "interface", Exported: true,
+		Body: ifaceBody,
+	}
+	iface.Hash = store.HashBody(iface.Body)
+	if _, err := db.UpsertDefinition(iface); err != nil {
+		t.Fatal(err)
+	}
+
+	result, _, err := s.handleMethods(context.Background(), nil, nameParam{Name: "Handler"})
+	if err != nil {
+		t.Fatalf("interface handleMethods: %v", err)
+	}
+	text := resultText(t, result)
+	for _, want := range []string{"Handler", "interface", "2 methods", "Handle", "Close", "processes one request", "releases resources"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("interface output missing %q\n---\n%s", want, text)
+		}
+	}
+}
