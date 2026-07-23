@@ -1439,6 +1439,34 @@ func (s *server) handleGetDefinition(_ context.Context, _ *sdkmcp.CallToolReques
 		}
 	}
 
+	// #184 auto-downgrade to outline on large bodies. Fires only when
+	// no other compact projection is active (summary/upstream/query),
+	// no explicit body request (full:true or mode:"body"), and the
+	// body exceeds readAutoOutlineThreshold. Delegates to handleOutline
+	// so the projection shape stays consistent; prepends a note that
+	// tells the model how to get the body if it actually needs it.
+	// Rationale: #174 receipt showed CLAUDE.md-level outline-first
+	// nudges failed. Taking the choice away is the recommended lever.
+	if !args.Full &&
+		args.Mode != "body" &&
+		strings.TrimSpace(args.Query) == "" &&
+		len(d.Body) > readAutoOutlineThreshold {
+		if outlineR, _, oErr := s.handleOutline(nil, nil, args); oErr == nil && outlineR != nil && !outlineR.IsError {
+			text := resultTextRaw(outlineR)
+			note := fmt.Sprintf(
+				"_[#184 auto-outline: body is %d bytes / %d lines. Pass `mode:\"body\"` or `full:true` for full source.]_\n\n",
+				len(d.Body), strings.Count(d.Body, "\n")+1,
+			)
+			out := note + text
+			return withUsage(textResult(out), usageStats{
+				Op:            "read",
+				BytesReturned: len(out),
+				BytesAltRead:  s.fileAltBytes(d),
+			}), nil, nil
+		}
+		// Outline failed for some reason; fall through to full body.
+	}
+
 	// #153: query-adaptive read. When args.Query is set, filter body
 	// statements to those containing any query token. Elided statements
 	// collapse to a single "…" comment; runs of elided stmts share one
@@ -6346,3 +6374,18 @@ func emitUsageLog(u usageStats) {
 	}
 	fmt.Fprint(os.Stderr, line)
 }
+
+// readAutoOutlineThreshold is the body-size in bytes above which a
+// bare `code(op:"read", name:X)` auto-downgrades to the outline
+// projection. #174 receipt: CLAUDE.md-level "outline first" nudges
+// had negligible adoption (2 outline calls vs 27 reads in a 10-turn
+// bench). Taking the choice away from the model at the server is the
+// mechanism the receipt recommends. Escape hatches: full:true and
+// mode:"body" both bypass; query-adaptive reads also bypass so
+// their filtered-body path is preserved.
+//
+// 1500 is deliberately larger than outlineBodyThreshold (300) —
+// outline crosses over below 300, but 300-1500 is still comfortable
+// to read directly and downgrading there produces model confusion
+// without meaningful savings.
+const readAutoOutlineThreshold = 1500
