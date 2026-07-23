@@ -79,14 +79,15 @@ func logBackend(msg string) {
 	fmt.Fprintln(os.Stderr, "defn: "+msg)
 }
 
-
+// cmdInit sets up defn for a project (new OR existing). Writes
+// CLAUDE.md, .mcp.json, .gitignore, .codex config, then ingests
+// source. Idempotent — safe to run any time. `defn ingest` is an
+// alias for this today: both do the same thing, both are safe on a
+// bare project or a re-run. Advanced users who only want to refresh
+// the DB (skip config writes) can pass --reindex.
 func cmdInit(modulePath string) {
 	// Operate from the target project dir so .defn/, .mcp.json, etc. all
-	// resolve against modulePath rather than the caller's cwd. Without
-	// this, `defn init /elsewhere` from inside another defn project opens
-	// the caller's .defn/ — which, if a serve holds the flock, fails with
-	// "manifest: read only"; if no serve holds it, silently corrupts the
-	// caller's DB.
+	// resolve against modulePath rather than the caller's cwd.
 	absModulePath, err := filepath.Abs(modulePath)
 	if err != nil {
 		fatal(err)
@@ -126,7 +127,6 @@ func cmdInit(modulePath string) {
 		fatal(err)
 	}
 
-	// Compact storage after a fresh ingest.
 	compactEmbedded(db, dbPath)
 
 	mods, _ := db.ListModules()
@@ -135,120 +135,8 @@ func cmdInit(modulePath string) {
 	fmt.Fprintf(os.Stderr, "done. %d modules, %d definitions, root hash: %s\n",
 		len(mods), len(defs), hash[:16])
 
-	// Get absolute paths for the MCP config.
 	absDB, _ := filepath.Abs(dbPath)
-	absBin, _ := os.Executable()
-	if absBin == "" {
-		if p, err := exec.LookPath("defn"); err == nil {
-			absBin = p
-		} else {
-			absBin = "defn" // fallback
-		}
-	}
-	// Resolve symlinks so the path is stable.
-	if resolved, err := filepath.EvalSymlinks(absBin); err == nil {
-		absBin = resolved
-	}
-
-	// Write .mcp.json at the project root (Claude Code's project-level MCP config).
-	mcpPath := filepath.Join(absModulePath, ".mcp.json")
-
-	// Read existing config if present, or start fresh.
-	mcpConfig := map[string]any{}
-	if data, err := os.ReadFile(mcpPath); err == nil {
-		json.Unmarshal(data, &mcpConfig)
-	}
-
-	// Set/update the defn MCP server entry.
-	mcpServers, _ := mcpConfig["mcpServers"].(map[string]any)
-	if mcpServers == nil {
-		mcpServers = map[string]any{}
-	}
-	mcpServers["defn"] = map[string]any{
-		"command": absBin,
-		"args":    []string{"serve"},
-		"env": map[string]string{
-			"DEFN_DB": absDB,
-		},
-	}
-	mcpConfig["mcpServers"] = mcpServers
-
-	mcpJSON, _ := json.MarshalIndent(mcpConfig, "", "  ")
-	if err := os.WriteFile(mcpPath, mcpJSON, 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not write %s: %v\n", mcpPath, err)
-		fmt.Fprintf(os.Stderr, "manually create .mcp.json:\n\n")
-		fmt.Fprintln(os.Stderr, string(mcpJSON))
-	} else {
-		fmt.Fprintf(os.Stderr, "wrote MCP config to %s\n", mcpPath)
-	}
-
-	// Write .codex/config.toml for OpenAI Codex.
-	codexDir := filepath.Join(absModulePath, ".codex")
-	codexPath := filepath.Join(codexDir, "config.toml")
-	if _, err := os.Stat(codexPath); os.IsNotExist(err) {
-		os.MkdirAll(codexDir, 0755)
-		codexConfig := fmt.Sprintf(`[mcp_servers.defn]
-command = %q
-args = ["serve"]
-
-[mcp_servers.defn.env]
-DEFN_DB = %q
-`, absBin, absDB)
-		if err := os.WriteFile(codexPath, []byte(codexConfig), 0644); err == nil {
-			fmt.Fprintf(os.Stderr, "wrote Codex config to %s\n", codexPath)
-		}
-	}
-
-	// Write or update the defn section in CLAUDE.md.
-	claudeMDPath := filepath.Join(absModulePath, "CLAUDE.md")
-	defnSection := defnClaudeMDSection()
-
-	// Add .defn/ to .gitignore if not already there.
-	gitignorePath := filepath.Join(absModulePath, ".gitignore")
-	gitignoreContent, _ := os.ReadFile(gitignorePath)
-	if !strings.Contains(string(gitignoreContent), ".defn") {
-		f, err := os.OpenFile(gitignorePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err == nil {
-			if len(gitignoreContent) > 0 && !strings.HasSuffix(string(gitignoreContent), "\n") {
-				f.WriteString("\n")
-			}
-			f.WriteString("\n# defn database\n.defn/\n.codex/\n")
-			f.Close()
-		}
-	}
-
-	// Write or update the defn section in CLAUDE.md.
-	// Sentinel markers allow updating the section on re-init without
-	// disturbing user-written content.
-	if existing, err := os.ReadFile(claudeMDPath); err == nil {
-		content := string(existing)
-		const beginMarker = "<!-- defn:begin -->"
-		const endMarker = "<!-- defn:end -->"
-		if bi := strings.Index(content, beginMarker); bi >= 0 {
-			if ei := strings.Index(content[bi:], endMarker); ei >= 0 {
-				// Replace existing defn section.
-				after := content[bi+ei+len(endMarker):]
-				content = content[:bi] + defnSection + after
-				os.WriteFile(claudeMDPath, []byte(content), 0644)
-				fmt.Fprintf(os.Stderr, "updated defn section in %s\n", claudeMDPath)
-			} else {
-				fmt.Fprintf(os.Stderr, "warning: found <!-- defn:begin --> but no <!-- defn:end --> in %s — skipping update\n", claudeMDPath)
-			}
-		} else {
-			// CLAUDE.md exists but has no defn section — append.
-			sep := "\n\n"
-			if strings.HasSuffix(content, "\n\n") {
-				sep = ""
-			} else if strings.HasSuffix(content, "\n") {
-				sep = "\n"
-			}
-			os.WriteFile(claudeMDPath, []byte(content+sep+defnSection), 0644)
-			fmt.Fprintf(os.Stderr, "appended defn section to %s\n", claudeMDPath)
-		}
-	} else {
-		os.WriteFile(claudeMDPath, []byte(defnSection), 0644)
-		fmt.Fprintf(os.Stderr, "wrote %s\n", claudeMDPath)
-	}
+	writeProjectConfig(absModulePath, defnBinaryPath(), absDB)
 
 	fmt.Fprintln(os.Stderr, "start a new AI coding session in this directory to use defn.")
 }
@@ -308,19 +196,21 @@ func logMem(phase string) {
 		runtime.NumGoroutine())
 }
 
+// cmdIngest is a functional alias for cmdInit — both write project
+// config (CLAUDE.md, .mcp.json, .gitignore, .codex) AND ingest the
+// source tree. The historic split between "init sets up, ingest
+// refreshes" was a semantic footgun: users adopting an existing
+// project would rationally reach for `ingest` and end up without a
+// CLAUDE.md — the model then wouldn't discover mcp__defn__code, and
+// defn silently underperformed (see #168 receipt).
+//
+// After this change: both commands do the right thing, always. Users
+// who want the pure DB-refresh path (skip config writes for perf on
+// hot rebuilds) can use `defn reindex`.
 func cmdIngest(modulePath string) {
-	// Normalize to absolute so downstream filepath.Rel calls (in ingest
-	// and resolve) compute module-relative source_file paths consistently
-	// regardless of where defn was invoked. With a relative ".", Rel
-	// errors out and IngestPackages falls back to basename — making
-	// IngestPackages and IngestFile disagree on source_file format,
-	// which breaks the incremental fast path's file_sources count
-	// comparison after the first incremental.
 	if abs, err := filepath.Abs(modulePath); err == nil {
 		modulePath = abs
 	}
-	// chdir to the project so .defn/ resolves to modulePath/.defn,
-	// not the caller's cwd. See cmdInit for the same fix.
 	if err := os.Chdir(modulePath); err != nil {
 		fatal(err)
 	}
@@ -339,18 +229,20 @@ func cmdIngest(modulePath string) {
 	// Fast path: when only a small number of files have changed and no
 	// files were added/deleted, skip packages.Load (~3 min, 1.1 GB peak
 	// on medium projects) and update just the changed files via
-	// ingest.IngestFile + resolve.ResolveFile (~10 ms per file). This
-	// is the common case for editor-save hooks that re-run `defn ingest .`
-	// on every .go change in projects without a live serve.
+	// ingest.IngestFile + resolve.ResolveFile (~10 ms per file).
 	if tryIncrementalIngest(db, modulePath, dbPath) {
+		// Config writes still fire in the incremental path so
+		// first-time users of `defn ingest` on an unconfigured project
+		// still get CLAUDE.md + .mcp.json. Cheap: idempotent no-ops
+		// once the files exist.
+		absDB, _ := filepath.Abs(dbPath)
+		writeProjectConfig(modulePath, defnBinaryPath(), absDB)
 		return
 	}
 
 	announceStaleIngest(db, modulePath)
 	fmt.Fprintf(os.Stderr, "ingesting %s...\n", modulePath)
 	logMem("before packages.Load")
-	// #125 winze methodology: time packages.Load separately so before/after
-	// comparisons of bulk-upsert wins aren't drowned by Go build-cache noise.
 	timing := os.Getenv("DEFN_SYNC_TIMING") == "1"
 	tLoad := time.Now()
 	pkgs, err := goload.LoadAll(modulePath)
@@ -384,6 +276,9 @@ func cmdIngest(modulePath string) {
 	compactEmbedded(db, dbPath)
 
 	fmt.Fprintf(os.Stderr, "done. root hash: %s\n", hash[:16])
+
+	absDB, _ := filepath.Abs(dbPath)
+	writeProjectConfig(modulePath, defnBinaryPath(), absDB)
 }
 
 // isCorruptDBError reports whether err looks like a corrupt embedded
