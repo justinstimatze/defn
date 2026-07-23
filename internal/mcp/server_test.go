@@ -999,7 +999,9 @@ func TestHandleExpand_BodyAndCallers(t *testing.T) {
 }
 
 // TestHandleExpand_DefaultInclude verifies empty include:[] defaults to
-// [body, callers] — the pair we picked as the MVP default.
+// [outline, callers] — the exploratory pair that answers most "what does
+// X do / who calls it" questions without paying for the body. Body must
+// be explicitly requested. Regression lock for #172.
 func TestHandleExpand_DefaultInclude(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
@@ -1010,11 +1012,47 @@ func TestHandleExpand_DefaultInclude(t *testing.T) {
 		t.Fatalf("expand: %v", err)
 	}
 	text := resultText(t, result)
-	if !strings.Contains(text, "### body") {
-		t.Errorf("default include should include body, got: %s", text)
+	if !strings.Contains(text, "### outline") {
+		t.Errorf("default include should include outline, got: %s", text)
 	}
 	if !strings.Contains(text, "### callers") {
 		t.Errorf("default include should include callers, got: %s", text)
+	}
+	if strings.Contains(text, "### body") {
+		t.Errorf("default include must NOT include body — #172 outline-first default; got: %s", text)
+	}
+}
+
+// TestHandleExpand_OutlineInclude verifies include:["outline"] returns
+// the compact projection (sig + doc + body-size + callees + flow) with
+// NO body block. This is the include kind that carries the -80% cost
+// story: 5-10× smaller than body for exploratory questions. #172.
+func TestHandleExpand_OutlineInclude(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.handleExpand(context.Background(), nil, codeParam{
+		Name:    "Greet",
+		Include: []string{"outline"},
+	})
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "### outline") {
+		t.Errorf("expected outline section header, got: %s", text)
+	}
+	if !strings.Contains(text, "Body:") {
+		t.Errorf("outline should report body byte/line count, got: %s", text)
+	}
+	if strings.Contains(text, "### body") {
+		t.Errorf("outline-only include must not emit body section; got: %s", text)
+	}
+	// The literal "Hello, " string is inside Greet's body — if it appears
+	// under outline-only, we're leaking the body via outline.
+	if strings.Contains(text, "Hello, ") {
+		t.Errorf("outline-only leaked body content; got: %s", text)
 	}
 }
 

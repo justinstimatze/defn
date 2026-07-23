@@ -4532,10 +4532,14 @@ func compactReadFile(file, modulePath string, defs []store.Definition, fullSize 
 // in one tool_result. Attacks the N² cache-read cost problem: every kind
 // under `include:` is a hop that would otherwise cost a separate turn.
 //
-// V1 supports two include kinds: "body" (the def source) and "callers"
-// (direct callers with source locations). Default include when omitted is
-// ["body","callers"] — the pair that kills the most common read→impact→read
-// pattern. Additional kinds fold in only if the bench shows a signal.
+// Supported include kinds: "outline" (sig+doc+body-size+callees+flow —
+// the compact projection, 5-10× smaller than body), "body" (full source),
+// "callers" (direct callers with source locations).
+//
+// Default when include is omitted: ["outline","callers"] — the pair that
+// answers most exploratory questions ("what does X do / who calls it")
+// without paying for the body. Explicitly request "body" when you're
+// about to edit or need to see branching. See #172.
 //
 // Design notes in scratchpad/expand-op-design.md.
 func (s *server) handleExpand(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
@@ -4549,7 +4553,7 @@ func (s *server) handleExpand(_ context.Context, _ *sdkmcp.CallToolRequest, args
 
 	includes := args.Include
 	if len(includes) == 0 {
-		includes = []string{"body", "callers"}
+		includes = []string{"outline", "callers"}
 	}
 	want := map[string]bool{}
 	for _, k := range includes {
@@ -4573,6 +4577,32 @@ func (s *server) handleExpand(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		sb.WriteString(fmt.Sprintf("Module: %s\n", modulePath))
 	}
 	sb.WriteString("\n")
+
+	if want["outline"] {
+		sb.WriteString("### outline\n")
+		switch {
+		case d.Signature != "":
+			sb.WriteString("```go\n" + d.Signature + "\n```\n")
+		case d.Doc != "":
+			sb.WriteString(d.Doc + "\n")
+		}
+		bodyLines := strings.Count(d.Body, "\n") + 1
+		sb.WriteString(fmt.Sprintf("Body: %d lines, %d bytes (add \"body\" to include for source)\n",
+			bodyLines, len(d.Body)))
+		callees, _ := s.backend.GetCallees(d.ID)
+		if len(callees) > 0 {
+			names := make([]string, 0, len(callees))
+			for _, c := range callees {
+				names = append(names, formatReceiver(c.Receiver)+c.Name)
+			}
+			sort.Strings(names)
+			sb.WriteString(fmt.Sprintf("Callees (%d): %s\n", len(callees), truncateList(names, outlineCalleeCap)))
+		}
+		if flow := topLevelFlow(d.Body); len(flow) > 0 {
+			sb.WriteString(fmt.Sprintf("Flow (%d): %s\n", len(flow), truncateFlow(flow, outlineFlowCap)))
+		}
+		sb.WriteString("\n")
+	}
 
 	if want["body"] {
 		sb.WriteString("### body\n")
@@ -4626,14 +4656,14 @@ func (s *server) handleExpand(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	for _, k := range includes {
 		norm := strings.ToLower(strings.TrimSpace(k))
 		switch norm {
-		case "body", "callers":
+		case "outline", "body", "callers":
 			// supported
 		default:
 			unknown = append(unknown, k)
 		}
 	}
 	if len(unknown) > 0 {
-		sb.WriteString(fmt.Sprintf("_note: unsupported include kinds ignored: %s (v1 supports: body, callers)_\n",
+		sb.WriteString(fmt.Sprintf("_note: unsupported include kinds ignored: %s (supported: outline, body, callers)_\n",
 			strings.Join(unknown, ", ")))
 	}
 

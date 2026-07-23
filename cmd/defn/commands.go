@@ -161,7 +161,7 @@ This project is indexed in defn (` + "`.defn/`" + `). For any ` + "`.go`" + ` fi
 ### By intent
 
 - **Explore / understand**: ` + "`code(op:\"overview\")`" + `, ` + "`code(op:\"outline\", name:\"F\")`" + `, ` + "`code(op:\"search\", pattern:\"...\")`" + `, ` + "`code(op:\"impact\", name:\"F\")`" + `. These answer most Go questions on their own.
-- **Saturate context in one call**: ` + "`code(op:\"expand\", name:\"F\", include:[\"outline\",\"callers\",\"refs\"])`" + ` — one round-trip instead of read → impact → read. Prefer ` + "`expand`" + ` over multiple sequential ` + "`code`" + ` calls whenever you'd otherwise chain them.
+- **Saturate context in one call**: ` + "`code(op:\"expand\", name:\"F\", include:[\"outline\",\"callers\"])`" + ` — one round-trip instead of read → impact → read. Prefer ` + "`expand`" + ` over multiple sequential ` + "`code`" + ` calls whenever you'd otherwise chain them.
 - **Read the full body**: ` + "`code(op:\"read\", name:\"F\")`" + ` — use when you're about to edit the def, or when ` + "`outline`" + ` was insufficient (you need to see how the branches actually flow). Add ` + "`full:true`" + ` to force the body when defn returns an upstream provenance tag.
 - **Edit a def**: ` + "`code(op:\"edit\", name:\"F\", new_body:\"...\")`" + `, ` + "`code(op:\"rename\", name:\"F\", new_name:\"G\")`" + ` — updates every reference across the repo atomically. ` + "`Edit`" + ` on a ` + "`.go`" + ` file leaves defn's graph stale.
 - **New def / whole file**: ` + "`code(op:\"create\", name:\"F\", file:\"pkg/x.go\", body:\"...\")`" + `.
