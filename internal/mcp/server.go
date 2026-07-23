@@ -6318,10 +6318,14 @@ func (s *server) handleCreateScaffoldFile(args createParam) (*sdkmcp.CallToolRes
 	return textResult(sb.String()), nil, nil
 }
 
-// emitUsageLog writes a single JSON line per op stats event to
-// defn's stderr. Bench harnesses redirect stderr (2>usage.log) and
-// parse the JSONL. No-op when DEFN_USAGE_LOG=off — keeps quiet
-// invocations quiet without conditionalizing every callsite.
+// emitUsageLog writes a single JSON line per op stats event.
+// Default sink: os.Stderr. Bench harnesses can redirect via
+// DEFN_USAGE_LOG_FILE=<path>; when set, the line is appended to that
+// file instead (opened once per call, so log rotation & long-running
+// serves are both fine). DEFN_USAGE_LOG=off disables emission entirely
+// — silences quiet invocations without conditionalizing every callsite.
+// See #177 for the prefix_hash_100 / body_sha256 fields these logs
+// carry; #180 depends on capturing this stream during bench runs.
 func emitUsageLog(u usageStats) {
 	if os.Getenv("DEFN_USAGE_LOG") == "off" {
 		return
@@ -6330,5 +6334,15 @@ func emitUsageLog(u usageStats) {
 	if err != nil {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "defn-usage %s\n", b)
+	line := fmt.Sprintf("defn-usage %s\n", b)
+	if path := os.Getenv("DEFN_USAGE_LOG_FILE"); path != "" {
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err == nil {
+			_, _ = f.WriteString(line)
+			_ = f.Close()
+			return
+		}
+		// Fall through to stderr on open failure so the signal isn't lost.
+	}
+	fmt.Fprint(os.Stderr, line)
 }

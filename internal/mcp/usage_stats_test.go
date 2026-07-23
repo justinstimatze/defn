@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -102,5 +103,35 @@ func TestWithUsageShortBodyPrefix(t *testing.T) {
 	if got.PrefixHash100 != got.BodySHA256 {
 		t.Errorf("PrefixHash100 should equal BodySHA256 for short body; got %q vs %q",
 			got.PrefixHash100, got.BodySHA256)
+	}
+}
+
+// TestEmitUsageLogFileSink verifies DEFN_USAGE_LOG_FILE redirects the
+// stderr JSONL to a file — the plumbing #180 and #174 diagnostics rely
+// on. Bench harnesses set this per-arm so the usage stream is captured
+// alongside stream-json turn files.
+func TestEmitUsageLogFileSink(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "usage.jsonl")
+	t.Setenv("DEFN_USAGE_LOG_FILE", path)
+
+	emitUsageLog(usageStats{Op: "read", BytesReturned: 123, PrefixHash100: "abcd", BodySHA256: "efgh"})
+	emitUsageLog(usageStats{Op: "outline", BytesReturned: 45})
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(got), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want 2 lines, got %d: %q", len(lines), got)
+	}
+	for i, want := range []string{`"op":"read"`, `"op":"outline"`} {
+		if !strings.HasPrefix(lines[i], "defn-usage ") {
+			t.Errorf("line %d missing defn-usage prefix: %q", i, lines[i])
+		}
+		if !strings.Contains(lines[i], want) {
+			t.Errorf("line %d missing %q: %q", i, want, lines[i])
+		}
 	}
 }

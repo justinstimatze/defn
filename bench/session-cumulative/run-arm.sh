@@ -6,8 +6,13 @@
 # Env:
 #   TURNS_FILE (default: turns.txt)
 #   OUT_DIR (default: ./out/<arm>)
+#   DEFN_CAPTURE_USAGE (default: 1 for arms containing "defn"): bounce
+#     the ambient defn serve with DEFN_USAGE_LOG_FILE pointed at
+#     OUT_DIR/defn-usage.jsonl so per-op stats (#177) are captured
+#     alongside the stream-json turn files. Set to 0 to skip.
 #
 # Emits one raw stream-json file per turn: OUT_DIR/turn-NN.json
+# Also captures OUT_DIR/defn-usage.jsonl when DEFN_CAPTURE_USAGE=1.
 set -euo pipefail
 
 ARM=${1:?arm name}
@@ -19,6 +24,19 @@ TURNS_FILE=${TURNS_FILE:-turns.txt}
 OUT_DIR=${OUT_DIR:-./out/$ARM}
 
 mkdir -p "$OUT_DIR"
+
+# #180 / #174 plumbing: capture defn serve's stderr JSONL for this arm.
+# Default on for any arm whose name contains "defn"; files-only arms
+# don't touch defn serve so nothing would be written.
+DEFN_CAPTURE_USAGE=${DEFN_CAPTURE_USAGE:-$([[ "$ARM" == *defn* ]] && echo 1 || echo 0)}
+if [ "$DEFN_CAPTURE_USAGE" = "1" ]; then
+    USAGE_LOG="$(realpath "$OUT_DIR")/defn-usage.jsonl"
+    : > "$USAGE_LOG"
+    echo "[$ARM] capturing defn usage to $USAGE_LOG (bouncing serve)"
+    DEFN_USAGE_LOG_FILE="$USAGE_LOG" defn restart >/dev/null 2>&1 || {
+        echo "[$ARM] defn restart failed — usage log will be empty" >&2
+    }
+fi
 
 # Pre-generate a session ID (UUID v4)
 SESSION_ID=$(uuidgen | tr 'A-Z' 'a-z')
