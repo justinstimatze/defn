@@ -114,4 +114,7 @@ type Backend interface {
 	// under SQLite's single-writer model.
 	GetDefSummary(defID int64) (*DefSummary, error)
 	SetDefSummary(defID int64, s *DefSummary) error
+	// ListDefsMissingSummary returns def IDs with no one_line yet.
+	// Sorted ascending for deterministic paging. #160 stage 3a backfill.
+	ListDefsMissingSummary() ([]int64, error)
 }

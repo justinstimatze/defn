@@ -870,6 +870,8 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	switch args.Op {
 	case "read":
 		return wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name, Full: args.Full, Query: args.Query, Mode: args.Mode}))
+	case "resummarize":
+		return s.handleResummarize(ctx, req, args)
 	case "read-and-verify":
 		return wrapStale(s.handleReadAndVerify(ctx, req, args))
 	case "retarget-field-value":
@@ -966,7 +968,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "gc":
 		return s.handleGC(ctx, req, args)
 	default:
-		return errResult(fmt.Errorf("unknown op %q — valid: read, read-and-verify, outline, slice, insert-precondition, replace-slice, replace-hunk, wrap-in-defer, rename-param, add-import, search, impact, explain, similar, untested, edit, create, delete, retarget-field-value, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc", args.Op))
+		return errResult(fmt.Errorf("unknown op %q — valid: read, read-and-verify, outline, slice, insert-precondition, replace-slice, replace-hunk, wrap-in-defer, rename-param, add-import, search, impact, explain, similar, untested, edit, create, delete, retarget-field-value, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc, resummarize", args.Op))
 	}
 }
 
@@ -6049,3 +6051,63 @@ func (s *server) enqueueSummary(d *store.Definition) {
 // ≈ the point where a 5-line "here's what it does" summary is
 // meaningfully cheaper than sending the whole body.
 const summaryHintLineThreshold = 40
+
+// handleResummarize walks the DB for defs with no one_line summary
+// and enqueues each on the summary worker. #160 stage 3a backfill.
+//
+// Fire-and-forget: enqueue is non-blocking; the worker's queue is
+// bounded (defaultQueueDepth), so on very large corpora the tail of
+// this batch may drop. Callers seeing "enqueued < missing" can
+// re-run — the next call re-lists whatever's still missing, so
+// backfill is idempotent and eventually complete.
+//
+// With the Stub backend (no ANTHROPIC_API_KEY) this enqueues but
+// produces "TODO: <Name>" placeholders that handleGetDefinition
+// treats as no summary — the read path still falls back to full
+// body, so running this without a real backend is a no-op in effect
+// (safe, but wastes DB rows). Response text calls that out.
+func (s *server) handleResummarize(_ context.Context, _ *sdkmcp.CallToolRequest, _ codeParam) (*sdkmcp.CallToolResult, any, error) {
+	if s.summaryWorker == nil {
+		return errResult(fmt.Errorf("summary worker not initialized (projectDir empty?)"))
+	}
+	ids, err := s.backend.ListDefsMissingSummary()
+	if err != nil {
+		return errResult(fmt.Errorf("list missing summaries: %w", err))
+	}
+	var enqueued, dropped, lookupFailed int
+	for _, id := range ids {
+		d, err := s.backend.GetDefinition(id)
+		if err != nil || d == nil {
+			lookupFailed++
+			continue
+		}
+		modulePath := s.modulePath(d.ModuleID)
+		ok := s.summaryWorker.Enqueue(summary.Request{
+			DefID:      d.ID,
+			Name:       d.Name,
+			Kind:       d.Kind,
+			Receiver:   d.Receiver,
+			ModulePath: modulePath,
+			Body:       d.Body,
+			BodyHash:   store.HashBodyStructural(d.Body),
+		})
+		if ok {
+			enqueued++
+		} else {
+			dropped++
+		}
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("resummarize: %d missing summaries\n", len(ids)))
+	sb.WriteString(fmt.Sprintf("  enqueued: %d\n", enqueued))
+	if dropped > 0 {
+		sb.WriteString(fmt.Sprintf("  dropped:  %d  (worker queue full — re-run to catch the tail)\n", dropped))
+	}
+	if lookupFailed > 0 {
+		sb.WriteString(fmt.Sprintf("  lookup-failed: %d  (defs vanished between list and read — usually harmless)\n", lookupFailed))
+	}
+	if os.Getenv("ANTHROPIC_API_KEY") == "" {
+		sb.WriteString("\n_note: ANTHROPIC_API_KEY is not set — the Stub backend is generating\n\"TODO: <Name>\" placeholders that the read path treats as no summary.\nSet ANTHROPIC_API_KEY (Haiku 4.5) for real summaries; see #160._\n")
+	}
+	return textResult(sb.String()), nil, nil
+}

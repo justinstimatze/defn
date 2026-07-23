@@ -349,3 +349,75 @@ func TestUpsertDefinitionsBulk_WithinBatchDuplicate(t *testing.T) {
 		t.Errorf("last-write-wins violated: body=%q, want %q", got.Body, second.Body)
 	}
 }
+
+// TestListDefsMissingSummary covers the three shapes handleResummarize
+// needs to distinguish: (1) no def_summaries row at all, (2) row exists
+// but one_line is NULL (from #151 minhash-only backfill), (3) row
+// exists with an empty one_line string. All three count as "missing"
+// — otherwise handleResummarize would skip defs the read path treats
+// as having no summary. Sorted-ascending contract lets callers page.
+func TestListDefsMissingSummary(t *testing.T) {
+	dir := t.TempDir()
+	db, err := OpenSQLite(filepath.Join(dir, "defn.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	mod, err := db.EnsureModule("example.com/miss", "miss", "")
+	if err != nil {
+		t.Fatalf("EnsureModule: %v", err)
+	}
+
+	// Three defs, all missing summaries at start.
+	var ids [3]int64
+	for i, name := range []string{"A", "B", "C"} {
+		d := &Definition{
+			ModuleID: mod.ID, Name: name, Kind: "function",
+			Body: "func " + name + "() {}",
+		}
+		id, err := db.UpsertDefinition(d)
+		if err != nil {
+			t.Fatalf("UpsertDefinition %s: %v", name, err)
+		}
+		ids[i] = id
+	}
+
+	got, err := db.ListDefsMissingSummary()
+	if err != nil {
+		t.Fatalf("ListDefsMissingSummary (initial): %v", err)
+	}
+	if len(got) != 3 {
+		t.Errorf("initial: got %d missing, want 3 (ids=%v)", len(got), got)
+	}
+	// Sorted-ascending contract.
+	for i := 1; i < len(got); i++ {
+		if got[i] <= got[i-1] {
+			t.Errorf("not sorted ascending: %v", got)
+		}
+	}
+
+	// Fill def A with a real summary → drops from missing.
+	if err := db.SetDefSummary(ids[0], &DefSummary{
+		OneLine: "returns nothing", BodyHash: "h", Model: "test",
+	}); err != nil {
+		t.Fatalf("SetDefSummary A: %v", err)
+	}
+	got, _ = db.ListDefsMissingSummary()
+	if len(got) != 2 || got[0] == ids[0] {
+		t.Errorf("after filling A: got %v, want 2 ids excluding %d", got, ids[0])
+	}
+
+	// Empty one_line still counts as missing (edge case: a failed
+	// generation that persisted an empty result would leave defs
+	// invisible to future backfill without this guard).
+	if err := db.SetDefSummary(ids[1], &DefSummary{
+		OneLine: "", BodyHash: "h", Model: "test",
+	}); err != nil {
+		t.Fatalf("SetDefSummary B (empty): %v", err)
+	}
+	got, _ = db.ListDefsMissingSummary()
+	if len(got) != 2 {
+		t.Errorf("after empty-B: got %d missing, want 2 (empty one_line must still count as missing): %v", len(got), got)
+	}
+}

@@ -2375,3 +2375,37 @@ func (s *SQLiteDB) SetDefSummary(defID int64, sum *DefSummary) error {
 	}
 	return nil
 }
+
+// ListDefsMissingSummary returns the IDs of definitions that do not
+// have a model-generated summary in def_summaries.one_line. Task #160
+// stage 3a backfill uses this to enqueue every def needing summarization.
+//
+// Staleness (summary written but the body has since been edited) is
+// NOT reported here — handleGetDefinition falls back to full body on
+// hash mismatch, and the next mutation re-enqueues via applyEditTerse.
+// Callers wanting to force re-summarize (e.g. after a model upgrade)
+// should truncate def_summaries.one_line first.
+//
+// Returns IDs in ascending order so callers can page deterministically
+// (limit N, resume from last-seen+1).
+func (s *SQLiteDB) ListDefsMissingSummary() ([]int64, error) {
+	rows, err := s.db.QueryContext(s.Ctx(), `
+		SELECT d.id
+		FROM definitions d
+		LEFT JOIN def_summaries ds ON ds.def_id = d.id
+		WHERE ds.one_line IS NULL OR ds.one_line = ''
+		ORDER BY d.id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: list missing summaries: %w", err)
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("sqlite: scan missing summary id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
