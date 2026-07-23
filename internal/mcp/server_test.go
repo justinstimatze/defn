@@ -2105,6 +2105,73 @@ func main() {}
 	}
 }
 
+// TestHandleOutline_QueryFilter validates the #157 query-context on
+// outline: callees list narrowed to those matching query token; count
+// header shows "N of M filtered by query" when hits < total.
+func TestHandleOutline_QueryFilter(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := &server{backend: db}
+
+	mod, _ := db.EnsureModule("example.com/svc", "svc", "")
+	target := &store.Definition{
+		ModuleID: mod.ID, Name: "Handler", Kind: "function",
+		Body: strings.Repeat("// pad the body past outlineBodyThreshold\n", 20) +
+			`func Handler() { authenticate(); logRequest(); parseJSON() }`,
+		Signature: "func Handler()",
+	}
+	target.Hash = store.HashBody(target.Body)
+	targetID, _ := db.UpsertDefinition(target)
+
+	// Three callees; only one matches "auth".
+	callees := []*store.Definition{
+		{ModuleID: mod.ID, Name: "authenticate", Kind: "function", Body: "func authenticate() {}"},
+		{ModuleID: mod.ID, Name: "logRequest", Kind: "function", Body: "func logRequest() {}"},
+		{ModuleID: mod.ID, Name: "parseJSON", Kind: "function", Body: "func parseJSON() {}"},
+	}
+	for _, c := range callees {
+		c.Hash = store.HashBody(c.Body)
+		cid, _ := db.UpsertDefinition(c)
+		_ = db.SetReferences(targetID, []store.Reference{{FromDef: targetID, ToDef: cid, Kind: "call"}})
+	}
+	// SetReferences replaces prior calls, so wire ALL three in one pass.
+	var allRefs []store.Reference
+	for _, c := range callees {
+		cid, _ := db.UpsertDefinition(c)
+		allRefs = append(allRefs, store.Reference{FromDef: targetID, ToDef: cid, Kind: "call"})
+	}
+	_ = db.SetReferences(targetID, allRefs)
+
+	result, _, err := s.handleOutline(context.Background(), nil,
+		nameParam{Name: "Handler", Query: "auth"})
+	if err != nil {
+		t.Fatalf("handleOutline query: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "filtered by query=\"auth\"") {
+		t.Errorf("expected 'filtered by query' header in Callees line\n---\n%s", text)
+	}
+	if !strings.Contains(text, "authenticate") {
+		t.Errorf("expected authenticate to survive filter\n---\n%s", text)
+	}
+	if strings.Contains(text, "logRequest") || strings.Contains(text, "parseJSON") {
+		t.Errorf("non-matching callees should be hidden\n---\n%s", text)
+	}
+}
+
+// Overview's query filter follows the same pattern proven by
+// TestHandleOutline_QueryFilter and TestHandleImpact_QueryFilter.
+// A dedicated overview-integration test is blocked by the known
+// dir-derivation bug for root-level files in handleOverview
+// (setupTestDB's main.go lives at project root; handleOverview
+// derives dir="main" from "main.go" and can't find defs whose
+// module.path is "testproj"). When that file-lookup wart is
+// fixed under a separate task, add a proper integration test.
+
 func TestHandleSlice_MissingArgs(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()

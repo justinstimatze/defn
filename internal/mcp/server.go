@@ -845,7 +845,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "retarget-field-value":
 		return s.handleRetargetFieldValue(ctx, req, args)
 	case "outline":
-		return wrapStale(s.handleOutline(ctx, req, nameParam{Name: args.Name}))
+		return wrapStale(s.handleOutline(ctx, req, nameParam{Name: args.Name, Query: args.Query}))
 	case "slice":
 		return wrapStale(s.handleSlice(ctx, req, args))
 	case "insert-precondition":
@@ -4004,9 +4004,43 @@ func (s *server) handleOverview(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 		return errResult(fmt.Errorf("no definitions found for %s", file))
 	}
 
+	// #157 query-context: filter defs to those whose name/doc/
+	// signature contains any query token. Empty result surfaces
+	// as an error hint so the model can drop the query and retry.
+	totalDefs := len(defs)
+	var hiddenDefs int
+	if q := strings.TrimSpace(args.Query); q != "" {
+		if tokens := extractQueryTokensLower(q); len(tokens) > 0 {
+			var kept []store.Definition
+			for _, d := range defs {
+				hay := strings.ToLower(d.Name + " " + d.Doc + " " + d.Signature)
+				matched := false
+				for _, t := range tokens {
+					if strings.Contains(hay, t) {
+						matched = true
+						break
+					}
+				}
+				if matched {
+					kept = append(kept, d)
+				} else {
+					hiddenDefs++
+				}
+			}
+			if len(kept) == 0 {
+				return errResult(fmt.Errorf("overview: no defs in %s match query=%q (of %d total). Drop the query for the full listing.", file, args.Query, totalDefs))
+			}
+			defs = kept
+		}
+	}
+
 	// Get full definitions with bodies to check relationships.
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("## %s (%d definitions)\n\n", file, len(defs)))
+	if hiddenDefs > 0 {
+		sb.WriteString(fmt.Sprintf("## %s (%d of %d definitions, filtered by query=%q)\n\n", file, len(defs), totalDefs, args.Query))
+	} else {
+		sb.WriteString(fmt.Sprintf("## %s (%d definitions)\n\n", file, len(defs)))
+	}
 
 	// Group by source file.
 	byFile := map[string][]store.Definition{}
@@ -5351,13 +5385,29 @@ func (s *server) handleOutline(_ context.Context, req *sdkmcp.CallToolRequest, a
 
 	sb.WriteString(fmt.Sprintf("Body: %d lines, %d bytes (fetch with op:\"read\")\n", bodyLines, len(d.Body)))
 	sb.WriteString(fmt.Sprintf("Callers: %d (%d production, %d test)\n", len(callers), prodCallers, testCallers))
-	if len(callees) > 0 {
-		names := make([]string, 0, len(callees))
-		for _, c := range callees {
+
+	// #157 query-context: narrow callees to those matching any
+	// query token. Overall count preserved via "(N total)".
+	filteredCallees := callees
+	var hiddenCallees int
+	if q := strings.TrimSpace(args.Query); q != "" {
+		if tokens := extractQueryTokensLower(q); len(tokens) > 0 {
+			filteredCallees, hiddenCallees = filterCallersByQuery(callees, tokens)
+		}
+	}
+	if len(filteredCallees) > 0 {
+		names := make([]string, 0, len(filteredCallees))
+		for _, c := range filteredCallees {
 			names = append(names, formatReceiver(c.Receiver)+c.Name)
 		}
 		sort.Strings(names)
-		sb.WriteString(fmt.Sprintf("Callees (%d): %s\n", len(callees), truncateList(names, outlineCalleeCap)))
+		hdr := fmt.Sprintf("Callees (%d)", len(filteredCallees))
+		if hiddenCallees > 0 {
+			hdr = fmt.Sprintf("Callees (%d of %d, filtered by query=%q)", len(filteredCallees), len(callees), args.Query)
+		}
+		sb.WriteString(fmt.Sprintf("%s: %s\n", hdr, truncateList(names, outlineCalleeCap)))
+	} else if hiddenCallees > 0 {
+		sb.WriteString(fmt.Sprintf("Callees: 0 matching query=%q (%d hidden)\n", args.Query, hiddenCallees))
 	} else {
 		sb.WriteString("Callees: 0\n")
 	}
