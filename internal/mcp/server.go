@@ -1454,7 +1454,11 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 	// Capture the pre-edit signature so we can decide whether the build
 	// gate is safely skippable (#148: body-only edit with a stable
 	// signature keeps dispatch invariant — callers don't need re-typecheck).
-	oldSignature := d.Signature
+	// Use extractSignature on both sides so the comparison is
+	// AST-canonicalized (d.Signature from ingest has doc-comment prefix
+	// lines; extractSignature strips them — comparing them directly
+	// false-positives "sig changed" on every doc-adjacent edit).
+	oldSignature := extractSignature(d.Body)
 	d.Body = args.NewBody
 	d.Signature = extractSignature(args.NewBody)
 
@@ -1465,8 +1469,9 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 
 	recv := formatReceiver(d.Receiver)
 
+	sigStable := oldSignature == d.Signature
 	var buildResult string
-	if oldSignature == d.Signature {
+	if sigStable {
 		buildResult = s.autoEmitOnly(d.SourceFile)
 	} else {
 		if os.Getenv("DEFN_MEASURE_TIMING") == "1" {
@@ -1475,7 +1480,25 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 		buildResult = s.autoEmitAndBuildForFile(d.SourceFile)
 	}
 
-	s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
+	// #150: sig-stable body edit → refs graph is safe to defer.
+	//   - Callers unaffected (refs are by def-ID, IDs stable, sig stable
+	//     means dispatch stable too)
+	//   - Interface satisfaction unaffected (sig-driven)
+	//   - Only D's OUTGOING refs may have changed (D calls new funcs /
+	//     stops calling old ones). Those refresh on the next full sync
+	//     or explicit `code(op:"sync")`.
+	// Skips ResolveFile's ~200ms packages.Load + all-file resolve.
+	// Signature-changing edits still eagerly re-resolve (dispatch shifts).
+	//
+	// Set DEFN_STRICT_BUILD=1 to also force eager resolve (same escape
+	// hatch as autoEmitOnly's build gate).
+	if sigStable && os.Getenv("DEFN_STRICT_BUILD") != "1" {
+		if os.Getenv("DEFN_MEASURE_TIMING") == "1" {
+			fmt.Fprintf(os.Stderr, "  [edit] resolve deferred (sig-stable; run code(op:\"sync\") to refresh D's outgoing refs)\n")
+		}
+	} else {
+		s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
+	}
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Updated %s%s (id=%d, hash=%s)\n", recv, d.Name, id, store.HashBody(args.NewBody)[:12]))
