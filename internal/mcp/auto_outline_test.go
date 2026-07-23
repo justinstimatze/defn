@@ -49,11 +49,15 @@ func TestHandleGetDefinition_AutoDowngradesLargeBody(t *testing.T) {
 		t.Fatalf("read: %v", err)
 	}
 	text := resultText(t, result)
-	if !strings.Contains(text, "#184 auto-outline") {
-		t.Errorf("expected auto-outline downgrade note, got: %s", text)
+	if !strings.Contains(text, "Outline shown") {
+		t.Errorf("expected outline-shown downgrade note, got: %s", text)
 	}
-	if !strings.Contains(text, `mode:"body"`) {
-		t.Errorf("expected escape-hatch hint mentioning mode:\"body\", got: %s", text)
+	// #184.b: escape hatches (mode:"body", full:true) are documented in
+	// the tool description, NOT advertised in the inline note — the
+	// post-#184 bench showed the model reflexively retried when the
+	// note enumerated them.
+	if strings.Contains(text, `mode:"body"`) {
+		t.Errorf("downgrade note must NOT advertise mode:\"body\" escape hatch (model retries); got: %s", text)
 	}
 	// Body content ("this is padding") must be absent — we returned outline.
 	if strings.Contains(text, "this is padding") {
@@ -63,7 +67,7 @@ func TestHandleGetDefinition_AutoDowngradesLargeBody(t *testing.T) {
 	// Escape hatch #1: mode:"body" bypasses.
 	result2, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "BigFunc", Mode: "body"})
 	text2 := resultText(t, result2)
-	if strings.Contains(text2, "#184 auto-outline") {
+	if strings.Contains(text2, "Outline shown") {
 		t.Errorf("mode:\"body\" should bypass auto-downgrade; got: %s", text2)
 	}
 	if !strings.Contains(text2, "this is padding") {
@@ -73,7 +77,7 @@ func TestHandleGetDefinition_AutoDowngradesLargeBody(t *testing.T) {
 	// Escape hatch #2: full:true bypasses.
 	result3, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "BigFunc", Full: true})
 	text3 := resultText(t, result3)
-	if strings.Contains(text3, "#184 auto-outline") {
+	if strings.Contains(text3, "Outline shown") {
 		t.Errorf("full:true should bypass auto-downgrade; got: %s", text3)
 	}
 	if !strings.Contains(text3, "this is padding") {

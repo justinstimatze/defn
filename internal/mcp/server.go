@@ -1453,8 +1453,13 @@ func (s *server) handleGetDefinition(_ context.Context, _ *sdkmcp.CallToolReques
 		len(d.Body) > readAutoOutlineThreshold {
 		if outlineR, _, oErr := s.handleOutline(nil, nil, args); oErr == nil && outlineR != nil && !outlineR.IsError {
 			text := resultTextRaw(outlineR)
+			// Note intentionally does NOT enumerate the escape hatches.
+			// Post-#184 chi bench showed the model reflexively retries
+			// with full:true when the hint reads like a menu. Escape
+			// hatches (full:true, mode:"body") still work; they're
+			// documented in the tool description, not advertised inline.
 			note := fmt.Sprintf(
-				"_[#184 auto-outline: body is %d bytes / %d lines. Pass `mode:\"body\"` or `full:true` for full source.]_\n\n",
+				"_[Outline shown — body is %d bytes / %d lines. Full body only needed when editing.]_\n\n",
 				len(d.Body), strings.Count(d.Body, "\n")+1,
 			)
 			out := note + text
