@@ -86,10 +86,11 @@ type server struct {
 	ready           atomic.Bool  // true after startup ingest+resolve completes
 	autoCommitCount atomic.Int64 // counts auto-commits; triggers GC every 10
 	idf             *rank.LazyIDF
-	respCache       *respCache      // #77/#152: per-session dedup of read-side responses
-	reach           *reachCache     // #154: in-memory reverse-refs cache for fast batch impact
-	hint            *mutationHint   // #158: apply-batching nudge on serial mutations to one file
-	summaryWorker   *summary.Worker // #160: async model-summary generation for def_summaries
+	respCache       *respCache             // #77/#152: per-session dedup of read-side responses
+	reach           *reachCache            // #154: in-memory reverse-refs cache for fast batch impact
+	hint            *mutationHint          // #158: apply-batching nudge on serial mutations to one file
+	summaryWorker   *summary.Worker        // #160: async model-summary generation for def_summaries
+	explainClient   *summary.ExplainClient // #186: Sonnet co-processor for op:"explain" with question
 }
 
 // Run starts the MCP server over stdio. projDir is the project root where
@@ -290,6 +291,10 @@ func newMCPServer(ctx context.Context, database store.Backend, projDir string) (
 	s.summaryWorker = summary.NewWorker(backend, database, 0)
 	s.summaryWorker.Start(ctx)
 
+	// #186: co-processor for op:"explain" with question. Nil when
+	// ANTHROPIC_API_KEY is unset — handler returns a clear error path.
+	s.explainClient = summary.NewExplain(summary.ExplainOptions{APIKey: os.Getenv("ANTHROPIC_API_KEY")})
+
 	if projDir != "" {
 		// Reconcile changes made while defn was not running (file moves,
 		// deletions, renames). Runs async so the MCP server starts within
@@ -397,11 +402,12 @@ type codeParam struct {
 	StmtIndex   int              `json:"stmt_index,omitempty"`
 	DeferBody   string           `json:"defer_body,omitempty"`
 	Full        bool             `json:"full,omitempty"`
-	Include     []string         `json:"include,omitempty"` // expand op: which graph hops to fold in
-	Test        string           `json:"test,omitempty"`    // L11: op:test named-test reproduction (`-run <regex>` verbatim)
-	Field       string           `json:"field,omitempty"`   // retarget-field-value: composite-literal field name
-	Query       string           `json:"query,omitempty"`   // #153: query-adaptive read — keep only body branches touching the query
-	Mode        string           `json:"mode,omitempty"`    // #160: "summary" returns model-generated one-line intent instead of body
+	Include     []string         `json:"include,omitempty"`  // expand op: which graph hops to fold in
+	Test        string           `json:"test,omitempty"`     // L11: op:test named-test reproduction (`-run <regex>` verbatim)
+	Field       string           `json:"field,omitempty"`    // retarget-field-value: composite-literal field name
+	Query       string           `json:"query,omitempty"`    // #153: query-adaptive read — keep only body branches touching the query
+	Mode        string           `json:"mode,omitempty"`     // #160: "summary" returns model-generated one-line intent instead of body
+	Question    string           `json:"question,omitempty"` // #186: natural-language question for op:"explain" co-processor
 }
 
 // applyOp is one operation inside an apply batch. Only Op is
@@ -722,9 +728,16 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	}
 
 	switch args.Op {
-	case "read", "impact", "explain", "delete", "test", "history", "similar":
+	case "read", "impact", "delete", "test", "history", "similar":
 		if r, o, e := need(args.Name, "name"); r != nil {
 			return r, o, e
+		}
+	case "explain":
+		// #186: accept name OR names[]; the Q+A co-processor path
+		// often passes a multi-def scope so a single "name" wouldn't
+		// suffice.
+		if strings.TrimSpace(args.Name) == "" && len(args.Names) == 0 {
+			return errResult(fmt.Errorf("explain: name or names is required"))
 		}
 	case "insert-precondition":
 		if r, o, e := need(args.Name, "name"); r != nil {
@@ -934,6 +947,13 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "impact":
 		return wrapStale(s.handleImpact(ctx, req, args))
 	case "explain":
+		// #186: when a `question` is passed, route to the Sonnet
+		// co-processor path (assembles bodies, calls Sonnet, returns
+		// synthesized answer). Bare explain (no question) keeps the
+		// legacy static-context shape.
+		if strings.TrimSpace(args.Question) != "" {
+			return wrapStale(s.handleExplainWithQuestion(ctx, req, args))
+		}
 		return wrapStale(s.handleExplain(ctx, req, nameParam{Name: args.Name}))
 	case "untested":
 		return wrapStale(s.handleUntested(ctx, req, emptyParam{}))
