@@ -397,34 +397,44 @@ type codeParam struct {
 	Mode        string           `json:"mode,omitempty"`    // #160: "summary" returns model-generated one-line intent instead of body
 }
 
+// applyOp is one operation inside an apply batch. Only Op is
+// required — every other field is conditional on Op's value. The
+// omitempty tags matter: mcp-go generates the tool's JSON schema
+// from these struct tags via reflection, and a field without
+// omitempty ends up as "required" in the schema. Before #182 every
+// field here was un-tagged, which meant a heterogeneous batch (e.g.,
+// create + add-import in one call) was rejected at schema-validation
+// time with "required: missing properties: [condition, ret, slice,
+// import_path, ...]" — defeating apply's whole purpose. See the
+// applyOp handler in handleApply for per-op field enforcement.
 type applyOp struct {
 	Op          string `json:"op"`
-	Name        string `json:"name"`
-	NewName     string `json:"new_name"`
-	Body        string `json:"body"`
-	NewBody     string `json:"new_body"`
-	Module      string `json:"module"`
-	File        string `json:"file"`
-	OldFragment string `json:"old_fragment"`
-	NewFragment string `json:"new_fragment"`
-	After       string `json:"after"`
-	ReplaceAll  bool   `json:"replace_all"`
+	Name        string `json:"name,omitempty"`
+	NewName     string `json:"new_name,omitempty"`
+	Body        string `json:"body,omitempty"`
+	NewBody     string `json:"new_body,omitempty"`
+	Module      string `json:"module,omitempty"`
+	File        string `json:"file,omitempty"`
+	OldFragment string `json:"old_fragment,omitempty"`
+	NewFragment string `json:"new_fragment,omitempty"`
+	After       string `json:"after,omitempty"`
+	ReplaceAll  bool   `json:"replace_all,omitempty"`
 
 	// Projection-op fields. Not all ops use every field; the op tag
 	// picks which apply. See internal/projection for the pure functions.
-	Condition  string `json:"condition"`   // insert-precondition
-	Ret        string `json:"ret"`         // insert-precondition
-	Slice      string `json:"slice"`       // replace-slice
-	Index      int    `json:"index"`       // replace-slice / replace-hunk
-	New        string `json:"new"`         // replace-slice / replace-hunk
-	Old        string `json:"old"`         // replace-hunk
-	Force      bool   `json:"force"`       // replace-slice
-	DeferBody  string `json:"defer_body"`  // wrap-in-defer
-	StmtIndex  int    `json:"stmt_index"`  // wrap-in-defer
-	OldParam   string `json:"old_param"`   // rename-param
-	NewParam   string `json:"new_param"`   // rename-param
-	ImportPath string `json:"import_path"` // add-import
-	Alias      string `json:"alias"`       // add-import
+	Condition  string `json:"condition,omitempty"`   // insert-precondition
+	Ret        string `json:"ret,omitempty"`         // insert-precondition
+	Slice      string `json:"slice,omitempty"`       // replace-slice
+	Index      int    `json:"index,omitempty"`       // replace-slice / replace-hunk
+	New        string `json:"new,omitempty"`         // replace-slice / replace-hunk
+	Old        string `json:"old,omitempty"`         // replace-hunk
+	Force      bool   `json:"force,omitempty"`       // replace-slice
+	DeferBody  string `json:"defer_body,omitempty"`  // wrap-in-defer
+	StmtIndex  int    `json:"stmt_index,omitempty"`  // wrap-in-defer
+	OldParam   string `json:"old_param,omitempty"`   // rename-param
+	NewParam   string `json:"new_param,omitempty"`   // rename-param
+	ImportPath string `json:"import_path,omitempty"` // add-import
+	Alias      string `json:"alias,omitempty"`       // add-import
 }
 
 // Legacy param types used by internal handlers.
