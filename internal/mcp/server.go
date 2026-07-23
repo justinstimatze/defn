@@ -34,6 +34,7 @@ import (
 	"github.com/justinstimatze/defn/internal/rank"
 	"github.com/justinstimatze/defn/internal/resolve"
 	"github.com/justinstimatze/defn/internal/store"
+	"github.com/justinstimatze/defn/internal/summary"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -76,9 +77,10 @@ type server struct {
 	ready           atomic.Bool  // true after startup ingest+resolve completes
 	autoCommitCount atomic.Int64 // counts auto-commits; triggers GC every 10
 	idf             *rank.LazyIDF
-	respCache       *respCache    // #77/#152: per-session dedup of read-side responses
-	reach           *reachCache   // #154: in-memory reverse-refs cache for fast batch impact
-	hint            *mutationHint // #158: apply-batching nudge on serial mutations to one file
+	respCache       *respCache      // #77/#152: per-session dedup of read-side responses
+	reach           *reachCache     // #154: in-memory reverse-refs cache for fast batch impact
+	hint            *mutationHint   // #158: apply-batching nudge on serial mutations to one file
+	summaryWorker   *summary.Worker // #160: async model-summary generation for def_summaries
 }
 
 // Run starts the MCP server over stdio. projDir is the project root where
@@ -268,6 +270,16 @@ func newMCPServer(ctx context.Context, database store.Backend, projDir string) (
 	s.respCache = newRespCache()
 	s.reach = newReachCache()
 	s.hint = newMutationHint()
+
+	// #160: summary worker. Fire-and-forget goroutine that consumes
+	// enqueue()d requests and writes model-generated one-line intent
+	// summaries to def_summaries. Backend is Haiku when
+	// ANTHROPIC_API_KEY is set (paid; ~$1/1M input tokens); otherwise
+	// [summary.Stub]{} — a no-op returning "TODO: <Name>" so the read
+	// path exercises without any spend. Never nil.
+	backend := summary.NewHaiku(summary.HaikuOptions{APIKey: os.Getenv("ANTHROPIC_API_KEY")})
+	s.summaryWorker = summary.NewWorker(backend, database, 0)
+	s.summaryWorker.Start(ctx)
 
 	if projDir != "" {
 		// Reconcile changes made while defn was not running (file moves,
@@ -1426,6 +1438,20 @@ func (s *server) handleGetDefinition(_ context.Context, _ *sdkmcp.CallToolReques
 	sb.WriteString(body)
 	sb.WriteString("\n```\n")
 
+	// #160 nudge: when the body is large and no compact projection is
+	// active (summary/query/upstream-match), point at mode:"summary".
+	// The tip only helps when the summary backend is producing real
+	// content — with the Stub, mode:"summary" returns "TODO: <Name>"
+	// which the reader treats as no-summary and falls back to body.
+	// Even then the tip is harmless: it costs ~100 bytes vs saving
+	// several kB when a real summary lands.
+	if args.Mode != "summary" && strings.Count(body, "\n") > summaryHintLineThreshold {
+		sb.WriteString(fmt.Sprintf(
+			"\n_tip: body is %d lines; `mode:\"summary\"` returns intent+sig in a compact projection when a summary is available._\n",
+			strings.Count(body, "\n")+1,
+		))
+	}
+
 	out := sb.String()
 	return withUsage(textResult(out), usageStats{
 		Op:            "read",
@@ -1770,6 +1796,9 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 	if err != nil {
 		return errResult(err)
 	}
+	d.ID = id
+	// #160: fire-and-forget summary regeneration (see enqueueSummary).
+	s.enqueueSummary(d)
 
 	recv := formatReceiver(d.Receiver)
 
@@ -3740,10 +3769,10 @@ func truncateTestOutput(out string) string {
 // blob rows when a compact projection would do.
 var (
 	sqlBodyGrep    = regexp.MustCompile(`(?i)\bbody\s+LIKE\s+'`)
-	sqlNameLookup  = regexp.MustCompile(`(?i)\b(?:d\.)?name\s*=\s*'`)
 	sqlFileScoped  = regexp.MustCompile(`(?i)\b(?:d\.)?source_file\s*(?:LIKE\b|=|\bIN\b)`)
-	sqlSchemaProbe = regexp.MustCompile(`(?i)^\s*(?:SHOW\s+(?:TABLES|DATABASES|COLUMNS)|DESCRIBE\s|DESC\s|EXPLAIN\s)`)
 	sqlInfoSchema  = regexp.MustCompile(`(?i)\bINFORMATION_SCHEMA\b`)
+	sqlNameLookup  = regexp.MustCompile(`(?i)\b(?:d\.)?name\s*=\s*'`)
+	sqlSchemaProbe = regexp.MustCompile(`(?i)^\s*(?:SHOW\s+(?:TABLES|DATABASES|COLUMNS)|DESCRIBE\s|DESC\s|EXPLAIN\s)`)
 )
 
 func searchShapedSQLRedirect(sql string) string {
@@ -5880,6 +5909,11 @@ func (s *server) applyEditTerse(session *sdkmcp.ServerSession, name, action, sni
 	if _, err := s.backend.UpsertDefinition(d); err != nil {
 		return errResult(err)
 	}
+	// #160: fire-and-forget summary regeneration. Body changed → any
+	// existing summary is stale. Worker computes async; if the queue
+	// is full or backend unconfigured we drop silently (the summary
+	// is best-effort, next mutation re-enqueues).
+	s.enqueueSummary(d)
 	// #148: projection ops (all callers of applyEditTerse) are AST-
 	// guaranteed sig-stable — skip the go-build gate to actually deliver
 	// the "faster than native because the index is maintained" thesis.
@@ -5985,3 +6019,33 @@ func renderSummaryOnly(d *store.Definition, sum *store.DefSummary) *sdkmcp.CallT
 		BytesReturned: len(out),
 	})
 }
+
+// enqueueSummary submits d for background summary regeneration. Safe
+// to call before the worker is initialized (nil-guarded), safe to
+// call when no summary backend is configured (Stub silently succeeds,
+// writes "TODO: <Name>" that the read path treats as a summary miss
+// and falls back to full body — no user-visible degradation).
+//
+// Always fire-and-forget: the enqueue is non-blocking; a full queue
+// drops silently so a slow model can't stall the write path.
+func (s *server) enqueueSummary(d *store.Definition) {
+	if s == nil || s.summaryWorker == nil || d == nil {
+		return
+	}
+	modulePath := s.modulePath(d.ModuleID)
+	s.summaryWorker.Enqueue(summary.Request{
+		DefID:      d.ID,
+		Name:       d.Name,
+		Kind:       d.Kind,
+		Receiver:   d.Receiver,
+		ModulePath: modulePath,
+		Body:       d.Body,
+		BodyHash:   store.HashBodyStructural(d.Body),
+	})
+}
+
+// summaryHintLineThreshold is the body-line count above which
+// handleGetDefinition appends the #160 mode:"summary" tip. 40 lines
+// ≈ the point where a 5-line "here's what it does" summary is
+// meaningfully cheaper than sending the whole body.
+const summaryHintLineThreshold = 40
