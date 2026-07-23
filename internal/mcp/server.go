@@ -5,7 +5,9 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -495,11 +497,18 @@ func textResult(text string) *sdkmcp.CallToolResult {
 // responses so bench harnesses can measure per-op savings without
 // re-parsing text. Also drives the compact footer line on dramatic
 // wins. See task #59 / [[project_marketing_playbook]].
+//
+// PrefixHash100 and BodySHA256 (added #177) enable cache-drift
+// detection: if two shape-identical ops emit different prefixes,
+// prompt-cache hits are being silently killed. Cross-call BodySHA256
+// equality flags duplicate-content that dedup should have compressed.
 type usageStats struct {
 	Op            string `json:"op"`
 	BytesReturned int    `json:"bytes_returned"`
 	BytesAltRead  int    `json:"bytes_alt_read,omitempty"`
 	SavingsPct    int    `json:"savings_pct,omitempty"`
+	PrefixHash100 string `json:"prefix_hash_100,omitempty"`
+	BodySHA256    string `json:"body_sha256,omitempty"`
 }
 
 // fileAltBytes is a proxy for "what a Read on the source file would
@@ -524,6 +533,10 @@ func (s *server) fileAltBytes(d *store.Definition) int {
 // (#165). Bench harnesses now read stderr JSON lines instead of
 // grepping the text response.
 //
+// #177 (2026-07-23): also computes prefix_hash_100 (first 100 bytes)
+// and body_sha256 to enable cache-drift detection and cross-call
+// dedup analysis. No response mutation — hashes go to stderr only.
+//
 // Historical note: an even earlier version of this function set
 // r.StructuredContent = u. Claude's tool_result serialization treated
 // structuredContent as a replacement for text content, silently
@@ -538,6 +551,16 @@ func withUsage(r *sdkmcp.CallToolResult, u usageStats) *sdkmcp.CallToolResult {
 			saved = 0
 		}
 		u.SavingsPct = 100 * saved / u.BytesAltRead
+	}
+	if text := resultTextRaw(r); text != "" {
+		full := sha256.Sum256([]byte(text))
+		u.BodySHA256 = hex.EncodeToString(full[:8])
+		n := len(text)
+		if n > 100 {
+			n = 100
+		}
+		prefix := sha256.Sum256([]byte(text[:n]))
+		u.PrefixHash100 = hex.EncodeToString(prefix[:8])
 	}
 	emitUsageLog(u)
 	return r
