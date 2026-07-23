@@ -40,7 +40,7 @@ while IFS= read -r prompt; do
             --dangerously-skip-permissions \
             --strict-mcp-config \
             "${EXTRA_ARGS[@]}" \
-            "$prompt") > "$OUT_FILE" 2> "$OUT_FILE.err" || {
+            -- "$prompt") > "$OUT_FILE" 2> "$OUT_FILE.err" || {
             echo "[$ARM] turn $TURN FAILED, stderr:"
             head -20 "$OUT_FILE.err" >&2
             exit 1
@@ -53,7 +53,7 @@ while IFS= read -r prompt; do
             --dangerously-skip-permissions \
             --strict-mcp-config \
             "${EXTRA_ARGS[@]}" \
-            "$prompt") > "$OUT_FILE" 2> "$OUT_FILE.err" || {
+            -- "$prompt") > "$OUT_FILE" 2> "$OUT_FILE.err" || {
             echo "[$ARM] turn $TURN FAILED, stderr:"
             head -20 "$OUT_FILE.err" >&2
             exit 1

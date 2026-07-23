@@ -2130,7 +2130,7 @@ func (s *server) autoEmitOnlyWithOpts(opts emit.Opts) string {
 		return s.autoEmitAndBuildWithOpts(opts)
 	}
 	if s.projectDir == "" || os.Getenv("DEFN_LEGACY") == "1" {
-		return "Saved to database."
+		return ""
 	}
 	timing := os.Getenv("DEFN_MEASURE_TIMING") == "1"
 
@@ -2141,7 +2141,7 @@ func (s *server) autoEmitOnlyWithOpts(opts emit.Opts) string {
 	if timing {
 		fmt.Fprintf(os.Stderr, "  [emit] emit.EmitWithOpts (build deferred): %s\n", time.Since(t).Round(time.Millisecond))
 	}
-	return "Build: deferred (safe mutation)"
+	return ""
 }
 
 // autoEmitAndBuildWithOpts is autoEmitAndBuild with caller-supplied
@@ -2150,9 +2150,13 @@ func (s *server) autoEmitOnlyWithOpts(opts emit.Opts) string {
 // data-loss safety net. Without this, the delete lands in the DB but
 // never in the file — the watcher then re-ingests the "resurrected" def
 // on the next tick. See project_defn_watch_delete_race memory.
+//
+// Return value is a status string appended to the tool response.
+// Success paths return "" — silence is the signal. Failure paths return
+// human-readable error strings the model must react to.
 func (s *server) autoEmitAndBuildWithOpts(opts emit.Opts) string {
 	if s.projectDir == "" || os.Getenv("DEFN_LEGACY") == "1" {
-		return "Saved to database."
+		return ""
 	}
 	timing := os.Getenv("DEFN_MEASURE_TIMING") == "1"
 
@@ -2185,7 +2189,7 @@ func (s *server) autoEmitAndBuildWithOpts(opts emit.Opts) string {
 	if err != nil {
 		return fmt.Sprintf("BUILD FAILED:\n%s", string(out))
 	}
-	return "Build: OK"
+	return ""
 }
 
 // buildTargetsForFiles derives the minimal `go build` target list from
