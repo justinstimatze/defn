@@ -50,7 +50,14 @@ const maxSearchResults = 20
 // results of a targeted search.
 const searchPreviewCount = 3
 
-const searchPreviewLines = 5
+// searchPreviewLines caps each inline body preview attached to top-N
+// search hits. #173 (2026-07-23): cut from 5 to 2. Gap-decomp showed
+// that a 5-line preview × 3 hits (~15 lines of code + JSON envelope)
+// was a meaningful chunk of every search response's cache_read tail.
+// 2 lines gives sig-line + first body line, which is enough for the
+// model to identify the winning hit; if it needs more, one follow-up
+// read is cheaper than paying 5×3 preview cost on every search.
+const searchPreviewLines = 2
 
 // Version is the running defn build's semver string. Kept as a package
 // constant so the CLI can compare its own version against what a
