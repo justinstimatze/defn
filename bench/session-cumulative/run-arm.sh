@@ -26,16 +26,16 @@ OUT_DIR=${OUT_DIR:-./out/$ARM}
 mkdir -p "$OUT_DIR"
 
 # #180 / #174 plumbing: capture defn serve's stderr JSONL for this arm.
-# Default on for any arm whose name contains "defn"; files-only arms
-# don't touch defn serve so nothing would be written.
+# The MCP config spawns a per-arm defn serve as a child of claude, which
+# inherits our env — so exporting DEFN_USAGE_LOG_FILE here reaches the
+# right process. No need to bounce anything: we're not talking to the
+# ambient serve.
 DEFN_CAPTURE_USAGE=${DEFN_CAPTURE_USAGE:-$([[ "$ARM" == *defn* ]] && echo 1 || echo 0)}
 if [ "$DEFN_CAPTURE_USAGE" = "1" ]; then
     USAGE_LOG="$(realpath "$OUT_DIR")/defn-usage.jsonl"
     : > "$USAGE_LOG"
-    echo "[$ARM] capturing defn usage to $USAGE_LOG (bouncing serve)"
-    DEFN_USAGE_LOG_FILE="$USAGE_LOG" defn restart >/dev/null 2>&1 || {
-        echo "[$ARM] defn restart failed — usage log will be empty" >&2
-    }
+    export DEFN_USAGE_LOG_FILE="$USAGE_LOG"
+    echo "[$ARM] capturing defn usage to $USAGE_LOG"
 fi
 
 # Pre-generate a session ID (UUID v4)
