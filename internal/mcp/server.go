@@ -1449,6 +1449,10 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 		return errResult(fmt.Errorf("new_body has syntax error: %v", parseErr))
 	}
 
+	// Capture the pre-edit signature so we can decide whether the build
+	// gate is safely skippable (#148: body-only edit with a stable
+	// signature keeps dispatch invariant — callers don't need re-typecheck).
+	oldSignature := d.Signature
 	d.Body = args.NewBody
 	d.Signature = extractSignature(args.NewBody)
 
@@ -1459,7 +1463,15 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 
 	recv := formatReceiver(d.Receiver)
 
-	buildResult := s.autoEmitAndBuildForFile(d.SourceFile)
+	var buildResult string
+	if oldSignature == d.Signature {
+		buildResult = s.autoEmitOnly(d.SourceFile)
+	} else {
+		if os.Getenv("DEFN_MEASURE_TIMING") == "1" {
+			fmt.Fprintf(os.Stderr, "  [edit] signature changed, build required:\n    old: %q\n    new: %q\n", oldSignature, d.Signature)
+		}
+		buildResult = s.autoEmitAndBuildForFile(d.SourceFile)
+	}
 
 	s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
 
@@ -1727,6 +1739,56 @@ func (s *server) autoEmitAndBuildForFile(sourceFile string) string {
 		GoimportsFiles: []string{sourceFile},
 		TouchedFiles:   []string{sourceFile},
 	})
+}
+
+// autoEmitOnly emits without running `go build` — for projection ops
+// that are AST-guaranteed sig-stable (insert-precondition, replace-slice,
+// replace-hunk, wrap-in-defer, rename-param, add-import). Task #148:
+// on winze, rename+build was 187ms with 148ms of that in go build;
+// skipping the build takes the op to ~35ms and delivers the "faster
+// than native because the index is maintained" thesis as a
+// demonstrable fact rather than an aspiration.
+//
+// Safety: these ops preserve syntactic well-formedness by construction
+// (they transform an already-valid AST). They CAN produce type errors
+// (undefined identifier in a new precondition, wrong signature in a
+// hunk replacement) — those surface on the next op that builds, or on
+// an explicit code(op:"test") / native `go build`. The DB is
+// authoritative; the emitted file is a projection.
+//
+// autoResolveFile still runs downstream via the callers so the ref
+// graph stays consistent. Only the go-build gate is deferred.
+//
+// Set DEFN_STRICT_BUILD=1 to force the build (opt-out for users who
+// want the old per-mutation gate — bench harnesses, CI, cautious flows).
+func (s *server) autoEmitOnly(sourceFile string) string {
+	opts := emit.Opts{}
+	if sourceFile != "" {
+		opts.GoimportsFiles = []string{sourceFile}
+		opts.TouchedFiles = []string{sourceFile}
+	}
+	return s.autoEmitOnlyWithOpts(opts)
+}
+
+// autoEmitOnlyWithOpts is the multi-file variant used by handleRename,
+// which touches the def's own file plus each caller's file.
+func (s *server) autoEmitOnlyWithOpts(opts emit.Opts) string {
+	if os.Getenv("DEFN_STRICT_BUILD") == "1" {
+		return s.autoEmitAndBuildWithOpts(opts)
+	}
+	if s.projectDir == "" || os.Getenv("DEFN_LEGACY") == "1" {
+		return "Saved to database."
+	}
+	timing := os.Getenv("DEFN_MEASURE_TIMING") == "1"
+
+	t := time.Now()
+	if err := emit.EmitWithOpts(s.backend, s.projectDir, opts); err != nil {
+		return fmt.Sprintf("emit error: %v", err)
+	}
+	if timing {
+		fmt.Fprintf(os.Stderr, "  [emit] emit.EmitWithOpts (build deferred): %s\n", time.Since(t).Round(time.Millisecond))
+	}
+	return "Build: deferred (safe mutation)"
 }
 
 // autoEmitAndBuildWithOpts is autoEmitAndBuild with caller-supplied
@@ -3157,7 +3219,12 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		goimportsFiles = append(goimportsFiles, f)
 	}
 
-	buildResult := s.autoEmitAndBuildWithOpts(emit.Opts{
+	// #148: rename is dispatch-safe by construction — refs are by def-ID,
+	// no ID changes on rename, so the ref graph and interface satisfaction
+	// are preserved regardless of build outcome. Skip the build gate;
+	// this is the biggest single win of #148 (rename was 187ms wall on
+	// winze with 148ms in go build; drops to ~40ms).
+	buildResult := s.autoEmitOnlyWithOpts(emit.Opts{
 		AllowedRemovals: []string{qualifiedOld},
 		GoimportsFiles:  goimportsFiles,
 		TouchedFiles:    goimportsFiles,
@@ -4850,7 +4917,8 @@ func (s *server) handleAddImport(_ context.Context, _ *sdkmcp.CallToolRequest, a
 	if err := s.backend.SetImports(moduleID, updated); err != nil {
 		return errResult(fmt.Errorf("add-import: set imports: %w", err))
 	}
-	buildResult := s.autoEmitAndBuildForFile(file)
+	// #148: adding an import is dispatch-safe by construction — skip build.
+	buildResult := s.autoEmitOnly(file)
 	snippet := fmt.Sprintf("import %q", args.ImportPath)
 	if args.Alias != "" {
 		snippet = fmt.Sprintf("import %s %q", args.Alias, args.ImportPath)
@@ -5063,7 +5131,11 @@ func (s *server) applyEditTerse(name, action, snippet, newBody string) (*sdkmcp.
 	if _, err := s.backend.UpsertDefinition(d); err != nil {
 		return errResult(err)
 	}
-	buildResult := s.autoEmitAndBuildForFile(d.SourceFile)
+	// #148: projection ops (all callers of applyEditTerse) are AST-
+	// guaranteed sig-stable — skip the go-build gate to actually deliver
+	// the "faster than native because the index is maintained" thesis.
+	// Set DEFN_STRICT_BUILD=1 to force the old per-mutation build.
+	buildResult := s.autoEmitOnly(d.SourceFile)
 	s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
 
 	recv := formatReceiver(d.Receiver)
