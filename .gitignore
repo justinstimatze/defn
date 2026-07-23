@@ -10,6 +10,11 @@
 # Generated configs (contain absolute paths)
 .mcp.json
 
+# Local secrets — sourced before defn serve/restart to pass
+# ANTHROPIC_API_KEY etc. into the process env. Never committed.
+.env
+.env.local
+
 # OS
 .DS_Store
 
