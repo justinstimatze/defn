@@ -975,6 +975,18 @@ func (s *server) handleImpact(_ context.Context, _ *sdkmcp.CallToolRequest, args
 			prodCallers = append(prodCallers, c)
 		}
 	}
+	// MDL surprise-first: if the safety-relevant signal is abnormal,
+	// lead with it. A def with production callers but zero test
+	// coverage is the highest-info bit for "is it safe to change?"
+	// Buried at the bottom of the response prior, model often stops
+	// reading before it — now the WARNING is line 3.
+	if impact.UncoveredBy > 0 && len(prodCallers) > 0 {
+		sb.WriteString(fmt.Sprintf("⚠ WARNING: %d/%d direct production callers have no test coverage — a change here may break code no test will catch.\n\n",
+			impact.UncoveredBy, len(prodCallers)))
+	} else if len(prodCallers) > 0 && len(impact.Tests) == 0 {
+		sb.WriteString(fmt.Sprintf("⚠ WARNING: %d production callers, 0 tests covering this def. Ship-blocking risk on any semantic change.\n\n",
+			len(prodCallers)))
+	}
 	sb.WriteString(fmt.Sprintf("Direct callers: %d (%d production, %d test)\n", len(impact.DirectCallers), len(prodCallers), len(testCallers)))
 	for i, c := range prodCallers {
 		if i >= impactCallerCap {
