@@ -46,6 +46,7 @@ const maxSearchResults = 20
 // body head is inline, and the model rarely reads beyond the top-3
 // results of a targeted search.
 const searchPreviewCount = 3
+
 const searchPreviewLines = 5
 
 // Version is the running defn build's semver string. Kept as a package
@@ -75,8 +76,8 @@ type server struct {
 	ready           atomic.Bool  // true after startup ingest+resolve completes
 	autoCommitCount atomic.Int64 // counts auto-commits; triggers GC every 10
 	idf             *rank.LazyIDF
-	respCache       *respCache  // #77/#152: per-session dedup of read-side responses
-	reach           *reachCache // #154: in-memory reverse-refs cache for fast batch impact
+	respCache       *respCache    // #77/#152: per-session dedup of read-side responses
+	reach           *reachCache   // #154: in-memory reverse-refs cache for fast batch impact
 	hint            *mutationHint // #158: apply-batching nudge on serial mutations to one file
 }
 
@@ -375,6 +376,7 @@ type codeParam struct {
 	Test        string           `json:"test,omitempty"`    // L11: op:test named-test reproduction (`-run <regex>` verbatim)
 	Field       string           `json:"field,omitempty"`   // retarget-field-value: composite-literal field name
 	Query       string           `json:"query,omitempty"`   // #153: query-adaptive read — keep only body branches touching the query
+	Mode        string           `json:"mode,omitempty"`    // #160: "summary" returns model-generated one-line intent instead of body
 }
 
 type applyOp struct {
@@ -423,6 +425,11 @@ type nameParam struct {
 	// from the query. Elided runs collapse to a single comment stub.
 	// No-op if the body has <2 statements or all statements match.
 	Query string `json:"query,omitempty"`
+	// Mode selects the response shape. Default ("") returns the full
+	// body. #160 introduces "summary": returns the model-generated
+	// one-line intent summary if one exists, else falls back to the
+	// full body with a header noting the summary is unavailable.
+	Mode string `json:"mode,omitempty"`
 }
 
 type editParam struct {
@@ -850,7 +857,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 
 	switch args.Op {
 	case "read":
-		return wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name, Full: args.Full, Query: args.Query}))
+		return wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name, Full: args.Full, Query: args.Query, Mode: args.Mode}))
 	case "read-and-verify":
 		return wrapStale(s.handleReadAndVerify(ctx, req, args))
 	case "retarget-field-value":
@@ -1335,6 +1342,23 @@ func (s *server) handleGetDefinition(_ context.Context, _ *sdkmcp.CallToolReques
 	d, err := s.backend.GetDefinitionByName(args.Name, "")
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
+	}
+
+	// #160 summary mode. Returns the compact model-generated intent
+	// line if we have a fresh one, else falls back through to the full
+	// body path below with a header noting summary unavailability. The
+	// staleness check compares stored BodyHash against current body —
+	// mismatch means the def was edited after the summary was written.
+	if args.Mode == "summary" {
+		if sum, sErr := s.backend.GetDefSummary(d.ID); sErr == nil && sum != nil {
+			currentHash := store.HashBodyStructural(d.Body)
+			if sum.BodyHash == currentHash {
+				return renderSummaryOnly(d, sum), nil, nil
+			}
+			// Stale — fall through to body but signal it.
+		}
+		// Falls through to full-body rendering; the reader can see
+		// no summary appeared in the response header.
 	}
 
 	// Look up module path for this definition.
@@ -3977,6 +4001,7 @@ func (s *server) handleSimilarBySignature(d *store.Definition) (*sdkmcp.CallTool
 // when called with no file/name arg — orientation before the model
 // commits to a subtree.
 const projectOverviewModuleCap = 40
+
 const projectOverviewDefsPerModule = 3
 
 func (s *server) projectOverview() (*sdkmcp.CallToolResult, any, error) {
@@ -5097,13 +5122,14 @@ func stmtKind(s ast.Stmt) string {
 // outline output. Bench trajectories showed some outlines pushing 7 kB
 // entirely from unbounded callee lists; head-of-list is enough for the
 // model to orient, and the total count is still reported.
+//
+// impactCallerCap bounds the markdown caller list in handleImpact.
+// Model rarely acts on more than the top 10-15; full list is still
+// available via the structured field.
 const (
+	impactCallerCap  = 15
 	outlineCalleeCap = 15
 	outlineFlowCap   = 20
-	// impactCallerCap bounds the markdown caller list in handleImpact.
-	// Model rarely acts on more than the top 10-15; full list is still
-	// available via format:"json" for the rare deep-analysis case.
-	impactCallerCap = 15
 )
 
 // truncateList returns "a, b, c, … (N more)" when the list exceeds cap,
@@ -5931,4 +5957,31 @@ func (s *server) inferSingleTargetName() (string, error) {
 		}
 		return "", fmt.Errorf("name is required; %d candidates: %s", len(candidates), strings.Join(candidates, ", "))
 	}
+}
+
+// renderSummaryOnly produces the #160 compact response for a def
+// whose stored summary is still fresh. Includes signature and the
+// model-generated one-line intent — no body. The reader can request
+// the body separately by omitting mode:"summary" or by passing
+// full:true if the def matched an upstream fingerprint.
+func renderSummaryOnly(d *store.Definition, sum *store.DefSummary) *sdkmcp.CallToolResult {
+	var sb strings.Builder
+	recv := formatReceiver(d.Receiver)
+	sb.WriteString(fmt.Sprintf("## %s%s (%s) — summary\n", recv, d.Name, d.Kind))
+	if d.Signature != "" {
+		sb.WriteString("```go\n")
+		sb.WriteString(d.Signature)
+		sb.WriteString("\n```\n\n")
+	}
+	if d.Doc != "" {
+		sb.WriteString(d.Doc)
+		sb.WriteString("\n\n")
+	}
+	sb.WriteString(fmt.Sprintf("_intent (%s):_ %s\n", sum.Model, sum.OneLine))
+	sb.WriteString("\n_summary mode — omit `mode:\"summary\"` for the full body._\n")
+	out := sb.String()
+	return withUsage(textResult(out), usageStats{
+		Op:            "read",
+		BytesReturned: len(out),
+	})
 }

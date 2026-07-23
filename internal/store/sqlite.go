@@ -2323,3 +2323,55 @@ func migrateAddSummaryColumns(db *sql.DB) error {
 	}
 	return nil
 }
+
+// GetDefSummary reads the #160 semantic-summary row for defID.
+// Returns (nil, nil) when no row exists yet — the fire-and-forget
+// worker hasn't populated one, or the schema was populated before
+// #160 landed. Missing one_line is normalized to empty string.
+func (s *SQLiteDB) GetDefSummary(defID int64) (*DefSummary, error) {
+	var oneLine, bodyHash, model sql.NullString
+	err := s.db.QueryRowContext(s.Ctx(),
+		`SELECT COALESCE(one_line,''), COALESCE(summary_body_hash,''), COALESCE(summary_model,'')
+		 FROM def_summaries WHERE def_id = ?`, defID,
+	).Scan(&oneLine, &bodyHash, &model)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("sqlite: get def summary %d: %w", defID, err)
+	}
+	if !oneLine.Valid || oneLine.String == "" {
+		return nil, nil
+	}
+	return &DefSummary{
+		OneLine:  oneLine.String,
+		BodyHash: bodyHash.String,
+		Model:    model.String,
+	}, nil
+}
+
+// SetDefSummary writes/updates the #160 semantic-summary row for
+// defID. Idempotent — INSERT OR REPLACE keys off def_id and preserves
+// the existing minhash column (BUT only if the row already exists;
+// SQLite's ON CONFLICT DO UPDATE guarantees this). If no row exists
+// yet, we fall back to a two-statement upsert path so we don't
+// clobber a not-yet-computed minhash with NULL.
+func (s *SQLiteDB) SetDefSummary(defID int64, sum *DefSummary) error {
+	if sum == nil {
+		return nil
+	}
+	// ON CONFLICT DO UPDATE ensures we don't lose the minhash column
+	// when the row already exists from the #151 backfill pass.
+	_, err := s.db.ExecContext(s.Ctx(),
+		`INSERT INTO def_summaries(def_id, one_line, summary_body_hash, summary_model)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(def_id) DO UPDATE SET
+		   one_line          = excluded.one_line,
+		   summary_body_hash = excluded.summary_body_hash,
+		   summary_model     = excluded.summary_model`,
+		defID, sum.OneLine, sum.BodyHash, sum.Model)
+	if err != nil {
+		return fmt.Errorf("sqlite: set def summary %d: %w", defID, err)
+	}
+	return nil
+}

@@ -3,6 +3,8 @@ package store
 import (
 	"crypto/sha256"
 	"fmt"
+
+	_ "modernc.org/sqlite"
 )
 
 // HashBody computes the content hash of a definition body.
@@ -138,4 +140,16 @@ type SimulationStep struct {
 	TestCoverage      int      `json:"test_coverage"`
 	UncoveredCallers  int      `json:"uncovered_callers"`
 	Error             string   `json:"error,omitempty"`
+}
+
+// DefSummary is a row in def_summaries carrying #160 model-generated
+// intent metadata. OneLine is a compact natural-language description
+// of what the def does; BodyHash is the structural hash of the body
+// the summary was generated from (staleness check); Model records
+// which LLM produced it. Empty OneLine means "no summary yet" — the
+// fire-and-forget worker fills these asynchronously after ingest.
+type DefSummary struct {
+	OneLine  string
+	BodyHash string
+	Model    string
 }

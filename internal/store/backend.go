@@ -105,5 +105,13 @@ type Backend interface {
 	// in handleSimilar.
 	SetDefSummaryMinHash(defID int64, minhash []byte) error
 	AllDefSummaryMinHashes() (map[int64][]byte, error)
-}
 
+	// #160 semantic summaries. GetDefSummary returns (nil, nil) when no
+	// summary exists yet — callers must distinguish "no row" from "row
+	// with empty OneLine" (latter shouldn't happen but is legal per the
+	// schema NULL). SetDefSummary is idempotent — INSERT OR REPLACE keys
+	// off def_id. Both are safe to call concurrently with UpsertDefinition
+	// under SQLite's single-writer model.
+	GetDefSummary(defID int64) (*DefSummary, error)
+	SetDefSummary(defID int64, s *DefSummary) error
+}
