@@ -68,6 +68,7 @@ type server struct {
 	idf             *rank.LazyIDF
 	respCache       *respCache  // #77/#152: per-session dedup of read-side responses
 	reach           *reachCache // #154: in-memory reverse-refs cache for fast batch impact
+	hint            *mutationHint // #158: apply-batching nudge on serial mutations to one file
 }
 
 // Run starts the MCP server over stdio. projDir is the project root where
@@ -256,6 +257,7 @@ func newMCPServer(ctx context.Context, database store.Backend, projDir string) (
 	s.idf = newIDF(database)
 	s.respCache = newRespCache()
 	s.reach = newReachCache()
+	s.hint = newMutationHint()
 
 	if projDir != "" {
 		// Reconcile changes made while defn was not running (file moves,
@@ -5501,7 +5503,7 @@ func pluralS(n int) string {
 //
 // If args.Name is empty, tries to infer the target: if the DB has exactly
 // one non-test function, uses it; otherwise errors with the candidate list.
-func (s *server) handleInsertPrecondition(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) handleInsertPrecondition(_ context.Context, req *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	if strings.TrimSpace(args.Condition) == "" {
 		return errResult(fmt.Errorf("insert-precondition: condition is required"))
 	}
@@ -5525,7 +5527,7 @@ func (s *server) handleInsertPrecondition(_ context.Context, _ *sdkmcp.CallToolR
 		return errResult(err)
 	}
 	snippet := fmt.Sprintf("if %s {\n\t%s\n}", args.Condition, args.Ret)
-	return s.applyEditTerse(name, "inserted precondition at entry", snippet, newBody)
+	return s.applyEditTerse(sessionOf(req), name, "inserted precondition at entry", snippet, newBody)
 }
 
 // handleAddImport adds a new import (with optional alias) to the module
@@ -5629,7 +5631,7 @@ func (s *server) handleAddImport(_ context.Context, _ *sdkmcp.CallToolRequest, a
 //
 // If args.Name is empty, tries to infer the target: if the DB has exactly
 // one non-test function, uses it; otherwise errors with the candidate list.
-func (s *server) handleRenameParam(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) handleRenameParam(_ context.Context, req *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	if strings.TrimSpace(args.OldParam) == "" {
 		return errResult(fmt.Errorf("rename-param: old_param is required"))
 	}
@@ -5657,7 +5659,7 @@ func (s *server) handleRenameParam(_ context.Context, _ *sdkmcp.CallToolRequest,
 	if idx := strings.Index(newBody, "\n"); idx > 0 {
 		snippet = newBody[:idx]
 	}
-	return s.applyEditTerse(name, action, snippet, newBody)
+	return s.applyEditTerse(sessionOf(req), name, action, snippet, newBody)
 }
 
 // handleWrapInDefer inserts a `defer <defer_body>` statement immediately
@@ -5666,7 +5668,7 @@ func (s *server) handleRenameParam(_ context.Context, _ *sdkmcp.CallToolRequest,
 //
 // If args.Name is empty, tries to infer the target: if the DB has exactly
 // one non-test function, uses it; otherwise errors with the candidate list.
-func (s *server) handleWrapInDefer(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) handleWrapInDefer(_ context.Context, req *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	if strings.TrimSpace(args.DeferBody) == "" {
 		return errResult(fmt.Errorf("wrap-in-defer: defer_body is required"))
 	}
@@ -5692,7 +5694,7 @@ func (s *server) handleWrapInDefer(_ context.Context, _ *sdkmcp.CallToolRequest,
 	}
 	action := fmt.Sprintf("inserted defer before stmt #%d", stmtIdx)
 	snippet := fmt.Sprintf("defer %s", args.DeferBody)
-	return s.applyEditTerse(name, action, snippet, newBody)
+	return s.applyEditTerse(sessionOf(req), name, action, snippet, newBody)
 }
 
 // handleReplaceSlice replaces the Nth (1-based) match of the given AST
@@ -5708,7 +5710,7 @@ func (s *server) handleWrapInDefer(_ context.Context, _ *sdkmcp.CallToolRequest,
 //
 // If args.Name is empty, tries to infer the target: if the DB has exactly
 // one non-test function, uses it; otherwise errors with the candidate list.
-func (s *server) handleReplaceSlice(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) handleReplaceSlice(_ context.Context, req *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	if strings.TrimSpace(args.Slice) == "" {
 		return errResult(fmt.Errorf("replace-slice: slice kind is required — valid: %s", strings.Join(projection.SliceKindNames(), ", ")))
 	}
@@ -5741,7 +5743,7 @@ func (s *server) handleReplaceSlice(_ context.Context, _ *sdkmcp.CallToolRequest
 		return errResult(err)
 	}
 	action := fmt.Sprintf("replaced %s #%d", args.Slice, index)
-	return s.applyEditTerse(name, action, args.New, newBody)
+	return s.applyEditTerse(sessionOf(req), name, action, args.New, newBody)
 }
 
 // handleReplaceHunk replaces a byte-exact occurrence of `old` inside
@@ -5758,7 +5760,7 @@ func (s *server) handleReplaceSlice(_ context.Context, _ *sdkmcp.CallToolRequest
 // If args.Name is empty, tries to infer the target: if the DB has
 // exactly one non-test function, uses it; otherwise errors with the
 // candidate list.
-func (s *server) handleReplaceHunk(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) handleReplaceHunk(_ context.Context, req *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	if strings.TrimSpace(args.Old) == "" {
 		return errResult(fmt.Errorf("replace-hunk: old is required"))
 	}
@@ -5782,7 +5784,7 @@ func (s *server) handleReplaceHunk(_ context.Context, _ *sdkmcp.CallToolRequest,
 	if args.Index > 0 {
 		action = fmt.Sprintf("replaced hunk #%d", args.Index)
 	}
-	return s.applyEditTerse(name, action, args.New, newBody)
+	return s.applyEditTerse(sessionOf(req), name, action, args.New, newBody)
 }
 
 // applyEditTerse is the projection-op response path: takes a computed
@@ -5799,7 +5801,7 @@ func (s *server) handleReplaceHunk(_ context.Context, _ *sdkmcp.CallToolRequest,
 //
 // Snippet is truncated to ~200 chars / ~6 lines. Skips the caller-count
 // FYI nudge that handleEdit prints (agents can ask for impact if they want).
-func (s *server) applyEditTerse(name, action, snippet, newBody string) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) applyEditTerse(session *sdkmcp.ServerSession, name, action, snippet, newBody string) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.backend.GetDefinitionByName(name, "")
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", name))
@@ -5845,6 +5847,11 @@ func (s *server) applyEditTerse(name, action, snippet, newBody string) (*sdkmcp.
 		sb.WriteString("build: ")
 		sb.WriteString(strings.ToLower(firstLine))
 		sb.WriteString("\n")
+	}
+	// #158: nudge apply-batching after N serial mutations to one file.
+	// hint returns "" when session is nil (Measure* paths) or under threshold.
+	if s.hint != nil {
+		sb.WriteString(s.hint.note(session, d.SourceFile))
 	}
 	return textResult(sb.String()), nil, nil
 }
