@@ -37,8 +37,9 @@ type respCache struct {
 }
 
 type sessionCache struct {
-	seq     int64
-	entries map[string]cacheEntry
+	seq             int64
+	entries         map[string]cacheEntry
+	starterInjected bool // #203: true after first orient op has appended the starter bundle
 }
 
 type cacheEntry struct {

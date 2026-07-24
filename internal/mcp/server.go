@@ -961,7 +961,8 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if args.Pattern == "" {
 			args.Pattern = args.Name
 		}
-		return wrapStale(s.handleSearch(ctx, req, args))
+		r, o, e := wrapStale(s.handleSearch(ctx, req, args))
+		return s.appendStarter(r, o, e, req, args.Pattern)
 	case "impact":
 		return wrapStale(s.handleImpact(ctx, req, args))
 	case "explain":
@@ -1015,7 +1016,12 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "find":
 		return wrapStale(s.handleFind(ctx, req, findParam{File: args.File, Line: args.Line}))
 	case "overview":
-		return wrapStale(s.handleOverview(ctx, req, args))
+		r, o, e := wrapStale(s.handleOverview(ctx, req, args))
+		q := args.File
+		if q == "" {
+			q = "project structure"
+		}
+		return s.appendStarter(r, o, e, req, q)
 	case "methods":
 		return wrapStale(s.handleMethods(ctx, req, nameParam{Name: args.Name, Query: args.Query}))
 	case "patch":
