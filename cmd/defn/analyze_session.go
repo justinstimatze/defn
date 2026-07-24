@@ -300,26 +300,61 @@ func renderMarkdownReport(w io.Writer, arms []analyzeArm) {
 // Parses stream-json output from a session-cumulative bench run and
 // prints a per-arm, per-turn cost/cache breakdown so gap-decomp is a
 // CLI call, not an ad-hoc python script every time. See #178.
+//
+// #199: --warming-usd and --amortize-over add a three-bucket cost
+// receipt (session / warming / amortized-over-N) so async precompute
+// (#160 summaries, #197 semantic bridge, etc.) is honestly counted.
+// Warming is default-on per #201; hiding its cost would misread the
+// numbers.
 func cmdAnalyzeSession(args []string) {
 	jsonOut := false
 	dir := ""
-	for _, a := range args {
+	warmingUSD := 0.0
+	amortizeOver := 10
+	i := 0
+	for i < len(args) {
+		a := args[i]
 		switch {
 		case a == "--json":
 			jsonOut = true
+		case a == "--warming-usd":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "--warming-usd requires a value")
+				os.Exit(1)
+			}
+			var v float64
+			if _, err := fmt.Sscanf(args[i+1], "%f", &v); err != nil {
+				fmt.Fprintf(os.Stderr, "--warming-usd: bad value %q: %v\n", args[i+1], err)
+				os.Exit(1)
+			}
+			warmingUSD = v
+			i++
+		case a == "--amortize-over":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "--amortize-over requires a value")
+				os.Exit(1)
+			}
+			var v int
+			if _, err := fmt.Sscanf(args[i+1], "%d", &v); err != nil || v <= 0 {
+				fmt.Fprintf(os.Stderr, "--amortize-over: bad value %q\n", args[i+1])
+				os.Exit(1)
+			}
+			amortizeOver = v
+			i++
 		case strings.HasPrefix(a, "--"):
 			fmt.Fprintf(os.Stderr, "unknown flag %q\n", a)
 			os.Exit(1)
 		default:
 			if dir != "" {
-				fmt.Fprintln(os.Stderr, "usage: defn analyze-session [--json] <dir>")
+				fmt.Fprintln(os.Stderr, "usage: defn analyze-session [--json] [--warming-usd F] [--amortize-over N] <dir>")
 				os.Exit(1)
 			}
 			dir = a
 		}
+		i++
 	}
 	if dir == "" {
-		fmt.Fprintln(os.Stderr, "usage: defn analyze-session [--json] <dir>")
+		fmt.Fprintln(os.Stderr, "usage: defn analyze-session [--json] [--warming-usd F] [--amortize-over N] <dir>")
 		os.Exit(1)
 	}
 	arms, err := discoverArms(dir)
@@ -337,6 +372,9 @@ func cmdAnalyzeSession(args []string) {
 		return
 	}
 	renderMarkdownReport(os.Stdout, arms)
+	if warmingUSD > 0 {
+		renderCostAccounting(os.Stdout, arms, warmingUSD, amortizeOver)
+	}
 }
 
 // commaGroup formats an int with thousands separators (12345 -> "12,345").
@@ -447,4 +485,36 @@ func renderBatchEfficiency(w io.Writer, a analyzeArm) {
 		fmt.Fprintf(w, " ⚠ adoption failure — expand/apply would collapse this")
 	}
 	fmt.Fprintln(w)
+}
+
+// renderCostAccounting emits the #199 three-bucket cost receipt when
+// warming was applied to this project. Session cost comes from the
+// stream-json result events; warming cost is passed by the caller
+// (per #199a we don't yet auto-attribute it from the usage log).
+// Amortized = session + warming/N, where N is the assumed number of
+// sessions the warming will benefit. Print BOTH the raw and the
+// amortized so nobody's fooled either direction.
+//
+// Only prints for arms whose name looks like a defn arm (contains
+// "defn"). Files arms don't have warming cost by definition.
+func renderCostAccounting(w io.Writer, arms []analyzeArm, warmingUSD float64, amortizeOver int) {
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "## Cost accounting (#199)")
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "_Warming cost: $%.4f — one-time async precompute (Sonnet summaries etc.); amortized over %d sessions._\n\n", warmingUSD, amortizeOver)
+	fmt.Fprintln(w, "| arm | session cost | + warming (raw) | + warming (amortized) |")
+	fmt.Fprintln(w, "|---|---:|---:|---:|")
+	for _, a := range arms {
+		isDefn := strings.Contains(strings.ToLower(a.Name), "defn")
+		w1 := 0.0
+		w2 := 0.0
+		if isDefn {
+			w1 = warmingUSD
+			w2 = warmingUSD / float64(amortizeOver)
+		}
+		fmt.Fprintf(w, "| %s | $%.4f | $%.4f | $%.4f |\n",
+			a.Name, a.Totals.CostUSD, a.Totals.CostUSD+w1, a.Totals.CostUSD+w2)
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "_Session cost is per-run raw. Warming (raw) shows the honest first-run cost. Amortized shows the steady-state cost for a repeat-use project. Compare vs files-mode session cost to judge whether defn is cheaper for your use pattern._")
 }
