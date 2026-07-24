@@ -2409,3 +2409,39 @@ func (s *SQLiteDB) ListDefsMissingSummary() ([]int64, error) {
 	}
 	return ids, rows.Err()
 }
+
+// SearchDefSummaries finds def IDs whose one_line summary contains
+// pattern (case-insensitive LIKE %pattern%). Rows without a summary
+// are skipped. Result is ordered by production caller-count desc as a
+// rough default relevance; the caller (context op #197) applies its
+// own scoring on top. This is the #160→#195 semantic bridge that lets
+// context find defs whose behavior matches the question even when the
+// name has zero lexical overlap.
+func (s *SQLiteDB) SearchDefSummaries(pattern string) ([]int64, error) {
+	if pattern == "" {
+		return nil, nil
+	}
+	// LOWER on both sides for case-insensitive LIKE. Cap at 200 hits
+	// so a pathological query doesn't drag the whole DB back.
+	rows, err := s.db.QueryContext(s.Ctx(), `
+		SELECT ds.def_id
+		FROM def_summaries ds
+		WHERE ds.one_line IS NOT NULL
+		  AND ds.one_line != ''
+		  AND LOWER(ds.one_line) LIKE '%' || LOWER(?) || '%'
+		ORDER BY ds.def_id ASC
+		LIMIT 200`, pattern)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: search def summaries: %w", err)
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("sqlite: scan summary search id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}

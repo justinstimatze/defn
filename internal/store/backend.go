@@ -117,4 +117,11 @@ type Backend interface {
 	// ListDefsMissingSummary returns def IDs with no one_line yet.
 	// Sorted ascending for deterministic paging. #160 stage 3a backfill.
 	ListDefsMissingSummary() ([]int64, error)
+
+	// SearchDefSummaries finds def IDs whose one_line contains pattern
+	// (LIKE %pattern%, case-insensitive). Returns def IDs ordered by
+	// caller-count descending as a rough relevance signal — the caller
+	// (context op #197) reranks with its own scoring. #197 bridges the
+	// lexical-only ranker to the semantic summaries #160 already builds.
+	SearchDefSummaries(pattern string) ([]int64, error)
 }

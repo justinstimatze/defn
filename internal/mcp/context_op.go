@@ -49,21 +49,27 @@ func contextFilterTokens(raw []string) []string {
 // contextCandidate is a scored search hit for the context bundle.
 // Score components (higher = more relevant):
 //
-//	nameHits * 8    — token appears in the def name (strongest signal)
-//	sigHits * 3     — token appears in the signature/doc
-//	bodyMatch * 1   — this hit came from body FTS (weakest signal)
-//	testPenalty     — subtract 5 when def is in a _test.go file
+//	nameHits * 8       — token appears in the def name (strongest signal)
+//	sigHits * 3        — token appears in the signature/doc
+//	summaryHits * 6    — #197: token appears in the #160 one-line intent
+//	                     summary. High weight because summaries are
+//	                     semantically curated (Sonnet/Haiku-generated
+//	                     "what does this def do"). Bridges to defs whose
+//	                     names have zero lexical overlap.
+//	FromBody          — +1 tiebreak when hit came from body FTS
+//	testPenalty       — subtract 5 when def is in a _test.go file
 //
-// Prefer name matches over body matches: a def named handleGetDefinition
-// is almost certainly relevant to a question mentioning
-// "handleGetDefinition", regardless of how many callers it has. The
-// previous version used rank.Rank which is caller-count-heavy and
-// buried answer-carrying defs behind plumbing types.
+// Prefer name/summary matches over body matches: a def whose SUMMARY
+// says "auto-downgrades read to outline" IS the answer regardless of
+// whether its name (handleGetDefinition) contains any of the query
+// tokens.
 type contextCandidate struct {
-	Def       store.Definition
-	Score     int
-	FromName  bool
-	FromBody  bool
+	Def         store.Definition
+	Summary     string
+	Score       int
+	FromName    bool
+	FromBody    bool
+	FromSummary bool // #197
 }
 
 // contextRank scores + sorts candidates against the filtered token
@@ -74,7 +80,8 @@ func contextRank(cands []contextCandidate, tokens []string) []contextCandidate {
 		nameLower := strings.ToLower(d.Name)
 		sigLower := strings.ToLower(d.Signature)
 		docLower := strings.ToLower(d.Doc)
-		var name, sig int
+		summaryLower := strings.ToLower(cands[i].Summary)
+		var name, sig, summary int
 		for _, tok := range tokens {
 			if strings.Contains(nameLower, tok) {
 				name++
@@ -82,8 +89,11 @@ func contextRank(cands []contextCandidate, tokens []string) []contextCandidate {
 			if strings.Contains(sigLower, tok) || strings.Contains(docLower, tok) {
 				sig++
 			}
+			if summaryLower != "" && strings.Contains(summaryLower, tok) {
+				summary++
+			}
 		}
-		s := name*8 + sig*3
+		s := name*8 + sig*3 + summary*6
 		if cands[i].FromBody {
 			s++
 		}
@@ -122,9 +132,13 @@ func (s *server) handleContext(ctx context.Context, _ *sdkmcp.CallToolRequest, a
 		return errResult(fmt.Errorf("context: question yielded no searchable tokens after stop-word filtering — try more specific wording"))
 	}
 
-	// Candidate set: for each token, name-LIKE search (strong signal
-	// via FromName=true) + FTS body search (weaker via FromBody=true).
-	// Dedupe by def ID; FromName wins the tag conflict.
+	// Candidate set: for each token, three parallel searches:
+	//   - name-LIKE (FromName, strongest signal)
+	//   - FTS body (FromBody, weakest)
+	//   - #197: LIKE against #160 semantic summaries (FromSummary,
+	//     semantic bridge — catches defs whose behavior matches the
+	//     question when the name has no lexical overlap).
+	// Dedupe by def ID; flags OR together across paths.
 	seen := map[int64]contextCandidate{}
 	for _, tok := range tokens {
 		if defs, err := s.backend.FindDefinitions("%" + tok + "%"); err == nil {
@@ -143,6 +157,29 @@ func (s *server) handleContext(ctx context.Context, _ *sdkmcp.CallToolRequest, a
 					c.FromBody = true
 				}
 				seen[d.ID] = c
+			}
+		}
+		if ids, err := s.backend.SearchDefSummaries(tok); err == nil {
+			for _, id := range ids {
+				c := seen[id]
+				c.FromSummary = true
+				// Def may not be populated yet if this ID hasn't
+				// shown up in name/body search. Fetch minimally
+				// via GetDefinition — the top-N reranker reloads
+				// anyway for bodies, so this is just to get Name/
+				// Signature/Doc for scoring.
+				if c.Def.ID == 0 {
+					if d, err := s.backend.GetDefinition(id); err == nil && d != nil {
+						c.Def = *d
+					}
+				}
+				// Pull the summary for the ranker to score against.
+				if c.Summary == "" {
+					if sum, err := s.backend.GetDefSummary(id); err == nil && sum != nil {
+						c.Summary = sum.OneLine
+					}
+				}
+				seen[id] = c
 			}
 		}
 	}
