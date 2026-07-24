@@ -326,6 +326,8 @@ func newMCPServer(ctx context.Context, database store.Backend, projDir string) (
 
 Use Read/Bash/Grep/Edit ONLY for non-Go files (yaml, json, md, sh, go.mod, Dockerfile). Any question about Go code — "what does X do?", "who calls Y?", "rename Z", "what's the shape of pkg/foo?" — starts here.
 
+For any "how does X work in this codebase" discovery question, reach for context (op:"context" question:"...") — returns one bundled response with top-N relevant defs outlined + refs graph + optional Sonnet synthesis. Replaces 10-40 sequential exploration calls in one round-trip.
+
 Orient before you read: overview (project shape) → outline (def shape) → impact (when you know which def matters). Only read whole bodies when you're about to edit them; whole-file reads on files you won't touch are pure wire cost — use outline or search instead.
 
 Ops: overview (project-wide shape when called with no args — one line per module with def counts + first exported names; pass file:"pkg-path" or file:"pkg-path/file.go" to drill in; the right first-touch when you don't know which def matters yet), outline (compact projection of a def — sig + doc + caller/callee summary, no body; use when body isn't needed), search, impact (blast radius of a known def — pass format:"json" for structured output; callers, transitives, test coverage in one call), read, read-and-verify (read a def AND run its covering tests in one call — use during bug triage so you see behavior alongside source and don't spiral into read-loops; pass name), read-file (all defs' bodies in one file — pass file:"path"; whole-file counterpart to read; prefer over N sequential read calls when scanning), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), replace-hunk (replace a byte-exact occurrence of 'old' inside a def body with 'new' — byte-exact PUTGET, content-addressed inside the def; pass name+old+new, plus index=1..N if 'old' occurs more than once; empty 'new' deletes the hunk. Send zero anchor context when the hunk is def-unique — the name argument does the file-level disambiguation), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), explain (structural analysis of a def — pass name to get sig + callers + callees + test coverage; ALSO accepts question:"how does X handle Y" which routes to a Sonnet co-processor that returns a prose answer grounded in the def's source with provenance refs. Cheaper than reading + interpreting a large body yourself when the answer is prose, not code. names:["A","B"] for multi-def scope. Requires ANTHROPIC_API_KEY), similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create (single def from body; with file: set, body may hold multiple top-level decls to author a whole file in one call — the whole-file equivalent of files-mode Write), delete (safe by default — refuses when other defs still reference this def; pass force:true to delete anyway. Refusal message lists the callers so you can rewrite them first), retarget-field-value (rewrite a composite-literal field's string value across every def whose body matches — pass name:"<StructType>" field:"<Field>" old:"<oldStr>" new:"<newStr>"; AST-safe, so unrelated occurrences of the string won't match), rename, move, test (run ONLY tests that cover a given def — pass name; scoped subset, not the full suite; prefer over bash 'go test ./...' when you only need coverage for a specific change. Also accepts test:"TestX" to run one test by name — use this to REPRODUCE a bug from the issue BEFORE writing any code; a passing test means your hypothesis about which def is broken is wrong), apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 6 projection ops insert-precondition/replace-slice/replace-hunk/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (rarely needed — every edit op auto-syncs the DB; only use after external file changes outside the code tool), query (raw SQL escape hatch — for schema analytics only; NEVER use to look up a def by name, grep bodies, or list files/defs-in-file — use search/outline/read-file/file-defs/impact instead, which are far cheaper on the wire), patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
@@ -739,6 +741,12 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if strings.TrimSpace(args.Name) == "" && len(args.Names) == 0 {
 			return errResult(fmt.Errorf("explain: name or names is required"))
 		}
+	case "context":
+		// #195: question-driven bundle. No name — server picks defs
+		// from the question tokens.
+		if strings.TrimSpace(args.Question) == "" {
+			return errResult(fmt.Errorf("context: question is required"))
+		}
 	case "insert-precondition":
 		if r, o, e := need(args.Name, "name"); r != nil {
 			return r, o, e
@@ -955,6 +963,13 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 			return wrapStale(s.handleExplainWithQuestion(ctx, req, args))
 		}
 		return wrapStale(s.handleExplain(ctx, req, nameParam{Name: args.Name}))
+	case "context":
+		// #195: server-side bundle to collapse turn-1 exploration.
+		// Question drives the search; server picks top-N relevant
+		// defs, outlines them, assembles ref graph, optionally adds
+		// Sonnet synthesis. One tool call replaces 10-40 sequential
+		// exploration calls in the anti-exploration turn shape.
+		return wrapStale(s.handleContext(ctx, req, args))
 	case "untested":
 		return wrapStale(s.handleUntested(ctx, req, emptyParam{}))
 	case "edit":
@@ -1022,7 +1037,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "gc":
 		return s.handleGC(ctx, req, args)
 	default:
-		return errResult(fmt.Errorf("unknown op %q — valid: read, read-and-verify, outline, slice, insert-precondition, replace-slice, replace-hunk, wrap-in-defer, rename-param, add-import, search, impact, explain, similar, untested, edit, create, delete, retarget-field-value, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc, resummarize", args.Op))
+		return errResult(fmt.Errorf("unknown op %q — valid: read, read-and-verify, outline, slice, insert-precondition, replace-slice, replace-hunk, wrap-in-defer, rename-param, add-import, search, impact, explain, context, similar, untested, edit, create, delete, retarget-field-value, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc, resummarize", args.Op))
 	}
 }
 
