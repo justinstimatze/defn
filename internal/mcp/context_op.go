@@ -81,10 +81,15 @@ func (s *server) handleContext(ctx context.Context, _ *sdkmcp.CallToolRequest, a
 	sb.WriteString(fmt.Sprintf("_Top %d of %d matching defs (searched %d tokens)._\n\n",
 		len(top), len(scored), len(tokens)))
 
-	// Outline projection of each top hit.
+	// Outline projection of each top hit. Reload each via
+	// GetDefinition to pull the body — search results carry
+	// metadata only, so d.Body is empty until we ask for it.
 	var refBodies []string
 	for _, r := range top {
 		d := r.Def
+		if full, err := s.backend.GetDefinition(d.ID); err == nil && full != nil {
+			d = *full
+		}
 		recv := formatReceiver(d.Receiver)
 		sb.WriteString(fmt.Sprintf("### %s%s (%s)\n", recv, d.Name, d.Kind))
 		if d.SourceFile != "" && d.StartLine > 0 {
