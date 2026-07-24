@@ -29,6 +29,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/justinstimatze/defn/internal/emit"
 	"github.com/justinstimatze/defn/internal/goload"
 	"github.com/justinstimatze/defn/internal/ingest"
@@ -287,7 +288,16 @@ func newMCPServer(ctx context.Context, database store.Backend, projDir string) (
 	// ANTHROPIC_API_KEY is set (paid; ~$1/1M input tokens); otherwise
 	// [summary.Stub]{} — a no-op returning "TODO: <Name>" so the read
 	// path exercises without any spend. Never nil.
-	backend := summary.NewHaiku(summary.HaikuOptions{APIKey: os.Getenv("ANTHROPIC_API_KEY")})
+	// Summary model is Haiku by default; override with DEFN_SUMMARY_MODEL
+	// to run Sonnet-quality summaries for a modest cost bump (roughly
+	// 3× per-call vs Haiku, still ~$1-2 total to backfill defn itself).
+	// Sonnet summaries carry more semantic signal, which the #197
+	// context-op summary-search relies on for the semantic bridge.
+	summaryModel := anthropic.Model(os.Getenv("DEFN_SUMMARY_MODEL"))
+	backend := summary.NewHaiku(summary.HaikuOptions{
+		APIKey: os.Getenv("ANTHROPIC_API_KEY"),
+		Model:  summaryModel,
+	})
 	s.summaryWorker = summary.NewWorker(backend, database, 0)
 	s.summaryWorker.Start(ctx)
 
