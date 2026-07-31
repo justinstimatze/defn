@@ -182,6 +182,10 @@ concurrent-branch experiments, run one `defn serve` per worktree
 
 This project is indexed in defn (`.defn/`). For any `.go` file, use the `code` MCP tool — **not** Read, Bash, Grep, or Edit. Those built-ins are reserved for non-Go files (yaml, json, md, sh, `go.mod`, Dockerfile).
 
+**This is enforced, not just requested.** `hooks/defn-go-guard.sh` (wired via `.claude/settings.local.json` `PreToolUse`) blocks `Read`/`Write`/`Edit`/`MultiEdit` on `.go` paths and Bash dumps (`cat`/`head`/`tail`/`awk`/`sed`/etc.) of `.go` files. It's an adoption nudge for habitual tool choice, not a security sandbox — regex-based command classification can't be made complete against deliberate obfuscation, and that's an accepted, documented limitation of the hook, not a gap to keep chasing.
+
+**Escape hatch (rare, e.g. a known defn write-path bug):** `touch ~/.claude-allow-go-edit` before the one blocked call you need — the hook consumes (deletes) the sentinel automatically on that single use, so it does not need to be manually removed and does not stay armed as a standing bypass.
+
 **Do not `ls` and `Read` files by hand.** Start any Go task with `code(op:"overview")` to see the project shape, then drill in with `search` / `outline` / `impact`.
 
 **Reach for `outline` before `read`.** `outline` returns the signature, doc, refs, and control-flow of a def — 5-10× smaller than the full body. It's enough to answer almost every "what does X do / how does Y work / where does Z fit" question. Only escalate to `read` (full body) when you're about to edit the def, or when outline was genuinely insufficient. A follow-up `read` costs nothing you haven't already committed to.
