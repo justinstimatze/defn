@@ -27,7 +27,17 @@
 [ -d .defn ] || exit 0
 
 INPUT=$(cat)
-PROMPT=$(echo "$INPUT" | jq -r '.prompt // .user_prompt // .message // empty')
+# jq -r (no slurp) processes stdin as a JSON-text stream: if Claude Code's
+# --resume mode sends the hook a JSONL history of prior prompts alongside
+# the new one, plain -r emits one line PER object, not one. Verified via
+# reproduction on 2026-07-31: the naive form left .last-question holding
+# all 10 turns of a bench concatenated instead of just the current one,
+# which silently defeated the whole point of capturing "the real
+# question" (the starter bundle bundled against all 10 turns' text at
+# once instead of the one that mattered). Slurp (-s) + take the LAST
+# object is robust whether stdin holds one JSON doc or many -- the
+# current prompt is presumed to be whichever arrived last.
+PROMPT=$(echo "$INPUT" | jq -rs '(.[-1].prompt // .[-1].user_prompt // .[-1].message // empty)' 2>/dev/null)
 [ -n "$PROMPT" ] && printf '%s' "$PROMPT" > .defn/.last-question
 
 date +%s%N > .defn/.turn-token
