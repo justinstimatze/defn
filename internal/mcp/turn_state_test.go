@@ -172,3 +172,45 @@ func TestCircuitBreaker_SingleNameExpandCountsAsSingleton(t *testing.T) {
 		t.Fatal("expected refusal once threshold exceeded by single-name expand calls")
 	}
 }
+
+func TestCircuitBreakerCheck_StrippedDisablesEntirely(t *testing.T) {
+	t.Setenv("DEFN_STRIP", "circuit-breaker")
+	sc := &sessionCache{entries: map[string]cacheEntry{}}
+	s := &server{}
+	for i := 0; i < defnReadShapedCircuitBreakerThreshold+10; i++ {
+		if msg := s.circuitBreakerCheck(sc, "read", false); msg != "" {
+			t.Fatalf("call %d: DEFN_STRIP=circuit-breaker should disable the breaker entirely, got %q", i, msg)
+		}
+	}
+}
+
+func TestStripped_EmptyEnvMeansNothingStripped(t *testing.T) {
+	t.Setenv("DEFN_STRIP", "")
+	if stripped("related-footer") {
+		t.Error("empty DEFN_STRIP should strip nothing")
+	}
+}
+
+func TestStripped_ReadsEnvFresh(t *testing.T) {
+	t.Setenv("DEFN_STRIP", "foo,bar")
+	if !stripped("foo") {
+		t.Error("expected foo to be stripped")
+	}
+	if !stripped("bar") {
+		t.Error("expected bar to be stripped")
+	}
+	if stripped("baz") {
+		t.Error("baz was not in DEFN_STRIP, should not be stripped")
+	}
+
+	// Re-set to a different value in the SAME test -- stripped() must
+	// re-read the env each call, not memoize the first result (a prior
+	// version used sync.OnceValue and would have failed this).
+	t.Setenv("DEFN_STRIP", "baz")
+	if stripped("foo") {
+		t.Error("foo should no longer be stripped after DEFN_STRIP changed")
+	}
+	if !stripped("baz") {
+		t.Error("expected baz to be stripped after DEFN_STRIP changed")
+	}
+}

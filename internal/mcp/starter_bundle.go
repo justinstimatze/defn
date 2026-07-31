@@ -7,22 +7,8 @@ import (
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// maybeAppendStarterBundle is #203: on the FIRST search/overview call
-// per session, appends a compact "Starter" bundle to the response.
-// The bundle is a #195-shape context view derived from the current
-// call's args — top-N relevant defs (outlined) + Sonnet synthesis
-// when co-processor is available. Model gets the "here's what this
-// codebase is" bundle without asking. Cuts the ~40-call exploration
-// burst that dominates turn-1 cost.
-//
-// Fires once per session (tracked via sessionCache.starterInjected).
-// Skipped when req or session is nil (test paths), or when the
-// respCache isn't wired.
-//
-// Cost: one bigger turn-1 response. Break-even: eliminates ~4
-// follow-up calls (per 2026-07-23 receipt analysis).
 func (s *server) maybeAppendStarterBundle(req *sdkmcp.CallToolRequest, question string) string {
-	if req == nil || s.respCache == nil {
+	if req == nil || s.respCache == nil || stripped("starter-bundle") {
 		return ""
 	}
 	s.respCache.mu.Lock()
@@ -41,7 +27,7 @@ func (s *server) maybeAppendStarterBundle(req *sdkmcp.CallToolRequest, question 
 	if strings.TrimSpace(question) == "" {
 		return ""
 	}
-	// Delegate to context op — it does the heavy lifting.
+	// Delegate to context op -- it does the heavy lifting.
 	r, _, err := s.handleContext(context.Background(), req, codeParam{
 		Op:       "context",
 		Question: question,
@@ -53,7 +39,7 @@ func (s *server) maybeAppendStarterBundle(req *sdkmcp.CallToolRequest, question 
 	if body == "" {
 		return ""
 	}
-	return "\n\n---\n_[#203 starter bundle — first orient op of this session; won't repeat.]_\n\n" + body
+	return "\n\n---\n_[#203 starter bundle -- first orient op of this session; won't repeat.]_\n\n" + body
 }
 
 func (s *server) appendStarter(r *sdkmcp.CallToolResult, o any, err error, req *sdkmcp.CallToolRequest, question string) (*sdkmcp.CallToolResult, any, error) {

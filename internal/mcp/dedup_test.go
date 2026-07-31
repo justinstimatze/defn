@@ -198,3 +198,20 @@ func TestIsWriteOp(t *testing.T) {
 		}
 	}
 }
+
+func TestDedup_StrippedDisablesCaching(t *testing.T) {
+	t.Setenv("DEFN_STRIP", "dedup")
+	c := newRespCache()
+	sess := &sdkmcp.ServerSession{}
+	big := strings.Repeat("x", 1000)
+
+	c.dedup(sess, "read", "Foo", mkText(big))
+	r := c.dedup(sess, "read", "Foo", mkText(big))
+	got := r.Content[0].(*sdkmcp.TextContent).Text
+	if strings.Contains(got, "cached") {
+		t.Errorf("DEFN_STRIP=dedup should disable caching entirely, got stub %q", got)
+	}
+	if got != big {
+		t.Errorf("expected the original content unchanged, got %q", got)
+	}
+}

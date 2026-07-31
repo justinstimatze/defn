@@ -2838,3 +2838,32 @@ func TestHandleExpand_MultipleNamesSkipsNotFound(t *testing.T) {
 		t.Errorf("expected a not-found note for the unresolvable name, got: %s", text)
 	}
 }
+
+func TestHandleGetDefinition_StrippedRelatedFooterOmitsIt(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	// Unstripped: Greet's related footer should surface Farewell, its
+	// only caller -- Farewell is never mentioned in Greet's own body.
+	result, _, err := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Greet"})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Farewell") {
+		t.Fatalf("expected related footer to mention caller Farewell, got: %s", text)
+	}
+
+	// Stripped: same read, DEFN_STRIP=related-footer -- Farewell should
+	// no longer appear anywhere in the response.
+	t.Setenv("DEFN_STRIP", "related-footer")
+	result2, _, err := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Greet"})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	text2 := resultText(t, result2)
+	if strings.Contains(text2, "Farewell") {
+		t.Errorf("DEFN_STRIP=related-footer should omit the related footer, but Farewell still appears: %s", text2)
+	}
+}

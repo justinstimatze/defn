@@ -144,7 +144,7 @@ func (c *respCache) invalidate(sess *sdkmcp.ServerSession) {
 }
 
 func (c *respCache) dedup(sess *sdkmcp.ServerSession, op, argKey string, r *sdkmcp.CallToolResult) *sdkmcp.CallToolResult {
-	if sess == nil || r == nil || r.IsError || len(r.Content) == 0 {
+	if sess == nil || r == nil || r.IsError || len(r.Content) == 0 || stripped("dedup") {
 		return r
 	}
 	tc, ok := r.Content[0].(*sdkmcp.TextContent)

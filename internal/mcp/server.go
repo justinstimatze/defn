@@ -1594,7 +1594,7 @@ func (s *server) handleGetDefinition(_ context.Context, _ *sdkmcp.CallToolReques
 	// not it asked, which collapses the read→impact→read-caller chain
 	// into one round-trip. Skipped only for query-adaptive filtered
 	// reads (query is set) since those are already narrower on purpose.
-	if strings.TrimSpace(args.Query) == "" {
+	if strings.TrimSpace(args.Query) == "" && !stripped("related-footer") {
 		sb.WriteString(s.renderReadNeighborhood(d))
 	}
 

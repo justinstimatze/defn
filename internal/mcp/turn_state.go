@@ -48,15 +48,10 @@ func (s *server) checkTurnBoundary(sc *sessionCache) {
 	}
 }
 
-// circuitBreakerCheck increments the per-turn read-shaped call counter
-// and returns a non-empty refusal message once the threshold is
-// exceeded, nudging the model toward context/expand/apply instead of
-// continuing one call at a time. isBatch is true only for calls that
-// actually consolidate multiple targets (context, apply, or expand
-// with 2+ names) -- computed by the caller, which has args in scope.
-// Only a genuine batch resets the counter; a single-name expand call
-// is read-shaped like any other singleton (see readShapedOps).
 func (s *server) circuitBreakerCheck(sc *sessionCache, op string, isBatch bool) string {
+	if stripped("circuit-breaker") {
+		return ""
+	}
 	if isBatch {
 		sc.readShapedCount = 0
 		return ""
@@ -107,4 +102,23 @@ func (s *server) lastUserQuestion() string {
 var readShapedOps = map[string]bool{
 	"read": true, "outline": true, "search": true,
 	"impact": true, "overview": true, "methods": true, "expand": true,
+}
+
+// stripped reports whether feature is listed in DEFN_STRIP (a
+// comma-separated env var), read fresh on every call. #180: lets a
+// bench harness isolate exactly one feature's marginal cost/behavior
+// (e.g. DEFN_STRIP=related-footer) instead of reverting code for a
+// single-variable A/B, or conflating several response-enrichment
+// features shipped this session when trying to explain a bench delta.
+// Known names: starter-bundle (#203), related-footer (#202),
+// circuit-breaker (#209), dedup (#77/#209). Deliberately NOT cached --
+// os.Getenv is cheap and a memoized read would be wrong the moment a
+// test (or a future runtime-reconfig path) changes the env mid-process.
+func stripped(feature string) bool {
+	for _, f := range strings.Split(os.Getenv("DEFN_STRIP"), ",") {
+		if strings.TrimSpace(f) == feature {
+			return true
+		}
+	}
+	return false
 }
