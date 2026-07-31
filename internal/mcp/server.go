@@ -933,31 +933,18 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	}
 
 	// #209: per-turn circuit breaker on read-shaped singleton calls
-	// (read/outline/search/impact/overview/methods). Resets when a
-	// batching op (context/expand/apply) is called, or when a new
-	// turn starts (detected via the turn-token bumped by
-	// hooks/defn-capture-question.sh on UserPromptSubmit).
+	// (read/outline/search/impact/overview/methods/single-name expand).
+	// Resets on a genuine batch (context/apply, or expand with 2+
+	// names), or when a new turn starts (detected via the turn-token
+	// bumped by hooks/defn-capture-question.sh on UserPromptSubmit).
 	if s.respCache != nil && req != nil {
 		s.respCache.mu.Lock()
 		sc := s.respCache.getSession(req.Session)
 		s.checkTurnBoundary(sc)
-		breakerMsg := s.circuitBreakerCheck(sc, args.Op)
-		s.respCache.mu.Unlock()
-		if breakerMsg != "" {
-			return textResult(breakerMsg), nil, nil
-		}
-	}
-
-	// #209: per-turn circuit breaker on read-shaped singleton calls
-	// (read/outline/search/impact/overview/methods). Resets when a
-	// batching op (context/expand/apply) is called, or when a new
-	// turn starts (detected via the turn-token bumped by
-	// hooks/defn-capture-question.sh on UserPromptSubmit).
-	if s.respCache != nil && req != nil {
-		s.respCache.mu.Lock()
-		sc := s.respCache.getSession(req.Session)
-		s.checkTurnBoundary(sc)
-		breakerMsg := s.circuitBreakerCheck(sc, args.Op)
+		// #210: a single-name expand is not a batch -- only 2+ names (or
+		// context/apply, which always consolidate) count as one.
+		isBatch := args.Op == "context" || args.Op == "apply" || (args.Op == "expand" && len(args.Names) >= 2)
+		breakerMsg := s.circuitBreakerCheck(sc, args.Op, isBatch)
 		s.respCache.mu.Unlock()
 		if breakerMsg != "" {
 			return textResult(breakerMsg), nil, nil

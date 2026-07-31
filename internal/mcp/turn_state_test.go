@@ -43,11 +43,11 @@ func TestCircuitBreaker_AllowsUpToThreshold(t *testing.T) {
 	sc := &sessionCache{entries: map[string]cacheEntry{}}
 	s := &server{}
 	for i := 1; i <= defnReadShapedCircuitBreakerThreshold; i++ {
-		if msg := s.circuitBreakerCheck(sc, "read"); msg != "" {
+		if msg := s.circuitBreakerCheck(sc, "read", false); msg != "" {
 			t.Fatalf("call %d: expected no refusal within threshold, got %q", i, msg)
 		}
 	}
-	msg := s.circuitBreakerCheck(sc, "read")
+	msg := s.circuitBreakerCheck(sc, "read", false)
 	if msg == "" {
 		t.Fatal("expected refusal once threshold exceeded")
 	}
@@ -60,15 +60,15 @@ func TestCircuitBreaker_BatchOpsReset(t *testing.T) {
 	sc := &sessionCache{entries: map[string]cacheEntry{}}
 	s := &server{}
 	for i := 0; i < defnReadShapedCircuitBreakerThreshold; i++ {
-		s.circuitBreakerCheck(sc, "outline")
+		s.circuitBreakerCheck(sc, "outline", false)
 	}
-	if msg := s.circuitBreakerCheck(sc, "context"); msg != "" {
+	if msg := s.circuitBreakerCheck(sc, "context", true); msg != "" {
 		t.Fatalf("batching op itself should never be refused, got %q", msg)
 	}
 	if sc.readShapedCount != 0 {
 		t.Fatalf("context call should reset counter, got %d", sc.readShapedCount)
 	}
-	if msg := s.circuitBreakerCheck(sc, "read"); msg != "" {
+	if msg := s.circuitBreakerCheck(sc, "read", false); msg != "" {
 		t.Fatalf("expected fresh budget after batching reset, got refusal %q", msg)
 	}
 }
@@ -77,9 +77,9 @@ func TestCircuitBreaker_EnvOverride(t *testing.T) {
 	t.Setenv("DEFN_CIRCUIT_BREAKER", "2")
 	sc := &sessionCache{entries: map[string]cacheEntry{}}
 	s := &server{}
-	s.circuitBreakerCheck(sc, "read")
-	s.circuitBreakerCheck(sc, "read")
-	if msg := s.circuitBreakerCheck(sc, "read"); msg == "" {
+	s.circuitBreakerCheck(sc, "read", false)
+	s.circuitBreakerCheck(sc, "read", false)
+	if msg := s.circuitBreakerCheck(sc, "read", false); msg == "" {
 		t.Fatal("expected refusal at lowered threshold=2")
 	}
 }
@@ -88,7 +88,7 @@ func TestCircuitBreaker_IgnoresNonReadShapedOps(t *testing.T) {
 	sc := &sessionCache{entries: map[string]cacheEntry{}}
 	s := &server{}
 	for i := 0; i < defnReadShapedCircuitBreakerThreshold+5; i++ {
-		if msg := s.circuitBreakerCheck(sc, "edit"); msg != "" {
+		if msg := s.circuitBreakerCheck(sc, "edit", false); msg != "" {
 			t.Fatalf("write ops must never be refused by the read-shaped breaker, got %q", msg)
 		}
 	}
@@ -136,5 +136,39 @@ func TestLastUserQuestion_ReadsStashedFile(t *testing.T) {
 	s := &server{projectDir: dir}
 	if got := s.lastUserQuestion(); got != "how does routing work?" {
 		t.Errorf("got %q, want trimmed stashed question", got)
+	}
+}
+
+func TestCircuitBreaker_MultiNameExpandResets(t *testing.T) {
+	sc := &sessionCache{entries: map[string]cacheEntry{}}
+	s := &server{}
+	for i := 0; i < defnReadShapedCircuitBreakerThreshold; i++ {
+		s.circuitBreakerCheck(sc, "read", false)
+	}
+	// A genuine multi-name expand (isBatch=true, computed by the caller
+	// from len(args.Names) >= 2) resets the counter like context/apply.
+	if msg := s.circuitBreakerCheck(sc, "expand", true); msg != "" {
+		t.Fatalf("multi-name expand should never be refused, got %q", msg)
+	}
+	if sc.readShapedCount != 0 {
+		t.Fatalf("multi-name expand should reset counter, got %d", sc.readShapedCount)
+	}
+}
+
+func TestCircuitBreaker_SingleNameExpandCountsAsSingleton(t *testing.T) {
+	sc := &sessionCache{entries: map[string]cacheEntry{}}
+	s := &server{}
+	// #210: chi-explore round 4 showed the model calling expand one name
+	// at a time despite names:[...] being documented -- a single-name
+	// expand call must count against the breaker like any other
+	// singleton, or it silently defeats the whole mechanism by resetting
+	// the counter on every call.
+	for i := 1; i <= defnReadShapedCircuitBreakerThreshold; i++ {
+		if msg := s.circuitBreakerCheck(sc, "expand", false); msg != "" {
+			t.Fatalf("call %d: expected no refusal within threshold, got %q", i, msg)
+		}
+	}
+	if msg := s.circuitBreakerCheck(sc, "expand", false); msg == "" {
+		t.Fatal("expected refusal once threshold exceeded by single-name expand calls")
 	}
 }

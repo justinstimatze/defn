@@ -51,11 +51,13 @@ func (s *server) checkTurnBoundary(sc *sessionCache) {
 // circuitBreakerCheck increments the per-turn read-shaped call counter
 // and returns a non-empty refusal message once the threshold is
 // exceeded, nudging the model toward context/expand/apply instead of
-// continuing one call at a time. Calling a batching op resets the
-// counter instead of incrementing it -- it's the intended escape
-// valve, not more of the problem.
-func (s *server) circuitBreakerCheck(sc *sessionCache, op string) string {
-	if op == "context" || op == "expand" || op == "apply" {
+// continuing one call at a time. isBatch is true only for calls that
+// actually consolidate multiple targets (context, apply, or expand
+// with 2+ names) -- computed by the caller, which has args in scope.
+// Only a genuine batch resets the counter; a single-name expand call
+// is read-shaped like any other singleton (see readShapedOps).
+func (s *server) circuitBreakerCheck(sc *sessionCache, op string, isBatch bool) string {
+	if isBatch {
 		sc.readShapedCount = 0
 		return ""
 	}
@@ -70,8 +72,8 @@ func (s *server) circuitBreakerCheck(sc *sessionCache, op string) string {
 		"[circuit breaker: %d individual lookups this turn without batching. "+
 			"Use code(op:\"context\", question:\"...\") to bundle the rest of "+
 			"this turn's exploration into one call, or code(op:\"expand\", "+
-			"name:\"...\", include:[...]) for a known def's related info -- "+
-			"not another singleton %s.]",
+			"names:[\"A\",\"B\",...], include:[...]) to batch several known defs "+
+			"at once -- not another singleton %s.]",
 		sc.readShapedCount-1, op,
 	)
 }
@@ -93,11 +95,16 @@ func (s *server) lastUserQuestion() string {
 // readShapedOps fetch information about one named/searched target at a
 // time -- the ones that sprawled into a 44-call binge in #209's
 // chi-explore bench (turn 1: 21 read + 12 outline + 5 search + 3
-// impact + 2 overview, several of them exact repeats). context/expand/
-// apply batch multiple targets into one call and are deliberately
+// impact + 2 overview, several of them exact repeats). context/apply
+// batch multiple targets into one call by design and are always
 // excluded -- calling one resets the counter rather than counting
-// against it.
+// against it. expand is included here too: a SINGLE-name expand call
+// (the common case, per #210's chi-explore round-4 finding that the
+// model kept calling expand one name at a time despite names:[...]
+// being documented) provides no more consolidation than a lone read,
+// so it counts like one; the call site only treats expand as a batch
+// (resetting the counter) when 2+ names were actually requested.
 var readShapedOps = map[string]bool{
 	"read": true, "outline": true, "search": true,
-	"impact": true, "overview": true, "methods": true,
+	"impact": true, "overview": true, "methods": true, "expand": true,
 }
