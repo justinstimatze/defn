@@ -124,4 +124,11 @@ type Backend interface {
 	// (context op #197) reranks with its own scoring. #197 bridges the
 	// lexical-only ranker to the semantic summaries #160 already builds.
 	SearchDefSummaries(pattern string) ([]int64, error)
+
+	// #212 file-level narratives — one level up from #160's per-def
+	// summaries. GetFileSummary returns (nil, nil) when no narrative
+	// exists yet. SetFileSummary is idempotent — INSERT OR REPLACE
+	// keys off source_file.
+	GetFileSummary(sourceFile string) (*FileSummary, error)
+	SetFileSummary(sourceFile string, moduleID int64, s *FileSummary) error
 }

@@ -2410,6 +2410,53 @@ func (s *SQLiteDB) ListDefsMissingSummary() ([]int64, error) {
 	return ids, rows.Err()
 }
 
+// GetFileSummary reads the #212 file-level narrative row for
+// sourceFile. Returns (nil, nil) when no row exists yet -- the file
+// hasn't been overview'd since ingest, or ANTHROPIC_API_KEY wasn't set
+// when it was. Missing narrative is normalized to "no summary".
+func (s *SQLiteDB) GetFileSummary(sourceFile string) (*FileSummary, error) {
+	var narrative, bodyHash, model sql.NullString
+	err := s.db.QueryRowContext(s.Ctx(),
+		`SELECT COALESCE(narrative,''), COALESCE(summary_body_hash,''), COALESCE(summary_model,'')
+		 FROM file_summaries WHERE source_file = ?`, sourceFile,
+	).Scan(&narrative, &bodyHash, &model)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("sqlite: get file summary %s: %w", sourceFile, err)
+	}
+	if !narrative.Valid || narrative.String == "" {
+		return nil, nil
+	}
+	return &FileSummary{
+		Narrative: narrative.String,
+		BodyHash:  bodyHash.String,
+		Model:     model.String,
+	}, nil
+}
+
+// SetFileSummary writes/updates the #212 file-level narrative row for
+// sourceFile. Idempotent -- INSERT OR REPLACE keys off source_file.
+func (s *SQLiteDB) SetFileSummary(sourceFile string, moduleID int64, sum *FileSummary) error {
+	if sum == nil {
+		return nil
+	}
+	_, err := s.db.ExecContext(s.Ctx(),
+		`INSERT INTO file_summaries(source_file, module_id, narrative, summary_body_hash, summary_model)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(source_file) DO UPDATE SET
+		   module_id         = excluded.module_id,
+		   narrative         = excluded.narrative,
+		   summary_body_hash = excluded.summary_body_hash,
+		   summary_model     = excluded.summary_model`,
+		sourceFile, moduleID, sum.Narrative, sum.BodyHash, sum.Model)
+	if err != nil {
+		return fmt.Errorf("sqlite: set file summary %s: %w", sourceFile, err)
+	}
+	return nil
+}
+
 // SearchDefSummaries finds def IDs whose one_line summary contains
 // pattern (case-insensitive LIKE %pattern%). Rows without a summary
 // are skipped. Result is ordered by production caller-count desc as a

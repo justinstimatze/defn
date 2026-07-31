@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -2865,5 +2866,64 @@ func TestHandleGetDefinition_StrippedRelatedFooterOmitsIt(t *testing.T) {
 	text2 := resultText(t, result2)
 	if strings.Contains(text2, "Farewell") {
 		t.Errorf("DEFN_STRIP=related-footer should omit the related footer, but Farewell still appears: %s", text2)
+	}
+}
+
+func TestFileNarrative_CacheHitReturnsWithoutExplainClient(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db} // explainClient is nil -- cache hit must never touch it
+
+	defs, err := db.FindDefinitionsByFile("", "main.go", 0)
+	if err != nil || len(defs) == 0 {
+		t.Fatalf("expected defs in main.go, got %v (err=%v)", defs, err)
+	}
+
+	// Compute the same structural hash fileNarrative would (sorted by
+	// name, concatenated bodies), pre-populate a matching row, and
+	// confirm fileNarrative returns the cached narrative without ever
+	// dereferencing the nil explainClient (which would panic if reached).
+	sorted := make([]store.Definition, len(defs))
+	copy(sorted, defs)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
+	var bodyBuf strings.Builder
+	for _, d := range sorted {
+		bodyBuf.WriteString(d.Body)
+		bodyBuf.WriteString("\n")
+	}
+	hash := store.HashBodyStructural(bodyBuf.String())
+
+	if err := db.SetFileSummary("main.go", sorted[0].ModuleID, &store.FileSummary{
+		Narrative: "Cached narrative for testing.",
+		BodyHash:  hash,
+		Model:     "test",
+	}); err != nil {
+		t.Fatalf("SetFileSummary: %v", err)
+	}
+
+	got := s.fileNarrative(context.Background(), "main.go", defs)
+	if got != "Cached narrative for testing." {
+		t.Errorf("expected cached narrative returned without touching explainClient, got %q", got)
+	}
+}
+
+func TestHandleOverview_NilExplainClientNoNarrative(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db} // explainClient nil -- the common no-API-key case
+
+	result, _, err := s.handleOverview(context.Background(), nil, codeParam{File: "main.go"})
+	if err != nil {
+		t.Fatalf("overview: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Greet") {
+		t.Fatalf("expected the normal per-def listing to still work, got: %s", text)
+	}
+	// No narrative should have been generated or stored -- explainClient
+	// is nil, so handleOverview must skip fileNarrative entirely rather
+	// than call it and crash on the nil receiver.
+	if fs, _ := db.GetFileSummary("main.go"); fs != nil {
+		t.Errorf("expected no file summary written when explainClient is nil, got %+v", fs)
 	}
 }

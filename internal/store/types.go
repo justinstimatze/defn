@@ -153,3 +153,16 @@ type DefSummary struct {
 	BodyHash string
 	Model    string
 }
+
+// FileSummary is a row in file_summaries carrying #212 model-generated
+// architectural narrative for a whole file. Narrative is a paragraph-
+// or-two synthesis of what the file does and how its defs relate;
+// BodyHash is a hash of the file's concatenated def bodies at
+// generation time (staleness check); Model records which LLM produced
+// it. Empty Narrative means "not generated yet" -- overview generates
+// one synchronously on first call if the co-processor is available.
+type FileSummary struct {
+	Narrative string
+	BodyHash  string
+	Model     string
+}

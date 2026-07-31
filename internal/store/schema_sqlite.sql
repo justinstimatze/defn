@@ -208,3 +208,23 @@ CREATE TABLE IF NOT EXISTS def_summaries (
     summary_model     TEXT,
     FOREIGN KEY (def_id) REFERENCES definitions(id) ON DELETE CASCADE
 );
+
+-- #212: file-level narratives, one row per source file. Extends #160's
+-- per-def summary pattern one level up: a paragraph-or-two synthesis of
+-- what the whole file does architecturally, generated on-demand (phase
+-- 2 -- synchronous, no backfill worker yet) when `overview file:"..."`
+-- is called on a file with no narrative yet or a stale one.
+CREATE TABLE IF NOT EXISTS file_summaries (
+    source_file       TEXT PRIMARY KEY,
+    module_id         INTEGER NOT NULL,
+    -- Model-generated architectural narrative. NULL when not yet
+    -- generated (no ANTHROPIC_API_KEY on the serve, or file hasn't
+    -- been overview'd since ingest/last edit).
+    narrative         TEXT,
+    -- Hash of the file's concatenated def bodies (sorted by name for
+    -- determinism) at generation time. Mismatch vs current means a def
+    -- in the file changed since -- regenerate on next overview.
+    summary_body_hash TEXT,
+    summary_model     TEXT,
+    FOREIGN KEY (module_id) REFERENCES modules(id) ON DELETE CASCADE
+);

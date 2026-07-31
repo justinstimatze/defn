@@ -4256,7 +4256,7 @@ func (s *server) projectOverview() (*sdkmcp.CallToolResult, any, error) {
 	return textResult(sb.String()), nil, nil
 }
 
-func (s *server) handleOverview(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) handleOverview(ctx context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	file := args.File
 	if file == "" {
 		file = args.Name
@@ -4268,13 +4268,16 @@ func (s *server) handleOverview(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 		return s.projectOverview()
 	}
 
-	// Strip filename to get package directory.
-	dir := file
-	if idx := strings.LastIndex(dir, "/"); idx >= 0 {
-		dir = dir[:idx]
-	} else {
-		dir = strings.TrimSuffix(dir, "_test.go")
-		dir = strings.TrimSuffix(dir, ".go")
+	// #82/#212: for subpath files use the dirname; for root-level files
+	// leave dir empty so the module-path LIKE-match is permissive and
+	// the source_file exact match narrows to the right file. Mirrors
+	// handleFileDefs/handleReadFile -- stripping .go to fabricate a
+	// fake directory name (e.g. "main.go" -> "main") never matched
+	// anything for root-level files, silently breaking
+	// `overview file:"<root-level-file>.go"` entirely.
+	dir := ""
+	if idx := strings.LastIndex(file, "/"); idx >= 0 {
+		dir = file[:idx]
 	}
 
 	defs, err := s.backend.FindDefinitionsByFile(dir, file, 0)
@@ -4328,6 +4331,19 @@ func (s *server) handleOverview(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 			f = "(unknown)"
 		}
 		byFile[f] = append(byFile[f], d)
+	}
+
+	// #212: a genuine single-file overview (not a directory listing
+	// several files) with enough defs to be worth it gets a precomputed
+	// architectural narrative prepended. Skipped when the co-processor
+	// isn't configured (no ANTHROPIC_API_KEY) -- degrades to the plain
+	// per-def listing below, unchanged from before this landed.
+	if len(byFile) == 1 && len(defs) >= fileNarrativeMinDefs && s.explainClient != nil {
+		for f, fileDefs := range byFile {
+			if narrative := s.fileNarrative(ctx, f, fileDefs); narrative != "" {
+				sb.WriteString(narrative + "\n\n")
+			}
+		}
 	}
 
 	for f, fileDefs := range byFile {
@@ -6509,3 +6525,65 @@ func emitUsageLog(u usageStats) {
 // to read directly and downgrading there produces model confusion
 // without meaningful savings.
 const readAutoOutlineThreshold = 1500
+
+// fileNarrativeMinDefs is the smallest def count a file needs before
+// #212 bothers generating an architectural narrative for it -- small
+// files are already fully understood from the plain per-def listing,
+// so a Sonnet call there would be pure cost with no orientation win.
+const fileNarrativeMinDefs = 5
+
+// fileNarrative returns a cached or freshly-generated #212
+// architectural narrative for sourceFile, or "" if unavailable (no
+// co-processor configured, or generation failed) -- callers degrade
+// gracefully to the existing per-def listing with no narrative
+// prepended. Staleness is checked via a structural hash of the file's
+// concatenated def bodies (sorted by name for determinism); a mismatch
+// means some def in the file changed since the narrative was generated.
+//
+// Generation deliberately sources from doc+signature only, not full
+// bodies -- keeps the generation call itself cheap and avoids ever
+// loading the whole file wholesale, the same win mechanism #211 found
+// (avoiding cache_creation cost on giant files) applied one level up
+// from per-def reads to file-level orientation.
+func (s *server) fileNarrative(ctx context.Context, sourceFile string, defs []store.Definition) string {
+	sorted := make([]store.Definition, len(defs))
+	copy(sorted, defs)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
+
+	var bodyBuf strings.Builder
+	for _, d := range sorted {
+		bodyBuf.WriteString(d.Body)
+		bodyBuf.WriteString("\n")
+	}
+	currentHash := store.HashBodyStructural(bodyBuf.String())
+
+	if existing, _ := s.backend.GetFileSummary(sourceFile); existing != nil && existing.BodyHash == currentHash {
+		return existing.Narrative
+	}
+
+	var sourceBuf strings.Builder
+	for _, d := range sorted {
+		recv := formatReceiver(d.Receiver)
+		sourceBuf.WriteString(fmt.Sprintf("// %s%s (%s)\n", recv, d.Name, d.Kind))
+		if d.Doc != "" {
+			sourceBuf.WriteString(d.Doc + "\n")
+		}
+		if d.Signature != "" {
+			sourceBuf.WriteString(d.Signature + "\n")
+		}
+		sourceBuf.WriteString("\n")
+	}
+	question := "Summarize this file's architectural role in 2-3 sentences: what it contains, the main types/functions, and how they relate to each other."
+	narrative, err := s.explainClient.Explain(ctx, question, sourceBuf.String())
+	if err != nil || strings.TrimSpace(narrative) == "" {
+		return ""
+	}
+	if len(sorted) > 0 {
+		s.backend.SetFileSummary(sourceFile, sorted[0].ModuleID, &store.FileSummary{
+			Narrative: narrative,
+			BodyHash:  currentHash,
+			Model:     "explain-co-processor",
+		})
+	}
+	return narrative
+}
