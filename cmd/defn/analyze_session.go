@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // turnMetrics captures the cost and tool-use signal for a single
@@ -306,8 +307,16 @@ func renderMarkdownReport(w io.Writer, arms []analyzeArm) {
 // (#160 summaries, #197 semantic bridge, etc.) is honestly counted.
 // Warming is default-on per #201; hiding its cost would misread the
 // numbers.
+//
+// #179: --watch polls dir every 2s and prints a running per-arm total
+// as new turn-NN.json files appear, instead of requiring the bench to
+// finish before any signal is visible. Useful for a live bench run in
+// another terminal/background job -- see one number tick up instead
+// of waiting the full 10-20 minutes for completion before finding out
+// something's off.
 func cmdAnalyzeSession(args []string) {
 	jsonOut := false
+	watch := false
 	dir := ""
 	warmingUSD := 0.0
 	amortizeOver := 10
@@ -317,6 +326,8 @@ func cmdAnalyzeSession(args []string) {
 		switch {
 		case a == "--json":
 			jsonOut = true
+		case a == "--watch":
+			watch = true
 		case a == "--warming-usd":
 			if i+1 >= len(args) {
 				fmt.Fprintln(os.Stderr, "--warming-usd requires a value")
@@ -346,7 +357,7 @@ func cmdAnalyzeSession(args []string) {
 			os.Exit(1)
 		default:
 			if dir != "" {
-				fmt.Fprintln(os.Stderr, "usage: defn analyze-session [--json] [--warming-usd F] [--amortize-over N] <dir>")
+				fmt.Fprintln(os.Stderr, "usage: defn analyze-session [--json] [--watch] [--warming-usd F] [--amortize-over N] <dir>")
 				os.Exit(1)
 			}
 			dir = a
@@ -354,8 +365,12 @@ func cmdAnalyzeSession(args []string) {
 		i++
 	}
 	if dir == "" {
-		fmt.Fprintln(os.Stderr, "usage: defn analyze-session [--json] [--warming-usd F] [--amortize-over N] <dir>")
+		fmt.Fprintln(os.Stderr, "usage: defn analyze-session [--json] [--watch] [--warming-usd F] [--amortize-over N] <dir>")
 		os.Exit(1)
+	}
+	if watch {
+		watchSession(dir)
+		return
 	}
 	arms, err := discoverArms(dir)
 	if err != nil {
@@ -517,4 +532,29 @@ func renderCostAccounting(w io.Writer, arms []analyzeArm, warmingUSD float64, am
 	}
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "_Session cost is per-run raw. Warming (raw) shows the honest first-run cost. Amortized shows the steady-state cost for a repeat-use project. Compare vs files-mode session cost to judge whether defn is cheaper for your use pattern._")
+}
+
+// watchSession polls dir every 2s for new/changed turn-*.json files
+// and prints one line per arm whenever its running total changes --
+// #179's live-visibility mode. Runs until interrupted (Ctrl-C); a
+// missing/not-yet-created dir is tolerated (discoverArms erroring)
+// since a bench harness may not have written its first turn file yet
+// when --watch is started.
+func watchSession(dir string) {
+	fmt.Printf("[watch] polling %s every 2s -- Ctrl-C to stop\n", dir)
+	last := map[string]turnMetrics{}
+	for {
+		arms, err := discoverArms(dir)
+		if err == nil {
+			for _, arm := range arms {
+				prev, ok := last[arm.Name]
+				if !ok || prev.CostUSD != arm.Totals.CostUSD || prev.ToolCallCount != arm.Totals.ToolCallCount {
+					fmt.Printf("[%s] %-16s turn %d, %d tool calls, $%.4f\n",
+						time.Now().Format("15:04:05"), arm.Name, len(arm.Turns), arm.Totals.ToolCallCount, arm.Totals.CostUSD)
+					last[arm.Name] = arm.Totals
+				}
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
 }

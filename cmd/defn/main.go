@@ -163,7 +163,10 @@ Usage:
   defn restart [--all]         Gracefully bounce this project's serve (or all)
   defn measure-rename [--in-place] <old> <new>    Time a rename against .defn without spinning up serve
   defn measure-edit   [--in-place] <name> <body-file>  Time an edit; body-file keeps multi-line source shell-safe
-  defn analyze-session [--json] <dir>   Parse session-cumulative bench stream-json; per-arm cost/cache breakdown
+  defn analyze-session [--json|--watch] <dir>   Parse session-cumulative bench stream-json; per-arm cost/cache breakdown
+                               --watch polls dir every 2s, printing a running per-arm total as new turn files
+                               appear -- live visibility into a bench still in progress instead of waiting for it
+                               to finish (#179)
                                --in-place pre-populates scratch with one full emit before timing so
                                file-scoped emit + package-scoped build actually apply (real interactive
                                cost); without it, fresh-tempdir mode gives the un-optimized ceiling number.`)
