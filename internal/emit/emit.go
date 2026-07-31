@@ -538,6 +538,19 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 		if file == docTarget {
 			pkgDoc = mod.Doc
 		}
+		// #208: writeFile/safeWriteGoFile already merge against current
+		// disk content safely (never drop on-disk decls) -- this doesn't
+		// change that behavior, it just surfaces when it happens. If the
+		// DB's last-known raw source for this file no longer matches
+		// what's actually on disk, something touched it outside defn
+		// (most likely the #205 sentinel bypass without a follow-up
+		// code(op:"sync")). Silent before this; now at least visible in
+		// the emit log instead of resolving invisibly.
+		if raw := rawByFile[file]; len(raw) > 0 {
+			if onDisk, rerr := os.ReadFile(path); rerr == nil && !bytes.Equal(onDisk, raw) {
+				fmt.Fprintf(os.Stderr, "[emit] disk drift: %s changed on disk since defn last ingested it -- merging against current disk content; run code(op:\"sync\", file:%q) to bring the DB back in sync.\n", path, projectRelByFile[file])
+			}
+		}
 		locs, err := writeFile(path, mod.Name, mod.Path, pkgDoc, imports, byFile[file], rawByFile[file], allowedRemovals, allowedAdds)
 		if err != nil {
 			return nil, nil, err

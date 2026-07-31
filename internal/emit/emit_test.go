@@ -1,6 +1,8 @@
 package emit
 
 import (
+	"bytes"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1541,5 +1543,49 @@ func Existing() int { return X }
 	// Orphan MUST NOT appear — it wasn't allowed-add, and disk didn't have it.
 	if strings.Contains(got, "func Orphan()") {
 		t.Errorf("Orphan def leaked into disk despite not being in AllowedAdds")
+	}
+}
+
+func TestEmitLogsDiskDriftWarning(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+
+	rawStale := "package test\n\nfunc Foo() {}\n"
+	if err := db.SetFileSource(mod.ID, "test.go", rawStale); err != nil {
+		t.Fatal(err)
+	}
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true,
+		Body: "func Foo() {}", SourceFile: "test.go",
+	})
+
+	outDir := t.TempDir()
+	// Disk has content that differs from what SetFileSource stored --
+	// simulates a native Edit landing outside defn's DB (e.g. via the
+	// #205 sentinel bypass) without a follow-up code(op:"sync").
+	diskDrifted := "package test\n\n// Added outside defn.\nfunc Foo() {}\n"
+	if err := os.WriteFile(filepath.Join(outDir, "test.go"), []byte(diskDrifted), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	origStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+
+	emitErr := Emit(db, outDir)
+
+	w.Close()
+	os.Stderr = origStderr
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+
+	if emitErr != nil {
+		t.Fatal(emitErr)
+	}
+	if !strings.Contains(buf.String(), "disk drift") {
+		t.Fatalf("expected disk-drift warning on stderr, got: %q", buf.String())
 	}
 }

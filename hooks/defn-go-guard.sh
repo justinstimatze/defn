@@ -27,6 +27,16 @@
 # Inspired by TokenMiser's publicly-described "Bash read-guard" concept
 # (tokenmiser.ai marketing copy only) — implemented independently here,
 # no code shared, no code borrowed.
+#
+# #207: DEFN_GUARD=0 disables this hook entirely for the current shell
+# environment (e.g. `DEFN_GUARD=0 claude` for a whole session, or export
+# it for a debugging shell) — a project-wide, non-single-use escape
+# distinct from the ~/.claude-allow-go-edit sentinel below, which is
+# scoped to exactly one blocked call. Use this when the guard itself is
+# what you're working on/around, not as a routine bypass.
+if [ "${DEFN_GUARD:-1}" = "0" ]; then
+    exit 0
+fi
 
 SENTINEL="$HOME/.claude-allow-go-edit"
 
