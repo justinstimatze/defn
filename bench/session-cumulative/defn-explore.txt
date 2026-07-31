@@ -1,0 +1,10 @@
+Explain how code(op:"read") handles a request end to end. What's the flow from handleCode dispatching to returning a result, and where does the auto-downgrade to outline kick in?
+Which functions call emitModule directly, and under what conditions does emit actually get triggered from an MCP mutation like edit or create?
+What's the relationship between respCache and sessionCache? Is sessionCache owned by respCache, or something else?
+If I wanted to change the signature of handleCode, which production callers would break? Which tests would need updates?
+Explain the dedup mechanism in dedup.go. Where is it invoked, and what pattern does it enforce for callers?
+Show me how the circuit breaker in turn_state.go is wired into handleCode and what resets its counter.
+Walk through the code path for a mutation like code(op:"edit") -- what files does it touch, from the MCP call to the file actually being written on disk?
+Which files in internal/mcp use sessionCache directly? List each with what it stores per session.
+In emitModule, how does scoped emit (touchedSet) decide which files to skip?
+Summarize the extension points defn exposes for adding a new op -- where would I plug in a new op end to end?

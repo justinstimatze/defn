@@ -340,7 +340,7 @@ For any "how does X work in this codebase" discovery question, reach for context
 
 Orient before you read: overview (project shape) → outline (def shape) → impact (when you know which def matters). Only read whole bodies when you're about to edit them; whole-file reads on files you won't touch are pure wire cost — use outline or search instead.
 
-Ops: overview (project-wide shape when called with no args — one line per module with def counts + first exported names; pass file:"pkg-path" or file:"pkg-path/file.go" to drill in; the right first-touch when you don't know which def matters yet), outline (compact projection of a def — sig + doc + caller/callee summary, no body; use when body isn't needed), search, impact (blast radius of a known def — pass format:"json" for structured output; callers, transitives, test coverage in one call), read (returns the def body + a compact "Related" footer with summary, top-3 callers, top-3 callees, and semantically-adjacent defs — one call gives you what would otherwise take 3-4 sequential impact/outline calls; auto-downgrades to outline when body > 1500 bytes, pass full:true or mode:"body" to force), read-and-verify (read a def AND run its covering tests in one call — use during bug triage so you see behavior alongside source and don't spiral into read-loops; pass name), read-file (all defs' bodies in one file — pass file:"path"; whole-file counterpart to read; prefer over N sequential read calls when scanning), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), replace-hunk (replace a byte-exact occurrence of 'old' inside a def body with 'new' — byte-exact PUTGET, content-addressed inside the def; pass name+old+new, plus index=1..N if 'old' occurs more than once; empty 'new' deletes the hunk. Send zero anchor context when the hunk is def-unique — the name argument does the file-level disambiguation), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), explain (structural analysis of a def — pass name to get sig + callers + callees + test coverage; ALSO accepts question:"how does X handle Y" which routes to a Sonnet co-processor that returns a prose answer grounded in the def's source with provenance refs. Cheaper than reading + interpreting a large body yourself when the answer is prose, not code. names:["A","B"] for multi-def scope. Requires ANTHROPIC_API_KEY), similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create (single def from body; with file: set, body may hold multiple top-level decls to author a whole file in one call — the whole-file equivalent of files-mode Write), delete (safe by default — refuses when other defs still reference this def; pass force:true to delete anyway. Refusal message lists the callers so you can rewrite them first), retarget-field-value (rewrite a composite-literal field's string value across every def whose body matches — pass name:"<StructType>" field:"<Field>" old:"<oldStr>" new:"<newStr>"; AST-safe, so unrelated occurrences of the string won't match), rename, move, test (run ONLY tests that cover a given def — pass name; scoped subset, not the full suite; prefer over bash 'go test ./...' when you only need coverage for a specific change. Also accepts test:"TestX" to run one test by name — use this to REPRODUCE a bug from the issue BEFORE writing any code; a passing test means your hypothesis about which def is broken is wrong), apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 6 projection ops insert-precondition/replace-slice/replace-hunk/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (rarely needed — every edit op auto-syncs the DB; only use after external file changes outside the code tool), query (raw SQL escape hatch — for schema analytics only; NEVER use to look up a def by name, grep bodies, or list files/defs-in-file — use search/outline/read-file/file-defs/impact instead, which are far cheaper on the wire), patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
+Ops: overview (project-wide shape when called with no args — one line per module with def counts + first exported names; pass file:"pkg-path" or file:"pkg-path/file.go" to drill in; the right first-touch when you don't know which def matters yet), outline (compact projection of a def — sig + doc + caller/callee summary, no body; use when body isn't needed), search, impact (blast radius of a known def — pass format:"json" for structured output; callers, transitives, test coverage in one call), read (returns the def body + a compact "Related" footer with summary, top-3 callers, top-3 callees, and semantically-adjacent defs — one call gives you what would otherwise take 3-4 sequential impact/outline calls; auto-downgrades to outline when body > 1500 bytes, pass full:true or mode:"body" to force), read-and-verify (read a def AND run its covering tests in one call — use during bug triage so you see behavior alongside source and don't spiral into read-loops; pass name), read-file (all defs' bodies in one file — pass file:"path"; whole-file counterpart to read; prefer over N sequential read calls when scanning), expand (bundle a def's outline/body/callers in one call — pass name:"F", or names:["A","B",...] to batch several targets into ONE response instead of one expand per target; include:["outline","callers","body"] controls sections, defaults to outline+callers; prefer over read+impact+read chains AND over N sequential single-name expand calls — round-trip count within a turn is the dominant session cost driver, not per-call size), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), replace-hunk (replace a byte-exact occurrence of 'old' inside a def body with 'new' — byte-exact PUTGET, content-addressed inside the def; pass name+old+new, plus index=1..N if 'old' occurs more than once; empty 'new' deletes the hunk. Send zero anchor context when the hunk is def-unique — the name argument does the file-level disambiguation), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), explain (structural analysis of a def — pass name to get sig + callers + callees + test coverage; ALSO accepts question:"how does X handle Y" which routes to a Sonnet co-processor that returns a prose answer grounded in the def's source with provenance refs. Cheaper than reading + interpreting a large body yourself when the answer is prose, not code. names:["A","B"] for multi-def scope. Requires ANTHROPIC_API_KEY), similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create (single def from body; with file: set, body may hold multiple top-level decls to author a whole file in one call — the whole-file equivalent of files-mode Write), delete (safe by default — refuses when other defs still reference this def; pass force:true to delete anyway. Refusal message lists the callers so you can rewrite them first), retarget-field-value (rewrite a composite-literal field's string value across every def whose body matches — pass name:"<StructType>" field:"<Field>" old:"<oldStr>" new:"<newStr>"; AST-safe, so unrelated occurrences of the string won't match), rename, move, test (run ONLY tests that cover a given def — pass name; scoped subset, not the full suite; prefer over bash 'go test ./...' when you only need coverage for a specific change. Also accepts test:"TestX" to run one test by name — use this to REPRODUCE a bug from the issue BEFORE writing any code; a passing test means your hypothesis about which def is broken is wrong), apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 6 projection ops insert-precondition/replace-slice/replace-hunk/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (rarely needed — every edit op auto-syncs the DB; only use after external file changes outside the code tool), query (raw SQL escape hatch — for schema analytics only; NEVER use to look up a def by name, grep bodies, or list files/defs-in-file — use search/outline/read-file/file-defs/impact instead, which are far cheaper on the wire), patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), branch (list/create/delete — pass from to branch from a source, force to delete), checkout (switch branch), merge (merge branch into current), commit (snapshot current state), status (current branch + dirty state), conflicts (list unresolved merge conflicts), resolve (name+body OR pick:"ours"/"theirs"), merge-abort (cancel in-progress merge), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), gc (compact Dolt noms store)`,
 	}, s.handleCode)
 
 	return s, mcpServer
@@ -4668,14 +4668,23 @@ func compactReadFile(file, modulePath string, defs []store.Definition, fullSize 
 // without paying for the body. Explicitly request "body" when you're
 // about to edit or need to see branching. See #172.
 //
+// #210: accepts names:["A","B",...] (plural) to expand several defs in
+// ONE call instead of one expand per target -- the #206/#209 chi-explore
+// bench found the model making 11 separate expand calls in a single turn
+// for exactly this shape (routeHTTP, Handle, Middlewares, Chain, Route,
+// Mount, ...), each paying a full round-trip's cache-read cost on top of
+// the growing conversation prefix. name (singular) still works and is
+// equivalent to names:[name] -- fully backward compatible. Unresolvable
+// names are skipped with a note rather than failing the whole call.
+//
 // Design notes in scratchpad/expand-op-design.md.
 func (s *server) handleExpand(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	if strings.TrimSpace(args.Name) == "" {
-		return errResult(fmt.Errorf("expand: name is required"))
-	}
-	d, err := s.backend.GetDefinitionByName(args.Name, "")
-	if err != nil {
-		return s.notFoundOrErr(args.Name, err)
+	names := args.Names
+	if len(names) == 0 {
+		if strings.TrimSpace(args.Name) == "" {
+			return errResult(fmt.Errorf("expand: name or names is required"))
+		}
+		names = []string{args.Name}
 	}
 
 	includes := args.Include
@@ -4687,17 +4696,70 @@ func (s *server) handleExpand(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		want[strings.ToLower(strings.TrimSpace(k))] = true
 	}
 
-	// Look up module path (all sections share it).
-	var modulePath string
 	mods, _ := s.backend.ListModules()
+	modulePathByID := make(map[int64]string, len(mods))
 	for _, m := range mods {
-		if m.ID == d.ModuleID {
-			modulePath = m.Path
-			break
-		}
+		modulePathByID[m.ID] = m.Path
 	}
 
 	var sb strings.Builder
+	var notFound []string
+	resolved := 0
+	var firstErr error
+	for i, name := range names {
+		d, err := s.backend.GetDefinitionByName(name, "")
+		if err != nil {
+			notFound = append(notFound, name)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if resolved > 0 {
+			sb.WriteString("\n---\n\n")
+		}
+		if err := s.renderExpandSection(&sb, d, modulePathByID[d.ModuleID], want); err != nil {
+			return errResult(fmt.Errorf("expand: gather callers for %s: %w", name, err))
+		}
+		resolved++
+		_ = i
+	}
+
+	if resolved == 0 {
+		return s.notFoundOrErr(names[0], firstErr)
+	}
+
+	// Warn on any unsupported include kinds so the caller learns the vocabulary.
+	var unknown []string
+	for _, k := range includes {
+		norm := strings.ToLower(strings.TrimSpace(k))
+		switch norm {
+		case "outline", "body", "callers":
+			// supported
+		default:
+			unknown = append(unknown, k)
+		}
+	}
+	if len(unknown) > 0 {
+		sb.WriteString(fmt.Sprintf("\n_note: unsupported include kinds ignored: %s (supported: outline, body, callers)_\n",
+			strings.Join(unknown, ", ")))
+	}
+	if len(notFound) > 0 {
+		sb.WriteString(fmt.Sprintf("\n_note: not found, skipped: %s_\n", strings.Join(notFound, ", ")))
+	}
+
+	out := sb.String()
+	return withUsage(textResult(out), usageStats{
+		Op:            "expand",
+		BytesReturned: len(out),
+	}), nil, nil
+}
+
+// renderExpandSection writes one def's expand sections (outline/body/
+// callers per want) into sb. Split out of handleExpand so #210's
+// multi-name batching can call it once per resolved def without
+// duplicating the section-rendering logic.
+func (s *server) renderExpandSection(sb *strings.Builder, d *store.Definition, modulePath string, want map[string]bool) error {
 	recv := formatReceiver(d.Receiver)
 	sb.WriteString(fmt.Sprintf("## %s%s (%s)\n", recv, d.Name, d.Kind))
 	if modulePath != "" {
@@ -4744,7 +4806,7 @@ func (s *server) handleExpand(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	if want["callers"] {
 		impact, err := s.backend.GetImpact(d.ID)
 		if err != nil {
-			return errResult(fmt.Errorf("expand: gather callers: %w", err))
+			return err
 		}
 		var prodCallers, testCallers []store.Definition
 		for _, c := range impact.DirectCallers {
@@ -4777,28 +4839,7 @@ func (s *server) handleExpand(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		}
 		sb.WriteString("\n")
 	}
-
-	// Warn on any unsupported include kinds so the caller learns the vocabulary.
-	var unknown []string
-	for _, k := range includes {
-		norm := strings.ToLower(strings.TrimSpace(k))
-		switch norm {
-		case "outline", "body", "callers":
-			// supported
-		default:
-			unknown = append(unknown, k)
-		}
-	}
-	if len(unknown) > 0 {
-		sb.WriteString(fmt.Sprintf("_note: unsupported include kinds ignored: %s (supported: outline, body, callers)_\n",
-			strings.Join(unknown, ", ")))
-	}
-
-	out := sb.String()
-	return withUsage(textResult(out), usageStats{
-		Op:            "expand",
-		BytesReturned: len(out),
-	}), nil, nil
+	return nil
 }
 
 func (s *server) handleFileDefs(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {

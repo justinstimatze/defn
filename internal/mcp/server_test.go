@@ -2785,3 +2785,56 @@ func TestHandleMethods_Interface(t *testing.T) {
 		}
 	}
 }
+
+func TestHandleExpand_AllNamesNotFound(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.handleExpand(context.Background(), nil, codeParam{Names: []string{"NoSuchDef1", "NoSuchDef2"}})
+	if err == nil && (result == nil || !result.IsError) {
+		t.Fatalf("expected an error/not-found result when every name fails to resolve, got result=%v err=%v", result, err)
+	}
+}
+
+func TestHandleExpand_MultipleNames(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.handleExpand(context.Background(), nil, codeParam{Names: []string{"Greet", "Farewell"}})
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "## Greet") {
+		t.Errorf("expected Greet section, got: %s", text)
+	}
+	if !strings.Contains(text, "## Farewell") {
+		t.Errorf("expected Farewell section, got: %s", text)
+	}
+	if !strings.Contains(text, "---") {
+		t.Errorf("expected --- separator between multiple names, got: %s", text)
+	}
+	if strings.Index(text, "## Greet") > strings.Index(text, "## Farewell") {
+		t.Errorf("expected names in request order (Greet before Farewell), got: %s", text)
+	}
+}
+
+func TestHandleExpand_MultipleNamesSkipsNotFound(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.handleExpand(context.Background(), nil, codeParam{Names: []string{"Greet", "NoSuchDef"}})
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "## Greet") {
+		t.Errorf("expected Greet section despite the other name failing, got: %s", text)
+	}
+	if !strings.Contains(text, "not found, skipped: NoSuchDef") {
+		t.Errorf("expected a not-found note for the unresolvable name, got: %s", text)
+	}
+}
