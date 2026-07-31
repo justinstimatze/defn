@@ -186,6 +186,13 @@ This project is indexed in defn (`.defn/`). For any `.go` file, use the `code` M
 
 **Escape hatch (rare, e.g. a known defn write-path bug):** `touch ~/.claude-allow-go-edit` before the one blocked call you need — the hook consumes (deletes) the sentinel automatically on that single use, so it does not need to be manually removed and does not stay armed as a standing bypass.
 
+**#209: enforcement alone made things worse, not better.** A chi-explore bench with the guard live cost +154% vs. native files — not because tool *choice* failed (100% of calls correctly went to `code()`), but because removing the cheap-native-peek escape valve turned an existing bundling bug into a 44-call binge. Root cause: `#203`'s starter bundle used a hardcoded `"project structure"` placeholder question for a bare `overview` call, returning content unrelated to what was actually asked — the model correctly ignored it and did the work itself, one small call at a time, several of them exact repeats. Three fixes now in place:
+- **Intent capture**: `hooks/defn-capture-question.sh` (`UserPromptSubmit`) stashes the raw prompt into `.defn/.last-question`; `appendStarter` prefers it over the op-specific fallback, so the one starter-bundle shot per session is actually targeted at the real question.
+- **Repeat-call dedup floor lowered** (512→200 bytes): a repeated small response (e.g. the same auto-downgrade note served twice) used to slip past dedup entirely, giving a blindly-retrying model zero signal to stop. The stub now also hints at `full:true` when the repeated content was itself a downgrade note.
+- **Per-turn circuit breaker**: after `DEFN_CIRCUIT_BREAKER` (default 8) individual `read`/`outline`/`search`/`impact`/`overview`/`methods` calls without a `context`/`expand`/`apply` in between, further singleton calls are refused with a nudge to batch. Turn boundaries are detected via a token the same hook bumps once per prompt.
+
+If you're tuning any of `#205`'s enforcement further, re-run the chi-explore bench (`bench/session-cumulative/`) after — enforcement that isn't measured against the actual workload is how this regression happened in the first place.
+
 **Do not `ls` and `Read` files by hand.** Start any Go task with `code(op:"overview")` to see the project shape, then drill in with `search` / `outline` / `impact`.
 
 **Reach for `outline` before `read`.** `outline` returns the signature, doc, refs, and control-flow of a def — 5-10× smaller than the full body. It's enough to answer almost every "what does X do / how does Y work / where does Z fit" question. Only escalate to `read` (full body) when you're about to edit the def, or when outline was genuinely insufficient. A follow-up `read` costs nothing you haven't already committed to.

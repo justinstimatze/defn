@@ -932,6 +932,38 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return r, o, e
 	}
 
+	// #209: per-turn circuit breaker on read-shaped singleton calls
+	// (read/outline/search/impact/overview/methods). Resets when a
+	// batching op (context/expand/apply) is called, or when a new
+	// turn starts (detected via the turn-token bumped by
+	// hooks/defn-capture-question.sh on UserPromptSubmit).
+	if s.respCache != nil && req != nil {
+		s.respCache.mu.Lock()
+		sc := s.respCache.getSession(req.Session)
+		s.checkTurnBoundary(sc)
+		breakerMsg := s.circuitBreakerCheck(sc, args.Op)
+		s.respCache.mu.Unlock()
+		if breakerMsg != "" {
+			return textResult(breakerMsg), nil, nil
+		}
+	}
+
+	// #209: per-turn circuit breaker on read-shaped singleton calls
+	// (read/outline/search/impact/overview/methods). Resets when a
+	// batching op (context/expand/apply) is called, or when a new
+	// turn starts (detected via the turn-token bumped by
+	// hooks/defn-capture-question.sh on UserPromptSubmit).
+	if s.respCache != nil && req != nil {
+		s.respCache.mu.Lock()
+		sc := s.respCache.getSession(req.Session)
+		s.checkTurnBoundary(sc)
+		breakerMsg := s.circuitBreakerCheck(sc, args.Op)
+		s.respCache.mu.Unlock()
+		if breakerMsg != "" {
+			return textResult(breakerMsg), nil, nil
+		}
+	}
+
 	switch args.Op {
 	case "read":
 		return wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name, Full: args.Full, Query: args.Query, Mode: args.Mode}))

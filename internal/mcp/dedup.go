@@ -39,7 +39,9 @@ type respCache struct {
 type sessionCache struct {
 	seq             int64
 	entries         map[string]cacheEntry
-	starterInjected bool // #203: true after first orient op has appended the starter bundle
+	starterInjected bool   // #203: true after first orient op has appended the starter bundle
+	turnToken       string // #209: last-seen turn-token; a change means a new turn started
+	readShapedCount int    // #209: individual read-shaped calls made so far this turn
 }
 
 type cacheEntry struct {
@@ -48,10 +50,15 @@ type cacheEntry struct {
 	size     int
 }
 
-// dedupMinBytes is the smallest response size we bother deduping. The stub
-// message is ~250 bytes; on smaller payloads a "cache hit" would actually
-// inflate wire cost. Set well above stub size so dedup is always a win.
-const dedupMinBytes = 512
+// dedupMinBytes is the smallest response size we bother deduping. #209:
+// lowered from 512 -- the original floor let small repeated responses
+// (e.g. the same auto-downgrade "outline shown" note served twice
+// verbatim) slip past dedup entirely, so a model blindly retrying a
+// call that told it nothing new got zero signal to stop. 200 stays
+// safely under any real outline/read/impact payload while still well
+// above the stub message's own size, so dedup is still always a wire-
+// cost win, just with a much lower bar for when it kicks in.
+const dedupMinBytes = 200
 
 func newRespCache() *respCache {
 	return &respCache{sessions: map[*sdkmcp.ServerSession]*sessionCache{}}
@@ -136,11 +143,6 @@ func (c *respCache) invalidate(sess *sdkmcp.ServerSession) {
 	}
 }
 
-// dedup inspects r; if this session has already returned an identical
-// response for (op, argKey), replace r's text with a compact stub and
-// return that. Otherwise record the response and return r unchanged.
-// Sessions with a nil session pointer (uncommon; happens in unit tests
-// invoking handlers directly) are pass-through.
 func (c *respCache) dedup(sess *sdkmcp.ServerSession, op, argKey string, r *sdkmcp.CallToolResult) *sdkmcp.CallToolResult {
 	if sess == nil || r == nil || r.IsError || len(r.Content) == 0 {
 		return r
@@ -162,7 +164,7 @@ func (c *respCache) dedup(sess *sdkmcp.ServerSession, op, argKey string, r *sdkm
 	key := op + "|" + argKey
 	if prev, hit := sc.entries[key]; hit && prev.hash == hash {
 		stub := fmt.Sprintf(
-			"[cached: identical %s response already served in this session at call #%d (hash=%s, %d bytes saved). Nothing has changed since — no need to re-request. If you need a fresh read after external changes, call `code(op:\"sync\")` first.]",
+			"[cached: identical %s response already served in this session at call #%d (hash=%s, %d bytes saved). Nothing has changed since — no need to re-request. If you need a fresh read after external changes, call `code(op:\"sync\")` first. If the earlier response was an outline/size-only note, pass full:true to get the full body instead of repeating this call.]",
 			op, prev.servedAt, hash, prev.size,
 		)
 		return textResult(stub)
