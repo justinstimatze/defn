@@ -361,15 +361,23 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 	// Fall back to the unwrapped path if Begin fails (embedded Dolt not
 	// ready, MySQL server rejects START TRANSACTION, etc.) — same shape
 	// as before, just slower on ref-dense flushes.
-	commit, rollback, txErr := db.Begin()
+	// #214: route the actual writes through the tx-scoped Backend Begin()
+	// hands back, not the original db -- writes issued against db would
+	// auto-commit immediately via the pool, bypassing this transaction
+	// entirely regardless of whether commit()/rollback() is later called.
+	txDB, commit, rollback, txErr := db.Begin()
 	txWrapped := txErr == nil
+	flushDB := db
+	if txWrapped {
+		flushDB = txDB
+	}
 	// Split the two flushes into separate timers — winze dispatch 2026-07-22
 	// msg-5c1eb8d6 saw 10-14s "flush SetReferences" on a 6-def sync and we
 	// need to know which of refs/litfields dominates on their shape before
 	// we can fix it. Also emit txn-commit time separately since Dolt's
 	// commit cost scales with dirty-chunk count.
 	tRefs := time.Now()
-	if err := db.SetManyReferences(defRefs); err != nil {
+	if err := flushDB.SetManyReferences(defRefs); err != nil {
 		if txWrapped {
 			rollback()
 		}
@@ -377,7 +385,7 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 	}
 	timeIt("flush SetManyReferences", tRefs)
 	tLit := time.Now()
-	if err := db.SetManyLiteralFields(defLitFields); err != nil {
+	if err := flushDB.SetManyLiteralFields(defLitFields); err != nil {
 		if txWrapped {
 			rollback()
 		}

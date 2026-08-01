@@ -3115,7 +3115,6 @@ func TestHandleRename_PointerReceiverMethodRemovesOldDecl(t *testing.T) {
 // ambiguity). If the batch is truly atomic, op1's write must NOT be
 // visible in the DB after the batch reports an error.
 func TestHandleApply_PartialFailureRollsBackEarlierDBWrite(t *testing.T) {
-	t.Skip("#214: handleApply's Begin()/commit()/rollback() does not actually wrap UpsertDefinition/DeleteDefinition/RenameDefinition, which write directly via the shared *sql.DB pool (SetMaxOpenConns(4)) instead of the returned *sql.Tx -- rollback() rolls back an empty, unused transaction. A real fix needs either a tx-scoped Backend view threaded through every write call, or a two-phase validate-then-write restructure of handleApply; both are architecturally significant and were left for deliberate follow-up rather than pushed through unsupervised. Un-skip once #214 is fixed -- this test currently fails (correctly) against the unfixed code.")
 	db, projDir := setupTestDB(t)
 	defer db.Close()
 	s := &server{backend: db, projectDir: projDir}

@@ -50,11 +50,27 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
+// dbConn is the subset of *sql.DB / *sql.Tx that SQLiteDB's query
+// methods actually call. Both types satisfy it with identical method
+// sets, which lets Begin() hand back a *SQLiteDB backed by a real
+// *sql.Tx instead of the pool -- every existing method keeps working
+// completely unchanged, since none of them care which one is
+// providing the connection. #214: this is what makes Begin()'s
+// returned commit/rollback actually mean something -- previously
+// nothing gave callers a way to route writes through the transaction
+// it opened, so every write auto-committed via the pool regardless.
+type dbConn interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 // SQLiteDB is a store.Backend backed by a local SQLite database file.
 // Writes hit disk on transaction commit (WAL mode). Safe for concurrent
 // read; writers are serialized by SQLite itself (single-writer model).
 type SQLiteDB struct {
-	db   *sql.DB
+	db   dbConn  // query/exec surface: the pool normally, a *sql.Tx when this is a tx-scoped view returned by Begin()
+	pool *sql.DB // only set on the root instance; used for Close/Ping/BeginTx -- nil on a tx-scoped view, which is never Close()'d or re-Begin()'able
 	path string
 
 	closeOnce sync.Once
@@ -106,7 +122,7 @@ func OpenSQLite(path string) (*SQLiteDB, error) {
 		return nil, fmt.Errorf("sqlite: backfill fts: %w", err)
 	}
 
-	sq := &SQLiteDB{db: db, path: path}
+	sq := &SQLiteDB{db: db, pool: db, path: path}
 	// Backfill def summaries if this is an existing DB predating #151.
 	// Same pattern as backfillFTS: skip when already populated. Cost
 	// on winze's 2378 defs is ~50-100ms one-shot; amortized on next
@@ -140,7 +156,7 @@ func (s *SQLiteDB) backfillDefSummaries() error {
 		return fmt.Errorf("select missing summaries: %w", err)
 	}
 	defer rows.Close()
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.pool.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -202,25 +218,26 @@ func backfillFTS(db *sql.DB) error {
 
 func (s *SQLiteDB) Close() error {
 	s.closeOnce.Do(func() {
-		s.closeErr = s.db.Close()
+		s.closeErr = s.pool.Close()
 	})
 	return s.closeErr
 }
 
 func (s *SQLiteDB) Path() string { return s.path }
 
-func (s *SQLiteDB) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
+func (s *SQLiteDB) Ping(ctx context.Context) error { return s.pool.PingContext(ctx) }
 
 func (s *SQLiteDB) Ctx() context.Context { return context.Background() }
 
 func (s *SQLiteDB) CleanTempFiles() {}
 
-func (s *SQLiteDB) Begin() (commit func() error, rollback func(), err error) {
-	tx, err := s.db.BeginTx(context.Background(), nil)
+func (s *SQLiteDB) Begin() (tx Backend, commit func() error, rollback func(), err error) {
+	t, err := s.pool.BeginTx(context.Background(), nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("sqlite: begin: %w", err)
+		return nil, nil, nil, fmt.Errorf("sqlite: begin: %w", err)
 	}
-	return tx.Commit, func() { _ = tx.Rollback() }, nil
+	txDB := &SQLiteDB{db: t, path: s.path}
+	return txDB, t.Commit, func() { _ = t.Rollback() }, nil
 }
 
 // GC runs a WAL checkpoint to fold the -wal file back into the main db.

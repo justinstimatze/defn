@@ -2832,7 +2832,7 @@ func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult
 		}
 	}
 
-	commit, rollback, txErr := s.backend.Begin()
+	tx, commit, rollback, txErr := s.backend.Begin()
 	if txErr != nil {
 		return errResult(txErr)
 	}
@@ -2852,7 +2852,7 @@ func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult
 			Body:       d.Body,
 			SourceFile: args.File,
 		}
-		id, err := s.backend.UpsertDefinition(def)
+		id, err := tx.UpsertDefinition(def)
 		if err != nil {
 			return errResult(fmt.Errorf("upsert %s: %v", d.Name, err))
 		}
@@ -3013,7 +3013,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			case "insert-precondition", "replace-slice", "replace-hunk", "wrap-in-defer", "rename-param":
 				name := op.Name
 				if name == "" {
-					if inferred, err := s.inferSingleTargetName(); err != nil {
+					if inferred, err := s.inferSingleTargetName(s.backend); err != nil {
 						errors = append(errors, fmt.Sprintf("%s: %v", op.Op, err))
 						continue
 					} else {
@@ -3045,7 +3045,13 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		return textResult(sb.String()), nil, nil
 	}
 
-	commit, rollback, txErr := s.backend.Begin()
+	// #214: tx is the transaction-scoped Backend view Begin() hands back.
+	// Every read and write for this batch MUST go through tx, not
+	// s.backend directly -- s.backend would auto-commit immediately via
+	// the pool and also would not see this batch's own uncommitted writes,
+	// breaking both rollback-on-failure and any op-to-op dependency within
+	// the same batch (e.g. op2 editing a def op1 just created).
+	tx, commit, rollback, txErr := s.backend.Begin()
 	if txErr != nil {
 		return errResult(txErr)
 	}
@@ -3083,13 +3089,13 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	projEdit := func(op applyOp, compute func(body string) (string, error)) (string, string) {
 		name := op.Name
 		if name == "" {
-			inferred, err := s.inferSingleTargetName()
+			inferred, err := s.inferSingleTargetName(tx)
 			if err != nil {
 				return "", fmt.Sprintf("%s: %v", op.Op, err)
 			}
 			name = inferred
 		}
-		d, err := s.backend.GetDefinitionByName(name, "")
+		d, err := tx.GetDefinitionByName(name, "")
 		if err != nil {
 			return "", fmt.Sprintf("%s %s: not found", op.Op, name)
 		}
@@ -3103,7 +3109,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		}
 		d.Body = newBody
 		d.Signature = extractSignature(newBody)
-		if _, err := s.backend.UpsertDefinition(d); err != nil {
+		if _, err := tx.UpsertDefinition(d); err != nil {
 			return "", fmt.Sprintf("%s %s: %v", op.Op, name, err)
 		}
 		addTouched(d.SourceFile)
@@ -3154,7 +3160,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				Test: isTest, Receiver: receiver, Signature: extractSignature(op.Body), Body: op.Body,
 				SourceFile: op.File,
 			}
-			id, err := s.backend.UpsertDefinition(d)
+			id, err := tx.UpsertDefinition(d)
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("create %s: %v", name, err))
 			} else {
@@ -3167,7 +3173,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			}
 
 		case "edit":
-			d, err := s.backend.GetDefinitionByName(op.Name, "")
+			d, err := tx.GetDefinitionByName(op.Name, "")
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("edit %s: not found", op.Name))
 				continue
@@ -3200,7 +3206,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				continue
 			}
 			d.Signature = extractSignature(d.Body)
-			if _, err := s.backend.UpsertDefinition(d); err != nil {
+			if _, err := tx.UpsertDefinition(d); err != nil {
 				errors = append(errors, fmt.Sprintf("edit %s: %v", op.Name, err))
 			} else {
 				addTouched(d.SourceFile)
@@ -3209,12 +3215,12 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			}
 
 		case "delete":
-			d, err := s.backend.GetDefinitionByName(op.Name, "")
+			d, err := tx.GetDefinitionByName(op.Name, "")
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("delete %s: not found", op.Name))
 				continue
 			}
-			if err := s.backend.DeleteDefinition(d.ID); err != nil {
+			if err := tx.DeleteDefinition(d.ID); err != nil {
 				errors = append(errors, fmt.Sprintf("delete %s: %v", op.Name, err))
 			} else {
 				addTouched(d.SourceFile)
@@ -3230,7 +3236,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				errors = append(errors, "rename: both name and new_name are required")
 				continue
 			}
-			d, err := s.backend.GetDefinitionByName(op.Name, "")
+			d, err := tx.GetDefinitionByName(op.Name, "")
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("rename %s: not found", op.Name))
 				continue
@@ -3245,7 +3251,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			d.Name = op.NewName
 			d.Signature = extractSignature(d.Body)
 			d.Exported = len(op.NewName) > 0 && op.NewName[0] >= 'A' && op.NewName[0] <= 'Z'
-			if _, err := s.backend.UpsertDefinition(d); err != nil {
+			if _, err := tx.UpsertDefinition(d); err != nil {
 				errors = append(errors, fmt.Sprintf("rename %s: %v", op.Name, err))
 				continue
 			}
@@ -3253,13 +3259,13 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			// #163: rename creates a new-named def from the emit path's POV.
 			allowedAdds = append(allowedAdds, emit.FuncIdentity(op.NewName, d.Receiver))
 			s.enqueueSummary(d)
-			callers, _ := s.backend.GetCallers(d.ID)
+			callers, _ := tx.GetCallers(d.ID)
 			callerCount := 0
 			for _, caller := range callers {
 				if strings.Contains(caller.Body, op.Name) {
 					caller.Body, _ = astRename(caller.Body, op.Name, op.NewName)
 					caller.Signature = extractSignature(caller.Body)
-					if _, err := s.backend.UpsertDefinition(&caller); err != nil {
+					if _, err := tx.UpsertDefinition(&caller); err != nil {
 						errors = append(errors, fmt.Sprintf("rename caller %s: %v", caller.Name, err))
 					} else {
 						addTouched(caller.SourceFile)
@@ -3335,7 +3341,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			}
 			file := op.File
 			if file == "" {
-				all, err := s.backend.DistinctSourceFiles()
+				all, err := tx.DistinctSourceFiles()
 				if err != nil {
 					errors = append(errors, fmt.Sprintf("add-import: %v", err))
 					continue
@@ -3357,13 +3363,13 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			if idx := strings.LastIndex(dir, "/"); idx >= 0 {
 				dir = dir[:idx]
 			}
-			defs, err := s.backend.FindDefinitionsByFile(dir, file, 0)
+			defs, err := tx.FindDefinitionsByFile(dir, file, 0)
 			if err != nil || len(defs) == 0 {
 				errors = append(errors, fmt.Sprintf("add-import: no defs in %q", file))
 				continue
 			}
 			moduleID := defs[0].ModuleID
-			existing, err := s.backend.GetImports(moduleID)
+			existing, err := tx.GetImports(moduleID)
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("add-import: read imports: %v", err))
 				continue
@@ -3380,7 +3386,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				continue
 			}
 			updated := append(existing, store.Import{ModuleID: moduleID, ImportedPath: op.ImportPath, Alias: op.Alias})
-			if err := s.backend.SetImports(moduleID, updated); err != nil {
+			if err := tx.SetImports(moduleID, updated); err != nil {
 				errors = append(errors, fmt.Sprintf("add-import %q: %v", op.ImportPath, err))
 			} else {
 				// add-import changes imports header only; body/refs untouched.
@@ -5961,7 +5967,7 @@ func (s *server) handleInsertPrecondition(_ context.Context, req *sdkmcp.CallToo
 	}
 	name := strings.TrimSpace(args.Name)
 	if name == "" {
-		inferred, err := s.inferSingleTargetName()
+		inferred, err := s.inferSingleTargetName(s.backend)
 		if err != nil {
 			return errResult(fmt.Errorf("insert-precondition: %w", err))
 		}
@@ -6089,7 +6095,7 @@ func (s *server) handleRenameParam(_ context.Context, req *sdkmcp.CallToolReques
 	}
 	name := strings.TrimSpace(args.Name)
 	if name == "" {
-		inferred, err := s.inferSingleTargetName()
+		inferred, err := s.inferSingleTargetName(s.backend)
 		if err != nil {
 			return errResult(fmt.Errorf("rename-param: %w", err))
 		}
@@ -6123,7 +6129,7 @@ func (s *server) handleWrapInDefer(_ context.Context, req *sdkmcp.CallToolReques
 	}
 	name := strings.TrimSpace(args.Name)
 	if name == "" {
-		inferred, err := s.inferSingleTargetName()
+		inferred, err := s.inferSingleTargetName(s.backend)
 		if err != nil {
 			return errResult(fmt.Errorf("wrap-in-defer: %w", err))
 		}
@@ -6172,7 +6178,7 @@ func (s *server) handleReplaceSlice(_ context.Context, req *sdkmcp.CallToolReque
 	}
 	name := strings.TrimSpace(args.Name)
 	if name == "" {
-		inferred, err := s.inferSingleTargetName()
+		inferred, err := s.inferSingleTargetName(s.backend)
 		if err != nil {
 			return errResult(fmt.Errorf("replace-slice: %w", err))
 		}
@@ -6215,7 +6221,7 @@ func (s *server) handleReplaceHunk(_ context.Context, req *sdkmcp.CallToolReques
 	}
 	name := strings.TrimSpace(args.Name)
 	if name == "" {
-		inferred, err := s.inferSingleTargetName()
+		inferred, err := s.inferSingleTargetName(s.backend)
 		if err != nil {
 			return errResult(fmt.Errorf("replace-hunk: %w", err))
 		}
@@ -6316,8 +6322,8 @@ func (s *server) applyEditTerse(session *sdkmcp.ServerSession, name, action, sni
 // the file-inference pattern in handleAddImport. Errors when zero or
 // more than one candidate exists, listing the candidates so the caller
 // can retry with an explicit name.
-func (s *server) inferSingleTargetName() (string, error) {
-	defs, err := s.backend.FilterDefinitions("", "", "", 0)
+func (s *server) inferSingleTargetName(backend store.Backend) (string, error) {
+	defs, err := backend.FilterDefinitions("", "", "", 0)
 	if err != nil {
 		return "", fmt.Errorf("infer name: list definitions: %w", err)
 	}

@@ -13,7 +13,15 @@ type Backend interface {
 	Path() string
 	Ping(ctx context.Context) error
 	Ctx() context.Context
-	Begin() (commit func() error, rollback func(), err error)
+	// Begin returns a transaction-scoped Backend view (tx) alongside the
+	// usual commit/rollback funcs. Callers doing a multi-write batch MUST
+	// route every write through tx, not the original Backend -- writes
+	// issued against the original still auto-commit immediately via the
+	// pool, bypassing the transaction entirely (this was #214: Begin's
+	// commit/rollback previously had nothing for callers to route writes
+	// through, so every write auto-committed regardless of the batch's
+	// outcome). tx is only valid until commit()/rollback() is called.
+	Begin() (tx Backend, commit func() error, rollback func(), err error)
 	CleanTempFiles()
 	GC() error                        // no-op under SQLite (WAL checkpoint replaces this)
 	ComputeRootHash() (string, error) // canonical dump hash under SQLite

@@ -30,10 +30,11 @@ func TestSQLiteSmoke(t *testing.T) {
 	}
 
 	// Begin -> commit round-trip.
-	commit, rollback, err := db.Begin()
+	tx, commit, rollback, err := db.Begin()
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
+	_ = tx
 	_ = rollback
 	if err := commit(); err != nil {
 		t.Fatalf("commit: %v", err)
@@ -270,10 +271,10 @@ func TestSearchDefinitions_FTSBackfill(t *testing.T) {
 	if err != nil {
 		t.Fatalf("re-open: %v", err)
 	}
-	if _, err := dbRaw.db.Exec("DELETE FROM bodies_fts"); err != nil {
+	if _, err := dbRaw.db.ExecContext(context.Background(), "DELETE FROM bodies_fts"); err != nil {
 		t.Fatalf("wipe bodies_fts: %v", err)
 	}
-	if _, err := dbRaw.db.Exec("DELETE FROM definitions_fts"); err != nil {
+	if _, err := dbRaw.db.ExecContext(context.Background(), "DELETE FROM definitions_fts"); err != nil {
 		t.Fatalf("wipe definitions_fts: %v", err)
 	}
 	_ = dbRaw.Close()
