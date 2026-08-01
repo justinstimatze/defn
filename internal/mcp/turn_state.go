@@ -99,9 +99,17 @@ func (s *server) lastUserQuestion() string {
 // being documented) provides no more consolidation than a lone read,
 // so it counts like one; the call site only treats expand as a batch
 // (resetting the counter) when 2+ names were actually requested.
+//
+// overview is deliberately NOT here (moved out per #212's validation
+// bench, 2026-07-31): unlike read/outline, it was never a per-def
+// singleton to begin with -- even a bare overview() summarizes the
+// whole project, and overview(file:...) summarizes every def in that
+// file in one call, optionally with a #212 narrative on top. Counting
+// it as a singleton let the breaker block the one overview call that
+// would have exercised #212 before it ever got a chance to fire.
 var readShapedOps = map[string]bool{
 	"read": true, "outline": true, "search": true,
-	"impact": true, "overview": true, "methods": true, "expand": true,
+	"impact": true, "methods": true, "expand": true,
 }
 
 // stripped reports whether feature is listed in DEFN_STRIP (a

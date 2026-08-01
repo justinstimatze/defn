@@ -942,8 +942,11 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		sc := s.respCache.getSession(req.Session)
 		s.checkTurnBoundary(sc)
 		// #210: a single-name expand is not a batch -- only 2+ names (or
-		// context/apply, which always consolidate) count as one.
-		isBatch := args.Op == "context" || args.Op == "apply" || (args.Op == "expand" && len(args.Names) >= 2)
+		// context/apply, which always consolidate) count as one. #212:
+		// overview always consolidates (whole project, or every def in a
+		// file) -- see readShapedOps for why it moved here instead of
+		// counting as a singleton.
+		isBatch := args.Op == "context" || args.Op == "apply" || args.Op == "overview" || (args.Op == "expand" && len(args.Names) >= 2)
 		breakerMsg := s.circuitBreakerCheck(sc, args.Op, isBatch)
 		s.respCache.mu.Unlock()
 		if breakerMsg != "" {

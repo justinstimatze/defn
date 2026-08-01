@@ -214,3 +214,22 @@ func TestStripped_ReadsEnvFresh(t *testing.T) {
 		t.Error("expected baz to be stripped after DEFN_STRIP changed")
 	}
 }
+
+func TestCircuitBreaker_OverviewNeverCountsAsSingleton(t *testing.T) {
+	sc := &sessionCache{entries: map[string]cacheEntry{}}
+	s := &server{}
+	// #212 validation bench (2026-07-31): the one overview(file:...) call
+	// that would have exercised the file-narrative feature got refused
+	// by the breaker because overview was counted as a read-shaped
+	// singleton. overview always consolidates (whole project, or every
+	// def in a file) -- it must never trip the breaker, and calling it
+	// resets the counter like context/apply.
+	for i := 0; i < defnReadShapedCircuitBreakerThreshold+10; i++ {
+		if msg := s.circuitBreakerCheck(sc, "overview", true); msg != "" {
+			t.Fatalf("call %d: overview must never be refused, got %q", i, msg)
+		}
+	}
+	if sc.readShapedCount != 0 {
+		t.Fatalf("overview should reset the counter each call, got %d", sc.readShapedCount)
+	}
+}
