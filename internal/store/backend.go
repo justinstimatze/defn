@@ -60,7 +60,13 @@ type Backend interface {
 	SetImports(moduleID int64, imports []Import) error
 
 	// Literal fields (composite-literal extraction)
-	QueryLiteralFields(typeName, fieldName, fieldValue string, fieldNames []string, limit int) ([]LiteralField, error)
+	// skipOrderBy/skipDefName are opt-OUT performance flags for bulk
+	// callers that discard ordering and/or the joined definition name --
+	// zero-value (false) preserves the original behavior for every
+	// existing caller. skipOrderBy drops the `ORDER BY type_name,
+	// field_name` (~103ms on a 90k-row bulk query); skipDefName skips the
+	// LEFT JOIN definitions used only to populate DefName (~210ms).
+	QueryLiteralFields(typeName, fieldName, fieldValue string, fieldNames []string, limit int, skipOrderBy, skipDefName bool) ([]LiteralField, error)
 	SetLiteralFields(defID int64, fields []LiteralField) error
 	SetManyLiteralFields(fieldsByDef map[int64][]LiteralField) error
 

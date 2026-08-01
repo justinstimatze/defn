@@ -178,6 +178,12 @@ CREATE INDEX IF NOT EXISTS idx_litfield_type ON literal_fields(type_name);
 CREATE INDEX IF NOT EXISTS idx_litfield_field ON literal_fields(field_name);
 CREATE INDEX IF NOT EXISTS idx_litfield_def ON literal_fields(def_id);
 CREATE INDEX IF NOT EXISTS idx_litfield_type_field ON literal_fields(type_name, field_name);
+-- field_value carries the identifiers a literal points AT (a claim's Subject,
+-- a config's referenced var), so "what refers to X" filters on it. Without this
+-- index that question is a full scan of the table. See QueryLiteralFields for
+-- the matching prefix-range rewrite, which is what lets the index be used at
+-- all — SQLite cannot use an index for LIKE while case_sensitive_like is OFF.
+CREATE INDEX IF NOT EXISTS idx_litfield_value ON literal_fields(field_value);
 
 CREATE TABLE IF NOT EXISTS defn_meta (
     "key"   TEXT PRIMARY KEY,

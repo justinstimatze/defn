@@ -421,3 +421,94 @@ func TestListDefsMissingSummary(t *testing.T) {
 		t.Errorf("after empty-B: got %d missing, want 2 (empty one_line must still count as missing): %v", len(got), got)
 	}
 }
+
+// TestQueryLiteralFields_SkipOrderByAndSkipDefName locks in the
+// opt-out contract for the two bulk-query performance flags: zero
+// value (false) must preserve the original behavior (DefName joined,
+// results ordered by type_name/field_name); true must actually skip
+// each one, not just be silently ignored.
+func TestQueryLiteralFields_SkipOrderByAndSkipDefName(t *testing.T) {
+	dir := t.TempDir()
+	db, err := OpenSQLite(filepath.Join(dir, "defn.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	mod, err := db.EnsureModule("example.com/pkg", "pkg", "")
+	if err != nil {
+		t.Fatalf("EnsureModule: %v", err)
+	}
+	def := &Definition{ModuleID: mod.ID, Name: "Config", Kind: "var", Exported: true, Body: "var Config = T{}", Hash: HashBody("var Config = T{}")}
+	defID, err := db.UpsertDefinition(def)
+	if err != nil {
+		t.Fatalf("UpsertDefinition: %v", err)
+	}
+
+	// Insertion order deliberately violates (type_name, field_name)
+	// alphabetical order, so a present-vs-absent ORDER BY is distinguishable.
+	fields := []LiteralField{
+		{TypeName: "Zeta", FieldName: "B", FieldValue: "z-b", Line: 3},
+		{TypeName: "Alpha", FieldName: "A", FieldValue: "a-a", Line: 1},
+		{TypeName: "Alpha", FieldName: "Z", FieldValue: "a-z", Line: 2},
+	}
+	if err := db.SetLiteralFields(defID, fields); err != nil {
+		t.Fatalf("SetLiteralFields: %v", err)
+	}
+
+	// Default (both false): DefName populated, results sorted by
+	// (type_name, field_name) -- Alpha/A, Alpha/Z, Zeta/B.
+	got, err := db.QueryLiteralFields("", "", "", nil, 0, false, false)
+	if err != nil {
+		t.Fatalf("QueryLiteralFields default: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected 3 fields, got %d", len(got))
+	}
+	for _, f := range got {
+		if f.DefName != "Config" {
+			t.Errorf("expected DefName %q joined by default, got %q", "Config", f.DefName)
+		}
+	}
+	wantOrder := []string{"a-a", "a-z", "z-b"}
+	for i, f := range got {
+		if f.FieldValue != wantOrder[i] {
+			t.Errorf("default order[%d] = %q, want %q (sorted by type_name,field_name): got order %v", i, f.FieldValue, wantOrder[i], fieldValues(got))
+		}
+	}
+
+	// skipDefName: DefName must come back empty even though the
+	// definition genuinely exists (proves the join was skipped, not
+	// coincidentally empty).
+	gotNoDefName, err := db.QueryLiteralFields("", "", "", nil, 0, false, true)
+	if err != nil {
+		t.Fatalf("QueryLiteralFields skipDefName: %v", err)
+	}
+	for _, f := range gotNoDefName {
+		if f.DefName != "" {
+			t.Errorf("skipDefName=true: expected DefName empty, got %q", f.DefName)
+		}
+	}
+
+	// skipOrderBy: first row should match insertion order (Zeta/B
+	// first), not the sorted order -- proves ORDER BY was actually
+	// omitted rather than silently still applied.
+	gotNoOrder, err := db.QueryLiteralFields("", "", "", nil, 0, true, false)
+	if err != nil {
+		t.Fatalf("QueryLiteralFields skipOrderBy: %v", err)
+	}
+	if len(gotNoOrder) != 3 {
+		t.Fatalf("expected 3 fields, got %d", len(gotNoOrder))
+	}
+	if gotNoOrder[0].FieldValue != "z-b" {
+		t.Errorf("skipOrderBy=true: expected first row in insertion order (z-b), got %v", fieldValues(gotNoOrder))
+	}
+}
+
+func fieldValues(fs []LiteralField) []string {
+	out := make([]string, len(fs))
+	for i, f := range fs {
+		out[i] = f.FieldValue
+	}
+	return out
+}

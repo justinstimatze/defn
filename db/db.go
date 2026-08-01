@@ -180,13 +180,25 @@ type LiteralFieldFilter struct {
 	FieldName  string   // exact match (e.g. "Subject") — mutually exclusive with FieldNames
 	FieldNames []string // IN match (e.g. []string{"Subject", "Object", "Prov"})
 	Value      string   // LIKE pattern on field_value
+
+	// SkipOrderBy and SkipDefName are opt-OUT performance flags for bulk
+	// callers that discard ordering and/or the joined definition name.
+	// Zero-value (false) preserves the original behavior for every
+	// existing caller -- setting either to true is a deliberate choice
+	// to trade that behavior away for speed, not a new default.
+	// SkipOrderBy drops the `ORDER BY type_name, field_name` (~103ms on
+	// a 90k-row bulk query); SkipDefName skips the LEFT JOIN definitions
+	// used only to populate DefName (~210ms) -- callers that key off
+	// DefID don't need it.
+	SkipOrderBy bool
+	SkipDefName bool
 }
 
 // LiteralFields returns composite literal fields matching the filter.
 func (db *DB) LiteralFields(f LiteralFieldFilter) ([]LiteralField, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	fields, err := db.s.QueryLiteralFields(f.TypeName, f.FieldName, f.Value, f.FieldNames, 0)
+	fields, err := db.s.QueryLiteralFields(f.TypeName, f.FieldName, f.Value, f.FieldNames, 0, f.SkipOrderBy, f.SkipDefName)
 	if err != nil {
 		return nil, err
 	}
