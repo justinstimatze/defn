@@ -2927,3 +2927,423 @@ func TestHandleOverview_NilExplainClientNoNarrative(t *testing.T) {
 		t.Errorf("expected no file summary written when explainClient is nil, got %+v", fs)
 	}
 }
+
+func TestProjectNarrative_CacheHitReturnsWithoutExplainClient(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db} // explainClient is nil -- cache hit must never touch it
+
+	if err := db.SetMeta("project_narrative", "1:3\nCached project narrative for testing."); err != nil {
+		t.Fatalf("SetMeta: %v", err)
+	}
+
+	got := s.projectNarrative(context.Background(), "- testproj — 3 defs", 1, 3)
+	if got != "Cached project narrative for testing." {
+		t.Errorf("expected cached narrative returned without touching explainClient, got %q", got)
+	}
+}
+
+// TestHandleApply_CreateMethodOnExistingFileLandsOnDisk is the
+// code(op:"apply") counterpart to TestHandleCreate_MethodOnExistingFileLandsOnDisk
+// -- same #213 bug, reached via handleApply's "create" case instead of
+// the handleCreate singleton path.
+func TestHandleApply_CreateMethodOnExistingFileLandsOnDisk(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "create", Body: "func (g *greeter) Whisper() string { return \"hi\" }", File: "main.go"},
+		},
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "created Whisper") {
+		t.Fatalf("expected creation confirmation, got: %s", text)
+	}
+
+	final, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	src := string(final)
+	if !strings.Contains(src, "func (g *greeter) Whisper()") {
+		t.Errorf("emitted main.go missing new method -- silently dropped (the #213 bug):\n%s", src)
+	}
+}
+
+// TestHandleCreate_MethodOnExistingFileLandsOnDisk is a regression test
+// for #213: creating a new METHOD (has a receiver) into a file that
+// already has content silently dropped the method from disk, even
+// though the DB believed it existed. Root cause: mergeDeclsIntoSource
+// keys new-function bodies by emit.FuncIdentity(name, receiver) --
+// receiver-qualified for methods (e.g. "*Server.Foo") -- but
+// handleCreate passed only the bare inferred name in AllowedAdds, so
+// the qualified lookup never matched and the method's body was
+// silently skipped instead of being appended to the merged file.
+// Fixed by qualifying the AllowedAdds entry with emit.FuncIdentity.
+func TestHandleCreate_MethodOnExistingFileLandsOnDisk(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body: "func (g *greeter) Shout() string { return \"HI\" }",
+		File: "main.go",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Created") {
+		t.Fatalf("expected 'Created', got: %s", text)
+	}
+
+	d, err := db.GetDefinitionByName("Shout", "")
+	if err != nil {
+		t.Fatalf("def not found in DB: %v", err)
+	}
+	if d.Receiver == "" {
+		t.Fatalf("expected a receiver on the stored def, got none")
+	}
+
+	final, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	src := string(final)
+	if !strings.Contains(src, "func (g *greeter) Shout()") {
+		t.Errorf("emitted main.go missing new method -- silently dropped (the #213 bug):\n%s", src)
+	}
+}
+
+// TestHandleDelete_PointerReceiverMethodActuallyLeavesFile is a
+// probe for a suspected sibling of #213 found while investigating it:
+// mergeDeclsIntoSource's removeKey (internal/emit/emit.go) is built via
+// recvTypeName, which KEEPS the pointer star (e.g. "*greeter.Shout"),
+// but handleDelete/handleRename/handleApply build their
+// emit.Opts.AllowedRemovals entries via
+// strings.TrimPrefix(d.Receiver, "*") -- star STRIPPED (e.g.
+// "greeter.Shout"). If those never match, the splice-based removal
+// never fires for POINTER-receiver methods (value-receiver methods
+// have no star to strip, so they're unaffected), and
+// safeWriteGoFile's own lost-decl check also can't catch it, because
+// topLevelDeclNames uses the same star-kept recvTypeName on both the
+// before and after content -- the stale decl is simply never spliced
+// out, so it's present in both and nothing looks "lost". This test
+// creates a pointer-receiver method into an existing file, deletes it,
+// and checks whether the method body is actually gone from disk.
+func TestHandleDelete_PointerReceiverMethodActuallyLeavesFile(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	createResult, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body: "func (g *greeter) Shout() string { return \"HI\" }",
+		File: "main.go",
+	})
+	if !strings.Contains(resultText(t, createResult), "Created") {
+		t.Fatalf("setup: create failed: %s", resultText(t, createResult))
+	}
+	afterCreate, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil || !strings.Contains(string(afterCreate), "func (g *greeter) Shout()") {
+		t.Fatalf("setup: method not on disk after create: err=%v src=%s", err, afterCreate)
+	}
+
+	deleteResult, _, _ := s.handleDelete(context.Background(), nil, nameParam{Name: "Shout"})
+	text := resultText(t, deleteResult)
+	if !strings.Contains(text, "Deleted") {
+		t.Fatalf("expected 'Deleted', got: %s", text)
+	}
+
+	final, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	src := string(final)
+	if strings.Contains(src, "func (g *greeter) Shout()") {
+		t.Errorf("deleted pointer-receiver method still present on disk after delete:\n%s", src)
+	}
+}
+
+// TestHandleRename_PointerReceiverMethodRemovesOldDecl is the rename
+// counterpart to TestHandleDelete_PointerReceiverMethodActuallyLeavesFile
+// -- same sibling-of-#213 bug (star-stripped allowedRemovals vs
+// star-kept funcIdentity/topLevelDeclNames), reached via handleRename
+// instead of handleDelete. Before the fix, renaming a pointer-receiver
+// method left the OLD method body on disk alongside the new one.
+func TestHandleRename_PointerReceiverMethodRemovesOldDecl(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	createResult, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body: "func (g *greeter) Shout() string { return \"HI\" }",
+		File: "main.go",
+	})
+	if !strings.Contains(resultText(t, createResult), "Created") {
+		t.Fatalf("setup: create failed: %s", resultText(t, createResult))
+	}
+
+	renameResult, _, _ := s.handleRename(context.Background(), nil, renameParam{
+		OldName: "Shout",
+		NewName: "Yell",
+	})
+	if renameResult == nil {
+		t.Fatal("nil rename result")
+	}
+
+	final, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	src := string(final)
+	if strings.Contains(src, "func (g *greeter) Shout()") {
+		t.Errorf("renamed pointer-receiver method still has old decl on disk:\n%s", src)
+	}
+	if !strings.Contains(src, "func (g *greeter) Yell()") {
+		t.Errorf("renamed pointer-receiver method missing new decl on disk:\n%s", src)
+	}
+}
+
+// TestHandleApply_PartialFailureRollsBackEarlierDBWrite probes #214:
+// does handleApply's Begin()/commit()/rollback() wrapper actually
+// protect an earlier op's DB write when a LATER op in the same batch
+// fails? op1 edits "Greet" (should succeed in isolation); op2 targets
+// a name that doesn't exist (guaranteed clean failure, no hunk-format
+// ambiguity). If the batch is truly atomic, op1's write must NOT be
+// visible in the DB after the batch reports an error.
+func TestHandleApply_PartialFailureRollsBackEarlierDBWrite(t *testing.T) {
+	t.Skip("#214: handleApply's Begin()/commit()/rollback() does not actually wrap UpsertDefinition/DeleteDefinition/RenameDefinition, which write directly via the shared *sql.DB pool (SetMaxOpenConns(4)) instead of the returned *sql.Tx -- rollback() rolls back an empty, unused transaction. A real fix needs either a tx-scoped Backend view threaded through every write call, or a two-phase validate-then-write restructure of handleApply; both are architecturally significant and were left for deliberate follow-up rather than pushed through unsupervised. Un-skip once #214 is fixed -- this test currently fails (correctly) against the unfixed code.")
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	before, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatalf("setup: Greet not found: %v", err)
+	}
+	originalBody := before.Body
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "edit", Name: "Greet", NewBody: "func Greet(name string) string { return \"HELLO\" }"},
+			{Op: "edit", Name: "DoesNotExist", NewBody: "func DoesNotExist() {}"},
+		},
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "not found") {
+		t.Fatalf("expected the batch to report the missing def, got: %s", text)
+	}
+
+	after, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatalf("Greet vanished after failed batch: %v", err)
+	}
+	if after.Body != originalBody {
+		t.Errorf("#214: Greet's DB body changed to %q despite the batch failing overall (was %q) -- handleApply's rollback did not protect this earlier op's write", after.Body, originalBody)
+	}
+}
+
+// TestHandleOverview_MultiFileSectionsSortedDeterministically is a
+// #180 regression test: handleOverview's byFile grouping used to be
+// ranged directly (Go map iteration order, randomized per call), so a
+// directory overview spanning multiple files could emit "### file"
+// sections in a different order across identical, back-to-back calls
+// -- breaking prompt-cache prefix stability on the response. Calls
+// handleOverview many times against an unchanged DB and asserts every
+// response has "### main.go" before "### main_test.go" (sorted order).
+func TestHandleOverview_MultiFileSectionsSortedDeterministically(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleOverview(context.Background(), nil, codeParam{File: "testproj"})
+	if err != nil {
+		t.Fatalf("overview: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "### main.go") || !strings.Contains(text, "### main_test.go") {
+		t.Fatalf("expected main.go + main_test.go grouped with ### headers, got:\n%s", text)
+	}
+	for i := 0; i < 20; i++ {
+		result, _, err := s.handleOverview(context.Background(), nil, codeParam{File: "testproj"})
+		if err != nil {
+			t.Fatalf("overview: %v", err)
+		}
+		text := resultText(t, result)
+		mainIdx := strings.Index(text, "### main.go")
+		testIdx := strings.Index(text, "### main_test.go")
+		if mainIdx == -1 || testIdx == -1 || mainIdx > testIdx {
+			t.Fatalf("iteration %d: expected \"### main.go\" before \"### main_test.go\" (sorted), got:\n%s", i, text)
+		}
+	}
+}
+
+// TestHandleGetDefinition_SummaryModeDefaultFallsBackWithoutSummary
+// confirms the #174 default flip is safe even at zero backfill
+// coverage: with no def_summaries row at all, a plain read (default
+// env, no mode: param) still returns the full body -- unbackfilled
+// defs are completely unaffected by the new default.
+func TestHandleGetDefinition_SummaryModeDefaultFallsBackWithoutSummary(t *testing.T) {
+	os.Unsetenv("DEFN_SUMMARY_READ_DEFAULT")
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Greet"})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Hello, ") {
+		t.Errorf("expected the full body when no summary exists yet, got:\n%s", text)
+	}
+}
+
+// TestHandleGetDefinition_SummaryModeIsDefaultWhenFreshSummaryExists is
+// a #174 regression test: summary mode is now the DEFAULT for read
+// (previously opt-in via DEFN_SUMMARY_READ_DEFAULT=1, now opt-out via
+// DEFN_SUMMARY_READ_DEFAULT=0). With no env var set and a fresh
+// (non-stale) summary on record, a plain read (no mode: param) must
+// return the compact summary rendering, not the full body.
+func TestHandleGetDefinition_SummaryModeIsDefaultWhenFreshSummaryExists(t *testing.T) {
+	os.Unsetenv("DEFN_SUMMARY_READ_DEFAULT")
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	d, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatalf("setup: Greet not found: %v", err)
+	}
+	if err := db.SetDefSummary(d.ID, &store.DefSummary{
+		OneLine:  "Returns a greeting for the given name.",
+		BodyHash: store.HashBodyStructural(d.Body),
+		Model:    "test",
+	}); err != nil {
+		t.Fatalf("SetDefSummary: %v", err)
+	}
+
+	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Greet"})
+	text := resultText(t, result)
+	if !strings.Contains(text, "summary") || !strings.Contains(text, "Returns a greeting for the given name.") {
+		t.Errorf("expected default read to return the summary rendering, got:\n%s", text)
+	}
+	if strings.Contains(text, "return \"Hello, \"") {
+		t.Errorf("expected the full body NOT to be present in the default (summary-mode) response, got:\n%s", text)
+	}
+}
+
+// TestHandleGetDefinition_SummaryModeOptOutReturnsFullBody verifies the
+// #174 opt-out escape hatch: DEFN_SUMMARY_READ_DEFAULT=0 must still
+// yield the full body even when a fresh summary is on record.
+func TestHandleGetDefinition_SummaryModeOptOutReturnsFullBody(t *testing.T) {
+	t.Setenv("DEFN_SUMMARY_READ_DEFAULT", "0")
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	d, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatalf("setup: Greet not found: %v", err)
+	}
+	if err := db.SetDefSummary(d.ID, &store.DefSummary{
+		OneLine:  "Returns a greeting for the given name.",
+		BodyHash: store.HashBodyStructural(d.Body),
+		Model:    "test",
+	}); err != nil {
+		t.Fatalf("SetDefSummary: %v", err)
+	}
+
+	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Greet"})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Hello, ") {
+		t.Errorf("expected DEFN_SUMMARY_READ_DEFAULT=0 to return the full body, got:\n%s", text)
+	}
+}
+
+// TestHandleGetDefinition_FullTrueOverridesSummaryDefault is a
+// regression test for a bug introduced (and caught) alongside the
+// #174 default flip: since summary-mode is now the implicit default
+// whenever args.Mode == "", passing full:true without also clearing
+// Mode used to be silently ignored -- the mode=="summary" branch fired
+// unconditionally, before args.Full was ever consulted. full:true must
+// win over the implicit default.
+func TestHandleGetDefinition_FullTrueOverridesSummaryDefault(t *testing.T) {
+	os.Unsetenv("DEFN_SUMMARY_READ_DEFAULT")
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	d, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatalf("setup: Greet not found: %v", err)
+	}
+	if err := db.SetDefSummary(d.ID, &store.DefSummary{
+		OneLine:  "Returns a greeting for the given name.",
+		BodyHash: store.HashBodyStructural(d.Body),
+		Model:    "test",
+	}); err != nil {
+		t.Fatalf("SetDefSummary: %v", err)
+	}
+
+	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Greet", Full: true})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Hello, ") {
+		t.Errorf("expected full:true to return the full body even with a fresh summary present, got:\n%s", text)
+	}
+}
+
+// TestHandleSearch_MergesNameMatchAndFTSMatch is a #216 regression
+// test: a Stage 1 (name/signature LIKE) hit must not suppress Stage 2
+// (FTS body/doc) results. Creates two defs for a needle that appears
+// in one def's NAME and in a completely different def's BODY only,
+// and asserts search returns both -- before the fix, finding the
+// name-match alone (Stage 1 non-empty) skipped the FTS stage entirely,
+// silently dropping the body-only match.
+func TestHandleSearch_MergesNameMatchAndFTSMatch(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	mods, err := db.ListModules()
+	if err != nil || len(mods) == 0 {
+		t.Fatalf("setup: no modules: %v", err)
+	}
+	moduleID := mods[0].ID
+
+	const needle = "XyzzyPlughNeedle"
+
+	if _, err := db.UpsertDefinition(&store.Definition{
+		ModuleID:   moduleID,
+		Name:       needle + "Func",
+		Kind:       "function",
+		Exported:   true,
+		Signature:  "func " + needle + "Func()",
+		Body:       "func " + needle + "Func() {}",
+		SourceFile: "extra1.go",
+	}); err != nil {
+		t.Fatalf("upsert name-match def: %v", err)
+	}
+	if _, err := db.UpsertDefinition(&store.Definition{
+		ModuleID:   moduleID,
+		Name:       "UnrelatedBodyOnly",
+		Kind:       "function",
+		Exported:   true,
+		Signature:  "func UnrelatedBodyOnly()",
+		Body:       "func UnrelatedBodyOnly() {\n\t_ = \"" + needle + "\"\n}",
+		SourceFile: "extra2.go",
+	}); err != nil {
+		t.Fatalf("upsert body-only def: %v", err)
+	}
+
+	result, _, _ := s.handleSearch(context.Background(), nil, codeParam{Pattern: needle})
+	text := resultText(t, result)
+	if !strings.Contains(text, needle+"Func") {
+		t.Errorf("expected the name-match def in results, got:\n%s", text)
+	}
+	if !strings.Contains(text, "UnrelatedBodyOnly") {
+		t.Errorf("expected the FTS body-only match in results (this is the #216 bug), got:\n%s", text)
+	}
+}

@@ -14,6 +14,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	for _, a := range os.Args[1:] {
+		if a == "-h" || a == "--help" {
+			usage()
+			os.Exit(1)
+		}
+	}
+
 	switch os.Args[1] {
 	case "init":
 		if len(os.Args) < 3 {

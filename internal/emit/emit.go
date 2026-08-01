@@ -962,7 +962,7 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 	for _, d := range defs {
 		switch d.Kind {
 		case "function", "method":
-			wantFuncs[funcIdentity(d.Name, d.Receiver)] = d.Body
+			wantFuncs[FuncIdentity(d.Name, d.Receiver)] = d.Body
 		case "type", "interface", "const", "var":
 			if bodyIsGroupedGenDecl(d.Body) {
 				wantGrouped[d.Name] = d.Body
@@ -1024,7 +1024,7 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 				reps = append(reps, replacement{s, e, ""})
 				continue
 			}
-			ident := funcIdentity(d.Name.Name, recv)
+			ident := FuncIdentity(d.Name.Name, recv)
 			body, ok := wantFuncs[ident]
 			if !ok {
 				continue
@@ -1269,16 +1269,6 @@ func firstSpecName(d *ast.GenDecl) string {
 	return ""
 }
 
-// funcIdentity produces the identity key used to match DB definitions
-// to AST FuncDecls. Free functions and methods share the same space:
-// "Foo" for a free function, "*Server.Foo" for a pointer-receiver method.
-func funcIdentity(name, receiver string) string {
-	if receiver == "" {
-		return name
-	}
-	return receiver + "." + name
-}
-
 // sourceHasPackageDoc reports whether src carries the given package
 // doc as the comment bound to its `package X` clause. Used by
 // emitModule to decide whether mod.Doc is already present in some
@@ -1336,7 +1326,7 @@ func declOrderInSource(src []byte) map[string]int {
 			if d.Recv != nil && len(d.Recv.List) > 0 {
 				recv = recvTypeName(d.Recv.List[0].Type)
 			}
-			order[funcIdentity(d.Name.Name, recv)] = pos
+			order[FuncIdentity(d.Name.Name, recv)] = pos
 		case *ast.GenDecl:
 			for _, spec := range d.Specs {
 				switch s := spec.(type) {
@@ -1360,7 +1350,17 @@ func declOrderInSource(src []byte) map[string]int {
 // encodes the receiver); everything else uses the bare name.
 func declKey(d store.Definition) string {
 	if d.Kind == "function" || d.Kind == "method" {
-		return funcIdentity(d.Name, d.Receiver)
+		return FuncIdentity(d.Name, d.Receiver)
 	}
 	return d.Name
+}
+
+// funcIdentity produces the identity key used to match DB definitions
+// to AST FuncDecls. Free functions and methods share the same space:
+// "Foo" for a free function, "*Server.Foo" for a pointer-receiver method.
+func FuncIdentity(name, receiver string) string {
+	if receiver == "" {
+		return name
+	}
+	return receiver + "." + name
 }

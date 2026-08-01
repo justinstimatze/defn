@@ -533,7 +533,8 @@ func (s *SQLiteDB) FindDefinitions(namePattern string) ([]Definition, error) {
 func (s *SQLiteDB) FindDefinitionsByFile(fileSuffix string, sourceFile string, line int) ([]Definition, error) {
 	query := `SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test,
 	            COALESCE(d.receiver,''), COALESCE(d.signature,''),
-	            COALESCE(d.start_line,0), COALESCE(d.end_line,0)
+	            COALESCE(d.start_line,0), COALESCE(d.end_line,0),
+	            COALESCE(d.source_file,'')
 	          FROM definitions d
 	          JOIN modules m ON d.module_id = m.id
 	          WHERE m.path LIKE ?`
@@ -558,7 +559,7 @@ func (s *SQLiteDB) FindDefinitionsByFile(fileSuffix string, sourceFile string, l
 	for rows.Next() {
 		var d Definition
 		if err := rows.Scan(&d.ID, &d.ModuleID, &d.Name, &d.Kind, &d.Exported, &d.Test,
-			&d.Receiver, &d.Signature, &d.StartLine, &d.EndLine); err != nil {
+			&d.Receiver, &d.Signature, &d.StartLine, &d.EndLine, &d.SourceFile); err != nil {
 			return nil, err
 		}
 		defs = append(defs, d)

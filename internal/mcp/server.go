@@ -1460,7 +1460,17 @@ func resultTextRaw(r *sdkmcp.CallToolResult) string {
 }
 
 func (s *server) handleGetDefinition(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
-	if args.Mode == "" && os.Getenv("DEFN_SUMMARY_READ_DEFAULT") == "1" {
+	// #174: summary-mode is now the default for read (opt-out via
+	// DEFN_SUMMARY_READ_DEFAULT=0), not opt-in. Safe regardless of
+	// backfill coverage -- the mode=="summary" branch below falls
+	// through to the full body whenever no summary exists yet or it's
+	// stale, so an unbackfilled def behaves identically to before this
+	// flip. !args.Full guards the escape hatch: an explicit full:true
+	// must win over the implicit default -- without this, full:true
+	// would be silently ignored on every def with a fresh summary,
+	// since args.Mode == "" is now no longer a reliable signal that
+	// the caller wants the body.
+	if args.Mode == "" && !args.Full && os.Getenv("DEFN_SUMMARY_READ_DEFAULT") != "0" {
 		args.Mode = "summary"
 	}
 	d, err := s.backend.GetDefinitionByName(args.Name, "")
@@ -1682,11 +1692,19 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	} else {
 		// Search names/signatures first (indexed, fast).
 		defs, err = s.backend.FindDefinitions("%" + args.Pattern + "%")
-		if err != nil || len(defs) == 0 {
-			// Fall back to body/doc search. Uses trigram FTS5 under
-			// SQLite (task #137) which treats `_` as content, so no
-			// underscore-guard needed anymore.
-			defs, err = s.backend.SearchDefinitions(args.Pattern)
+		if err != nil {
+			return errResult(err)
+		}
+		// #216: always also run the FTS body/doc search and merge, rather
+		// than gating it on Stage 1 being completely empty. Stage 1's
+		// signature LIKE can incidentally match a def whose ingested
+		// signature has its doc comment baked in (a separate ingest bug
+		// -- see #216), which used to silently suppress the far more
+		// complete and correct FTS search entirely: one coincidental,
+		// arbitrarily incomplete Stage 1 hit meant Stage 2 never ran.
+		ftsDefs, ftsErr := s.backend.SearchDefinitions(args.Pattern)
+		if ftsErr == nil {
+			defs = mergeDefsByID(defs, ftsDefs)
 		}
 	}
 	if err != nil {
@@ -2619,7 +2637,7 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	d.ID = id
 	s.enqueueSummary(d)
 
-	buildResult := s.autoEmitAndBuildForCreate(args.File, []string{name})
+	buildResult := s.autoEmitAndBuildForCreate(args.File, []string{emit.FuncIdentity(name, receiver)})
 	s.autoResolveFile(args.File, mod.Path)
 
 	var sb strings.Builder
@@ -2849,7 +2867,7 @@ func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult
 
 	addNames := make([]string, len(decls))
 	for i, d := range decls {
-		addNames[i] = d.Name
+		addNames[i] = emit.FuncIdentity(d.Name, d.Receiver)
 	}
 	buildResult := s.autoEmitAndBuildForCreate(args.File, addNames)
 	s.autoResolveFile(args.File, mod.Path)
@@ -3144,7 +3162,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				s.enqueueSummary(d)
 				addTouched(op.File)
 				addResolve(op.File, mod.ID)
-				allowedAdds = append(allowedAdds, name)
+				allowedAdds = append(allowedAdds, emit.FuncIdentity(name, receiver))
 				sb.WriteString(fmt.Sprintf("+ created %s (id=%d)\n", name, id))
 			}
 
@@ -3202,10 +3220,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				addTouched(d.SourceFile)
 				// #109 rationale: DeleteDefinition already dropped every refs
 				// row where from_def=D OR to_def=D — no resolve needed.
-				qualified := d.Name
-				if d.Receiver != "" {
-					qualified = strings.TrimPrefix(d.Receiver, "*") + "." + d.Name
-				}
+				qualified := emit.FuncIdentity(d.Name, d.Receiver)
 				allowedRemovals = append(allowedRemovals, qualified)
 				sb.WriteString(fmt.Sprintf("- deleted %s\n", op.Name))
 			}
@@ -3223,10 +3238,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			// Reserve the qualified pre-rename name so safeWriteGoFile lets
 			// the disappearing decl actually vanish from the file (same as
 			// handleRename's qualifiedOld).
-			qualifiedOld := d.Name
-			if d.Receiver != "" {
-				qualifiedOld = strings.TrimPrefix(d.Receiver, "*") + "." + d.Name
-			}
+			qualifiedOld := emit.FuncIdentity(d.Name, d.Receiver)
 			allowedRemovals = append(allowedRemovals, qualifiedOld)
 			addTouched(d.SourceFile)
 			d.Body, _ = astRename(d.Body, op.Name, op.NewName)
@@ -3239,7 +3251,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			}
 			s.enqueueSummary(d)
 			// #163: rename creates a new-named def from the emit path's POV.
-			allowedAdds = append(allowedAdds, op.NewName)
+			allowedAdds = append(allowedAdds, emit.FuncIdentity(op.NewName, d.Receiver))
 			s.enqueueSummary(d)
 			callers, _ := s.backend.GetCallers(d.ID)
 			callerCount := 0
@@ -3649,10 +3661,7 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// net. topLevelDeclNames formats methods as "<Recv>.Name" (pointer
 	// receivers unwrapped); match that. Without this, the file on disk
 	// would be left unchanged and watchFiles would resurrect the def.
-	qualified := d.Name
-	if d.Receiver != "" {
-		qualified = strings.TrimPrefix(d.Receiver, "*") + "." + d.Name
-	}
+	qualified := emit.FuncIdentity(d.Name, d.Receiver)
 	deleteOpts := emit.Opts{AllowedRemovals: []string{qualified}}
 	if d.SourceFile != "" {
 		deleteOpts.GoimportsFiles = []string{d.SourceFile}
@@ -3704,10 +3713,7 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// disappearing from the file — otherwise safeWriteGoFile refuses to drop
 	// it and the merge appends the new name alongside the old one (bug fixed
 	// for deletes in b274ccc; the same shape recurs for renames).
-	qualifiedOld := d.Name
-	if d.Receiver != "" {
-		qualifiedOld = strings.TrimPrefix(d.Receiver, "*") + "." + d.Name
-	}
+	qualifiedOld := emit.FuncIdentity(d.Name, d.Receiver)
 	originalID := d.ID
 
 	// Update the definition name in its own body using AST rename.
@@ -3776,7 +3782,7 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// name spliced) instead of leaving the new name behind as drift.
 	buildResult := s.autoEmitOnlyWithOpts(emit.Opts{
 		AllowedRemovals: []string{qualifiedOld},
-		AllowedAdds:     []string{args.NewName},
+		AllowedAdds:     []string{emit.FuncIdentity(args.NewName, d.Receiver)},
 		GoimportsFiles:  goimportsFiles,
 		TouchedFiles:    goimportsFiles,
 	})
@@ -4219,7 +4225,7 @@ const projectOverviewModuleCap = 40
 
 const projectOverviewDefsPerModule = 3
 
-func (s *server) projectOverview() (*sdkmcp.CallToolResult, any, error) {
+func (s *server) projectOverview(ctx context.Context) (*sdkmcp.CallToolResult, any, error) {
 	mods, err := s.backend.ListModules()
 	if err != nil {
 		return errResult(fmt.Errorf("list modules: %w", err))
@@ -4228,15 +4234,16 @@ func (s *server) projectOverview() (*sdkmcp.CallToolResult, any, error) {
 		return textResult("[project overview: no modules ingested — run defn ingest .]"), nil, nil
 	}
 	sort.Slice(mods, func(i, j int) bool { return mods[i].Path < mods[j].Path })
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("## Project overview (%d modules)\n\n", len(mods)))
+
+	var listing strings.Builder
 	shown := 0
+	totalDefs := 0
 	for _, m := range mods {
-		if shown >= projectOverviewModuleCap {
-			sb.WriteString(fmt.Sprintf("… (%d more modules omitted — pass file:\"path/to/pkg\" for a subtree)\n", len(mods)-shown))
-			break
-		}
 		defs, _ := s.backend.GetModuleDefinitions(m.ID)
+		totalDefs += len(defs)
+		if shown >= projectOverviewModuleCap {
+			continue
+		}
 		nExp := 0
 		var exemplars []string
 		for _, d := range defs {
@@ -4248,15 +4255,67 @@ func (s *server) projectOverview() (*sdkmcp.CallToolResult, any, error) {
 				exemplars = append(exemplars, formatReceiver(d.Receiver)+d.Name)
 			}
 		}
-		sb.WriteString(fmt.Sprintf("- %s — %d defs (%d exported)", m.Path, len(defs), nExp))
+		listing.WriteString(fmt.Sprintf("- %s — %d defs (%d exported)", m.Path, len(defs), nExp))
 		if len(exemplars) > 0 {
-			sb.WriteString(fmt.Sprintf(" — %s", strings.Join(exemplars, ", ")))
+			listing.WriteString(fmt.Sprintf(" — %s", strings.Join(exemplars, ", ")))
 		}
-		sb.WriteString("\n")
+		listing.WriteString("\n")
 		shown++
 	}
+	if len(mods) > shown {
+		listing.WriteString(fmt.Sprintf("… (%d more modules omitted — pass file:\"path/to/pkg\" for a subtree)\n", len(mods)-shown))
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("## Project overview (%d modules)\n\n", len(mods)))
+
+	// #212 project-wide: same win mechanism as file/directory narratives
+	// (#211's proven cache_creation-avoidance pattern), applied at the
+	// top level -- the highest-leverage first-touch call a model makes.
+	// Generation sources from the module listing itself (already a
+	// compact, information-dense summary of the whole project's shape)
+	// rather than concatenating doc+signature for every def
+	// project-wide, which could be huge on a large codebase. Staleness
+	// is keyed off module count + total def count -- cheap signals that
+	// change whenever ingest adds/removes packages or defs, without
+	// hashing every body in the project.
+	if totalDefs >= fileNarrativeMinDefs && s.explainClient != nil {
+		if narrative := s.projectNarrative(ctx, listing.String(), len(mods), totalDefs); narrative != "" {
+			sb.WriteString(narrative + "\n\n")
+		}
+	}
+
+	sb.WriteString(listing.String())
 	sb.WriteString("\nUse `op:\"overview\" file:\"<pkg-path>\"` to drill in, `op:\"search\" pattern:\"<term>\"` to jump to a def.\n")
 	return textResult(sb.String()), nil, nil
+}
+
+// projectNarrative returns a cached or freshly-generated #212
+// project-wide architectural narrative, or "" if unavailable. Unlike
+// fileNarrative (staleness hashed against concatenated def bodies),
+// staleness here is keyed off module count + total def count --
+// module/def churn is a cheap, sufficient signal for a project-level
+// summary and avoids ever reading or hashing every body across a
+// potentially huge codebase. Stored via the generic meta key-value
+// store rather than file_summaries, since a project-wide narrative has
+// no single owning module for that table's FOREIGN KEY.
+func (s *server) projectNarrative(ctx context.Context, moduleListing string, moduleCount, totalDefs int) string {
+	const metaKey = "project_narrative"
+	sig := fmt.Sprintf("%d:%d", moduleCount, totalDefs)
+
+	if cached, _ := s.backend.GetMeta(metaKey); cached != "" {
+		if sigLine, narrative, ok := strings.Cut(cached, "\n"); ok && sigLine == sig {
+			return narrative
+		}
+	}
+
+	question := "Summarize this project's overall architecture in 2-3 sentences: what kind of system it is, its main components/packages, and how they fit together."
+	narrative, err := s.explainClient.Explain(ctx, question, moduleListing)
+	if err != nil || strings.TrimSpace(narrative) == "" {
+		return ""
+	}
+	s.backend.SetMeta(metaKey, sig+"\n"+narrative)
+	return narrative
 }
 
 func (s *server) handleOverview(ctx context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
@@ -4268,7 +4327,7 @@ func (s *server) handleOverview(ctx context.Context, _ *sdkmcp.CallToolRequest, 
 		// L18: empty overview → project-wide module summary. The preamble
 		// calls overview "the right first-touch" but the old impl errored
 		// without a file; agents got a rejection instead of orientation.
-		return s.projectOverview()
+		return s.projectOverview(ctx)
 	}
 
 	// #82/#212: for subpath files use the dirname; for root-level files
@@ -4369,7 +4428,18 @@ func (s *server) handleOverview(ctx context.Context, _ *sdkmcp.CallToolRequest, 
 		}
 	}
 
-	for f, fileDefs := range byFile {
+	// #180: iterate byFile in sorted order, not Go's randomized map
+	// order -- an unsorted range here meant two identical overview
+	// calls against an unchanged DB could emit "### file" sections in
+	// a different order each time, breaking prompt-cache prefix
+	// matching on the response (and just being confusing on its own).
+	fileNames := make([]string, 0, len(byFile))
+	for f := range byFile {
+		fileNames = append(fileNames, f)
+	}
+	sort.Strings(fileNames)
+	for _, f := range fileNames {
+		fileDefs := byFile[f]
 		if len(byFile) > 1 {
 			sb.WriteString(fmt.Sprintf("### %s\n", f))
 		}
@@ -6609,4 +6679,23 @@ func (s *server) fileNarrative(ctx context.Context, sourceFile string, defs []st
 		})
 	}
 	return narrative
+}
+
+// mergeDefsByID unions a and b, preserving a's order first, then any
+// defs from b not already present in a (by ID). #216: lets handleSearch
+// combine Stage 1 (name/signature LIKE) and Stage 2 (FTS body/doc)
+// results instead of treating Stage 1 as an all-or-nothing gate.
+func mergeDefsByID(a, b []store.Definition) []store.Definition {
+	seen := make(map[int64]bool, len(a))
+	for _, d := range a {
+		seen[d.ID] = true
+	}
+	out := a
+	for _, d := range b {
+		if !seen[d.ID] {
+			out = append(out, d)
+			seen[d.ID] = true
+		}
+	}
+	return out
 }
