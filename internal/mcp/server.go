@@ -4278,12 +4278,28 @@ func (s *server) handleOverview(ctx context.Context, _ *sdkmcp.CallToolRequest, 
 	// fake directory name (e.g. "main.go" -> "main") never matched
 	// anything for root-level files, silently breaking
 	// `overview file:"<root-level-file>.go"` entirely.
-	dir := ""
-	if idx := strings.LastIndex(file, "/"); idx >= 0 {
-		dir = file[:idx]
+	// #212 validation (2026-07-31): overview(file:"pkg-path") -- the
+	// tool's own documented usage for a bare package directory, no
+	// trailing file -- has never worked at all. FindDefinitionsByFile's
+	// sourceFile param does an EXACT match against d.source_file, which
+	// is always a real file path like "internal/mcp/server.go"; passing
+	// a bare directory like "internal/mcp" as sourceFile can never
+	// match anything, so every such call silently returned "no
+	// definitions found". Distinguish the two shapes: a .go path gets
+	// the exact-file match (dir = its parent); a bare directory gets
+	// dir = itself and NO sourceFile constraint, relying purely on the
+	// module-path LIKE filter to gather every def under that prefix.
+	var dir, sourceFile string
+	if strings.HasSuffix(file, ".go") {
+		sourceFile = file
+		if idx := strings.LastIndex(file, "/"); idx >= 0 {
+			dir = file[:idx]
+		}
+	} else {
+		dir = file
 	}
 
-	defs, err := s.backend.FindDefinitionsByFile(dir, file, 0)
+	defs, err := s.backend.FindDefinitionsByFile(dir, sourceFile, 0)
 	if err != nil || len(defs) == 0 {
 		return errResult(fmt.Errorf("no definitions found for %s", file))
 	}
