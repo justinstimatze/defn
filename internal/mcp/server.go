@@ -4336,16 +4336,20 @@ func (s *server) handleOverview(ctx context.Context, _ *sdkmcp.CallToolRequest, 
 		byFile[f] = append(byFile[f], d)
 	}
 
-	// #212: a genuine single-file overview (not a directory listing
-	// several files) with enough defs to be worth it gets a precomputed
-	// architectural narrative prepended. Skipped when the co-processor
-	// isn't configured (no ANTHROPIC_API_KEY) -- degrades to the plain
-	// per-def listing below, unchanged from before this landed.
-	if len(byFile) == 1 && len(defs) >= fileNarrativeMinDefs && s.explainClient != nil {
-		for f, fileDefs := range byFile {
-			if narrative := s.fileNarrative(ctx, f, fileDefs); narrative != "" {
-				sb.WriteString(narrative + "\n\n")
-			}
+	// #212: any overview scope (a single file OR a whole package
+	// directory -- validation benches found the model calls overview
+	// at the DIRECTORY level far more often than per-file, so gating on
+	// a single matched file meant this almost never fired in practice)
+	// with enough defs to be worth it gets ONE precomputed architectural
+	// narrative prepended, covering every def in the requested scope --
+	// not one narrative per individual file within it, which would be
+	// as many Sonnet calls as files in the directory. Skipped when the
+	// co-processor isn't configured (no ANTHROPIC_API_KEY) -- degrades
+	// to the plain per-def listing below, unchanged from before this
+	// landed.
+	if len(defs) >= fileNarrativeMinDefs && s.explainClient != nil {
+		if narrative := s.fileNarrative(ctx, file, defs); narrative != "" {
+			sb.WriteString(narrative + "\n\n")
 		}
 	}
 
