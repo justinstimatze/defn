@@ -19,9 +19,10 @@ import (
 // modulePath must be an absolute path; caller is responsible for
 // the chdir into it. absBin is the path to the defn executable
 // (used in the emitted .mcp.json / .codex config). absDB is the
-// absolute path to .defn/defn.db.
-func writeProjectConfig(modulePath, absBin, absDB string) {
-	writeMCPConfigForProject(modulePath, absBin, absDB)
+// absolute path to .defn/defn.db. noSummaries threads through to
+// writeMCPConfigForProject (#201 init --no-summaries).
+func writeProjectConfig(modulePath, absBin, absDB string, noSummaries bool) {
+	writeMCPConfigForProject(modulePath, absBin, absDB, noSummaries)
 	writeCodexConfig(modulePath, absBin, absDB)
 	writeGitignore(modulePath)
 	writeCLAUDEMDSection(modulePath)
@@ -105,8 +106,16 @@ func writeCLAUDEMDSection(modulePath string) {
 
 // writeMCPConfigForProject writes/updates .mcp.json at modulePath
 // to include the defn server pointed at absDB via absBin. Idempotent
-// — preserves other MCP servers already declared in the file.
-func writeMCPConfigForProject(modulePath, absBin, absDB string) {
+// — preserves other MCP servers already declared in the file, and
+// preserves any env vars already set on the defn entry itself (so a
+// prior --no-summaries opt-out survives a later plain `ingest`
+// rewrite instead of being silently clobbered).
+//
+// noSummaries sets DEFN_LLM_OPS=0 (#201). Sticky: passing false on a
+// later call does NOT clear a previously-set DEFN_LLM_OPS -- ingest's
+// idempotent config rewrite must never silently re-enable a paid
+// feature the user explicitly opted out of.
+func writeMCPConfigForProject(modulePath, absBin, absDB string, noSummaries bool) {
 	mcpPath := filepath.Join(modulePath, ".mcp.json")
 	mcpConfig := map[string]any{}
 	if data, err := os.ReadFile(mcpPath); err == nil {
@@ -116,12 +125,26 @@ func writeMCPConfigForProject(modulePath, absBin, absDB string) {
 	if mcpServers == nil {
 		mcpServers = map[string]any{}
 	}
+
+	env := map[string]string{}
+	if existing, ok := mcpServers["defn"].(map[string]any); ok {
+		if existingEnv, ok := existing["env"].(map[string]any); ok {
+			for k, v := range existingEnv {
+				if s, ok := v.(string); ok {
+					env[k] = s
+				}
+			}
+		}
+	}
+	env["DEFN_DB"] = absDB
+	if noSummaries {
+		env["DEFN_LLM_OPS"] = "0"
+	}
+
 	mcpServers["defn"] = map[string]any{
 		"command": absBin,
 		"args":    []string{"serve"},
-		"env": map[string]string{
-			"DEFN_DB": absDB,
-		},
+		"env":     env,
 	}
 	mcpConfig["mcpServers"] = mcpServers
 	mcpJSON, _ := json.MarshalIndent(mcpConfig, "", "  ")

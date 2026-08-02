@@ -130,3 +130,17 @@ func stripped(feature string) bool {
 	}
 	return false
 }
+
+// envDisabled reports whether the named env var is set to a falsy
+// value (0, false, off, no -- case-insensitive). Unset or any other
+// value means "not disabled" -- these are opt-OUT flags (#201), so
+// absence is the enabled-by-default state, matching the existing
+// no-ANTHROPIC_API_KEY degrade-gracefully path these flags reuse.
+func envDisabled(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "0", "false", "off", "no":
+		return true
+	default:
+		return false
+	}
+}

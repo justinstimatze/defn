@@ -282,6 +282,20 @@ func newMCPServer(ctx context.Context, database store.Backend, projDir string) (
 	s.reach = newReachCache()
 	s.hint = newMutationHint()
 
+	// #201: graduated LLM opt-out. DEFN_LLM_OPS=0 is the blanket kill
+	// switch, covering the async summary backfill below AND every
+	// on-demand co-processor path (op:explain question, op:context
+	// synthesis, overview/file/project narratives) by leaving
+	// s.explainClient nil -- every one of those call sites already
+	// treats a nil explainClient as "co-processor unavailable, degrade
+	// gracefully", the same path already taken when ANTHROPIC_API_KEY is
+	// unset. DEFN_ASYNC_BACKFILL=0 is narrower: keeps on-demand ops
+	// available but skips the background per-def summary spend that
+	// otherwise fires automatically on every ingest, for a user who wants
+	// explain/context but not unprompted ingest-time spend.
+	llmOpsDisabled := envDisabled("DEFN_LLM_OPS")
+	asyncBackfillDisabled := envDisabled("DEFN_ASYNC_BACKFILL")
+
 	// #160: summary worker. Fire-and-forget goroutine that consumes
 	// enqueue()d requests and writes model-generated one-line intent
 	// summaries to def_summaries. Backend is Haiku when
@@ -294,16 +308,24 @@ func newMCPServer(ctx context.Context, database store.Backend, projDir string) (
 	// Sonnet summaries carry more semantic signal, which the #197
 	// context-op summary-search relies on for the semantic bridge.
 	summaryModel := anthropic.Model(os.Getenv("DEFN_SUMMARY_MODEL"))
-	backend := summary.NewHaiku(summary.HaikuOptions{
-		APIKey: os.Getenv("ANTHROPIC_API_KEY"),
-		Model:  summaryModel,
-	})
-	s.summaryWorker = summary.NewWorker(backend, database, 0)
+	var summaryBackend summary.Backend
+	if llmOpsDisabled || asyncBackfillDisabled {
+		summaryBackend = summary.Stub{}
+	} else {
+		summaryBackend = summary.NewHaiku(summary.HaikuOptions{
+			APIKey: os.Getenv("ANTHROPIC_API_KEY"),
+			Model:  summaryModel,
+		})
+	}
+	s.summaryWorker = summary.NewWorker(summaryBackend, database, 0)
 	s.summaryWorker.Start(ctx)
 
 	// #186: co-processor for op:"explain" with question. Nil when
-	// ANTHROPIC_API_KEY is unset — handler returns a clear error path.
-	s.explainClient = summary.NewExplain(summary.ExplainOptions{APIKey: os.Getenv("ANTHROPIC_API_KEY")})
+	// ANTHROPIC_API_KEY is unset, or when DEFN_LLM_OPS=0 -- handler
+	// returns a clear error path either way.
+	if !llmOpsDisabled {
+		s.explainClient = summary.NewExplain(summary.ExplainOptions{APIKey: os.Getenv("ANTHROPIC_API_KEY")})
+	}
 
 	if projDir != "" {
 		// Reconcile changes made while defn was not running (file moves,

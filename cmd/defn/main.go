@@ -24,10 +24,16 @@ func main() {
 	switch os.Args[1] {
 	case "init":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: defn init <path>")
+			fmt.Fprintln(os.Stderr, "usage: defn init <path> [--no-summaries]")
 			os.Exit(1)
 		}
-		cmdInit(os.Args[2])
+		noSummaries := false
+		for _, a := range os.Args[3:] {
+			if a == "--no-summaries" {
+				noSummaries = true
+			}
+		}
+		cmdInit(os.Args[2], noSummaries)
 	case "repair":
 		dir := "."
 		if len(os.Args) >= 3 {

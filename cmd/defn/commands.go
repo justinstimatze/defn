@@ -85,7 +85,13 @@ func logBackend(msg string) {
 // alias for this today: both do the same thing, both are safe on a
 // bare project or a re-run. Advanced users who only want to refresh
 // the DB (skip config writes) can pass --reindex.
-func cmdInit(modulePath string) {
+//
+// noSummaries (--no-summaries) persists DEFN_LLM_OPS=0 into .mcp.json
+// (#201) so every future session's spawned `defn serve` opts out of
+// all LLM-backed ops (async summary backfill, op:explain question,
+// op:context synthesis, overview/file/project narratives) without
+// needing the env var set by hand each session.
+func cmdInit(modulePath string, noSummaries bool) {
 	// Operate from the target project dir so .defn/, .mcp.json, etc. all
 	// resolve against modulePath rather than the caller's cwd.
 	absModulePath, err := filepath.Abs(modulePath)
@@ -136,7 +142,7 @@ func cmdInit(modulePath string) {
 		len(mods), len(defs), hash[:16])
 
 	absDB, _ := filepath.Abs(dbPath)
-	writeProjectConfig(absModulePath, defnBinaryPath(), absDB)
+	writeProjectConfig(absModulePath, defnBinaryPath(), absDB, noSummaries)
 
 	fmt.Fprintln(os.Stderr, "start a new AI coding session in this directory to use defn.")
 }
@@ -207,6 +213,11 @@ func logMem(phase string) {
 // After this change: both commands do the right thing, always. Users
 // who want the pure DB-refresh path (skip config writes for perf on
 // hot rebuilds) can use `defn reindex`.
+//
+// Always passes noSummaries=false to writeProjectConfig -- `ingest`'s
+// CLI doesn't parse --no-summaries. This is safe: writeMCPConfigForProject
+// (#201) preserves a prior --no-summaries opt-out already recorded in
+// .mcp.json rather than clearing it on every plain re-ingest.
 func cmdIngest(modulePath string) {
 	if abs, err := filepath.Abs(modulePath); err == nil {
 		modulePath = abs
@@ -236,7 +247,7 @@ func cmdIngest(modulePath string) {
 		// still get CLAUDE.md + .mcp.json. Cheap: idempotent no-ops
 		// once the files exist.
 		absDB, _ := filepath.Abs(dbPath)
-		writeProjectConfig(modulePath, defnBinaryPath(), absDB)
+		writeProjectConfig(modulePath, defnBinaryPath(), absDB, false)
 		return
 	}
 
@@ -278,7 +289,7 @@ func cmdIngest(modulePath string) {
 	fmt.Fprintf(os.Stderr, "done. root hash: %s\n", hash[:16])
 
 	absDB, _ := filepath.Abs(dbPath)
-	writeProjectConfig(modulePath, defnBinaryPath(), absDB)
+	writeProjectConfig(modulePath, defnBinaryPath(), absDB, false)
 }
 
 // isCorruptDBError reports whether err looks like a corrupt embedded
