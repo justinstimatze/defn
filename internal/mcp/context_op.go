@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/justinstimatze/defn/internal/embed"
 	"github.com/justinstimatze/defn/internal/store"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -56,6 +57,13 @@ func contextFilterTokens(raw []string) []string {
 //	                     semantically curated (Sonnet/Haiku-generated
 //	                     "what does this def do"). Bridges to defs whose
 //	                     names have zero lexical overlap.
+//	embeddingScore * 8 — #198: cosine similarity (local hashing-trick
+//	                     vector, internal/embed) between the question
+//	                     and the def's name+signature+doc, scaled to
+//	                     roughly a name-hit's weight. Cruder signal than
+//	                     a real embedding model, but it is the only path
+//	                     that finds defs sharing zero literal tokens
+//	                     with the question at all.
 //	FromBody          — +1 tiebreak when hit came from body FTS
 //	testPenalty       — subtract 5 when def is in a _test.go file
 //
@@ -64,12 +72,14 @@ func contextFilterTokens(raw []string) []string {
 // whether its name (handleGetDefinition) contains any of the query
 // tokens.
 type contextCandidate struct {
-	Def         store.Definition
-	Summary     string
-	Score       int
-	FromName    bool
-	FromBody    bool
-	FromSummary bool // #197
+	Def            store.Definition
+	Summary        string
+	Score          int
+	FromName       bool
+	FromBody       bool
+	FromSummary    bool    // #197
+	FromEmbedding  bool    // #198: found only via embedding similarity, no token overlap
+	EmbeddingScore float64 // #198: cosine similarity in [-1, 1], 0 if not computed
 }
 
 // contextRank scores + sorts candidates against the filtered token
@@ -96,6 +106,13 @@ func contextRank(cands []contextCandidate, tokens []string) []contextCandidate {
 		s := name*8 + sig*3 + summary*6
 		if cands[i].FromBody {
 			s++
+		}
+		// #198: only add the embedding bonus when it actually contributed
+		// something a token match didn't already cover -- a candidate that
+		// also matched by name/summary doesn't need the (noisier) hashing-
+		// trick signal stacked on top.
+		if cands[i].FromEmbedding && name == 0 && sig == 0 && summary == 0 {
+			s += int(cands[i].EmbeddingScore * 8)
 		}
 		if d.Test {
 			s -= 5
@@ -183,6 +200,14 @@ func (s *server) handleContext(ctx context.Context, _ *sdkmcp.CallToolRequest, a
 			}
 		}
 	}
+	// #198: embedding-based semantic search. Adds defs that share zero
+	// tokens with the question but score high on a local hashing-trick
+	// embedding similarity -- the gap token-based candidate gathering
+	// above structurally can't close.
+	for _, c := range s.contextEmbeddingCandidates(question, seen) {
+		seen[c.Def.ID] = c
+	}
+
 	if len(seen) == 0 {
 		return errResult(fmt.Errorf("context: no defs matched any of %v — try a different question", tokens))
 	}
@@ -273,3 +298,75 @@ func (s *server) handleContext(ctx context.Context, _ *sdkmcp.CallToolRequest, a
 		BytesReturned: len(out),
 	}), nil, nil
 }
+
+// contextEmbeddingCandidates is #198: token-based candidate gathering
+// (name-LIKE, FTS body, summary-LIKE) can only find defs that share
+// actual words with the question. A question like "how do we verify
+// a login token" won't surface a def named checkSessionCredentials
+// with zero literal overlap. This computes a local, dependency-free
+// hashing-trick embedding (internal/embed -- no network call, no API
+// key, no cost) for the question and for every non-test def already
+// NOT in seen, and returns the ones above contextEmbeddingThreshold,
+// capped and sorted by similarity.
+//
+// Brute-force cosine over every def is deliberately not indexed --
+// defn projects run to at most a few thousand defs, and comparing
+// two 64-float vectors is on the order of nanoseconds, so a full scan
+// costs low-single-digit milliseconds even on a large codebase. An
+// ANN index would be solving a problem this scale doesn't have.
+func (s *server) contextEmbeddingCandidates(question string, seen map[int64]contextCandidate) []contextCandidate {
+	qVec := embed.Embed(question)
+
+	all, err := s.backend.FindDefinitions("%")
+	if err != nil {
+		return nil
+	}
+
+	type scoredDef struct {
+		d   store.Definition
+		sim float64
+	}
+	var found []scoredDef
+	for _, d := range all {
+		if d.Test {
+			continue
+		}
+		if _, already := seen[d.ID]; already {
+			continue
+		}
+		text := formatReceiver(d.Receiver) + d.Name + " " + d.Signature + " " + d.Doc
+		sim := embed.Cosine(qVec, embed.Embed(text))
+		if sim >= contextEmbeddingThreshold {
+			found = append(found, scoredDef{d, sim})
+		}
+	}
+	sort.Slice(found, func(i, j int) bool { return found[i].sim > found[j].sim })
+	if len(found) > contextEmbeddingCap {
+		found = found[:contextEmbeddingCap]
+	}
+
+	out := make([]contextCandidate, 0, len(found))
+	for _, f := range found {
+		out = append(out, contextCandidate{
+			Def:            f.d,
+			FromEmbedding:  true,
+			EmbeddingScore: f.sim,
+		})
+	}
+	return out
+}
+
+// contextEmbeddingThreshold is the minimum cosine similarity (hashing-
+// trick vectors, internal/embed) for a def to be added to the context
+// bundle's candidate set purely on semantic grounds -- i.e. despite
+// sharing zero tokens with the question. Deliberately conservative:
+// this is a much cruder signal than a real embedding model, so a low
+// threshold would flood the candidate set with noise.
+//
+// contextEmbeddingCap bounds how many embedding-only candidates get
+// added per call, so a large project can't turn this into an
+// unbounded full-corpus scan result.
+const (
+	contextEmbeddingThreshold = 0.6
+	contextEmbeddingCap       = 10
+)
