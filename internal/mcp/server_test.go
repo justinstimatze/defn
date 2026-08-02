@@ -3496,3 +3496,68 @@ func TestHandleAddImport_NoFalsePositiveAlreadyPresent(t *testing.T) {
 		t.Errorf("expected math import to land on disk, got:\n%s", final)
 	}
 }
+
+// TestHandleCreate_ReceiverBlindCollisionAllowsDistinctReceivers is the
+// #220 regression: handleCreate's pre-existence check called
+// GetDefinitionByName(name, modulePath) without the receiver, so it
+// could match an unrelated same-named method via the blast-radius
+// tiebreak and falsely reject a legitimate create. Go allows the same
+// method name on different receiver types -- creating (*Agent).Reconsider
+// must succeed even though (*LLM).Reconsider already exists.
+func TestHandleCreate_ReceiverBlindCollisionAllowsDistinctReceivers(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	if err := os.MkdirAll(projDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package main
+
+type LLM struct{}
+type Agent struct{}
+
+func (l *LLM) Reconsider() string { return "llm-original" }
+
+func main() {}
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCreate(context.Background(), nil, createParam{
+		File: "main.go",
+		Body: "func (a *Agent) Reconsider() string { return \"agent-original\" }",
+	})
+	if err != nil {
+		t.Fatalf("handleCreate: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "already exists") {
+		t.Fatalf("false collision: (*Agent).Reconsider should not collide with (*LLM).Reconsider, got: %s", text)
+	}
+
+	final, ferr := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if ferr != nil {
+		t.Fatalf("read main.go: %v", ferr)
+	}
+	src := string(final)
+	if !strings.Contains(src, "agent-original") {
+		t.Errorf("expected (*Agent).Reconsider to be created, got:\n%s", src)
+	}
+	if !strings.Contains(src, "llm-original") {
+		t.Errorf("expected (*LLM).Reconsider to remain untouched, got:\n%s", src)
+	}
+}

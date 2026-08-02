@@ -2659,8 +2659,21 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		return errResult(fmt.Errorf("no modules found — run defn init first"))
 	}
 
-	// Check if a definition with this name already exists in the target module.
-	if existing, err := s.backend.GetDefinitionByName(name, mod.Path); err == nil {
+	// Check if a definition with this name AND receiver already exists in
+	// the target module. #220: a bare GetDefinitionByName ignores receiver
+	// and falls back to a blast-radius tiebreak, so creating (*Agent).Foo
+	// falsely collided with an unrelated (*LLM).Foo. Try both with and
+	// without a leading "*" since inferFromBody's parsed receiver form may
+	// not match how the DB stored an existing method's receiver.
+	existing, existErr := s.backend.GetDefinitionByNameAndReceiver(name, mod.Path, receiver)
+	if existErr != nil && receiver != "" {
+		if alt := strings.TrimPrefix(receiver, "*"); alt != receiver {
+			existing, existErr = s.backend.GetDefinitionByNameAndReceiver(name, mod.Path, alt)
+		} else {
+			existing, existErr = s.backend.GetDefinitionByNameAndReceiver(name, mod.Path, "*"+receiver)
+		}
+	}
+	if existErr == nil {
 		recv := formatReceiver(existing.Receiver)
 		return errResult(fmt.Errorf("definition %s%s already exists in %s (id=%d) — use code(op:\"edit\") to modify it", recv, name, mod.Path, existing.ID))
 	}
