@@ -166,3 +166,12 @@ type FileSummary struct {
 	BodyHash  string
 	Model     string
 }
+
+// ExplainCacheEntry is a cached #192 explain-QA answer, keyed by a
+// content-addressed hash of the question and the scoped defs' bodies
+// (computed by the caller — see internal/mcp's explainCacheKey).
+type ExplainCacheEntry struct {
+	Answer string
+	Refs   []string
+	Model  string
+}

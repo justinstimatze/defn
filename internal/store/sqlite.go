@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -2574,4 +2575,44 @@ func (s *SQLiteDB) SearchDefSummaries(pattern string) ([]int64, error) {
 		ids = append(ids, id)
 	}
 	return ids, rows.Err()
+}
+
+// GetExplainCache returns the cached #192 explain-QA answer for
+// cacheKey, or (nil, nil) if there's no entry yet.
+func (s *SQLiteDB) GetExplainCache(cacheKey string) (*ExplainCacheEntry, error) {
+	var answer, refs, model string
+	err := s.db.QueryRowContext(s.Ctx(),
+		`SELECT answer, refs, model FROM explain_cache WHERE cache_key = ?`, cacheKey,
+	).Scan(&answer, &refs, &model)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("sqlite: get explain cache %s: %w", cacheKey, err)
+	}
+	var refList []string
+	if refs != "" {
+		refList = strings.Split(refs, ",")
+	}
+	return &ExplainCacheEntry{Answer: answer, Refs: refList, Model: model}, nil
+}
+
+// SetExplainCache writes/updates the #192 explain-QA cache row for
+// cacheKey. Idempotent -- INSERT OR REPLACE keys off cache_key.
+func (s *SQLiteDB) SetExplainCache(cacheKey, question, scope, answer, model string, refs []string) error {
+	_, err := s.db.ExecContext(s.Ctx(),
+		`INSERT INTO explain_cache(cache_key, question, scope, answer, refs, model, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(cache_key) DO UPDATE SET
+		   question   = excluded.question,
+		   scope      = excluded.scope,
+		   answer     = excluded.answer,
+		   refs       = excluded.refs,
+		   model      = excluded.model,
+		   created_at = excluded.created_at`,
+		cacheKey, question, scope, answer, strings.Join(refs, ","), model, time.Now().Unix())
+	if err != nil {
+		return fmt.Errorf("sqlite: set explain cache %s: %w", cacheKey, err)
+	}
+	return nil
 }

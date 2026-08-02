@@ -145,4 +145,11 @@ type Backend interface {
 	// keys off source_file.
 	GetFileSummary(sourceFile string) (*FileSummary, error)
 	SetFileSummary(sourceFile string, moduleID int64, s *FileSummary) error
+
+	// #192 explain-QA cache. GetExplainCache returns (nil, nil) when no
+	// entry exists yet for cacheKey. SetExplainCache is idempotent —
+	// INSERT OR REPLACE keys off cacheKey (content-addressed: question +
+	// scoped defs' body hashes, computed by the caller).
+	GetExplainCache(cacheKey string) (*ExplainCacheEntry, error)
+	SetExplainCache(cacheKey, question, scope, answer, model string, refs []string) error
 }

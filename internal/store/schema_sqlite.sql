@@ -234,3 +234,22 @@ CREATE TABLE IF NOT EXISTS file_summaries (
     summary_model     TEXT,
     FOREIGN KEY (module_id) REFERENCES modules(id) ON DELETE CASCADE
 );
+
+-- #192: content-addressed cache for op:"explain" question+scope answers.
+-- cache_key is computed by the MCP layer as a hash of the question plus
+-- each scoped def's (qualified name, body hash) -- an edited body
+-- naturally produces a fresh key, no explicit invalidation needed.
+-- Stale rows are harmless and just accumulate (one row per unique
+-- question+scope ever asked); not pruned yet.
+CREATE TABLE IF NOT EXISTS explain_cache (
+    cache_key  TEXT PRIMARY KEY,
+    question   TEXT NOT NULL,
+    scope      TEXT NOT NULL,
+    answer     TEXT NOT NULL,
+    refs       TEXT NOT NULL,
+    -- Provenance only, same as def_summaries.summary_model /
+    -- file_summaries.summary_model -- not currently compared on read,
+    -- just recorded for debugging/A-B visibility.
+    model      TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
