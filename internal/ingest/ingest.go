@@ -93,18 +93,16 @@ func IngestPackages(db store.Backend, pkgs []*packages.Package, modulePath strin
 	tPhaseStart := time.Now()
 
 	for i, pkg := range filtered {
+		// #223: ingestPackage now flushes this package's buffered defs
+		// (#125 batched INSERT) internally, before extracting comments --
+		// comments need to look up defs by FindDefinitionsByFile, which
+		// can't see them until flushed. tFlush is no longer split out
+		// separately; it's included in tWalk below.
 		t0 := time.Now()
 		if err := ingestPackage(db, pkg, modulePath, state); err != nil {
 			return fmt.Errorf("ingest %s: %w", pkg.PkgPath, err)
 		}
 		tWalk += time.Since(t0)
-		// Flush buffered defs for this package via batched INSERT (#125).
-		// Per-package boundary — matches the per-package resolve/GC cadence.
-		t0 = time.Now()
-		if err := state.flushDefs(db); err != nil {
-			return fmt.Errorf("flush defs %s: %w", pkg.PkgPath, err)
-		}
-		tFlush += time.Since(t0)
 		if i+1 >= len(filtered) {
 			continue
 		}
@@ -215,6 +213,12 @@ func ingestPackage(db store.Backend, pkg *packages.Package, modulePath string, s
 		return err
 	}
 
+	type fileForComments struct {
+		file       *ast.File
+		sourceFile string
+	}
+	var commentFiles []fileForComments
+
 	for _, file := range pkg.Syntax {
 		// Get source filename from the token.FileSet.
 		isTest := false
@@ -247,6 +251,24 @@ func ingestPackage(db store.Backend, pkg *packages.Package, modulePath string, s
 		}
 		if err := ingestFile(db, pkg, mod, file, isTest, sourceFile, state); err != nil {
 			return err
+		}
+		if sourceFile != "" && len(file.Comments) > 0 {
+			commentFiles = append(commentFiles, fileForComments{file, sourceFile})
+		}
+	}
+
+	// #223: flush this package's defs before extracting comments.
+	// ingestComments looks up defs via FindDefinitionsByFile to link
+	// pragma/doc comments to their DefID -- with the #125 batched-upsert
+	// buffer, those defs don't exist in the database until flushed, so
+	// doing this before the flush always saw an empty or stale set and
+	// every comment's DefID came back nil regardless of position.
+	if err := state.flushDefs(db); err != nil {
+		return err
+	}
+	for _, cf := range commentFiles {
+		if err := ingestComments(db, pkg.Fset, cf.file, cf.sourceFile); err != nil {
+			return fmt.Errorf("ingest comments: %w", err)
 		}
 	}
 	return nil
@@ -316,12 +338,12 @@ func ingestFile(db store.Backend, pkg *packages.Package, mod *store.Module, file
 		}
 	}
 
-	// Extract comments and pragmas.
-	if sourceFile != "" && len(file.Comments) > 0 {
-		if err := ingestComments(db, fset, file, sourceFile); err != nil {
-			return fmt.Errorf("ingest comments: %w", err)
-		}
-	}
+	// #223: comment/pragma extraction moved to ingestPackage, run AFTER
+	// state.flushDefs -- ingestComments looks up this file's defs via
+	// FindDefinitionsByFile, which can't see them yet while they're still
+	// sitting in state.pendingDefs (the #125 batched-upsert buffer).
+	// Doing it here, mid-decl-loop, meant every pragma comment's DefID
+	// came back nil regardless of position.
 
 	return nil
 }

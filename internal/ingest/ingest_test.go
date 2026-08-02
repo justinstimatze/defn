@@ -207,3 +207,68 @@ func stripDocComment(body string) string {
 	}
 	return body
 }
+
+// TestIngestComments_PragmaLinkedToFollowingDef is the winze regression:
+// a pragma comment (e.g. //winze:functional) that is the doc comment
+// (or the last line of a multi-line doc comment) directly above a
+// definition should carry that definition's DefID -- db.Pragmas()
+// otherwise returns DefName="" for every def-attached pragma. Covers
+// both a bare single-line pragma-as-doc and a pragma trailing prose in
+// one doc-comment group, since winze's own repro didn't specify which
+// shape their corpus uses.
+func TestIngestComments_PragmaLinkedToFollowingDef(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module pragmatest\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	src := `package pragmatest
+
+//winze:functional
+type FormedAt struct{ V int }
+
+// EnergyEstimate is a rough figure.
+//winze:contested
+type EnergyEstimate struct{ V int }
+`
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	db := testDB(t)
+	if err := Ingest(db, dir); err != nil {
+		t.Fatal(err)
+	}
+
+	formedAt, err := db.GetDefinitionByName("FormedAt", "")
+	if err != nil {
+		t.Fatalf("FormedAt not found: %v", err)
+	}
+	energyEstimate, err := db.GetDefinitionByName("EnergyEstimate", "")
+	if err != nil {
+		t.Fatalf("EnergyEstimate not found: %v", err)
+	}
+	t.Logf("FormedAt id=%d start=%d end=%d", formedAt.ID, formedAt.StartLine, formedAt.EndLine)
+	t.Logf("EnergyEstimate id=%d start=%d end=%d", energyEstimate.ID, energyEstimate.StartLine, energyEstimate.EndLine)
+
+	functionalComments, err := db.GetCommentsByPragma("winze:functional")
+	if err != nil {
+		t.Fatalf("GetCommentsByPragma winze:functional: %v", err)
+	}
+	if len(functionalComments) != 1 {
+		t.Fatalf("expected 1 winze:functional comment, got %d: %+v", len(functionalComments), functionalComments)
+	}
+	if functionalComments[0].DefID == nil || *functionalComments[0].DefID != formedAt.ID {
+		t.Errorf("winze:functional (bare single-line doc) should carry FormedAt's def_id (%d), got %+v", formedAt.ID, functionalComments[0])
+	}
+
+	contestedComments, err := db.GetCommentsByPragma("winze:contested")
+	if err != nil {
+		t.Fatalf("GetCommentsByPragma winze:contested: %v", err)
+	}
+	if len(contestedComments) != 1 {
+		t.Fatalf("expected 1 winze:contested comment, got %d: %+v", len(contestedComments), contestedComments)
+	}
+	if contestedComments[0].DefID == nil || *contestedComments[0].DefID != energyEstimate.ID {
+		t.Errorf("winze:contested (last line of a multi-line doc group) should carry EnergyEstimate's def_id (%d), got %+v", energyEstimate.ID, contestedComments[0])
+	}
+}
