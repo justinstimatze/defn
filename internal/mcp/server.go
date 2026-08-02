@@ -2307,11 +2307,18 @@ func (s *server) autoEmitOnlyWithOpts(opts emit.Opts) string {
 	timing := os.Getenv("DEFN_MEASURE_TIMING") == "1"
 
 	t := time.Now()
-	if err := emit.EmitWithOpts(s.backend, s.projectDir, opts); err != nil {
+	warnings, err := emit.EmitWithOpts(s.backend, s.projectDir, opts)
+	if err != nil {
 		return fmt.Sprintf("emit error: %v", err)
 	}
 	if timing {
 		fmt.Fprintf(os.Stderr, "  [emit] emit.EmitWithOpts (build deferred): %s\n", time.Since(t).Round(time.Millisecond))
+	}
+	// #218: a warning here means the DB write succeeded but one or more
+	// requested changes never made it to disk -- surface it prominently
+	// rather than reporting silent success.
+	if len(warnings) > 0 {
+		return "WARNING: " + strings.Join(warnings, "\nWARNING: ")
 	}
 	return ""
 }
@@ -2325,7 +2332,10 @@ func (s *server) autoEmitOnlyWithOpts(opts emit.Opts) string {
 //
 // Return value is a status string appended to the tool response.
 // Success paths return "" — silence is the signal. Failure paths return
-// human-readable error strings the model must react to.
+// human-readable error strings the model must react to. #218: a
+// WARNING-prefixed line means the DB write succeeded but the file write
+// was refused or silently skipped one or more requested changes --
+// treat this the same as a failure, not as success with a footnote.
 func (s *server) autoEmitAndBuildWithOpts(opts emit.Opts) string {
 	if s.projectDir == "" || os.Getenv("DEFN_LEGACY") == "1" {
 		return ""
@@ -2334,7 +2344,8 @@ func (s *server) autoEmitAndBuildWithOpts(opts emit.Opts) string {
 
 	// Emit to the actual project directory — keeps files in sync.
 	t := time.Now()
-	if err := emit.EmitWithOpts(s.backend, s.projectDir, opts); err != nil {
+	warnings, err := emit.EmitWithOpts(s.backend, s.projectDir, opts)
+	if err != nil {
 		return fmt.Sprintf("emit error: %v", err)
 	}
 	if timing {
@@ -2358,10 +2369,17 @@ func (s *server) autoEmitAndBuildWithOpts(opts emit.Opts) string {
 	if timing {
 		fmt.Fprintf(os.Stderr, "  [emit] go %s: %s\n", strings.Join(args, " "), time.Since(t).Round(time.Millisecond))
 	}
-	if err != nil {
-		return fmt.Sprintf("BUILD FAILED:\n%s", string(out))
+	var sb strings.Builder
+	if len(warnings) > 0 {
+		sb.WriteString("WARNING: " + strings.Join(warnings, "\nWARNING: "))
 	}
-	return ""
+	if err != nil {
+		if sb.Len() > 0 {
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString(fmt.Sprintf("BUILD FAILED:\n%s", string(out)))
+	}
+	return sb.String()
 }
 
 // buildTargetsForFiles derives the minimal `go build` target list from

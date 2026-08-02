@@ -176,7 +176,7 @@ func Dropped() {}
 		t.Fatal(err)
 	}
 
-	if err := EmitWithOpts(db, outDir, Opts{AllowedRemovals: []string{"Dropped"}}); err != nil {
+	if _, err := EmitWithOpts(db, outDir, Opts{AllowedRemovals: []string{"Dropped"}}); err != nil {
 		t.Fatalf("emit: %v", err)
 	}
 
@@ -231,7 +231,7 @@ func Dropped() {}
 		t.Fatal(err)
 	}
 
-	if err := EmitWithOpts(db, outDir, Opts{AllowedRemovals: []string{"Dropped"}}); err != nil {
+	if _, err := EmitWithOpts(db, outDir, Opts{AllowedRemovals: []string{"Dropped"}}); err != nil {
 		t.Fatalf("emit: %v", err)
 	}
 
@@ -469,7 +469,7 @@ func TestEmitMergeFallsBackToRegenerateForNewDefs(t *testing.T) {
 	})
 
 	outDir := t.TempDir()
-	if err := EmitWithOpts(db, outDir, Opts{AllowedAdds: []string{"Bar"}}); err != nil {
+	if _, err := EmitWithOpts(db, outDir, Opts{AllowedAdds: []string{"Bar"}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -536,7 +536,7 @@ func Alpha() {}
 	})
 
 	outDir := t.TempDir()
-	if err := EmitWithOpts(db, outDir, Opts{AllowedAdds: []string{"Gamma"}}); err != nil {
+	if _, err := EmitWithOpts(db, outDir, Opts{AllowedAdds: []string{"Gamma"}}); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(outDir, "test.go"))
@@ -1295,7 +1295,7 @@ func TestEmitOptsTouchedFilesFiltersModuleFiles(t *testing.T) {
 		ModuleID: mod.ID, Name: "Touched", Kind: "function", Exported: true,
 		Body: "func Touched() { /* changed */ }", SourceFile: "pkg/touched.go",
 	})
-	if err := EmitWithOpts(db, outDir, Opts{TouchedFiles: []string{"pkg/touched.go"}}); err != nil {
+	if _, err := EmitWithOpts(db, outDir, Opts{TouchedFiles: []string{"pkg/touched.go"}}); err != nil {
 		t.Fatal(err)
 	}
 	after, err := os.Stat(filepath.Join(outDir, "pkg", "untouched.go"))
@@ -1332,7 +1332,7 @@ func TestEmitScopedAlwaysWritesProjectFiles(t *testing.T) {
 	outDir := t.TempDir()
 	// Scoped emit into empty dir — must still write go.mod even though it
 	// isn't in TouchedFiles.
-	if err := EmitWithOpts(db, outDir, Opts{TouchedFiles: []string{"pkg/f.go"}}); err != nil {
+	if _, err := EmitWithOpts(db, outDir, Opts{TouchedFiles: []string{"pkg/f.go"}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(outDir, "go.mod")); err != nil {
@@ -1414,7 +1414,7 @@ func Existing() int { return X + Y }
 		{Name: "New", Kind: "function", Body: "// New was added via code op:create.\nfunc New() string { return \"new\" }"},
 	}
 
-	merged, ok := mergeDeclsIntoSource(existing, defs, nil, []string{"New"})
+	merged, ok, _ := mergeDeclsIntoSource(existing, defs, nil, []string{"New"})
 	if !ok {
 		t.Fatalf("mergeDeclsIntoSource returned ok=false (expected true — fix should handle new-def add without falling through to regen)")
 	}
@@ -1476,7 +1476,7 @@ func Existing() int { return X + Y }
 		{Name: "New", Kind: "function", Body: "func New() string { return \"new\" }"},
 	}
 
-	merged, ok := mergeDeclsIntoSource(existing, defs, nil, []string{"New"})
+	merged, ok, _ := mergeDeclsIntoSource(existing, defs, nil, []string{"New"})
 	if !ok {
 		t.Fatalf("mergeDeclsIntoSource returned ok=false")
 	}
@@ -1529,7 +1529,7 @@ func Existing() int { return X }
 	}
 	// AllowedAdds only declares the CURRENT caller's intent (New);
 	// Orphan is drift and shouldn't be added.
-	merged, ok := mergeDeclsIntoSource(existing, defs, nil, []string{"New"})
+	merged, ok, _ := mergeDeclsIntoSource(existing, defs, nil, []string{"New"})
 	if !ok {
 		t.Fatalf("mergeDeclsIntoSource returned ok=false when orphan Present — this is #163: fix should skip orphan, not bail")
 	}
@@ -1587,5 +1587,86 @@ func TestEmitLogsDiskDriftWarning(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "disk drift") {
 		t.Fatalf("expected disk-drift warning on stderr, got: %q", buf.String())
+	}
+}
+
+// TestMergeDeclsIntoSource_UnmatchedWantSurfacedNotSilent is the #218
+// regression: gemot-2847127 reported op:edit resolving a method to a
+// stale pre-sync id, reporting "Updated" success and bumping the graph
+// hash, but never writing the new body to disk. Root cause: when a
+// requested def's (name, receiver) identity doesn't match any on-disk
+// declaration -- e.g. a stale DB row with the wrong receiver -- the
+// merge used to splice in everything that DID match and silently drop
+// the rest with no signal at all (#163's "skip silently" was silent
+// all the way up the stack, not just to the file). ok must still be
+// true (Foo matches and gets its update), but unmatched must report
+// the def that didn't.
+func TestMergeDeclsIntoSource_UnmatchedWantSurfacedNotSilent(t *testing.T) {
+	existing := []byte(`package p
+
+func Foo() {}
+
+func Bar() {}
+`)
+	defs := []store.Definition{
+		{Name: "Foo", Kind: "function", Body: "func Foo() { /* updated */ }"},
+		// Stale DB row: on disk Bar is a free function, but this def
+		// thinks it's a method on *Baz -- simulates a resolved-but-stale
+		// id whose identity no longer matches its real on-disk decl.
+		{Name: "Bar", Kind: "method", Receiver: "Baz", Body: "func (b *Baz) Bar() { /* should not land */ }"},
+	}
+	merged, ok, unmatched := mergeDeclsIntoSource(existing, defs, nil, nil)
+	if !ok {
+		t.Fatalf("expected ok=true (Foo matches an on-disk decl), got false")
+	}
+	got := string(merged)
+	if !strings.Contains(got, "/* updated */") {
+		t.Errorf("expected Foo's body to be updated in the merged result:\n%s", got)
+	}
+	if strings.Contains(got, "should not land") {
+		t.Errorf("Bar's stale-identity body must not appear anywhere in the merged result:\n%s", got)
+	}
+	if len(unmatched) != 1 || unmatched[0] != "Baz.Bar" {
+		t.Fatalf("expected unmatched=[%q], got %v", "Baz.Bar", unmatched)
+	}
+}
+
+// TestWriteFile_UnmatchedWantReturnsWarning is the #218 regression one
+// layer up: writeFile must surface mergeDeclsIntoSource's unmatched
+// names as a non-empty warning string, not just a server-side stderr
+// log line nobody watching the MCP response would ever see.
+func TestWriteFile_UnmatchedWantReturnsWarning(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.go")
+	existing := []byte(`package p
+
+func Foo() {}
+
+func Bar() {}
+`)
+	if err := os.WriteFile(path, existing, 0644); err != nil {
+		t.Fatal(err)
+	}
+	defs := []store.Definition{
+		{Name: "Foo", Kind: "function", Body: "func Foo() { /* updated */ }"},
+		{Name: "Bar", Kind: "method", Receiver: "Baz", Body: "func (b *Baz) Bar() {}"},
+	}
+	_, warning, err := writeFile(path, "p", "example.com/p", "", nil, defs, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("writeFile: %v", err)
+	}
+	if warning == "" {
+		t.Fatal("expected a non-empty warning when a requested def couldn't be matched on disk, got \"\"")
+	}
+	if !strings.Contains(warning, "Baz.Bar") {
+		t.Errorf("expected warning to name the unmatched def, got: %s", warning)
+	}
+
+	onDisk, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(onDisk), "/* updated */") {
+		t.Errorf("expected Foo's matched update to still land on disk despite Bar's mismatch:\n%s", onDisk)
 	}
 }

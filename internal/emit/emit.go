@@ -83,31 +83,42 @@ type Opts struct {
 // Emit writes all definitions from the database as .go files into outDir.
 // Each module becomes a directory, and definitions are grouped into files by kind.
 func Emit(db store.Backend, outDir string) error {
-	_, err := emitWithOpts(db, outDir, Opts{})
+	_, _, err := emitWithOpts(db, outDir, Opts{})
 	return err
 }
 
 // EmitWithMap is like Emit but also returns a source map: for each emitted
 // line, which definition it belongs to. This powers defn lint.
 func EmitWithMap(db store.Backend, outDir string) ([]DefLocation, error) {
-	return emitWithOpts(db, outDir, Opts{})
+	locs, _, err := emitWithOpts(db, outDir, Opts{})
+	return locs, err
 }
 
 // EmitWithOpts is Emit with caller-supplied Opts (e.g. AllowedRemovals so
 // a code(op:"delete") can actually land on disk without safeWriteGoFile
 // blocking the write).
-func EmitWithOpts(db store.Backend, outDir string, opts Opts) error {
-	_, err := emitWithOpts(db, outDir, opts)
-	return err
+//
+// The returned warnings (#218) are non-fatal: err is nil and the emit
+// otherwise completed, but one or more requested changes could not be
+// safely written to disk (a def's DB row didn't match any on-disk
+// declaration, or writing would have dropped an on-disk declaration the
+// database doesn't know about). Callers that surface emit results to a
+// human or an agent MUST check this -- it is the difference between
+// "the edit landed" and "the edit updated the graph but not the file."
+func EmitWithOpts(db store.Backend, outDir string, opts Opts) ([]string, error) {
+	_, warnings, err := emitWithOpts(db, outDir, opts)
+	return warnings, err
 }
 
 // EmitWithMapAndOpts is EmitWithMap with caller-supplied Opts.
 func EmitWithMapAndOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, error) {
-	return emitWithOpts(db, outDir, opts)
+	locs, _, err := emitWithOpts(db, outDir, opts)
+	return locs, err
 }
 
-func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, error) {
+func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, []string, error) {
 	var allLocs []DefLocation
+	var warnings []string
 	timing := os.Getenv("DEFN_MEASURE_TIMING") == "1"
 	timeIt := func(name string, t0 time.Time) {
 		if timing {
@@ -137,24 +148,24 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, er
 	t := time.Now()
 	projectFiles, err := db.ListProjectFiles()
 	if err != nil {
-		return nil, fmt.Errorf("list project files: %w", err)
+		return nil, nil, fmt.Errorf("list project files: %w", err)
 	}
 	for _, pf := range projectFiles {
 		content, err := db.GetProjectFile(pf)
 		if err != nil {
-			return nil, fmt.Errorf("get project file %s: %w", pf, err)
+			return nil, nil, fmt.Errorf("get project file %s: %w", pf, err)
 		}
 		// Sanitize path to prevent directory traversal.
 		clean := filepath.Clean(pf)
 		if filepath.IsAbs(clean) || strings.Contains(clean, "..") {
-			return nil, fmt.Errorf("invalid project file path: %s", pf)
+			return nil, nil, fmt.Errorf("invalid project file path: %s", pf)
 		}
 		dst := filepath.Join(outDir, clean)
 		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if err := os.WriteFile(dst, []byte(content), 0644); err != nil {
-			return nil, fmt.Errorf("write %s: %w", pf, err)
+			return nil, nil, fmt.Errorf("write %s: %w", pf, err)
 		}
 	}
 	timeIt("project-files", t)
@@ -162,7 +173,7 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, er
 	t = time.Now()
 	modules, err := db.ListModules()
 	if err != nil {
-		return nil, fmt.Errorf("list modules: %w", err)
+		return nil, nil, fmt.Errorf("list modules: %w", err)
 	}
 
 	// Determine the module root path from go.mod so we can compute
@@ -171,12 +182,13 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, er
 
 	var writtenFiles []writtenFile
 	for _, mod := range modules {
-		locs, written, err := emitModule(db, &mod, outDir, moduleRoot, opts.AllowedRemovals, opts.AllowedAdds, touchedSet)
+		locs, written, modWarnings, err := emitModule(db, &mod, outDir, moduleRoot, opts.AllowedRemovals, opts.AllowedAdds, touchedSet)
 		if err != nil {
-			return nil, fmt.Errorf("emit %s: %w", mod.Path, err)
+			return nil, nil, fmt.Errorf("emit %s: %w", mod.Path, err)
 		}
 		allLocs = append(allLocs, locs...)
 		writtenFiles = append(writtenFiles, written...)
+		warnings = append(warnings, modWarnings...)
 	}
 	timeIt("module-writes", t)
 
@@ -184,7 +196,7 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, er
 	t = time.Now()
 	goimports, err := exec.LookPath("goimports")
 	if err != nil {
-		return nil, fmt.Errorf("goimports not found — install with: go install golang.org/x/tools/cmd/goimports@latest")
+		return nil, nil, fmt.Errorf("goimports not found — install with: go install golang.org/x/tools/cmd/goimports@latest")
 	}
 	// #109 pass 3: prefer scoped goimports when the caller has named
 	// touched files. Falls back to the full recursive walk when the
@@ -223,7 +235,7 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, er
 		args = append(args, outDir)
 	}
 	if out, err := exec.Command(goimports, args...).CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("goimports: %s", out)
+		return nil, nil, fmt.Errorf("goimports: %s", out)
 	}
 	timeIt("goimports", t)
 
@@ -250,7 +262,7 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, er
 			continue
 		}
 		if err := db.SetFileSource(wf.ModuleID, wf.SourceFile, string(raw)); err != nil {
-			return nil, fmt.Errorf("refresh file_sources for %s: %w", wf.SourceFile, err)
+			return nil, nil, fmt.Errorf("refresh file_sources for %s: %w", wf.SourceFile, err)
 		}
 	}
 	timeIt("refresh-file-sources", t)
@@ -262,7 +274,7 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, er
 	// walking every module here would defeat the point of file-scoping.
 	if scoped {
 		timeIt("rebuild-loc-index-skipped", t)
-		return nil, nil
+		return nil, warnings, nil
 	}
 	allLocs = nil
 	for _, mod := range modules {
@@ -298,7 +310,7 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, er
 	}
 	timeIt("rebuild-loc-index", t)
 
-	return allLocs, nil
+	return allLocs, warnings, nil
 }
 
 // detectModuleRoot finds the common module root from the stored module paths.
@@ -334,18 +346,18 @@ type writtenFile struct {
 	SourceFile string // project-relative; empty means don't refresh file_sources
 }
 
-func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, allowedRemovals, allowedAdds []string, touchedSet map[string]bool) ([]DefLocation, []writtenFile, error) {
+func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, allowedRemovals, allowedAdds []string, touchedSet map[string]bool) ([]DefLocation, []writtenFile, []string, error) {
 	scoped := len(touchedSet) > 0
 	defs, err := db.GetModuleDefinitions(mod.ID)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if len(defs) == 0 {
 		// No definitions — clean up any previously emitted files for this
 		// module. Scoped emit skips this cleanup: a singleton rename/edit
 		// against an unrelated module shouldn't garbage-collect it.
 		if scoped {
-			return nil, nil, nil
+			return nil, nil, nil, nil
 		}
 		relPath := mod.Path
 		if moduleRoot != "" && strings.HasPrefix(mod.Path, moduleRoot) {
@@ -359,13 +371,13 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 			os.Remove(mainFile)
 			os.Remove(testFile)
 		}
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
 	// Get imports for this module.
 	imports, err := db.GetImports(mod.ID)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// Compute the relative directory path by stripping the module root.
@@ -381,7 +393,7 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 	}
 	pkgDir := filepath.Join(outDir, relPath)
 	if err := os.MkdirAll(pkgDir, 0755); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// Group definitions by source file. Use the basename because
@@ -437,7 +449,7 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 		}
 		fileNames = kept
 		if len(fileNames) == 0 {
-			return nil, nil, nil
+			return nil, nil, nil, nil
 		}
 	}
 
@@ -514,6 +526,7 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 
 	var allLocs []DefLocation
 	var written []writtenFile
+	var warnings []string
 	for _, file := range fileNames {
 		// #120 root fix: when source_file carries an intra-project
 		// directory prefix (e.g. "command/root.go"), use it as the
@@ -529,7 +542,7 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 		if projRel != "" && filepath.Dir(filepath.Clean(projRel)) != "." {
 			path = filepath.Join(outDir, projRel)
 			if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 		} else {
 			path = filepath.Join(pkgDir, file)
@@ -551,9 +564,12 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 				fmt.Fprintf(os.Stderr, "[emit] disk drift: %s changed on disk since defn last ingested it -- merging against current disk content; run code(op:\"sync\", file:%q) to bring the DB back in sync.\n", path, projectRelByFile[file])
 			}
 		}
-		locs, err := writeFile(path, mod.Name, mod.Path, pkgDoc, imports, byFile[file], rawByFile[file], allowedRemovals, allowedAdds)
+		locs, warning, err := writeFile(path, mod.Name, mod.Path, pkgDoc, imports, byFile[file], rawByFile[file], allowedRemovals, allowedAdds)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
+		}
+		if warning != "" {
+			warnings = append(warnings, warning)
 		}
 		allLocs = append(allLocs, locs...)
 		written = append(written, writtenFile{
@@ -563,10 +579,16 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 		})
 	}
 
-	return allLocs, written, nil
+	return allLocs, written, warnings, nil
 }
 
-func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import, defs []store.Definition, rawFromDB []byte, allowedRemovals, allowedAdds []string) ([]DefLocation, error) {
+// writeFile merges defs into path (or regenerates it) and writes the
+// result. Returns a non-empty warning (2nd value) when some requested
+// change could not be safely written to disk -- #218: this used to be
+// silent (stderr-only), so a def whose DB row no longer matched its
+// on-disk counterpart (stale receiver/name, orphaned id) could report
+// success up the stack while the file itself never changed.
+func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import, defs []store.Definition, rawFromDB []byte, allowedRemovals, allowedAdds []string) ([]DefLocation, string, error) {
 	// Pick the merge base. Prefer disk when it exists and parses: a
 	// user's built-in Edit lands on disk before file_sources knows about
 	// it (built-in tools bypass defn's sync), so disk is the post-Edit
@@ -591,13 +613,19 @@ func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import,
 	// everything defn's schema doesn't represent (package doc, build
 	// constraints, per-file imports, init() names, floating comments).
 	if len(existingSrc) > 0 {
-		if merged, ok := mergeDeclsIntoSource(existingSrc, defs, allowedRemovals, allowedAdds); ok {
+		if merged, ok, unmatched := mergeDeclsIntoSource(existingSrc, defs, allowedRemovals, allowedAdds); ok {
 			wrote, lost, err := safeWriteGoFile(path, merged, allowedRemovals)
 			if err != nil {
-				return nil, err
+				return nil, "", err
 			}
 			if wrote {
-				return buildLocIndex(path, modulePath, defs), nil
+				var warning string
+				if len(unmatched) > 0 {
+					warning = fmt.Sprintf("%s: %d requested change(s) could not be matched to an on-disk declaration and were NOT written: %v -- the database and disk have diverged for these (stale id, renamed receiver, or edited outside defn); run code(op:\"sync\", file:%q) to refresh, then retry",
+						path, len(unmatched), unmatched, path)
+					fmt.Fprintf(os.Stderr, "defn: %s\n", warning)
+				}
+				return buildLocIndex(path, modulePath, defs), warning, nil
 			}
 			fmt.Fprintf(os.Stderr,
 				"defn: ast-merge safety net unexpectedly flagged %s (lost: %v) — falling back to regenerate\n",
@@ -731,7 +759,7 @@ func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import,
 	}
 	wrote, lost, err := safeWriteGoFile(path, formatted, allowedRemovals)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if !wrote {
 		// The DB's reconstruction would remove top-level declarations that
@@ -739,12 +767,12 @@ func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import,
 		// or top-level code the current schema can't represent). Keep the
 		// file intact; downstream callers (lint, etc.) that need locations
 		// will get an empty slice for this file — safer than corruption.
-		fmt.Fprintf(os.Stderr,
-			"defn: skipping emit of %s to preserve %d on-disk declaration(s) not in the database: %v\n",
-			path, len(lost), lost)
-		return nil, nil
+		warning := fmt.Sprintf("%s: skipped writing — would remove %d on-disk declaration(s) not in the database: %v -- DB was updated but disk was NOT; run code(op:\"sync\", file:%q) to refresh, then retry",
+			path, len(lost), lost, path)
+		fmt.Fprintf(os.Stderr, "defn: %s\n", warning)
+		return nil, warning, nil
 	}
-	return buildLocIndex(path, modulePath, defs), nil
+	return buildLocIndex(path, modulePath, defs), "", nil
 }
 
 // safeWriteGoFile writes content to path only if doing so will not remove
@@ -935,11 +963,21 @@ func groupKeyword(d store.Definition) string {
 // Ok=false means the caller should fall back to regenerating — the
 // source doesn't parse, the result after splicing doesn't parse, or
 // nothing in defs matched an on-disk decl.
-func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemovals, allowedAdds []string) ([]byte, bool) {
+//
+// unmatched (only meaningful when ok=true) lists DB def identities that
+// were requested (present in defs) but found no matching on-disk decl
+// and were NOT in allowedAdds — #218: this is exactly the "an existing
+// def silently fails to find its on-disk counterpart" case (stale
+// receiver/name in the DB row, e.g. from a resolved-but-stale id), and
+// previously these were dropped with no signal at all per the #163
+// rationale below. The caller now surfaces this instead of trusting
+// that a clean merge (ok=true) means every requested change actually
+// landed.
+func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemovals, allowedAdds []string) ([]byte, bool, []string) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "", existing, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
-		return nil, false
+		return nil, false, nil
 	}
 
 	// remove holds names (pointer-unwrapped for methods, matching
@@ -981,7 +1019,7 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 	totalWants := len(wantFuncs) + len(wantTypes) +
 		len(wantConsts) + len(wantVars) + len(wantGrouped)
 	if totalWants == 0 {
-		return nil, false
+		return nil, false, nil
 	}
 
 	type replacement struct {
@@ -1114,7 +1152,7 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 	}
 
 	if len(reps) == 0 {
-		return nil, false
+		return nil, false, nil
 	}
 
 	// Count only body replacements (not removals) when checking that
@@ -1178,14 +1216,38 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 	sort.Strings(appendBodies)
 
 	// #163 fix: unmatched wants not in AllowedAdds are drift the caller
-	// didn't declare intent for. Skip them silently — the disk file
-	// stays consistent with what the caller ASKED for (patched existing
-	// decls, appended allowed adds), and the orphan DB entries neither
-	// land on disk nor cause the merge to fall through to regen (which
-	// would drop floating comments the merge path preserves). The real
-	// data-loss safety net is safeWriteGoFile, which still runs after
-	// this returns and refuses any write that would silently drop an
-	// on-disk decl the DB doesn't know about.
+	// didn't declare intent for. Skip them silently for write purposes —
+	// the disk file stays consistent with what the caller ASKED for
+	// (patched existing decls, appended allowed adds), and the orphan DB
+	// entries neither land on disk nor cause the merge to fall through to
+	// regen (which would drop floating comments the merge path
+	// preserves). The real data-loss safety net is safeWriteGoFile, which
+	// still runs after this returns and refuses any write that would
+	// silently drop an on-disk decl the DB doesn't know about.
+	//
+	// #218: "skip silently" only ever meant silent to the FILE CONTENTS.
+	// Collect what's left in the want maps here and hand it back to the
+	// caller so it can be silent to disk but NOT silent to whoever asked
+	// for the change — an edit whose target def never matched an on-disk
+	// decl is exactly the "stale id" class of bug that made a def-update
+	// vanish with no signal.
+	var unmatched []string
+	for name := range wantFuncs {
+		unmatched = append(unmatched, name)
+	}
+	for name := range wantTypes {
+		unmatched = append(unmatched, name)
+	}
+	for name := range wantConsts {
+		unmatched = append(unmatched, name)
+	}
+	for name := range wantVars {
+		unmatched = append(unmatched, name)
+	}
+	for name := range wantGrouped {
+		unmatched = append(unmatched, name)
+	}
+	sort.Strings(unmatched)
 
 	// Apply in reverse offset order so earlier splices don't invalidate
 	// later offsets. Byte ranges for distinct decls never overlap (Go
@@ -1194,7 +1256,7 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 	result := append([]byte{}, existing...)
 	for _, r := range reps {
 		if r.start < 0 || r.end > len(result) || r.start > r.end {
-			return nil, false
+			return nil, false, nil
 		}
 		var buf bytes.Buffer
 		buf.Grow(len(result) - (r.end - r.start) + len(r.body))
@@ -1228,9 +1290,9 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 	// than write invalid Go to disk.
 	if _, err := parser.ParseFile(token.NewFileSet(), "", result,
 		parser.ParseComments|parser.SkipObjectResolution); err != nil {
-		return nil, false
+		return nil, false, nil
 	}
-	return result, true
+	return result, true, unmatched
 }
 
 // bodyIsGroupedGenDecl reports whether a DB body is a parenthesized
