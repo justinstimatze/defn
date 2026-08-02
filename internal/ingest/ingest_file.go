@@ -106,6 +106,16 @@ func IngestFile(db store.Backend, modulePath string, filePath string) (int, erro
 		return updated, fmt.Errorf("flush defs: %w", err)
 	}
 
+	// #224: link doc/pragma comments to this file's defs. Must run AFTER
+	// flushDefs -- ingestComments looks defs up via FindDefinitionsByFile,
+	// which (like #223's full-ingest bug) would otherwise race the
+	// not-yet-visible batched upserts for defs new in this file.
+	if len(file.Comments) > 0 {
+		if err := ingestComments(db, fset, file, relFile); err != nil {
+			return updated, fmt.Errorf("ingest comments: %w", err)
+		}
+	}
+
 	return updated, nil
 }
 

@@ -272,3 +272,46 @@ type EnergyEstimate struct{ V int }
 		t.Errorf("winze:contested (last line of a multi-line doc group) should carry EnergyEstimate's def_id (%d), got %+v", energyEstimate.ID, contestedComments[0])
 	}
 }
+
+// TestIngestFile_PragmaLinkedToFollowingDef is the #224 regression:
+// IngestFile (the incremental single-file sync path used by
+// code(op:"sync", file:...)) never called ingestComments at all, so
+// pragma/doc-comment-to-def linking only ever happened on a full
+// Ingest -- any def added or changed via incremental sync kept
+// def_id=NULL for its comments even after #223's full-ingest fix.
+func TestIngestFile_PragmaLinkedToFollowingDef(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module pragmafiletest\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	src := `package pragmafiletest
+
+//winze:functional
+type FormedAt struct{ V int }
+`
+	mainPath := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(mainPath, []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	db := testDB(t)
+	if _, err := IngestFile(db, dir, mainPath); err != nil {
+		t.Fatal(err)
+	}
+
+	formedAt, err := db.GetDefinitionByName("FormedAt", "")
+	if err != nil {
+		t.Fatalf("FormedAt not found: %v", err)
+	}
+
+	comments, err := db.GetCommentsByPragma("winze:functional")
+	if err != nil {
+		t.Fatalf("GetCommentsByPragma winze:functional: %v", err)
+	}
+	if len(comments) != 1 {
+		t.Fatalf("expected 1 winze:functional comment, got %d: %+v", len(comments), comments)
+	}
+	if comments[0].DefID == nil || *comments[0].DefID != formedAt.ID {
+		t.Errorf("winze:functional should carry FormedAt's def_id (%d) after IngestFile, got %+v", formedAt.ID, comments[0])
+	}
+}
