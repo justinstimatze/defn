@@ -3346,3 +3346,69 @@ func TestHandleSearch_MergesNameMatchAndFTSMatch(t *testing.T) {
 		t.Errorf("expected the FTS body-only match in results (this is the #216 bug), got:\n%s", text)
 	}
 }
+
+// TestHandleEdit_ReceiverDisambiguatesSameNamedMethod is the #219
+// regression: gemot-2847127 reported op:edit name:"Reconsider"
+// receiver:"LLM" updating (*Agent).Reconsider instead of
+// (*LLM).Reconsider -- codeParam.Receiver was accepted by the schema
+// but never threaded through to handleEdit, which fell back to
+// GetDefinitionByName's blast-radius tiebreak (most callers wins,
+// receiver-blind). With Receiver wired through, the edit must land on
+// the named receiver's method only.
+func TestHandleEdit_ReceiverDisambiguatesSameNamedMethod(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	if err := os.MkdirAll(projDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package main
+
+type LLM struct{}
+type Agent struct{}
+
+func (l *LLM) Reconsider() string { return "llm-original" }
+
+func (a *Agent) Reconsider() string { return "agent-original" }
+
+func main() {}
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleEdit(context.Background(), nil, editParam{
+		Name:     "Reconsider",
+		Receiver: "LLM",
+		NewBody:  "func (l *LLM) Reconsider() string { return \"llm-updated\" }",
+	})
+	if err != nil {
+		t.Fatalf("handleEdit: %v", err)
+	}
+	_ = resultText(t, result)
+
+	final, ferr := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if ferr != nil {
+		t.Fatalf("read main.go: %v", ferr)
+	}
+	src := string(final)
+	if !strings.Contains(src, "llm-updated") {
+		t.Errorf("expected (*LLM).Reconsider to be updated, got:\n%s", src)
+	}
+	if !strings.Contains(src, "agent-original") {
+		t.Errorf("expected (*Agent).Reconsider to remain untouched, got:\n%s", src)
+	}
+}

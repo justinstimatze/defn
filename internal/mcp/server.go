@@ -488,6 +488,13 @@ type nameParam struct {
 type editParam struct {
 	Name    string `json:"name"`
 	NewBody string `json:"new_body"`
+	// Receiver disambiguates between multiple methods sharing Name
+	// across different types (e.g. two "Reconsider" methods). #219:
+	// previously accepted on the top-level codeParam but never
+	// threaded through to handleEdit, so it was silently ignored and
+	// the blast-radius tiebreak in GetDefinitionByName could resolve
+	// to the wrong receiver's method.
+	Receiver string `json:"receiver,omitempty"`
 }
 
 type createParam struct {
@@ -1013,7 +1020,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if body == "" {
 			body = args.Body
 		}
-		return s.handleEdit(ctx, req, editParam{Name: args.Name, NewBody: body})
+		return s.handleEdit(ctx, req, editParam{Name: args.Name, NewBody: body, Receiver: args.Receiver})
 	case "insert":
 		return s.handleInsert(ctx, req, args)
 	case "create":
@@ -1937,9 +1944,31 @@ func (s *server) handleUntested(_ context.Context, _ *sdkmcp.CallToolRequest, _ 
 }
 
 func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args editParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.backend.GetDefinitionByName(args.Name, "")
-	if err != nil {
-		return s.notFoundOrErr(args.Name, err)
+	// #219: an explicit receiver disambiguates between multiple methods
+	// sharing Name across different types -- without this, a bare
+	// GetDefinitionByName falls back to a blast-radius tiebreak that can
+	// silently pick the WRONG receiver's method. Try both with and
+	// without a leading "*" since callers may pass either form.
+	var d *store.Definition
+	var err error
+	if args.Receiver != "" {
+		recv := args.Receiver
+		d, err = s.backend.GetDefinitionByNameAndReceiver(args.Name, "", recv)
+		if err != nil {
+			if alt := strings.TrimPrefix(recv, "*"); alt != recv {
+				d, err = s.backend.GetDefinitionByNameAndReceiver(args.Name, "", alt)
+			} else {
+				d, err = s.backend.GetDefinitionByNameAndReceiver(args.Name, "", "*"+recv)
+			}
+		}
+		if err != nil {
+			return s.notFoundOrErr(fmt.Sprintf("%s.%s", args.Receiver, args.Name), err)
+		}
+	} else {
+		d, err = s.backend.GetDefinitionByName(args.Name, "")
+		if err != nil {
+			return s.notFoundOrErr(args.Name, err)
+		}
 	}
 
 	// Validate new body parses as Go.
