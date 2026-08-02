@@ -215,3 +215,47 @@ func TestDedup_StrippedDisablesCaching(t *testing.T) {
 		t.Errorf("expected the original content unchanged, got %q", got)
 	}
 }
+
+// TestBodyServed_InvalidateClears confirms invalidate() (already fired
+// on every write op by handleCode) also clears the body-served state,
+// same lifecycle as the existing dedup entries.
+func TestBodyServed_InvalidateClears(t *testing.T) {
+	c := newRespCache()
+	sess := &sdkmcp.ServerSession{}
+
+	c.markBodyServed(sess, "Foo")
+	c.invalidate(sess)
+	if c.hasBodyServed(sess, "Foo") {
+		t.Error("expected hasBodyServed false after invalidate")
+	}
+}
+
+// TestBodyServed_MarkAndCheck is the #176 unit-level regression for
+// respCache's new cross-def reuse tracking: hasBodyServed must be
+// false before any mark, true after markBodyServed, and scoped per
+// name (marking Foo must not report Bar as served).
+func TestBodyServed_MarkAndCheck(t *testing.T) {
+	c := newRespCache()
+	sess := &sdkmcp.ServerSession{}
+
+	if c.hasBodyServed(sess, "Foo") {
+		t.Error("expected hasBodyServed false before any mark")
+	}
+	c.markBodyServed(sess, "Foo")
+	if !c.hasBodyServed(sess, "Foo") {
+		t.Error("expected hasBodyServed true after markBodyServed")
+	}
+	if c.hasBodyServed(sess, "Bar") {
+		t.Error("marking Foo should not affect Bar")
+	}
+}
+
+// TestBodyServed_NilSessionSafe mirrors TestDedup_NilSessionPassThrough:
+// a nil session must not panic and must simply report unserved.
+func TestBodyServed_NilSessionSafe(t *testing.T) {
+	c := newRespCache()
+	c.markBodyServed(nil, "Foo") // must not panic
+	if c.hasBodyServed(nil, "Foo") {
+		t.Error("expected hasBodyServed false for nil session")
+	}
+}

@@ -39,9 +39,10 @@ type respCache struct {
 type sessionCache struct {
 	seq             int64
 	entries         map[string]cacheEntry
-	starterInjected bool   // #203: true after first orient op has appended the starter bundle
-	turnToken       string // #209: last-seen turn-token; a change means a new turn started
-	readShapedCount int    // #209: individual read-shaped calls made so far this turn
+	starterInjected bool            // #203: true after first orient op has appended the starter bundle
+	turnToken       string          // #209: last-seen turn-token; a change means a new turn started
+	readShapedCount int             // #209: individual read-shaped calls made so far this turn
+	bodyServed      map[string]bool // #176: names whose full body (read full:true) was served this session
 }
 
 type cacheEntry struct {
@@ -140,6 +141,7 @@ func (c *respCache) invalidate(sess *sdkmcp.ServerSession) {
 	defer c.mu.Unlock()
 	if sc, ok := c.sessions[sess]; ok {
 		sc.entries = map[string]cacheEntry{}
+		sc.bodyServed = nil
 	}
 }
 
@@ -171,4 +173,42 @@ func (c *respCache) dedup(sess *sdkmcp.ServerSession, op, argKey string, r *sdkm
 	}
 	sc.entries[key] = cacheEntry{hash: hash, servedAt: sc.seq, size: len(tc.Text)}
 	return r
+}
+
+// hasBodyServed is #176's cross-def context reuse: reports whether
+// name's full body has already been served via read(full:true) in
+// this session. Used to suppress a now-redundant outline() call --
+// outline's signature+doc+callers/callees is a strict subset of what
+// a full body read already includes, so re-deriving and
+// re-transmitting it would be pure waste. Only read(full:true) marks
+// this (see markBodyServed) -- a plain read() can be silently
+// downgraded to summary or auto-outline (#174/#184), so it is not a
+// reliable signal that the caller actually has the full body.
+func (c *respCache) hasBodyServed(sess *sdkmcp.ServerSession, name string) bool {
+	if sess == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sc := c.sessions[sess]
+	if sc == nil || sc.bodyServed == nil {
+		return false
+	}
+	return sc.bodyServed[name]
+}
+
+// markBodyServed records that name's full body was served this
+// session. Cleared by invalidate() alongside dedup entries -- any
+// write op means the def's shape could have changed.
+func (c *respCache) markBodyServed(sess *sdkmcp.ServerSession, name string) {
+	if sess == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sc := c.getSession(sess)
+	if sc.bodyServed == nil {
+		sc.bodyServed = map[string]bool{}
+	}
+	sc.bodyServed[name] = true
 }

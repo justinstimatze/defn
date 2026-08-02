@@ -743,6 +743,16 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if err != nil || result == nil || result.IsError || req == nil {
 			return
 		}
+		// #176: record before dedup potentially replaces result with a
+		// stub -- marking is driven by args (what was asked for), not
+		// by the final response bytes. Only an explicit full:true with
+		// no query is an unambiguous full-body serve: a plain read()
+		// can be silently downgraded to summary or auto-outline mode
+		// (#174/#184), and a query-filtered read elides statements, so
+		// neither is a reliable "the caller has everything" signal.
+		if args.Op == "read" && args.Full && strings.TrimSpace(args.Query) == "" {
+			s.respCache.markBodyServed(req.Session, args.Name)
+		}
 		if op, argKey, ok := dedupOpKey(args); ok {
 			result = s.respCache.dedup(req.Session, op, argKey, result)
 			return
@@ -993,6 +1003,20 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "retarget-field-value":
 		return s.handleRetargetFieldValue(ctx, req, args)
 	case "outline":
+		// #176: cross-def context reuse. If this def's full body was
+		// already served via read(full:true) this session, outline
+		// would return strictly less information (signature/doc/
+		// callers/callees, no body) -- skip re-deriving and
+		// re-transmitting it. Bypassed when a query is set: a
+		// query-filtered outline highlights different callees than a
+		// plain one, so it is not redundant even with the body in hand.
+		if req != nil && s.respCache != nil && strings.TrimSpace(args.Query) == "" && s.respCache.hasBodyServed(req.Session, args.Name) {
+			stub := fmt.Sprintf(
+				"[%s's full body was already read in this session (read with full:true) -- outline would return strictly less information (signature/doc/callers/callees, no body). Nothing new here. If the def may have changed since, call code(op:\"sync\") first.]\n",
+				args.Name,
+			)
+			return textResult(stub), nil, nil
+		}
 		return wrapStale(s.handleOutline(ctx, req, nameParam{Name: args.Name, Query: args.Query}))
 	case "slice":
 		return wrapStale(s.handleSlice(ctx, req, args))
