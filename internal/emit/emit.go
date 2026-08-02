@@ -164,6 +164,17 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, []
 		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 			return nil, nil, err
 		}
+		// #217: unlike emitModule's per-.go-file write below, project
+		// files have no merge logic at all -- this is a straight
+		// overwrite. Warn (mirroring the .go disk-drift warning) when
+		// disk no longer matches the DB's stored blob, since that means
+		// a manual edit (or an out-of-band tool write) is about to be
+		// silently clobbered. Full `defn ingest` (or code(op:"sync")
+		// without file:) re-reads go:embed/project files from disk and
+		// refreshes this row before that would happen.
+		if onDisk, rerr := os.ReadFile(dst); rerr == nil && !bytes.Equal(onDisk, []byte(content)) {
+			fmt.Fprintf(os.Stderr, "[emit] disk drift: %s changed on disk since defn last recorded it -- overwriting with the database's stored content; run a full `defn ingest` (or code(op:\"sync\") with no file:) first if this was a manual edit you want kept.\n", dst)
+		}
 		if err := os.WriteFile(dst, []byte(content), 0644); err != nil {
 			return nil, nil, fmt.Errorf("write %s: %w", pf, err)
 		}

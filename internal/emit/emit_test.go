@@ -1670,3 +1670,61 @@ func Bar() {}
 		t.Errorf("expected Foo's matched update to still land on disk despite Bar's mismatch:\n%s", onDisk)
 	}
 }
+
+// TestEmitProjectFileDiskDriftWarning is the #217 regression: emit's
+// project-files loop (go.mod, go.sum, and any go:embed-tracked file
+// like schema_sqlite.sql) does a straight overwrite with zero merge
+// logic and, before this fix, zero warning -- a manually-edited tracked
+// project file got silently reverted to the DB's stale blob on the
+// next unrelated mutation's auto-emit. This mirrors
+// TestEmitLogsDiskDriftWarning's .go-file disk-drift warning, applied
+// to the project-files write path.
+func TestEmitProjectFileDiskDriftWarning(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true,
+		Body: "func Foo() {}", SourceFile: "test.go",
+	})
+	if err := db.SetProjectFile("go.mod", "module example.com/test\n\ngo 1.22\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	outDir := t.TempDir()
+	// Disk has content that differs from the DB's stored project_files
+	// row -- simulates a manual edit to a tracked project file made
+	// outside defn, with no follow-up full ingest to refresh the row.
+	driftedGoMod := "module example.com/test\n\ngo 1.22\n\nrequire foo v1.0.0\n"
+	if err := os.WriteFile(filepath.Join(outDir, "go.mod"), []byte(driftedGoMod), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	origStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+
+	emitErr := Emit(db, outDir)
+
+	w.Close()
+	os.Stderr = origStderr
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+
+	if emitErr != nil {
+		t.Fatal(emitErr)
+	}
+	if !strings.Contains(buf.String(), "disk drift") {
+		t.Fatalf("expected disk-drift warning on stderr for clobbered project file, got: %q", buf.String())
+	}
+
+	// Document current behavior: #217 only asks for visibility, not a
+	// behavior change -- a fresh tempdir emit must still produce a
+	// buildable go.mod, so the DB's content still wins.
+	final, _ := os.ReadFile(filepath.Join(outDir, "go.mod"))
+	if strings.Contains(string(final), "require foo") {
+		t.Fatalf("expected DB content to overwrite drifted disk content, got:\n%s", final)
+	}
+}
