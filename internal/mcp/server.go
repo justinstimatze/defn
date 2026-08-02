@@ -290,9 +290,10 @@ func newMCPServer(ctx context.Context, database store.Backend, projDir string) (
 	// treats a nil explainClient as "co-processor unavailable, degrade
 	// gracefully", the same path already taken when ANTHROPIC_API_KEY is
 	// unset. DEFN_ASYNC_BACKFILL=0 is narrower: keeps on-demand ops
-	// available but skips the background per-def summary spend that
-	// otherwise fires automatically on every ingest, for a user who wants
-	// explain/context but not unprompted ingest-time spend.
+	// available but skips background spend that fires automatically
+	// without a user asking -- the per-def summary worker below, and
+	// (#200) the startup file/project narrative backfill -- for a user
+	// who wants explain/context but not unprompted background spend.
 	llmOpsDisabled := envDisabled("DEFN_LLM_OPS")
 	asyncBackfillDisabled := envDisabled("DEFN_ASYNC_BACKFILL")
 
@@ -342,6 +343,11 @@ func newMCPServer(ctx context.Context, database store.Backend, projDir string) (
 				}
 			}
 			s.ready.Store(true)
+			// #200: warm file/project narrative caches now that defs
+			// are stable, instead of waiting for the first overview()
+			// call to pay the LLM round-trip. No-op without a
+			// co-processor; see backfillNarratives.
+			s.backfillNarratives(ctx)
 		}()
 		go s.watchFiles(ctx)
 		go s.startGCTicker(ctx)
@@ -6912,4 +6918,51 @@ func mergeDefsByID(a, b []store.Definition) []store.Definition {
 		}
 	}
 	return out
+}
+
+// backfillNarratives is #200: extends #160's async-precompute pattern
+// to the file/project narratives #211/#212 shipped. Those are
+// generated synchronously on first overview() call at each scope --
+// this walks every source file plus the project scope once, right
+// after startup ingest/resolve completes, so the caches are warm
+// before any user-facing overview() call pays the LLM round-trip.
+// Reuses the real overview()/projectOverview() code paths (discarding
+// their returned results) rather than duplicating fileNarrative's
+// caching/threshold logic -- the side effect (populating
+// file_summaries / the project_narrative meta row) is the point.
+//
+// No-op when explainClient is nil (no ANTHROPIC_API_KEY) or when
+// DEFN_ASYNC_BACKFILL=0 (#201) -- that flag already means "skip
+// background LLM spend that fires automatically"; this is a second
+// instance of exactly that spend, not a new category needing its own
+// flag. Sequential, one file at a time, same conservative rationale
+// summary.Worker's stage-1 loop documents: this is backfill, not a
+// latency-sensitive path, so there is no pressure to parallelize API
+// round-trips.
+//
+// Directory/package-scope narratives reuse the identical fileNarrative
+// mechanism (handleOverview's file:"pkg/dir" branch) but aren't
+// backfilled here: unlike per-file scopes (bounded by file_sources) or
+// the single project scope, there's no existing enumeration of which
+// directory groupings are worth warming ahead of need -- left for a
+// follow-up rather than guessed at.
+func (s *server) backfillNarratives(ctx context.Context) {
+	if s.explainClient == nil || envDisabled("DEFN_ASYNC_BACKFILL") {
+		return
+	}
+
+	// Project-level: same side effect a real bare overview() call has.
+	s.projectOverview(ctx)
+
+	rows, err := s.backend.Query("SELECT DISTINCT source_file FROM file_sources")
+	if err != nil {
+		return
+	}
+	for _, row := range rows {
+		f, ok := row["source_file"].(string)
+		if !ok || f == "" {
+			continue
+		}
+		s.handleOverview(ctx, nil, codeParam{File: f})
+	}
 }
