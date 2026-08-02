@@ -1977,6 +1977,20 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 		return errResult(fmt.Errorf("new_body has syntax error: %v", parseErr))
 	}
 
+	// #222: edit must preserve identity. A new_body that declares a
+	// different name/receiver than d leaves d.Name/d.Receiver stale
+	// while the body says otherwise -- mergeDeclsIntoSource matches the
+	// on-disk decl by the (now-stale) d.Name and splices in the
+	// differently-named body, so the merged file ends up with no decl
+	// under the old name. That trips safeWriteGoFile's separate
+	// on-disk-decl-loss check and blocks the write for the WHOLE file,
+	// silently dragging down any other op batched alongside this one.
+	// Reject up front instead: op:"edit" changes content, op:"rename"
+	// changes identity.
+	if newName, _, newReceiver, _ := s.inferFromBody(args.NewBody); newName != "" && (newName != d.Name || newReceiver != d.Receiver) {
+		return errResult(fmt.Errorf("edit %s%s: new_body declares %s%s, which changes its name/receiver — use code(op:\"rename\") to rename a definition; op:\"edit\" only changes body content", formatReceiver(d.Receiver), d.Name, formatReceiver(newReceiver), newName))
+	}
+
 	// Capture the pre-edit signature so we can decide whether the build
 	// gate is safely skippable (#148: body-only edit with a stable
 	// signature keeps dispatch invariant — callers don't need re-typecheck).
@@ -3167,6 +3181,12 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		if _, parseErr := parser.ParseFile(token.NewFileSet(), "", validSrc, parser.ParseComments); parseErr != nil {
 			return "", fmt.Sprintf("%s %s: produces invalid Go: %v", op.Op, name, parseErr)
 		}
+		// #222: same identity-preserving guard as the "edit" case above —
+		// see its comment for the full mergeDeclsIntoSource/safeWriteGoFile
+		// rationale.
+		if newName, _, newReceiver, _ := s.inferFromBody(newBody); newName != "" && (newName != d.Name || newReceiver != d.Receiver) {
+			return "", fmt.Sprintf("%s %s: new_body declares %s%s, which changes its name/receiver — use op:\"rename\" instead; this op only changes body content", op.Op, name, formatReceiver(newReceiver), newName)
+		}
 		d.Body = newBody
 		d.Signature = extractSignature(newBody)
 		if _, err := tx.UpsertDefinition(d); err != nil {
@@ -3263,6 +3283,18 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			validSrc := "package x\n" + d.Body
 			if _, parseErr := parser.ParseFile(token.NewFileSet(), "", validSrc, parser.ParseComments); parseErr != nil {
 				errors = append(errors, fmt.Sprintf("edit %s: produces invalid Go: %v", op.Name, parseErr))
+				continue
+			}
+			// #222: edit must preserve identity -- see handleEdit's identical
+			// check for the full rationale. A body that renames the decl
+			// without going through op:"rename" leaves d.Name stale, which
+			// makes mergeDeclsIntoSource splice a differently-named body
+			// under the old key; the merged file then has no decl under
+			// that old name, tripping safeWriteGoFile's on-disk-decl-loss
+			// check and blocking the write for the WHOLE file -- including
+			// any other op batched alongside this edit.
+			if newName, _, newReceiver, _ := s.inferFromBody(d.Body); newName != "" && (newName != d.Name || newReceiver != d.Receiver) {
+				errors = append(errors, fmt.Sprintf("edit %s: new_body declares %s%s, which changes its name/receiver — use op:\"rename\" instead; op:\"edit\" only changes body content", op.Name, formatReceiver(newReceiver), newName))
 				continue
 			}
 			d.Signature = extractSignature(d.Body)
@@ -6383,6 +6415,17 @@ func (s *server) applyEditTerse(session *sdkmcp.ServerSession, name, action, sni
 	src := "package x\n" + newBody
 	if _, parseErr := parser.ParseFile(token.NewFileSet(), "", src, parser.ParseComments); parseErr != nil {
 		return errResult(fmt.Errorf("new_body has syntax error: %v", parseErr))
+	}
+	// #222: same identity-preserving guard as handleEdit. A projection op
+	// (replace-hunk, replace-slice, etc.) can technically produce a body
+	// whose signature line declares a different name/receiver -- e.g. a
+	// replace-hunk targeting the "func Foo(...)" line itself. That would
+	// leave d.Name stale exactly like the edit-path bug: mergeDeclsIntoSource
+	// splices the differently-named body under the old key, the merged file
+	// ends up with no decl under the old name, and safeWriteGoFile's
+	// on-disk-decl-loss check silently blocks the write.
+	if newName, _, newReceiver, _ := s.inferFromBody(newBody); newName != "" && (newName != d.Name || newReceiver != d.Receiver) {
+		return errResult(fmt.Errorf("%s%s: new_body declares %s%s, which changes its name/receiver — use code(op:\"rename\") to rename a definition; this op only changes body content", formatReceiver(d.Receiver), d.Name, formatReceiver(newReceiver), newName))
 	}
 	d.Body = newBody
 	d.Signature = extractSignature(newBody)

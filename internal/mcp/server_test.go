@@ -3561,3 +3561,135 @@ func main() {}
 		t.Errorf("expected (*LLM).Reconsider to remain untouched, got:\n%s", src)
 	}
 }
+
+// TestHandleApply_EditRejectsIdentityChangeInBody is the #222
+// regression: an "edit" op whose new_body declares a different
+// function name than the def being edited (a rename attempted via
+// edit instead of op:"rename") left the DB's Name field stale while
+// the body said otherwise. mergeDeclsIntoSource matched the on-disk
+// decl by the stale Name and spliced in the differently-named body;
+// the resulting file then had no decl under the old name, which
+// tripped safeWriteGoFile's on-disk-decl-loss check and silently
+// blocked the write for the WHOLE file -- including an unrelated
+// "create" op batched in the same apply call. The fix rejects an
+// identity-changing edit up front, before any DB write, so the whole
+// batch cleanly rolls back with an actionable error instead of landing
+// a desynced DB/disk state.
+func TestHandleApply_EditRejectsIdentityChangeInBody(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main_test.go"), []byte("package testproj\n\nimport \"testing\"\n\nfunc TestOldName(t *testing.T) {\n\tt.Log(\"old\")\n}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package testproj\n\nfunc main() {}\n"), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{
+				Op:      "edit",
+				Name:    "TestOldName",
+				NewBody: "func TestNewName(t *testing.T) {\n\tt.Log(\"new\")\n}",
+			},
+			{
+				Op:   "create",
+				File: "main_test.go",
+				Body: "func TestBrandNew(t *testing.T) {\n\tt.Log(\"brand new\")\n}",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleApply: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "use op:\"rename\"") {
+		t.Fatalf("expected identity-change rejection pointing at op:\"rename\", got: %s", text)
+	}
+	if !strings.Contains(text, "rolled back") {
+		t.Fatalf("expected the whole batch to roll back, got: %s", text)
+	}
+
+	// Neither the identity-changing edit NOR the unrelated batched
+	// create should have landed -- a clean all-or-nothing rejection,
+	// not a partial DB/disk desync.
+	final, ferr := os.ReadFile(filepath.Join(projDir, "main_test.go"))
+	if ferr != nil {
+		t.Fatalf("read main_test.go: %v", ferr)
+	}
+	src := string(final)
+	if !strings.Contains(src, "TestOldName") {
+		t.Errorf("expected TestOldName to remain untouched on disk, got:\n%s", src)
+	}
+	if strings.Contains(src, "TestNewName") || strings.Contains(src, "TestBrandNew") {
+		t.Errorf("expected neither TestNewName nor TestBrandNew to land (whole batch rejected), got:\n%s", src)
+	}
+	if _, err := db.GetDefinitionByName("TestBrandNew", ""); err == nil {
+		t.Errorf("expected TestBrandNew to NOT exist in the DB (transaction rolled back)")
+	}
+}
+
+// TestHandleEdit_RejectsIdentityChangeInBody is the singleton-path half
+// of the #222 fix: op:"edit" must reject a new_body that renames the
+// def (same root cause as TestHandleApply_EditRejectsIdentityChangeInBody),
+// pointing the caller at op:"rename" instead of silently landing a
+// stale Name in the DB.
+func TestHandleEdit_RejectsIdentityChangeInBody(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main_test.go"), []byte("package testproj\n\nimport \"testing\"\n\nfunc TestOldName(t *testing.T) {\n\tt.Log(\"old\")\n}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package testproj\n\nfunc main() {}\n"), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleEdit(context.Background(), nil, editParam{
+		Name:    "TestOldName",
+		NewBody: "func TestNewName(t *testing.T) {\n\tt.Log(\"new\")\n}",
+	})
+	if err != nil {
+		t.Fatalf("handleEdit: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "use code(op:\"rename\")") {
+		t.Fatalf("expected identity-change rejection pointing at op:\"rename\", got: %s", text)
+	}
+
+	final, ferr := os.ReadFile(filepath.Join(projDir, "main_test.go"))
+	if ferr != nil {
+		t.Fatalf("read main_test.go: %v", ferr)
+	}
+	src := string(final)
+	if !strings.Contains(src, "TestOldName") || strings.Contains(src, "TestNewName") {
+		t.Errorf("expected TestOldName to remain untouched, got:\n%s", src)
+	}
+}
