@@ -3412,3 +3412,87 @@ func main() {}
 		t.Errorf("expected (*Agent).Reconsider to remain untouched, got:\n%s", src)
 	}
 }
+
+// TestHandleAddImport_LandsOnDisk is the #221 regression: previously
+// add-import only updated the DB's per-module imports table and
+// reported "added import" success, but mergeDeclsIntoSource's
+// AST-merge path never touches import blocks at all -- unless
+// something else forced a full regen, the import never actually
+// reached disk despite the success message. The fix patches the
+// file's real source directly via projection.AddImport.
+func TestHandleAddImport_LandsOnDisk(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleAddImport(context.Background(), nil, codeParam{
+		File:       "main.go",
+		ImportPath: "hash/fnv",
+	})
+	if err != nil {
+		t.Fatalf("handleAddImport: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "added import") {
+		t.Errorf("expected 'added import' in response, got: %s", text)
+	}
+
+	final, ferr := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if ferr != nil {
+		t.Fatalf("read main.go: %v", ferr)
+	}
+	if !strings.Contains(string(final), "\"hash/fnv\"") {
+		t.Errorf("expected hash/fnv import to land on disk, got:\n%s", final)
+	}
+}
+
+// TestHandleAddImport_NoFalsePositiveAlreadyPresent is the other half
+// of #221: gemot-2847127 reported add-import falsely reporting
+// "already present (no-op)" for an import that was NOT actually in the
+// file, because presence was checked against the DB's per-module
+// imports table (a union shared by every file in the package, never
+// refreshed by an incremental code(op:"sync")) rather than the file
+// itself. Seed the DB's imports table with an import for THIS module
+// that the target file does not actually have, and confirm add-import
+// still adds it instead of reporting a false no-op.
+func TestHandleAddImport_NoFalsePositiveAlreadyPresent(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	d, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatalf("GetDefinitionByName Greet: %v", err)
+	}
+	// Simulate a stale per-module imports row: the DB thinks "math" is
+	// already imported somewhere in this module, but main.go on disk
+	// does not actually have it.
+	if err := db.SetImports(d.ModuleID, []store.Import{{ModuleID: d.ModuleID, ImportedPath: "math"}}); err != nil {
+		t.Fatalf("seed stale imports: %v", err)
+	}
+
+	result, _, err := s.handleAddImport(context.Background(), nil, codeParam{
+		File:       "main.go",
+		ImportPath: "math",
+	})
+	if err != nil {
+		t.Fatalf("handleAddImport: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "already present") {
+		t.Errorf("false positive: reported already present despite math not being in main.go, got: %s", text)
+	}
+	if !strings.Contains(text, "added import") {
+		t.Errorf("expected 'added import', got: %s", text)
+	}
+
+	final, ferr := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if ferr != nil {
+		t.Fatalf("read main.go: %v", ferr)
+	}
+	if !strings.Contains(string(final), "\"math\"") {
+		t.Errorf("expected math import to land on disk, got:\n%s", final)
+	}
+}

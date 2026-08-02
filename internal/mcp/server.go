@@ -6032,13 +6032,25 @@ func (s *server) handleInsertPrecondition(_ context.Context, req *sdkmcp.CallToo
 	return s.applyEditTerse(sessionOf(req), name, "inserted precondition at entry", snippet, newBody)
 }
 
-// handleAddImport adds a new import (with optional alias) to the module
-// that owns the given file. The projection package hosts the pure
-// AddImport function for testing over file source; defn's on-disk
-// projection is regenerated via the normal emit path so goimports
-// handles per-group placement.
+// handleAddImport adds a new import (with optional alias) to the given
+// file directly, via the pure projection.AddImport function operating
+// on the file's actual current source -- not via the DB's per-module
+// imports table.
 //
-// Idempotent: adding an already-present (path, alias) is a no-op.
+// #221: the previous implementation checked presence against
+// db.GetImports(moduleID), which is a per-MODULE union (every file in
+// a package shares one row set) that code(op:"sync")'s incremental
+// path never refreshes. That produced false "already present" no-ops
+// reported by gemot-2847127: the check said present when the specific
+// file didn't have it (stale from another file in the package, or from
+// before an edit removed it), and separately the add itself never
+// reliably reached disk anyway -- mergeDeclsIntoSource's AST-merge path
+// doesn't touch import blocks at all, so unless something else forced a
+// full regen, "added import" was reported while the file was
+// unchanged. Patching the file's real source directly with
+// projection.AddImport (idempotent, goimports-canonical grouping)
+// fixes both: presence is now checked against the file itself, and the
+// write actually lands.
 //
 // If args.File is empty, tries to infer the target: if the DB has exactly
 // one non-test .go file, uses it; otherwise errors with the candidate
@@ -6086,25 +6098,81 @@ func (s *server) handleAddImport(_ context.Context, _ *sdkmcp.CallToolRequest, a
 		return errResult(fmt.Errorf("add-import: no definitions found in file %q — cannot resolve module", file))
 	}
 	moduleID := defs[0].ModuleID
+
+	// #221 safety: no projectDir means there's no real file tree to
+	// write to (Measure*/unit-test-style server construction, or
+	// DEFN_LEGACY read-only mode) -- os.ReadFile/WriteFile below must
+	// never run against a bare relative path in that case, since it
+	// would resolve against the process's CWD instead of a project
+	// root. Fall back to the DB's raw source purely to compute the
+	// idempotency check; there is nothing to write to disk.
+	var fileSrc []byte
+	if s.projectDir != "" {
+		diskPath := filepath.Join(s.projectDir, file)
+		data, rerr := os.ReadFile(diskPath)
+		if rerr != nil {
+			// Fall back to the DB's raw source (fresh emit to a
+			// not-yet-materialized dir) -- mirrors writeFile's own
+			// merge-base preference.
+			raw, rawErr := s.backend.GetFileSource(moduleID, file)
+			if rawErr != nil || raw == "" {
+				return errResult(fmt.Errorf("add-import: read %s: %w", file, rerr))
+			}
+			data = []byte(raw)
+		}
+		fileSrc = data
+	} else {
+		raw, rawErr := s.backend.GetFileSource(moduleID, file)
+		if rawErr != nil || raw == "" {
+			return errResult(fmt.Errorf("add-import: read %s: no projectDir and no file_sources entry", file))
+		}
+		fileSrc = []byte(raw)
+	}
+	updatedSrc, aerr := projection.AddImport(string(fileSrc), args.ImportPath, args.Alias)
+	if aerr != nil {
+		return errResult(fmt.Errorf("add-import: %w", aerr))
+	}
+	if updatedSrc == string(fileSrc) {
+		return textResult(fmt.Sprintf("%s: import %q already present (no-op)\n", file, args.ImportPath)), nil, nil
+	}
+
+	// Keep the DB's per-module imports table in sync too, so a later
+	// full regen (or another file in the same package) sees this import
+	// as part of the module's known set.
 	existing, err := s.backend.GetImports(moduleID)
 	if err != nil {
 		return errResult(fmt.Errorf("add-import: read imports: %w", err))
 	}
+	alreadyInDB := false
 	for _, imp := range existing {
 		if imp.ImportedPath == args.ImportPath && imp.Alias == args.Alias {
-			return textResult(fmt.Sprintf("%s: import %q already present (no-op)\n", file, args.ImportPath)), nil, nil
+			alreadyInDB = true
+			break
 		}
 	}
-	updated := append(existing, store.Import{
-		ModuleID:     moduleID,
-		ImportedPath: args.ImportPath,
-		Alias:        args.Alias,
-	})
-	if err := s.backend.SetImports(moduleID, updated); err != nil {
-		return errResult(fmt.Errorf("add-import: set imports: %w", err))
+	if !alreadyInDB {
+		updated := append(existing, store.Import{
+			ModuleID:     moduleID,
+			ImportedPath: args.ImportPath,
+			Alias:        args.Alias,
+		})
+		if err := s.backend.SetImports(moduleID, updated); err != nil {
+			return errResult(fmt.Errorf("add-import: set imports: %w", err))
+		}
 	}
-	// #148: adding an import is dispatch-safe by construction — skip build.
-	buildResult := s.autoEmitOnly(file)
+
+	if s.projectDir != "" {
+		if err := os.WriteFile(filepath.Join(s.projectDir, file), []byte(updatedSrc), 0644); err != nil {
+			return errResult(fmt.Errorf("add-import: write %s: %w", file, err))
+		}
+	}
+	// Best effort: file_sources is a merge-base cache, not the source of
+	// truth (disk is, when projectDir is set). A failure here shouldn't
+	// report the whole op as failed when the actual file write above
+	// already succeeded -- the next call that needs a merge base falls
+	// back to reading disk directly anyway.
+	_ = s.backend.SetFileSource(moduleID, file, updatedSrc)
+
 	snippet := fmt.Sprintf("import %q", args.ImportPath)
 	if args.Alias != "" {
 		snippet = fmt.Sprintf("import %s %q", args.Alias, args.ImportPath)
@@ -6114,15 +6182,6 @@ func (s *server) handleAddImport(_ context.Context, _ *sdkmcp.CallToolRequest, a
 	sb.WriteString(": added import\n    ")
 	sb.WriteString(snippet)
 	sb.WriteString("\n")
-	if buildResult != "" {
-		firstLine := buildResult
-		if idx := strings.Index(buildResult, "\n"); idx > 0 {
-			firstLine = buildResult[:idx]
-		}
-		sb.WriteString("build: ")
-		sb.WriteString(strings.ToLower(firstLine))
-		sb.WriteString("\n")
-	}
 	return textResult(sb.String()), nil, nil
 }
 
