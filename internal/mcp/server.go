@@ -448,6 +448,7 @@ type codeParam struct {
 	Query       string           `json:"query,omitempty"`    // #153: query-adaptive read — keep only body branches touching the query
 	Mode        string           `json:"mode,omitempty"`     // #160: "summary" returns model-generated one-line intent instead of body
 	Question    string           `json:"question,omitempty"` // #186: natural-language question for op:"explain" co-processor
+	Plan        string           `json:"plan,omitempty"`     // #187/#188/#189: trajectory plan text for op:"plan-dsl" / op:"plan-sexpr"
 }
 
 // applyOp is one operation inside an apply batch. Only Op is
@@ -962,6 +963,10 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if r, o, e := need(args.Out, "out"); r != nil {
 			return r, o, e
 		}
+	case "plan-dsl", "plan-sexpr":
+		if r, o, e := need(args.Plan, "plan"); r != nil {
+			return r, o, e
+		}
 	}
 
 	// Tag results from read-only ops while startup ingest is still running.
@@ -1119,6 +1124,10 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return s.handleFileDefs(ctx, req, args)
 	case "expand":
 		return wrapStale(s.handleExpand(ctx, req, args))
+	case "plan-dsl":
+		return wrapStale(s.handlePlanDSL(ctx, req, args))
+	case "plan-sexpr":
+		return wrapStale(s.handlePlanSExpr(ctx, req, args))
 	case "read-file":
 		return wrapStale(s.handleReadFile(ctx, req, args))
 	case "validate-plan":
@@ -1134,7 +1143,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "gc":
 		return s.handleGC(ctx, req, args)
 	default:
-		return errResult(fmt.Errorf("unknown op %q — valid: read, read-and-verify, outline, slice, insert-precondition, replace-slice, replace-hunk, wrap-in-defer, rename-param, add-import, search, impact, explain, context, similar, untested, edit, create, delete, retarget-field-value, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc, resummarize", args.Op))
+		return errResult(fmt.Errorf("unknown op %q — valid: read, read-and-verify, outline, slice, insert-precondition, replace-slice, replace-hunk, wrap-in-defer, rename-param, add-import, search, impact, explain, context, similar, untested, edit, create, delete, retarget-field-value, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc, resummarize, plan-dsl, plan-sexpr", args.Op))
 	}
 }
 
