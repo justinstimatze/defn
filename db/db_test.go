@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -82,5 +83,56 @@ func TestSetMetaRequiresNamespacePrefix(t *testing.T) {
 	// can still observe defn's own metadata.
 	if _, err := d.GetMeta("last_ingest"); err != nil {
 		t.Errorf("GetMeta on defn-managed key failed: %v", err)
+	}
+}
+
+// TestSyncIngestsProjectDir covers the #winze-migration ask: an embedder
+// should be able to build/refresh a .defn database in-process, with no
+// defn CLI binary involved. Sync(dir) on a fresh DB should populate
+// definitions from the module at dir, queryable immediately after.
+func TestSyncIngestsProjectDir(t *testing.T) {
+	modDir := t.TempDir()
+	src := `package greet
+
+func Hello(name string) string { return "hello " + name }
+`
+	if err := os.WriteFile(filepath.Join(modDir, "go.mod"), []byte("module example.com/greet\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(modDir, "greet.go"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dbDir := t.TempDir()
+	d, err := Open(filepath.Join(dbDir, ".defn"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	if err := d.Sync(modDir); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	defs, err := d.Definitions(DefinitionFilter{Name: "Hello"})
+	if err != nil {
+		t.Fatalf("Definitions: %v", err)
+	}
+	if len(defs) != 1 {
+		t.Fatalf("expected 1 def named Hello after Sync, got %d: %+v", len(defs), defs)
+	}
+	if defs[0].Kind != "function" {
+		t.Errorf("Hello kind = %q, want %q", defs[0].Kind, "function")
+	}
+
+	// last_ingest meta should be set so a future Sync could offer an
+	// incremental path (not yet implemented, but the DB-side signal
+	// this relies on must already be correct).
+	lastIngest, err := d.GetMeta("last_ingest")
+	if err != nil {
+		t.Fatalf("GetMeta last_ingest: %v", err)
+	}
+	if lastIngest == "" {
+		t.Error("expected last_ingest meta to be set after Sync")
 	}
 }

@@ -24,6 +24,9 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/justinstimatze/defn/internal/goload"
+	"github.com/justinstimatze/defn/internal/ingest"
+	"github.com/justinstimatze/defn/internal/resolve"
 	"github.com/justinstimatze/defn/internal/store"
 )
 
@@ -383,4 +386,28 @@ func convertDefs(defs []store.Definition) []Definition {
 		out[i] = convertDef(d)
 	}
 	return out
+}
+
+// Sync ingests projectDir into the database in-process, letting an
+// embedder build or refresh a .defn database without shelling out to
+// the defn CLI binary. Always does a full re-ingest (packages.Load +
+// IngestPackages + ResolvePackages) -- the same non-incremental path
+// cmdIngest falls back to on a cold DB. No incremental fast path yet;
+// that machinery is CLI-internal (cmd/defn's incrementalPreflight/
+// applyIncrementalIngest) and worth extracting only once an embedder
+// with a corpus large enough to need it shows up.
+func (db *DB) Sync(projectDir string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	pkgs, err := goload.LoadAll(projectDir)
+	if err != nil {
+		return fmt.Errorf("load packages: %w", err)
+	}
+	if err := ingest.IngestPackages(db.s, pkgs, projectDir); err != nil {
+		return fmt.Errorf("ingest: %w", err)
+	}
+	if err := resolve.ResolvePackages(db.s, pkgs, projectDir); err != nil {
+		return fmt.Errorf("resolve: %w", err)
+	}
+	return nil
 }
