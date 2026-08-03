@@ -3693,3 +3693,158 @@ func TestHandleEdit_RejectsIdentityChangeInBody(t *testing.T) {
 		t.Errorf("expected TestOldName to remain untouched, got:\n%s", src)
 	}
 }
+
+// TestHandleApply_ReplaceHunkBatchRollsBackOnLaterFailure probes #229:
+// the exact repro shape reported from real usage -- multiple
+// replace-hunk ops followed by a later op that fails (a multi-decl
+// create body, which handleApply rejects before ever touching the
+// DB). If the batch is truly atomic, NEITHER replace-hunk's write may
+// be visible after the reported rollback, regardless of position in
+// the batch (the field report specifically saw an interior op survive
+// while its neighbors correctly rolled back).
+func TestHandleApply_ReplaceHunkBatchRollsBackOnLaterFailure(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	greetBefore, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatalf("setup: Greet not found: %v", err)
+	}
+	farewellBefore, err := db.GetDefinitionByName("Farewell", "")
+	if err != nil {
+		t.Fatalf("setup: Farewell not found: %v", err)
+	}
+	greetOriginalBody := greetBefore.Body
+	farewellOriginalBody := farewellBefore.Body
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "replace-hunk", Name: "Greet", Old: `return "Hello, " + name`, New: `return "HELLO, " + name`},
+			{Op: "replace-hunk", Name: "Farewell", Old: `Greet(name) + " and goodbye"`, New: `Greet(name) + " and farewell"`},
+			{Op: "create", Body: "func A() {}\nfunc B() {}"},
+		},
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "rolled back") {
+		t.Fatalf("expected the batch to report rollback, got: %s", text)
+	}
+
+	greetAfter, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatalf("Greet vanished after failed batch: %v", err)
+	}
+	if greetAfter.Body != greetOriginalBody {
+		t.Errorf("#229: Greet's DB body changed to %q despite the batch failing overall (was %q)", greetAfter.Body, greetOriginalBody)
+	}
+
+	farewellAfter, err := db.GetDefinitionByName("Farewell", "")
+	if err != nil {
+		t.Fatalf("Farewell vanished after failed batch: %v", err)
+	}
+	if farewellAfter.Body != farewellOriginalBody {
+		t.Errorf("#229: Farewell's DB body changed to %q despite the batch failing overall (was %q)", farewellAfter.Body, farewellOriginalBody)
+	}
+}
+
+// TestHandleApply_SameDefMultiHunkChainRollsBackOnLaterFailure probes
+// #229's likely actual shape more closely than the independent-def
+// variant above: the field report described 4 replace-hunk ops
+// inserting distinct case clauses into the SAME switch (i.e. the SAME
+// def's body, edited incrementally, each hunk depending on the
+// previous op's write within the batch's tx) followed by a failing
+// create. If tx-scoped read-your-own-writes visibility isn't fully
+// undone by rollback for some reason, an interior hunk in this chain
+// is the shape most likely to expose it.
+func TestHandleApply_SameDefMultiHunkChainRollsBackOnLaterFailure(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	before, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatalf("setup: Greet not found: %v", err)
+	}
+	originalBody := before.Body
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "replace-hunk", Name: "Greet", Old: `return "Hello, " + name`, New: "step1 := \"Hello, \" + name\n\treturn step1"},
+			{Op: "replace-hunk", Name: "Greet", Old: `step1 := "Hello, " + name`, New: `step2 := "Hello, " + name`},
+			{Op: "replace-hunk", Name: "Greet", Old: `step2 := "Hello, " + name`, New: `step3 := "Hello, " + name`},
+			{Op: "replace-hunk", Name: "Greet", Old: `step3 := "Hello, " + name`, New: `step4 := "Hello, " + name`},
+			{Op: "create", Body: "func A() {}\nfunc B() {}"},
+		},
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "rolled back") {
+		t.Fatalf("expected the batch to report rollback, got: %s", text)
+	}
+
+	after, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatalf("Greet vanished after failed batch: %v", err)
+	}
+	if after.Body != originalBody {
+		t.Errorf("#229: Greet's DB body changed to %q despite the batch failing overall (was %q)", after.Body, originalBody)
+	}
+}
+
+// TestHandleCreateFallsBackToModuleWhenFileUnresolved fixes #225:
+// handleCreate used to return "file %q does not map to any known
+// module" immediately whenever file: didn't resolve to a module,
+// even when the caller explicitly passed module: as a fallback —
+// making it impossible to scaffold the first file in a brand-new
+// package directory via the normal MCP path. file: naming a
+// not-yet-existing directory (no prior .go files there, so
+// findModuleByFile has nothing to match) combined with an explicit
+// module: naming an already-known module must now succeed, with the
+// new def's SourceFile set to the requested (new) path.
+func TestHandleCreateFallsBackToModuleWhenFileUnresolved(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body:   "func NewPkgFunc() int { return 1 }",
+		File:   "internal/newpkg/x.go",
+		Module: "testproj",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Created") {
+		t.Fatalf("expected 'Created', got: %s", text)
+	}
+
+	d, err := db.GetDefinitionByName("NewPkgFunc", "")
+	if err != nil {
+		t.Fatalf("def not found: %v", err)
+	}
+	if d.SourceFile != "internal/newpkg/x.go" {
+		t.Errorf("SourceFile = %q, want %q", d.SourceFile, "internal/newpkg/x.go")
+	}
+}
+
+// TestHandleCreateStillErrorsWhenNeitherFileNorModuleResolve guards the
+// #225 fix's error path: if file: doesn't resolve AND the caller's
+// module: also doesn't exist, this must still fail loudly rather than
+// silently falling through to "first module found".
+func TestHandleCreateStillErrorsWhenNeitherFileNorModuleResolve(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body:   "func NewPkgFunc() int { return 1 }",
+		File:   "internal/newpkg/x.go",
+		Module: "does-not-exist",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "not found") {
+		t.Fatalf("expected a module-not-found error, got: %s", text)
+	}
+	if _, err := db.GetDefinitionByName("NewPkgFunc", ""); err == nil {
+		t.Fatal("NewPkgFunc should not have been created")
+	}
+}

@@ -2721,15 +2721,15 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	var mod *store.Module
 	if args.File != "" {
 		mod = s.findModuleByFile(args.File)
-		if mod == nil {
-			return errResult(fmt.Errorf("file %q does not map to any known module — run defn ingest first, or pass module: explicitly", args.File))
-		}
 	}
 	if mod == nil && args.Module != "" {
 		mod = s.findModule(args.Module)
 		if mod == nil {
 			return errResult(fmt.Errorf("module %q not found", args.Module))
 		}
+	}
+	if mod == nil && args.File != "" {
+		return errResult(fmt.Errorf("file %q does not map to any known module — run defn ingest first, or pass module: explicitly", args.File))
 	}
 	if mod == nil {
 		mods, _ := s.backend.ListModules() // best effort — nil is safe
