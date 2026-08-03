@@ -6932,31 +6932,30 @@ func mergeDefsByID(a, b []store.Definition) []store.Definition {
 }
 
 // backfillNarratives is #200: extends #160's async-precompute pattern
-// to the file/project narratives #211/#212 shipped. Those are
-// generated synchronously on first overview() call at each scope --
-// this walks every source file plus the project scope once, right
-// after startup ingest/resolve completes, so the caches are warm
-// before any user-facing overview() call pays the LLM round-trip.
-// Reuses the real overview()/projectOverview() code paths (discarding
-// their returned results) rather than duplicating fileNarrative's
-// caching/threshold logic -- the side effect (populating
-// file_summaries / the project_narrative meta row) is the point.
+// to the file/project narratives #211/#212 shipped, and #234: also
+// warms directory/package-scope narratives, reusing the identical
+// handleOverview(file:"pkg/dir") path -- derived from each source
+// file's parent directory (deduped) rather than guessed at, since
+// that's the exact enumeration #212 validation found the model calls
+// far more often than per-file scopes. Those are generated
+// synchronously on first overview() call at each scope -- this walks
+// every source file, its parent directory, and the project scope
+// once, right after startup ingest/resolve completes, so the caches
+// are warm before any user-facing overview() call pays the LLM
+// round-trip. Reuses the real overview()/projectOverview() code paths
+// (discarding their returned results) rather than duplicating
+// fileNarrative's caching/threshold logic -- the side effect
+// (populating file_summaries / the project_narrative meta row) is the
+// point.
 //
 // No-op when explainClient is nil (no ANTHROPIC_API_KEY) or when
 // DEFN_ASYNC_BACKFILL=0 (#201) -- that flag already means "skip
 // background LLM spend that fires automatically"; this is a second
 // instance of exactly that spend, not a new category needing its own
-// flag. Sequential, one file at a time, same conservative rationale
-// summary.Worker's stage-1 loop documents: this is backfill, not a
-// latency-sensitive path, so there is no pressure to parallelize API
-// round-trips.
-//
-// Directory/package-scope narratives reuse the identical fileNarrative
-// mechanism (handleOverview's file:"pkg/dir" branch) but aren't
-// backfilled here: unlike per-file scopes (bounded by file_sources) or
-// the single project scope, there's no existing enumeration of which
-// directory groupings are worth warming ahead of need -- left for a
-// follow-up rather than guessed at.
+// flag. Sequential, one file/dir at a time, same conservative
+// rationale summary.Worker's stage-1 loop documents: this is
+// backfill, not a latency-sensitive path, so there is no pressure to
+// parallelize API round-trips.
 func (s *server) backfillNarratives(ctx context.Context) {
 	if s.explainClient == nil || envDisabled("DEFN_ASYNC_BACKFILL") {
 		return
@@ -6969,12 +6968,19 @@ func (s *server) backfillNarratives(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	dirs := map[string]bool{}
 	for _, row := range rows {
 		f, ok := row["source_file"].(string)
 		if !ok || f == "" {
 			continue
 		}
 		s.handleOverview(ctx, nil, codeParam{File: f})
+		if idx := strings.LastIndex(f, "/"); idx >= 0 {
+			dirs[f[:idx]] = true
+		}
+	}
+	for dir := range dirs {
+		s.handleOverview(ctx, nil, codeParam{File: dir})
 	}
 }
 
