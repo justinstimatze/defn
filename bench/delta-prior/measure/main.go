@@ -2,9 +2,10 @@
 //
 // Reads a curated list of target symbols from an ingested project DB.
 // For each symbol, records three sizes:
-//   files_bytes  — whole file containing the symbol (files-mode Read equivalent)
-//   full_bytes   — defn's current body-in-fence rendering (defn-natural)
-//   compact_bytes — the sig+doc+provenance-tag form (defn-D active)
+//
+//	files_bytes  — whole file containing the symbol (files-mode Read equivalent)
+//	full_bytes   — defn's current body-in-fence rendering (defn-natural)
+//	compact_bytes — the sig+doc+provenance-tag form (defn-D active)
 //
 // Compact size is computed from the same template shape as renderUpstreamMatch
 // in internal/mcp/server.go. If that template changes, this measurement drifts.
@@ -253,7 +254,7 @@ func fatal(err error) {
 	os.Exit(1)
 }
 
-func itoa(n int) string    { return fmt.Sprintf("%d", n) }
+func itoa(n int) string     { return fmt.Sprintf("%d", n) }
 func ftoa(f float64) string { return fmt.Sprintf("%.1f", f) }
 func ftoaRatio(num, denom int) string {
 	if denom == 0 {

@@ -264,7 +264,7 @@ func runSizeSweepBench(defnBin string, samples int, csvPath string, sizesOverrid
 				name:            fmt.Sprintf("rename-param-loc-%d", size),
 				fixtureFile:     fmt.Sprintf("sweep_%d.go", size),
 				fixtureContents: fixtureContents,
-				prompt: fmt.Sprintf(`In the file sweep_%d.go, rename the parameter "data" to "payload" in the Process function — throughout the signature and body. Do not rename "verbose" or any other identifier. Do not touch any other function. Do not change any behavior.`, size),
+				prompt:          fmt.Sprintf(`In the file sweep_%d.go, rename the parameter "data" to "payload" in the Process function — throughout the signature and body. Do not rename "verbose" or any other identifier. Do not touch any other function. Do not change any behavior.`, size),
 				mustContain: []string{
 					`payload []byte`,
 					`len(payload)`,

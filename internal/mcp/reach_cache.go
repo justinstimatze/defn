@@ -26,8 +26,8 @@ import (
 )
 
 type reachCache struct {
-	mu       sync.RWMutex
-	built    bool
+	mu    sync.RWMutex
+	built bool
 	// revRefs[to_def] = list of from_defs that reference it (i.e., callers).
 	// Not including edge kind — impact walks structural back-edges
 	// regardless of ref kind for compatibility with GetImpact.

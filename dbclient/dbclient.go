@@ -212,14 +212,14 @@ func (c *Client) Search(query string) ([]Definition, error) {
 // Schema table names — exported for consumers writing raw SQL via Query().
 const (
 	TableDefinitions  = "definitions"
-	TableBodies       = "bodies"       // def_id, body TEXT
-	TableRefs         = "refs"         // from_def, to_def, kind
-	TableModules      = "modules"      // id, path, name, doc
-	TableImports      = "imports"      // module_id, import_path
-	TableLiterals     = "literals"     // def_id, type_name, field, value
-	TablePragmas      = "pragmas"      // def_id, key, value
+	TableBodies       = "bodies"        // def_id, body TEXT
+	TableRefs         = "refs"          // from_def, to_def, kind
+	TableModules      = "modules"       // id, path, name, doc
+	TableImports      = "imports"       // module_id, import_path
+	TableLiterals     = "literals"      // def_id, type_name, field, value
+	TablePragmas      = "pragmas"       // def_id, key, value
 	TableProjectFiles = "project_files" // path, content
-	TableMeta         = "defn_meta"    // key, value (last_ingest, etc.)
+	TableMeta         = "defn_meta"     // key, value (last_ingest, etc.)
 )
 
 // isReadOnlySQL is a client-side guard: rejects anything that isn't

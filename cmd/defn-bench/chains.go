@@ -342,7 +342,7 @@ func StreamChunks(total int) int {
 		name: "move-def-between-packages",
 		fixtures: []chainFixture{
 			{
-				path: "go.mod",
+				path:    "go.mod",
 				content: "module fixture\n\ngo 1.26\n",
 			},
 			{
@@ -529,10 +529,10 @@ func Dispatch(h Handler, msg string) string {
 		},
 		prompt: `Rename the Handler interface's method from Handle to Process. Every type that satisfies Handler (Shout, Whisper) must rename its method too so they still satisfy Handler. Every call site (Dispatch calls h.Handle) must update. Do not rename the types themselves.`,
 		mustContain: map[string][]string{
-			"iface.go":         {`Process(msg string) string`},
-			"impl_shout.go":    {`func (s Shout) Process(`},
-			"impl_whisper.go":  {`func (w Whisper) Process(`},
-			"dispatch.go":      {`h.Process(msg)`},
+			"iface.go":        {`Process(msg string) string`},
+			"impl_shout.go":   {`func (s Shout) Process(`},
+			"impl_whisper.go": {`func (w Whisper) Process(`},
+			"dispatch.go":     {`h.Process(msg)`},
 		},
 		mustNotContain: map[string][]string{
 			"iface.go":        {`Handle(msg`},
