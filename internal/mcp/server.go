@@ -3209,6 +3209,15 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	resolveSet := map[filePkg]bool{}
 	var allowedRemovals []string
 	var allowedAdds []string
+	// #233: add-import's disk write can't go through mergeDeclsIntoSource
+	// (it never touches import blocks) -- queued here, applied via
+	// patchImportOnDisk after commit succeeds, mirroring how every other
+	// op's disk write is deferred to the tail scoped emit.
+	type pendingImport struct {
+		moduleID                int64
+		file, importPath, alias string
+	}
+	var pendingImports []pendingImport
 	addTouched := func(f string) {
 		if f != "" {
 			touchedFiles[f] = true
@@ -3519,9 +3528,13 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 					continue
 				}
 			}
-			dir := file
-			if idx := strings.LastIndex(dir, "/"); idx >= 0 {
-				dir = dir[:idx]
+			// #233: dir must be "" for a root-level file (no "/"), not
+			// the file name itself -- FindDefinitionsByFile matches dir
+			// against module.path, and "main.go" never matches a real
+			// module path. Mirrors handleAddImport's #221 fix.
+			dir := ""
+			if idx := strings.LastIndex(file, "/"); idx >= 0 {
+				dir = file[:idx]
 			}
 			defs, err := tx.FindDefinitionsByFile(dir, file, 0)
 			if err != nil || len(defs) == 0 {
@@ -3534,26 +3547,37 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				errors = append(errors, fmt.Sprintf("add-import: read imports: %v", err))
 				continue
 			}
-			alreadyPresent := false
+			alreadyInDB := false
 			for _, imp := range existing {
 				if imp.ImportedPath == op.ImportPath && imp.Alias == op.Alias {
-					alreadyPresent = true
+					alreadyInDB = true
 					break
 				}
 			}
-			if alreadyPresent {
-				sb.WriteString(fmt.Sprintf("= import %q already present\n", op.ImportPath))
-				continue
+			if !alreadyInDB {
+				updated := append(existing, store.Import{ModuleID: moduleID, ImportedPath: op.ImportPath, Alias: op.Alias})
+				if err := tx.SetImports(moduleID, updated); err != nil {
+					errors = append(errors, fmt.Sprintf("add-import %q: %v", op.ImportPath, err))
+					continue
+				}
 			}
-			updated := append(existing, store.Import{ModuleID: moduleID, ImportedPath: op.ImportPath, Alias: op.Alias})
-			if err := tx.SetImports(moduleID, updated); err != nil {
-				errors = append(errors, fmt.Sprintf("add-import %q: %v", op.ImportPath, err))
-			} else {
-				// add-import changes imports header only; body/refs untouched.
-				// Touch file so goimports re-formats the imports block.
-				addTouched(file)
-				sb.WriteString(fmt.Sprintf("+ added import %q\n", op.ImportPath))
-			}
+			// #233: the DB's per-module imports table isn't what lands this
+			// on disk -- mergeDeclsIntoSource never touches import blocks
+			// (#221), so the real write must go through patchImportOnDisk,
+			// applied directly to the file. That can't happen until the
+			// transaction commits, so queue it and apply after commit.
+			//
+			// Deliberately NOT addTouched(file): patchImportOnDisk already
+			// produces goimports-canonical grouping on its own (same as
+			// the singleton handleAddImport, which also skips emit
+			// entirely for this reason). Marking the file touched would
+			// pull it into the tail's scoped goimports pass, which
+			// legitimately strips imports with no usage yet in the file --
+			// exactly what a bare add-import (not yet paired with code
+			// that references it) always is. If another op in this same
+			// batch also edits this file's body, that op's own addTouched
+			// already covers it independently.
+			pendingImports = append(pendingImports, pendingImport{moduleID: moduleID, file: file, importPath: op.ImportPath, alias: op.Alias})
 
 		default:
 			errors = append(errors, fmt.Sprintf("unknown op: %s", op.Op))
@@ -3571,10 +3595,33 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		return errResult(fmt.Errorf("commit: %w", err))
 	}
 
+	// #233: apply queued add-import disk patches now that the DB write
+	// they mirror is durable. A failure here can't roll back the
+	// already-committed DB state -- same asymmetry autoEmitAndBuildWithOpts
+	// already has for every other op -- so surface it as a warning rather
+	// than an error result.
+	for _, pi := range pendingImports {
+		changed, err := s.patchImportOnDisk(pi.moduleID, pi.file, pi.importPath, pi.alias)
+		switch {
+		case err != nil:
+			sb.WriteString(fmt.Sprintf("WARNING: add-import %q on %s: %v\n", pi.importPath, pi.file, err))
+		case changed:
+			sb.WriteString(fmt.Sprintf("+ added import %q to %s\n", pi.importPath, pi.file))
+		default:
+			sb.WriteString(fmt.Sprintf("= import %q already present in %s\n", pi.importPath, pi.file))
+		}
+	}
+
 	// #114 batch scoping: if we tracked any touched files, run one scoped
 	// emit + goimports + per-file resolve at the tail. Safety valve — if
-	// tracking came up empty (every op had empty SourceFile, edge case),
-	// fall back to full autoEmitAndBuild + autoResolve for correctness.
+	// tracking came up empty AND there were no pending add-import disk
+	// patches (edge case: every op had empty SourceFile), fall back to
+	// full autoEmitAndBuild + autoResolve for correctness. #233: a batch
+	// of ONLY add-import op(s) also leaves tracking empty by design (see
+	// the add-import case above) — that must NOT hit either emit path,
+	// scoped or unscoped: patchImportOnDisk already landed the change,
+	// and running goimports over the file (scoped or project-wide) would
+	// strip the import right back out if nothing uses it yet.
 	var buildResult string
 	if len(touchedFiles) > 0 || len(allowedRemovals) > 0 || len(allowedAdds) > 0 {
 		goimportsFiles := make([]string, 0, len(touchedFiles))
@@ -3590,7 +3637,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		for fp := range resolveSet {
 			s.autoResolveFile(fp.file, fp.module)
 		}
-	} else {
+	} else if len(pendingImports) == 0 {
 		buildResult = s.autoEmitAndBuild()
 		s.autoResolve("")
 	}
@@ -6146,24 +6193,13 @@ func (s *server) handleInsertPrecondition(_ context.Context, req *sdkmcp.CallToo
 }
 
 // handleAddImport adds a new import (with optional alias) to the given
-// file directly, via the pure projection.AddImport function operating
-// on the file's actual current source -- not via the DB's per-module
-// imports table.
+// file directly, via patchImportOnDisk (shared with handleApply's
+// batch "add-import" case).
 //
-// #221: the previous implementation checked presence against
-// db.GetImports(moduleID), which is a per-MODULE union (every file in
-// a package shares one row set) that code(op:"sync")'s incremental
-// path never refreshes. That produced false "already present" no-ops
-// reported by gemot-2847127: the check said present when the specific
-// file didn't have it (stale from another file in the package, or from
-// before an edit removed it), and separately the add itself never
-// reliably reached disk anyway -- mergeDeclsIntoSource's AST-merge path
-// doesn't touch import blocks at all, so unless something else forced a
-// full regen, "added import" was reported while the file was
-// unchanged. Patching the file's real source directly with
-// projection.AddImport (idempotent, goimports-canonical grouping)
-// fixes both: presence is now checked against the file itself, and the
-// write actually lands.
+// #221: presence is checked against the file itself (not the DB's
+// per-module imports table, which is a union across every file in a
+// package and unreliable for single-file presence), and the write
+// actually lands via projection.AddImport.
 //
 // If args.File is empty, tries to infer the target: if the DB has exactly
 // one non-test .go file, uses it; otherwise errors with the candidate
@@ -6212,40 +6248,11 @@ func (s *server) handleAddImport(_ context.Context, _ *sdkmcp.CallToolRequest, a
 	}
 	moduleID := defs[0].ModuleID
 
-	// #221 safety: no projectDir means there's no real file tree to
-	// write to (Measure*/unit-test-style server construction, or
-	// DEFN_LEGACY read-only mode) -- os.ReadFile/WriteFile below must
-	// never run against a bare relative path in that case, since it
-	// would resolve against the process's CWD instead of a project
-	// root. Fall back to the DB's raw source purely to compute the
-	// idempotency check; there is nothing to write to disk.
-	var fileSrc []byte
-	if s.projectDir != "" {
-		diskPath := filepath.Join(s.projectDir, file)
-		data, rerr := os.ReadFile(diskPath)
-		if rerr != nil {
-			// Fall back to the DB's raw source (fresh emit to a
-			// not-yet-materialized dir) -- mirrors writeFile's own
-			// merge-base preference.
-			raw, rawErr := s.backend.GetFileSource(moduleID, file)
-			if rawErr != nil || raw == "" {
-				return errResult(fmt.Errorf("add-import: read %s: %w", file, rerr))
-			}
-			data = []byte(raw)
-		}
-		fileSrc = data
-	} else {
-		raw, rawErr := s.backend.GetFileSource(moduleID, file)
-		if rawErr != nil || raw == "" {
-			return errResult(fmt.Errorf("add-import: read %s: no projectDir and no file_sources entry", file))
-		}
-		fileSrc = []byte(raw)
+	changed, perr := s.patchImportOnDisk(moduleID, file, args.ImportPath, args.Alias)
+	if perr != nil {
+		return errResult(fmt.Errorf("add-import: %w", perr))
 	}
-	updatedSrc, aerr := projection.AddImport(string(fileSrc), args.ImportPath, args.Alias)
-	if aerr != nil {
-		return errResult(fmt.Errorf("add-import: %w", aerr))
-	}
-	if updatedSrc == string(fileSrc) {
+	if !changed {
 		return textResult(fmt.Sprintf("%s: import %q already present (no-op)\n", file, args.ImportPath)), nil, nil
 	}
 
@@ -6273,18 +6280,6 @@ func (s *server) handleAddImport(_ context.Context, _ *sdkmcp.CallToolRequest, a
 			return errResult(fmt.Errorf("add-import: set imports: %w", err))
 		}
 	}
-
-	if s.projectDir != "" {
-		if err := os.WriteFile(filepath.Join(s.projectDir, file), []byte(updatedSrc), 0644); err != nil {
-			return errResult(fmt.Errorf("add-import: write %s: %w", file, err))
-		}
-	}
-	// Best effort: file_sources is a merge-base cache, not the source of
-	// truth (disk is, when projectDir is set). A failure here shouldn't
-	// report the whole op as failed when the actual file write above
-	// already succeeded -- the next call that needs a merge base falls
-	// back to reading disk directly anyway.
-	_ = s.backend.SetFileSource(moduleID, file, updatedSrc)
 
 	snippet := fmt.Sprintf("import %q", args.ImportPath)
 	if args.Alias != "" {
@@ -6981,4 +6976,47 @@ func (s *server) backfillNarratives(ctx context.Context) {
 		}
 		s.handleOverview(ctx, nil, codeParam{File: f})
 	}
+}
+
+// patchImportOnDisk adds importPath (aliased as alias, if set) to
+// file's actual current source via projection.AddImport -- the #221
+// mechanism, extracted so both the singleton handleAddImport and
+// handleApply's batch "add-import" case (which must defer all disk
+// writes until after its transaction commits) share one
+// implementation. Idempotent: changed=false and no write when the
+// import is already present.
+func (s *server) patchImportOnDisk(moduleID int64, file, importPath, alias string) (changed bool, err error) {
+	var fileSrc []byte
+	if s.projectDir != "" {
+		diskPath := filepath.Join(s.projectDir, file)
+		data, rerr := os.ReadFile(diskPath)
+		if rerr != nil {
+			raw, rawErr := s.backend.GetFileSource(moduleID, file)
+			if rawErr != nil || raw == "" {
+				return false, fmt.Errorf("read %s: %w", file, rerr)
+			}
+			data = []byte(raw)
+		}
+		fileSrc = data
+	} else {
+		raw, rawErr := s.backend.GetFileSource(moduleID, file)
+		if rawErr != nil || raw == "" {
+			return false, fmt.Errorf("read %s: no projectDir and no file_sources entry", file)
+		}
+		fileSrc = []byte(raw)
+	}
+	updatedSrc, aerr := projection.AddImport(string(fileSrc), importPath, alias)
+	if aerr != nil {
+		return false, aerr
+	}
+	if updatedSrc == string(fileSrc) {
+		return false, nil
+	}
+	if s.projectDir != "" {
+		if err := os.WriteFile(filepath.Join(s.projectDir, file), []byte(updatedSrc), 0644); err != nil {
+			return false, fmt.Errorf("write %s: %w", file, err)
+		}
+	}
+	_ = s.backend.SetFileSource(moduleID, file, updatedSrc)
+	return true, nil
 }

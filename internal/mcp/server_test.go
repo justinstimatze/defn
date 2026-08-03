@@ -3848,3 +3848,74 @@ func TestHandleCreateStillErrorsWhenNeitherFileNorModuleResolve(t *testing.T) {
 		t.Fatal("NewPkgFunc should not have been created")
 	}
 }
+
+// TestHandleApply_AddImportAlreadyPresentIsNoOp covers the idempotent
+// path through the #233 fix: batching the same import twice (or
+// against one already on disk) must not error or duplicate the import.
+func TestHandleApply_AddImportAlreadyPresentIsNoOp(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	for i := 0; i < 2; i++ {
+		result, _, err := s.handleApply(context.Background(), nil, applyParam{
+			Operations: []applyOp{
+				{Op: "add-import", File: "main.go", ImportPath: "hash/fnv"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("handleApply iteration %d: %v", i, err)
+		}
+		text := resultText(t, result)
+		if strings.Contains(text, "rolled back") {
+			t.Fatalf("iteration %d: unexpected failure: %s", i, text)
+		}
+	}
+
+	final, ferr := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if ferr != nil {
+		t.Fatalf("read main.go: %v", ferr)
+	}
+	if strings.Count(string(final), "\"hash/fnv\"") != 1 {
+		t.Errorf("expected hash/fnv imported exactly once, got:\n%s", final)
+	}
+}
+
+// TestHandleApply_AddImportOnRootFileLandsOnDisk is the #233
+// regression: handleApply's batch "add-import" case computed
+// dir := file (not "") for a root-level file with no "/", so
+// FindDefinitionsByFile never matched any module and the whole batch
+// errored with "add-import: no defs in \"main.go\"" -- mirrors #221's
+// already-fixed bug in the singleton handleAddImport path. Also
+// verifies the deeper #221 mechanism applies here too: the DB's
+// per-module imports table alone never reaches disk (mergeDeclsIntoSource
+// doesn't touch import blocks), so the fix must patch the file directly
+// via patchImportOnDisk after commit, not just fix the dir bug.
+func TestHandleApply_AddImportOnRootFileLandsOnDisk(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "add-import", File: "main.go", ImportPath: "hash/fnv"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleApply: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "rolled back") || strings.Contains(text, "no defs in") {
+		t.Fatalf("add-import failed on root-level file: %s", text)
+	}
+
+	final, ferr := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if ferr != nil {
+		t.Fatalf("read main.go: %v", ferr)
+	}
+	if !strings.Contains(string(final), "\"hash/fnv\"") {
+		t.Errorf("expected hash/fnv import to land on disk via batch apply, got:\n%s", final)
+	}
+}
