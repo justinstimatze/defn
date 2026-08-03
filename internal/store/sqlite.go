@@ -74,6 +74,16 @@ type SQLiteDB struct {
 	pool *sql.DB // only set on the root instance; used for Close/Ping/BeginTx -- nil on a tx-scoped view, which is never Close()'d or re-Begin()'able
 	path string
 
+	// txMu serializes Begin()...commit()/rollback() on the root instance.
+	// The pool allows up to 4 concurrent connections (SetMaxOpenConns),
+	// but a Begin()-returned tx-scoped view is only isolated from OTHER
+	// writes if no other connection in the pool writes concurrently --
+	// without this, a concurrent write via s.backend (outside the tx)
+	// racing an in-flight apply transaction can leave a rolled-back
+	// batch's writes silently persisted. Root-instance-only; nil on a
+	// tx-scoped view, which never calls Begin() again.
+	txMu sync.Mutex
+
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -233,12 +243,16 @@ func (s *SQLiteDB) Ctx() context.Context { return context.Background() }
 func (s *SQLiteDB) CleanTempFiles() {}
 
 func (s *SQLiteDB) Begin() (tx Backend, commit func() error, rollback func(), err error) {
+	s.txMu.Lock()
 	t, err := s.pool.BeginTx(context.Background(), nil)
 	if err != nil {
+		s.txMu.Unlock()
 		return nil, nil, nil, fmt.Errorf("sqlite: begin: %w", err)
 	}
 	txDB := &SQLiteDB{db: t, path: s.path}
-	return txDB, t.Commit, func() { _ = t.Rollback() }, nil
+	var unlockOnce sync.Once
+	unlock := func() { unlockOnce.Do(s.txMu.Unlock) }
+	return txDB, func() error { defer unlock(); return t.Commit() }, func() { defer unlock(); _ = t.Rollback() }, nil
 }
 
 // GC runs a WAL checkpoint to fold the -wal file back into the main db.
