@@ -2,6 +2,8 @@ package mcp
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -104,4 +106,101 @@ func (s *server) runPlanSteps(steps []planformat.Step) (*sdkmcp.CallToolResult, 
 		Op:            "plan",
 		BytesReturned: len(out),
 	}), nil, nil
+}
+
+// handlePlanIntent is #186's Opus/Sonnet-driven half of code(op:"plan"):
+// given a natural-language intent, ground it in real candidate defs
+// (reusing #195/#197/#198's shared candidate search via
+// gatherContextCandidates), ask the co-processor to emit an
+// S-expression trajectory referencing only those candidates (#187's
+// decision -- see internal/planformat), then mechanically expand it
+// via runPlanSteps, the same walker code(op:"plan-sexpr") uses.
+//
+// Cached by (intent, candidate-set) hash -- see planCacheKey -- the
+// same explain_cache table #192 already uses, so a repeated intent
+// against unchanged code skips the co-processor call entirely. A
+// cached response that no longer parses (e.g. the trajectory grammar
+// changed since it was cached) falls through to a fresh call rather
+// than wedging the op.
+func (s *server) handlePlanIntent(ctx context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	intent := strings.TrimSpace(args.Intent)
+	if intent == "" {
+		return errResult(fmt.Errorf("plan: intent is required — pass intent:\"...\" describing what you want to explore"))
+	}
+
+	scored, _, err := s.gatherContextCandidates(intent)
+	if err != nil {
+		return errResult(fmt.Errorf("plan: %w", err))
+	}
+	const planCandidateCap = 20
+	if len(scored) > planCandidateCap {
+		scored = scored[:planCandidateCap]
+	}
+
+	candLines := make([]string, 0, len(scored))
+	for _, c := range scored {
+		name := formatReceiver(c.Def.Receiver) + c.Def.Name
+		desc := c.Summary
+		if desc == "" {
+			desc = c.Def.Signature
+		}
+		if desc == "" {
+			desc = c.Def.Doc
+		}
+		candLines = append(candLines, fmt.Sprintf("%s -- %s", name, oneLine(desc)))
+	}
+	candidatesText := strings.Join(candLines, "\n")
+
+	cacheKey := planCacheKey(intent, scored)
+	if cached, err := s.backend.GetExplainCache(cacheKey); err == nil && cached != nil {
+		if steps, perr := planformat.ParseSExpr(cached.Answer); perr == nil {
+			return s.runPlanSteps(steps)
+		}
+	}
+
+	if s.explainClient == nil {
+		return errResult(fmt.Errorf("plan: co-processor unavailable (set ANTHROPIC_API_KEY to enable) — use code(op:\"plan-sexpr\", plan:\"...\") to walk a hand-written trajectory instead"))
+	}
+
+	raw, err := s.explainClient.Plan(ctx, intent, candidatesText)
+	if err != nil {
+		return errResult(fmt.Errorf("plan: %w", err))
+	}
+
+	steps, err := planformat.ParseSExpr(raw)
+	if err != nil {
+		return errResult(fmt.Errorf("plan: co-processor response didn't parse as a trajectory: %w\n\nraw response:\n%s", err, raw))
+	}
+
+	// Best effort -- a cache write failure shouldn't fail a request that
+	// already got its trajectory.
+	_ = s.backend.SetExplainCache(cacheKey, intent, candidatesText, raw, "plan-co-processor", nil)
+
+	return s.runPlanSteps(steps)
+}
+
+// oneLine collapses a doc comment or signature to a single line for
+// the plan prompt's candidate list -- newlines in a multi-line doc
+// would otherwise break the "one candidate per line" format the
+// prompt promises the model.
+func oneLine(s string) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// planCacheKey hashes the intent together with the qualified name +
+// body hash of each grounding candidate, in ranked order -- mirrors
+// explainCacheKey's approach (#192) so an edited body or a reranked
+// candidate set naturally produces a fresh key instead of needing
+// explicit invalidation.
+func planCacheKey(intent string, cands []contextCandidate) string {
+	h := sha256.New()
+	h.Write([]byte(intent))
+	for _, c := range cands {
+		h.Write([]byte{0})
+		h.Write([]byte(formatReceiver(c.Def.Receiver) + c.Def.Name))
+		h.Write([]byte{0})
+		h.Write([]byte(c.Def.Hash))
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }

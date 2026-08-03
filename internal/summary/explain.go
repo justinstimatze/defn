@@ -125,3 +125,59 @@ func (e *ExplainClient) Explain(ctx context.Context, question, sourceContext str
 	}
 	return text, nil
 }
+
+// Plan sends one trajectory-generation request to the co-processor
+// (#186/#187: S-expression format decided in #189 over the compact
+// DSL -- see internal/planformat). candidates is a newline-delimited
+// list of real def names (plus a short signature or summary) the
+// model may reference; intent is the caller's natural-language
+// exploration goal. Returns the model's raw text response, expected
+// to be S-expression lines only -- the caller parses it with
+// planformat.ParseSExpr and should treat a parse failure as "the
+// model didn't follow the format", not a hard error.
+func (e *ExplainClient) Plan(ctx context.Context, intent, candidates string) (string, error) {
+	if e == nil {
+		return "", fmt.Errorf("plan: client not configured (set ANTHROPIC_API_KEY)")
+	}
+	msg, err := e.client.Messages.New(ctx, anthropic.MessageNewParams{
+		Model:     e.model,
+		MaxTokens: 800,
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(buildPlanPrompt(intent, candidates))),
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("plan: messages.new: %w", err)
+	}
+	var sb strings.Builder
+	for _, block := range msg.Content {
+		if block.Type == "text" {
+			sb.WriteString(block.Text)
+		}
+	}
+	text := strings.TrimSpace(sb.String())
+	if text == "" {
+		return "", fmt.Errorf("plan: no text content in response")
+	}
+	return text, nil
+}
+
+// buildPlanPrompt assembles the trajectory-generation prompt: the
+// S-expression grammar and vocabulary, the grounding candidate list
+// (real def names only -- the model must not invent names), and the
+// caller's intent. Explicitly asks for trajectory lines only, no
+// prose, since the response is parsed mechanically by
+// planformat.ParseSExpr.
+func buildPlanPrompt(intent, candidates string) string {
+	return fmt.Sprintf(`You are choosing which pieces of a Go codebase to fetch in order to satisfy an exploration goal. Respond with ONLY a trajectory: one line per step, format "(op target)" or "(op target !test)", where:
+  - op is one of: read (fetch full body), outline (fetch signature+doc+callee summary, no body), impact (fetch callers)
+  - target is EXACTLY one of the candidate names below -- do not invent names, do not add receivers or packages not shown
+  - "!test" (impact only) excludes test-file callers from the result
+
+Order steps the way you would actually want to read them (entry point first, then what it calls or who calls it). Use as few steps as answer the goal well -- typically 3-8. Do NOT include any prose, explanation, or markdown -- only the trajectory lines.
+
+GOAL: %s
+
+CANDIDATES (name -- signature or summary):
+%s`, intent, candidates)
+}

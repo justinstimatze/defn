@@ -144,79 +144,12 @@ func (s *server) handleContext(ctx context.Context, _ *sdkmcp.CallToolRequest, a
 	if question == "" {
 		return errResult(fmt.Errorf("context: question is required — pass question:\"how does X handle Y\""))
 	}
-	tokens := contextFilterTokens(extractQueryTokensLower(question))
-	if len(tokens) == 0 {
-		return errResult(fmt.Errorf("context: question yielded no searchable tokens after stop-word filtering — try more specific wording"))
+	// #186: shared with code(op:"plan")'s intent-grounding step --
+	// see gatherContextCandidates.
+	scored, tokens, err := s.gatherContextCandidates(question)
+	if err != nil {
+		return errResult(fmt.Errorf("context: %w", err))
 	}
-
-	// Candidate set: for each token, three parallel searches:
-	//   - name-LIKE (FromName, strongest signal)
-	//   - FTS body (FromBody, weakest)
-	//   - #197: LIKE against #160 semantic summaries (FromSummary,
-	//     semantic bridge — catches defs whose behavior matches the
-	//     question when the name has no lexical overlap).
-	// Dedupe by def ID; flags OR together across paths.
-	seen := map[int64]contextCandidate{}
-	for _, tok := range tokens {
-		if defs, err := s.backend.FindDefinitions("%" + tok + "%"); err == nil {
-			for _, d := range defs {
-				c := seen[d.ID]
-				c.Def = d
-				c.FromName = true
-				seen[d.ID] = c
-			}
-		}
-		if defs, err := s.backend.SearchDefinitions(tok); err == nil {
-			for _, d := range defs {
-				c := seen[d.ID]
-				c.Def = d
-				if !c.FromName {
-					c.FromBody = true
-				}
-				seen[d.ID] = c
-			}
-		}
-		if ids, err := s.backend.SearchDefSummaries(tok); err == nil {
-			for _, id := range ids {
-				c := seen[id]
-				c.FromSummary = true
-				// Def may not be populated yet if this ID hasn't
-				// shown up in name/body search. Fetch minimally
-				// via GetDefinition — the top-N reranker reloads
-				// anyway for bodies, so this is just to get Name/
-				// Signature/Doc for scoring.
-				if c.Def.ID == 0 {
-					if d, err := s.backend.GetDefinition(id); err == nil && d != nil {
-						c.Def = *d
-					}
-				}
-				// Pull the summary for the ranker to score against.
-				if c.Summary == "" {
-					if sum, err := s.backend.GetDefSummary(id); err == nil && sum != nil {
-						c.Summary = sum.OneLine
-					}
-				}
-				seen[id] = c
-			}
-		}
-	}
-	// #198: embedding-based semantic search. Adds defs that share zero
-	// tokens with the question but score high on a local hashing-trick
-	// embedding similarity -- the gap token-based candidate gathering
-	// above structurally can't close.
-	for _, c := range s.contextEmbeddingCandidates(question, seen) {
-		seen[c.Def.ID] = c
-	}
-
-	if len(seen) == 0 {
-		return errResult(fmt.Errorf("context: no defs matched any of %v — try a different question", tokens))
-	}
-
-	cands := make([]contextCandidate, 0, len(seen))
-	for _, c := range seen {
-		cands = append(cands, c)
-	}
-	scored := contextRank(cands, tokens)
 
 	const contextTopN = 5
 	top := scored
@@ -370,3 +303,85 @@ const (
 	contextEmbeddingThreshold = 0.6
 	contextEmbeddingCap       = 10
 )
+
+// gatherContextCandidates runs the shared candidate search used by
+// both code(op:"context") (#195/#197/#198) and code(op:"plan")'s
+// intent-grounding step (#186): tokenize the question, search by
+// name/body/summary per token plus embedding similarity, dedupe by
+// def ID, and rank. Returns the ranked candidates (best first) and
+// the filtered token set used to score them.
+func (s *server) gatherContextCandidates(question string) ([]contextCandidate, []string, error) {
+	tokens := contextFilterTokens(extractQueryTokensLower(question))
+	if len(tokens) == 0 {
+		return nil, nil, fmt.Errorf("question yielded no searchable tokens after stop-word filtering — try more specific wording")
+	}
+
+	// Candidate set: for each token, three parallel searches:
+	//   - name-LIKE (FromName, strongest signal)
+	//   - FTS body (FromBody, weakest)
+	//   - #197: LIKE against #160 semantic summaries (FromSummary,
+	//     semantic bridge — catches defs whose behavior matches the
+	//     question when the name has no lexical overlap).
+	// Dedupe by def ID; flags OR together across paths.
+	seen := map[int64]contextCandidate{}
+	for _, tok := range tokens {
+		if defs, err := s.backend.FindDefinitions("%" + tok + "%"); err == nil {
+			for _, d := range defs {
+				c := seen[d.ID]
+				c.Def = d
+				c.FromName = true
+				seen[d.ID] = c
+			}
+		}
+		if defs, err := s.backend.SearchDefinitions(tok); err == nil {
+			for _, d := range defs {
+				c := seen[d.ID]
+				c.Def = d
+				if !c.FromName {
+					c.FromBody = true
+				}
+				seen[d.ID] = c
+			}
+		}
+		if ids, err := s.backend.SearchDefSummaries(tok); err == nil {
+			for _, id := range ids {
+				c := seen[id]
+				c.FromSummary = true
+				// Def may not be populated yet if this ID hasn't
+				// shown up in name/body search. Fetch minimally
+				// via GetDefinition — the top-N reranker reloads
+				// anyway for bodies, so this is just to get Name/
+				// Signature/Doc for scoring.
+				if c.Def.ID == 0 {
+					if d, err := s.backend.GetDefinition(id); err == nil && d != nil {
+						c.Def = *d
+					}
+				}
+				// Pull the summary for the ranker to score against.
+				if c.Summary == "" {
+					if sum, err := s.backend.GetDefSummary(id); err == nil && sum != nil {
+						c.Summary = sum.OneLine
+					}
+				}
+				seen[id] = c
+			}
+		}
+	}
+	// #198: embedding-based semantic search. Adds defs that share zero
+	// tokens with the question but score high on a local hashing-trick
+	// embedding similarity -- the gap token-based candidate gathering
+	// above structurally can't close.
+	for _, c := range s.contextEmbeddingCandidates(question, seen) {
+		seen[c.Def.ID] = c
+	}
+
+	if len(seen) == 0 {
+		return nil, tokens, fmt.Errorf("no defs matched any of %v — try a different question", tokens)
+	}
+
+	cands := make([]contextCandidate, 0, len(seen))
+	for _, c := range seen {
+		cands = append(cands, c)
+	}
+	return contextRank(cands, tokens), tokens, nil
+}
