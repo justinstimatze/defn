@@ -552,7 +552,11 @@ func main() {
 func runClaude(dir string, q question, mode string) result {
 	start := time.Now()
 
-	cmd := exec.Command("claude", "-p", "--verbose", "--output-format", "stream-json")
+	args := []string{"-p", "--strict-mcp-config", "--verbose", "--output-format", "stream-json"}
+	if mode == "defn" {
+		args = append(args, "--mcp-config", ".mcp.json")
+	}
+	cmd := exec.Command("claude", args...)
 	cmd.Dir = dir
 
 	// In defn mode, prepend CLAUDE.md instructions to the prompt so

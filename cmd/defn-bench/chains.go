@@ -691,7 +691,11 @@ func runChainCase(scratch, defnBin string, c chain, mode string) mutationResult 
 	}
 
 	start := time.Now()
-	cmd := exec.Command("claude", "-p", "--mcp-config", ".mcp.json", "--verbose", "--output-format", "stream-json")
+	args := []string{"-p", "--strict-mcp-config", "--verbose", "--output-format", "stream-json"}
+	if mode == "defn" {
+		args = append(args, "--mcp-config", ".mcp.json")
+	}
+	cmd := exec.Command("claude", args...)
 	cmd.Dir = scratch
 	cmd.Env = append(os.Environ(), "CLAUDE_ALLOW_GO_EDIT=1")
 	cmd.Stdin = strings.NewReader(prompt)

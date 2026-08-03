@@ -119,7 +119,7 @@ func runYourRepoCase(repoDir, task, mode string) mutationResult {
 	}
 
 	start := time.Now()
-	args := []string{"-p", "--verbose", "--output-format", "stream-json"}
+	args := []string{"-p", "--strict-mcp-config", "--verbose", "--output-format", "stream-json"}
 	if mode == "defn" {
 		args = append(args, "--mcp-config", ".mcp.json")
 	}
