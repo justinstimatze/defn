@@ -1739,7 +1739,7 @@ func (s *SQLiteDB) SetImports(moduleID int64, imports []Import) error {
 	return nil
 }
 
-func (s *SQLiteDB) QueryLiteralFields(typeName, fieldName, fieldValue string, fieldNames []string, limit int, skipOrderBy, skipDefName bool) ([]LiteralField, error) {
+func (s *SQLiteDB) QueryLiteralFields(typeName, fieldName, fieldValue string, fieldNames []string, defIDs []int64, limit int, skipOrderBy, skipDefName bool) ([]LiteralField, error) {
 	ctx := s.Ctx()
 	// skipDefName drops the LEFT JOIN definitions entirely -- it exists
 	// only to populate DefName, which bulk callers that key off DefID
@@ -1770,6 +1770,14 @@ func (s *SQLiteDB) QueryLiteralFields(typeName, fieldName, fieldValue string, fi
 			args = append(args, n)
 		}
 		q += " AND lf.field_name IN (" + strings.Join(ph, ",") + ")"
+	}
+	if len(defIDs) > 0 {
+		ph := make([]string, len(defIDs))
+		for i, id := range defIDs {
+			ph[i] = "?"
+			args = append(args, id)
+		}
+		q += " AND lf.def_id IN (" + strings.Join(ph, ",") + ")"
 	}
 	if fieldValue != "" {
 		// A LIKE never uses an index while case_sensitive_like is OFF (the

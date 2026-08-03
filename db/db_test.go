@@ -136,3 +136,70 @@ func Hello(name string) string { return "hello " + name }
 		t.Error("expected last_ingest meta to be set after Sync")
 	}
 }
+
+// TestSyncPatternScopesToRootPackage covers winze's #230 ask: an
+// embedder whose corpus is a single declarative package shouldn't pay
+// full-module type-checking on every Sync. SyncPattern(dir, ".")
+// should ingest only the root package, leaving a sibling subpackage
+// untouched -- unlike Sync (== SyncPattern(dir, "./...")), which
+// ingests everything.
+func TestSyncPatternScopesToRootPackage(t *testing.T) {
+	modDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(modDir, "go.mod"), []byte("module example.com/multi\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(modDir, "root.go"), []byte(`package multi
+
+func Root() string { return "root" }
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(modDir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(modDir, "sub", "sub.go"), []byte(`package sub
+
+func Leaf() string { return "leaf" }
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dbDir := t.TempDir()
+	d, err := Open(filepath.Join(dbDir, ".defn"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	if err := d.SyncPattern(modDir, "."); err != nil {
+		t.Fatalf("SyncPattern(\".\"): %v", err)
+	}
+
+	root, err := d.Definitions(DefinitionFilter{Name: "Root"})
+	if err != nil {
+		t.Fatalf("Definitions Root: %v", err)
+	}
+	if len(root) != 1 {
+		t.Fatalf("expected Root to be ingested by SyncPattern(\".\"), got %d matches", len(root))
+	}
+
+	leaf, err := d.Definitions(DefinitionFilter{Name: "Leaf"})
+	if err != nil {
+		t.Fatalf("Definitions Leaf: %v", err)
+	}
+	if len(leaf) != 0 {
+		t.Fatalf("expected Leaf (sub-package) NOT to be ingested by SyncPattern(\".\"), got %d matches", len(leaf))
+	}
+
+	// Sync (whole module) picks up the sub-package too.
+	if err := d.Sync(modDir); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	leafAfterSync, err := d.Definitions(DefinitionFilter{Name: "Leaf"})
+	if err != nil {
+		t.Fatalf("Definitions Leaf after Sync: %v", err)
+	}
+	if len(leafAfterSync) != 1 {
+		t.Fatalf("expected Leaf to be ingested after whole-module Sync, got %d matches", len(leafAfterSync))
+	}
+}

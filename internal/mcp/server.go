@@ -5260,7 +5260,7 @@ func (s *server) handleLiterals(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 	} else if !strings.Contains(typeName, "%") {
 		typeName = "%" + typeName + "%" // convenience: partial match
 	}
-	fields, err := s.backend.QueryLiteralFields(typeName, args.Name, args.Body, nil, 200, false, false)
+	fields, err := s.backend.QueryLiteralFields(typeName, args.Name, args.Body, nil, nil, 200, false, false)
 	if err != nil {
 		return errResult(fmt.Errorf("query literals: %w", err))
 	}

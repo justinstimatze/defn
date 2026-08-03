@@ -459,7 +459,7 @@ func TestQueryLiteralFields_SkipOrderByAndSkipDefName(t *testing.T) {
 
 	// Default (both false): DefName populated, results sorted by
 	// (type_name, field_name) -- Alpha/A, Alpha/Z, Zeta/B.
-	got, err := db.QueryLiteralFields("", "", "", nil, 0, false, false)
+	got, err := db.QueryLiteralFields("", "", "", nil, nil, 0, false, false)
 	if err != nil {
 		t.Fatalf("QueryLiteralFields default: %v", err)
 	}
@@ -481,7 +481,7 @@ func TestQueryLiteralFields_SkipOrderByAndSkipDefName(t *testing.T) {
 	// skipDefName: DefName must come back empty even though the
 	// definition genuinely exists (proves the join was skipped, not
 	// coincidentally empty).
-	gotNoDefName, err := db.QueryLiteralFields("", "", "", nil, 0, false, true)
+	gotNoDefName, err := db.QueryLiteralFields("", "", "", nil, nil, 0, false, true)
 	if err != nil {
 		t.Fatalf("QueryLiteralFields skipDefName: %v", err)
 	}
@@ -494,7 +494,7 @@ func TestQueryLiteralFields_SkipOrderByAndSkipDefName(t *testing.T) {
 	// skipOrderBy: first row should match insertion order (Zeta/B
 	// first), not the sorted order -- proves ORDER BY was actually
 	// omitted rather than silently still applied.
-	gotNoOrder, err := db.QueryLiteralFields("", "", "", nil, 0, true, false)
+	gotNoOrder, err := db.QueryLiteralFields("", "", "", nil, nil, 0, true, false)
 	if err != nil {
 		t.Fatalf("QueryLiteralFields skipOrderBy: %v", err)
 	}
@@ -512,4 +512,74 @@ func fieldValues(fs []LiteralField) []string {
 		out[i] = f.FieldValue
 	}
 	return out
+}
+
+// TestQueryLiteralFields_DefIDsFilter locks in winze's #230 ask: a
+// def-set predicate that pushes membership filtering to SQL instead
+// of a caller fetching every matching field and filtering by def_id
+// in Go afterward.
+func TestQueryLiteralFields_DefIDsFilter(t *testing.T) {
+	dir := t.TempDir()
+	db, err := OpenSQLite(filepath.Join(dir, "defn.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	mod, err := db.EnsureModule("example.com/pkg", "pkg", "")
+	if err != nil {
+		t.Fatalf("EnsureModule: %v", err)
+	}
+	defA := &Definition{ModuleID: mod.ID, Name: "ClaimA", Kind: "var", Exported: true, Body: "var ClaimA = T{}", Hash: HashBody("var ClaimA = T{}")}
+	idA, err := db.UpsertDefinition(defA)
+	if err != nil {
+		t.Fatalf("UpsertDefinition A: %v", err)
+	}
+	defB := &Definition{ModuleID: mod.ID, Name: "ClaimB", Kind: "var", Exported: true, Body: "var ClaimB = T{}", Hash: HashBody("var ClaimB = T{}")}
+	idB, err := db.UpsertDefinition(defB)
+	if err != nil {
+		t.Fatalf("UpsertDefinition B: %v", err)
+	}
+
+	if err := db.SetLiteralFields(idA, []LiteralField{{TypeName: "Claim", FieldName: "Subject", FieldValue: "alice", Line: 1}}); err != nil {
+		t.Fatalf("SetLiteralFields A: %v", err)
+	}
+	if err := db.SetLiteralFields(idB, []LiteralField{{TypeName: "Claim", FieldName: "Subject", FieldValue: "bob", Line: 1}}); err != nil {
+		t.Fatalf("SetLiteralFields B: %v", err)
+	}
+
+	// No DefIDs: both fields come back.
+	all, err := db.QueryLiteralFields("", "", "", nil, nil, 0, false, false)
+	if err != nil {
+		t.Fatalf("QueryLiteralFields (no filter): %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("expected 2 fields with no DefIDs filter, got %d", len(all))
+	}
+
+	// DefIDs scoped to A only: only alice's field comes back, pushed to
+	// SQL rather than filtered in Go.
+	scoped, err := db.QueryLiteralFields("", "", "", nil, []int64{idA}, 0, false, false)
+	if err != nil {
+		t.Fatalf("QueryLiteralFields (DefIDs=A): %v", err)
+	}
+	if len(scoped) != 1 {
+		t.Fatalf("expected 1 field scoped to def A, got %d", len(scoped))
+	}
+	if scoped[0].FieldValue != "alice" {
+		t.Errorf("expected alice's field, got %q", scoped[0].FieldValue)
+	}
+	if scoped[0].DefID != idA {
+		t.Errorf("expected DefID %d, got %d", idA, scoped[0].DefID)
+	}
+
+	// DefIDs scoped to a def with no literal fields: empty result, not
+	// an error.
+	none, err := db.QueryLiteralFields("", "", "", nil, []int64{99999}, 0, false, false)
+	if err != nil {
+		t.Fatalf("QueryLiteralFields (DefIDs=nonexistent): %v", err)
+	}
+	if len(none) != 0 {
+		t.Errorf("expected 0 fields for a nonexistent def ID, got %d", len(none))
+	}
 }

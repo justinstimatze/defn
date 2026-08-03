@@ -74,7 +74,7 @@ type Backend interface {
 	// existing caller. skipOrderBy drops the `ORDER BY type_name,
 	// field_name` (~103ms on a 90k-row bulk query); skipDefName skips the
 	// LEFT JOIN definitions used only to populate DefName (~210ms).
-	QueryLiteralFields(typeName, fieldName, fieldValue string, fieldNames []string, limit int, skipOrderBy, skipDefName bool) ([]LiteralField, error)
+	QueryLiteralFields(typeName, fieldName, fieldValue string, fieldNames []string, defIDs []int64, limit int, skipOrderBy, skipDefName bool) ([]LiteralField, error)
 	SetLiteralFields(defID int64, fields []LiteralField) error
 	SetManyLiteralFields(fieldsByDef map[int64][]LiteralField) error
 

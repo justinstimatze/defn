@@ -183,6 +183,11 @@ type LiteralFieldFilter struct {
 	FieldName  string   // exact match (e.g. "Subject") — mutually exclusive with FieldNames
 	FieldNames []string // IN match (e.g. []string{"Subject", "Object", "Prov"})
 	Value      string   // LIKE pattern on field_value
+	// DefIDs restricts results to fields owned by one of these
+	// definitions -- an IN-predicate pushed to SQL, so a caller scoping
+	// to a known def set (e.g. a single-entity lookup) doesn't have to
+	// fetch every matching field and filter def-membership in Go.
+	DefIDs []int64
 
 	// SkipOrderBy and SkipDefName are opt-OUT performance flags for bulk
 	// callers that discard ordering and/or the joined definition name.
@@ -201,7 +206,7 @@ type LiteralFieldFilter struct {
 func (db *DB) LiteralFields(f LiteralFieldFilter) ([]LiteralField, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	fields, err := db.s.QueryLiteralFields(f.TypeName, f.FieldName, f.Value, f.FieldNames, 0, f.SkipOrderBy, f.SkipDefName)
+	fields, err := db.s.QueryLiteralFields(f.TypeName, f.FieldName, f.Value, f.FieldNames, f.DefIDs, 0, f.SkipOrderBy, f.SkipDefName)
 	if err != nil {
 		return nil, err
 	}
@@ -391,15 +396,26 @@ func convertDefs(defs []store.Definition) []Definition {
 // Sync ingests projectDir into the database in-process, letting an
 // embedder build or refresh a .defn database without shelling out to
 // the defn CLI binary. Always does a full re-ingest (packages.Load +
-// IngestPackages + ResolvePackages) -- the same non-incremental path
-// cmdIngest falls back to on a cold DB. No incremental fast path yet;
-// that machinery is CLI-internal (cmd/defn's incrementalPreflight/
-// applyIncrementalIngest) and worth extracting only once an embedder
-// with a corpus large enough to need it shows up.
+// IngestPackages + ResolvePackages) over the whole module ("./...") --
+// see SyncPattern to scope this to a single package. No incremental
+// fast path yet; that machinery is CLI-internal (cmd/defn's
+// incrementalPreflight/applyIncrementalIngest) and worth extracting
+// only once an embedder with a corpus large enough to need it shows up.
 func (db *DB) Sync(projectDir string) error {
+	return db.SyncPattern(projectDir, "./...")
+}
+
+// SyncPattern is Sync scoped to a package pattern (e.g. "." for just
+// the root package) instead of the whole module ("./..."). An
+// embedder whose corpus is a single declarative package pays
+// full-module type-checking on every Sync otherwise -- editing any
+// unrelated package in the module marks the DB stale and forces a
+// whole-module re-Sync on the next reader, for no benefit to that
+// embedder's own package.
+func (db *DB) SyncPattern(projectDir, pattern string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	pkgs, err := goload.LoadAll(projectDir)
+	pkgs, err := goload.LoadPattern(projectDir, pattern)
 	if err != nil {
 		return fmt.Errorf("load packages: %w", err)
 	}

@@ -266,7 +266,7 @@ var Sample = Provenance{
 		t.Fatalf("resolve: %v", err)
 	}
 
-	rows, err := db.QueryLiteralFields("%Provenance", "Quote", "", nil, 0, false, false)
+	rows, err := db.QueryLiteralFields("%Provenance", "Quote", "", nil, nil, 0, false, false)
 	if err != nil {
 		t.Fatalf("query literal fields: %v", err)
 	}
