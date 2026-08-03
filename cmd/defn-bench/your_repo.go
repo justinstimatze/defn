@@ -63,21 +63,21 @@ func runYourRepoBench(defnBin, repoDir, task string) {
 	}
 
 	rFiles := runYourRepoCase(abs, task, "files")
-	fmt.Printf("files:  %d calls, %s, in/out/cache=%d/%d/%d tok\n",
+	fmt.Printf("files:  %d calls, %s, in/out/cacheR/cacheW=%d/%d/%d/%d tok\n",
 		rFiles.toolCalls, rFiles.duration.Round(time.Second),
-		rFiles.inputTokens, rFiles.outputTokens, rFiles.cachedTokens)
+		rFiles.inputTokens, rFiles.outputTokens, rFiles.cachedTokens, rFiles.cacheCreationTokens)
 
 	rDefn := runYourRepoCase(abs, task, "defn")
-	fmt.Printf("defn:   %d calls, %s, in/out/cache=%d/%d/%d tok\n\n",
+	fmt.Printf("defn:   %d calls, %s, in/out/cacheR/cacheW=%d/%d/%d/%d tok\n\n",
 		rDefn.toolCalls, rDefn.duration.Round(time.Second),
-		rDefn.inputTokens, rDefn.outputTokens, rDefn.cachedTokens)
+		rDefn.inputTokens, rDefn.outputTokens, rDefn.cachedTokens, rDefn.cacheCreationTokens)
 
 	fmt.Println("=== summary ===")
-	fmt.Printf("%-8s %6s %8s %8s %8s\n", "mode", "calls", "in.tok", "out.tok", "cache")
-	fmt.Println(strings.Repeat("-", 46))
-	fmt.Printf("%-8s %6d %8d %8d %8d\n", "files", rFiles.toolCalls, rFiles.inputTokens, rFiles.outputTokens, rFiles.cachedTokens)
-	fmt.Printf("%-8s %6d %8d %8d %8d\n", "defn", rDefn.toolCalls, rDefn.inputTokens, rDefn.outputTokens, rDefn.cachedTokens)
-	fmt.Println(strings.Repeat("-", 46))
+	fmt.Printf("%-8s %6s %8s %8s %8s %8s\n", "mode", "calls", "in.tok", "out.tok", "cacheR", "cacheW")
+	fmt.Println(strings.Repeat("-", 54))
+	fmt.Printf("%-8s %6d %8d %8d %8d %8d\n", "files", rFiles.toolCalls, rFiles.inputTokens, rFiles.outputTokens, rFiles.cachedTokens, rFiles.cacheCreationTokens)
+	fmt.Printf("%-8s %6d %8d %8d %8d %8d\n", "defn", rDefn.toolCalls, rDefn.inputTokens, rDefn.outputTokens, rDefn.cachedTokens, rDefn.cacheCreationTokens)
+	fmt.Println(strings.Repeat("-", 54))
 	if rFiles.inputTokens > 0 {
 		delta := float64(rFiles.inputTokens-rDefn.inputTokens) / float64(rFiles.inputTokens) * 100
 		fmt.Printf("input token Δ vs files: %+.0f%%  (negative = defn cheaper)\n", -delta)
@@ -139,5 +139,6 @@ func runYourRepoCase(repoDir, task, mode string) mutationResult {
 	res.inputTokens = stats.InputTokens
 	res.outputTokens = stats.OutputTokens
 	res.cachedTokens = stats.CachedTokens
+	res.cacheCreationTokens = stats.CacheCreationTokens
 	return res
 }

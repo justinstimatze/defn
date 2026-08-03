@@ -28,16 +28,17 @@ type question struct {
 }
 
 type result struct {
-	question     string
-	mode         string // "files" or "defn"
-	toolCalls    int
-	inputTokens  int
-	outputTokens int
-	cachedTokens int
-	duration     time.Duration
-	answerLen    int
-	correct      bool // did the answer contain expected strings?
-	rawOutput    string
+	question            string
+	mode                string // "files" or "defn"
+	toolCalls           int
+	inputTokens         int
+	outputTokens        int
+	cachedTokens        int
+	cacheCreationTokens int
+	duration            time.Duration
+	answerLen           int
+	correct             bool // did the answer contain expected strings?
+	rawOutput           string
 }
 
 // Question corpus for the read-side bench. Every entry carries a
@@ -376,7 +377,7 @@ func main() {
 		if !appendCSV {
 			_ = csvWriter.Write([]string{
 				"project", "kind", "question", "mode",
-				"tool_calls", "input_tokens", "output_tokens", "cached_tokens",
+				"tool_calls", "input_tokens", "output_tokens", "cached_tokens", "cache_creation_tokens",
 				"duration_ms", "correct",
 			})
 		}
@@ -392,6 +393,7 @@ func main() {
 			strconv.Itoa(r.inputTokens),
 			strconv.Itoa(r.outputTokens),
 			strconv.Itoa(r.cachedTokens),
+			strconv.Itoa(r.cacheCreationTokens),
 			strconv.FormatInt(r.duration.Milliseconds(), 10),
 			strconv.FormatBool(r.correct),
 		})
@@ -415,9 +417,9 @@ func main() {
 		r1 := runClaude(dir, q, "files")
 		filesResults = append(filesResults, r1)
 		writeRow(q, r1)
-		fmt.Printf("  files:  %d calls, %s, in/out/cache=%d/%d/%d tok, correct=%v\n",
+		fmt.Printf("  files:  %d calls, %s, in/out/cacheR/cacheW=%d/%d/%d/%d tok, correct=%v\n",
 			r1.toolCalls, r1.duration.Round(time.Second),
-			r1.inputTokens, r1.outputTokens, r1.cachedTokens, r1.correct)
+			r1.inputTokens, r1.outputTokens, r1.cachedTokens, r1.cacheCreationTokens, r1.correct)
 
 		if len(mcpBackup) > 0 {
 			os.WriteFile(mcpPath, mcpBackup, 0644)
@@ -429,9 +431,9 @@ func main() {
 		r2 := runClaude(dir, q, "defn")
 		defnResults = append(defnResults, r2)
 		writeRow(q, r2)
-		fmt.Printf("  defn:   %d calls, %s, in/out/cache=%d/%d/%d tok, correct=%v\n",
+		fmt.Printf("  defn:   %d calls, %s, in/out/cacheR/cacheW=%d/%d/%d/%d tok, correct=%v\n",
 			r2.toolCalls, r2.duration.Round(time.Second),
-			r2.inputTokens, r2.outputTokens, r2.cachedTokens, r2.correct)
+			r2.inputTokens, r2.outputTokens, r2.cachedTokens, r2.cacheCreationTokens, r2.correct)
 		fmt.Println()
 	}
 
@@ -603,16 +605,17 @@ func runClaude(dir string, q question, mode string) result {
 	}
 
 	return result{
-		question:     q.query,
-		mode:         mode,
-		toolCalls:    stats.ToolCalls,
-		inputTokens:  stats.InputTokens,
-		outputTokens: stats.OutputTokens,
-		cachedTokens: stats.CachedTokens,
-		duration:     dur,
-		answerLen:    len(answer),
-		correct:      correct,
-		rawOutput:    string(out),
+		question:            q.query,
+		mode:                mode,
+		toolCalls:           stats.ToolCalls,
+		inputTokens:         stats.InputTokens,
+		outputTokens:        stats.OutputTokens,
+		cachedTokens:        stats.CachedTokens,
+		cacheCreationTokens: stats.CacheCreationTokens,
+		duration:            dur,
+		answerLen:           len(answer),
+		correct:             correct,
+		rawOutput:           string(out),
 	}
 }
 

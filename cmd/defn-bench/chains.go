@@ -560,17 +560,17 @@ func runChainBench(defnBin string) {
 		filesScratch := prepareChainScratch(defnBin)
 		rFiles := runChainCase(filesScratch, defnBin, c, "files")
 		filesResults = append(filesResults, rFiles)
-		fmt.Printf("  files:  %d calls, %s, in/out/cache=%d/%d/%d tok, correct=%v\n",
+		fmt.Printf("  files:  %d calls, %s, in/out/cacheR/cacheW=%d/%d/%d/%d tok, correct=%v\n",
 			rFiles.toolCalls, rFiles.duration.Round(time.Second),
-			rFiles.inputTokens, rFiles.outputTokens, rFiles.cachedTokens, rFiles.correct)
+			rFiles.inputTokens, rFiles.outputTokens, rFiles.cachedTokens, rFiles.cacheCreationTokens, rFiles.correct)
 		os.RemoveAll(filesScratch)
 
 		defnScratch := prepareChainScratch(defnBin)
 		rDefn := runChainCase(defnScratch, defnBin, c, "defn")
 		defnResults = append(defnResults, rDefn)
-		fmt.Printf("  defn:   %d calls, %s, in/out/cache=%d/%d/%d tok, correct=%v\n",
+		fmt.Printf("  defn:   %d calls, %s, in/out/cacheR/cacheW=%d/%d/%d/%d tok, correct=%v\n",
 			rDefn.toolCalls, rDefn.duration.Round(time.Second),
-			rDefn.inputTokens, rDefn.outputTokens, rDefn.cachedTokens, rDefn.correct)
+			rDefn.inputTokens, rDefn.outputTokens, rDefn.cachedTokens, rDefn.cacheCreationTokens, rDefn.correct)
 		os.RemoveAll(defnScratch)
 
 		fmt.Println()
@@ -707,6 +707,7 @@ func runChainCase(scratch, defnBin string, c chain, mode string) mutationResult 
 	res.inputTokens = stats.InputTokens
 	res.outputTokens = stats.OutputTokens
 	res.cachedTokens = stats.CachedTokens
+	res.cacheCreationTokens = stats.CacheCreationTokens
 	res.correct = checkChainPostCondition(scratch, c)
 
 	if !res.correct {

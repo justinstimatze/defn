@@ -244,7 +244,7 @@ func runSizeSweepBench(defnBin string, samples int, csvPath string, sizesOverrid
 	_ = w.Write([]string{
 		"mutation", "loc_target", "loc_actual",
 		"sample", "mode", "tool_calls",
-		"input_tokens", "output_tokens", "cached_tokens",
+		"input_tokens", "output_tokens", "cached_tokens", "cache_creation_tokens",
 		"duration_ms", "correct",
 	})
 
@@ -301,9 +301,9 @@ func runSizeSweepBench(defnBin string, samples int, csvPath string, sizesOverrid
 				fmt.Printf("[%d/%d] size=%d sample=%d mode=%s\n", step, total, size, sample, mode)
 				r := runMutationCase(scratch, defnBin, m, mode)
 				agg[key{size, sample, mode}] = r
-				fmt.Printf("  %d calls, %s, in/out/cache=%d/%d/%d tok, correct=%v\n",
+				fmt.Printf("  %d calls, %s, in/out/cacheR/cacheW=%d/%d/%d/%d tok, correct=%v\n",
 					r.toolCalls, r.duration.Round(time.Second),
-					r.inputTokens, r.outputTokens, r.cachedTokens, r.correct)
+					r.inputTokens, r.outputTokens, r.cachedTokens, r.cacheCreationTokens, r.correct)
 				// Persist the raw claude -p stream-json alongside the CSV
 				// so anomalies (e.g. runaway tool-call counts) are
 				// inspectable after the fact without a re-run.
@@ -320,6 +320,7 @@ func runSizeSweepBench(defnBin string, samples int, csvPath string, sizesOverrid
 					strconv.Itoa(r.inputTokens),
 					strconv.Itoa(r.outputTokens),
 					strconv.Itoa(r.cachedTokens),
+					strconv.Itoa(r.cacheCreationTokens),
 					strconv.FormatInt(r.duration.Milliseconds(), 10),
 					strconv.FormatBool(r.correct),
 				})

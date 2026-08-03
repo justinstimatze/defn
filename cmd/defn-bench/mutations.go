@@ -193,15 +193,16 @@ func Show(x int) {
 }
 
 type mutationResult struct {
-	name         string
-	mode         string
-	toolCalls    int
-	inputTokens  int
-	outputTokens int
-	cachedTokens int
-	duration     time.Duration
-	correct      bool
-	rawOutput    string
+	name                string
+	mode                string
+	toolCalls           int
+	inputTokens         int
+	outputTokens        int
+	cachedTokens        int
+	cacheCreationTokens int
+	duration            time.Duration
+	correct             bool
+	rawOutput           string
 }
 
 // runMutationBench runs every mutation case in both files-mode and defn-mode
@@ -257,15 +258,15 @@ func runMutationBench(defnBin string) {
 
 		rFiles := runMutationCase(scratch, defnBin, m, "files")
 		filesResults = append(filesResults, rFiles)
-		fmt.Printf("  files:  %d calls, %s, in/out/cache=%d/%d/%d tok, correct=%v\n",
+		fmt.Printf("  files:  %d calls, %s, in/out/cacheR/cacheW=%d/%d/%d/%d tok, correct=%v\n",
 			rFiles.toolCalls, rFiles.duration.Round(time.Second),
-			rFiles.inputTokens, rFiles.outputTokens, rFiles.cachedTokens, rFiles.correct)
+			rFiles.inputTokens, rFiles.outputTokens, rFiles.cachedTokens, rFiles.cacheCreationTokens, rFiles.correct)
 
 		rDefn := runMutationCase(scratch, defnBin, m, "defn")
 		defnResults = append(defnResults, rDefn)
-		fmt.Printf("  defn:   %d calls, %s, in/out/cache=%d/%d/%d tok, correct=%v\n",
+		fmt.Printf("  defn:   %d calls, %s, in/out/cacheR/cacheW=%d/%d/%d/%d tok, correct=%v\n",
 			rDefn.toolCalls, rDefn.duration.Round(time.Second),
-			rDefn.inputTokens, rDefn.outputTokens, rDefn.cachedTokens, rDefn.correct)
+			rDefn.inputTokens, rDefn.outputTokens, rDefn.cachedTokens, rDefn.cacheCreationTokens, rDefn.correct)
 		fmt.Println()
 	}
 
@@ -356,6 +357,7 @@ func runMutationCase(scratch, defnBin string, m mutation, mode string) mutationR
 	res.inputTokens = stats.InputTokens
 	res.outputTokens = stats.OutputTokens
 	res.cachedTokens = stats.CachedTokens
+	res.cacheCreationTokens = stats.CacheCreationTokens
 
 	finalBytes, ferr := os.ReadFile(fixturePath)
 	if ferr != nil {
@@ -368,10 +370,11 @@ func runMutationCase(scratch, defnBin string, m mutation, mode string) mutationR
 // streamStats captures both the tool-call count and the token accounting
 // for a single claude -p invocation's stream-json output.
 type streamStats struct {
-	ToolCalls    int
-	InputTokens  int
-	OutputTokens int
-	CachedTokens int
+	ToolCalls           int
+	InputTokens         int
+	OutputTokens        int
+	CachedTokens        int
+	CacheCreationTokens int
 }
 
 // parseStreamJSON walks a claude -p stream-json output, counting tool_use
@@ -410,6 +413,7 @@ func parseStreamJSON(out []byte) streamStats {
 			s.InputTokens += intField(usage, "input_tokens")
 			s.OutputTokens += intField(usage, "output_tokens")
 			s.CachedTokens += intField(usage, "cache_read_input_tokens")
+			s.CacheCreationTokens += intField(usage, "cache_creation_input_tokens")
 		}
 	}
 	return s
