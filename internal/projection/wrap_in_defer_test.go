@@ -113,6 +113,7 @@ func TestWrapInDefer_ErrorCases(t *testing.T) {
 		{"unparseable", "not go code {", 1, "close()", "parse body"},
 		{"not_a_func", "type T struct{}", 1, "close()", "not a function declaration"},
 		{"index_too_big", "func F() {\n\ta()\n}", 5, "close()", "exceeds 1 statement"},
+		{"already_applied", "func F() {\n\tdefer close()\n\ta()\n}", 2, "close()", "already be applied"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

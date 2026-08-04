@@ -182,6 +182,18 @@ func TestAstRename(t *testing.T) {
 			newName:     "Baz",
 			wantSkipped: 1, // param decl skipped, usage renamed
 		},
+		{
+			// KNOWN LIMITATION (not fixed here, see astRename's doc comment):
+			// astRename has no type information, so it can't tell a genuine
+			// call to the renamed def apart from an unrelated selector of
+			// the same name on some other receiver. Both get renamed here.
+			// This documents actual current behavior, not desired behavior.
+			name:        "selector collision renames unrelated receiver too",
+			body:        "func Foo() { Get(); cfg.Get() }",
+			oldName:     "Get",
+			newName:     "Fetch",
+			wantContain: "cfg.Fetch()", // the actual bug: unrelated selector also renamed
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -3917,5 +3929,51 @@ func TestHandleApply_AddImportOnRootFileLandsOnDisk(t *testing.T) {
 	}
 	if !strings.Contains(string(final), "\"hash/fnv\"") {
 		t.Errorf("expected hash/fnv import to land on disk via batch apply, got:\n%s", final)
+	}
+}
+
+// TestSuggestMissingImportFixes_CrossPackageHint verifies the
+// diagnostic-to-code-action lift: an "undefined: X" build failure where X
+// is defined in a different package gets a ready-to-use add-import hint,
+// the way an LSP quick-fix would offer inline.
+func TestSuggestMissingImportFixes_CrossPackageHint(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	mod, err := db.(*store.SQLiteDB).EnsureModule("testproj/otherpkg", "otherpkg", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Helper", Kind: "function", Exported: true,
+		Signature: "func Helper() string", Body: "func Helper() string {\n\treturn \"x\"\n}",
+		SourceFile: "otherpkg/helper.go",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	hint := s.suggestMissingImportFixes("# testproj\n./main.go:12:2: undefined: Helper\n")
+	if !strings.Contains(hint, "add-import") || !strings.Contains(hint, "testproj/otherpkg") {
+		t.Errorf("expected add-import hint mentioning testproj/otherpkg, got: %q", hint)
+	}
+	if !strings.Contains(hint, `file:"main.go"`) {
+		t.Errorf("expected hint's file param normalized (no ./ prefix), got: %q", hint)
+	}
+}
+
+// TestSuggestMissingImportFixes_SamePackageNoHint verifies no hint fires
+// when the undefined name resolves to the SAME package as the failing
+// file -- that's a typo or a real bug, not a missing import.
+func TestSuggestMissingImportFixes_SamePackageNoHint(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	hint := s.suggestMissingImportFixes("./main.go:12:2: undefined: Greet\n")
+	if hint != "" {
+		t.Errorf("expected no hint for same-package undefined, got: %q", hint)
 	}
 }

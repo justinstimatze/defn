@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"strings"
 )
 
 // WrapInDefer inserts a `defer <deferBody>` statement immediately before
@@ -46,7 +47,11 @@ func WrapInDefer(body string, stmtIndex int, deferBody string) (string, error) {
 	stmts := fn.Body.List
 	if len(stmts) == 0 {
 		lbrace := off(fn.Body.Lbrace)
-		return body[:lbrace+1] + "\n\tdefer " + deferBody + body[lbrace+1:], nil
+		insertion := "\n\tdefer " + deferBody
+		if strings.HasPrefix(body[lbrace+1:], insertion) {
+			return "", fmt.Errorf("wrap-in-defer: this exact defer already present -- may already be applied")
+		}
+		return body[:lbrace+1] + insertion + body[lbrace+1:], nil
 	}
 	if stmtIndex < 1 {
 		stmtIndex = 1
@@ -60,5 +65,9 @@ func WrapInDefer(body string, stmtIndex int, deferBody string) (string, error) {
 	for lineStart > 0 && body[lineStart-1] != '\n' {
 		lineStart--
 	}
-	return body[:lineStart] + "\tdefer " + deferBody + "\n" + body[lineStart:], nil
+	insertion := "\tdefer " + deferBody + "\n"
+	if strings.HasSuffix(body[:lineStart], insertion) {
+		return "", fmt.Errorf("wrap-in-defer: this exact defer already present immediately before the target statement -- may already be applied")
+	}
+	return body[:lineStart] + insertion + body[lineStart:], nil
 }

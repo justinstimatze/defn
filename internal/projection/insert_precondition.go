@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"strings"
 )
 
 // InsertPrecondition inserts an `if <condition> { <ret> }` block at the
@@ -20,6 +21,10 @@ import (
 // (column 0), so the inserted `if` is at one tab and its inner statement
 // is at two tabs. Callers passing nested function bodies will get an
 // under-indented block — v1 does not compensate.
+//
+// Idempotency: if the exact same block is already present at the
+// insertion point (a retried or duplicate call), returns an error
+// saying so instead of silently inserting it a second time.
 func InsertPrecondition(body, condition, ret string) (string, error) {
 	if body == "" {
 		return "", fmt.Errorf("insert-precondition: body is empty")
@@ -54,5 +59,8 @@ func InsertPrecondition(body, condition, ret string) (string, error) {
 		return "", fmt.Errorf("insert-precondition: Lbrace offset %d outside body [0,%d)", lbraceOff, len(body))
 	}
 	block := "\n\tif " + condition + " {\n\t\t" + ret + "\n\t}"
+	if strings.HasPrefix(body[lbraceOff+1:], block) {
+		return "", fmt.Errorf("insert-precondition: this exact precondition already present at the top of the body -- may already be applied")
+	}
 	return body[:lbraceOff+1] + block + body[lbraceOff+1:], nil
 }

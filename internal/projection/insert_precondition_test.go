@@ -214,6 +214,7 @@ func TestInsertPrecondition_ErrorCases(t *testing.T) {
 		{"empty_ret", "func F() {}", "true", "", "ret is required"},
 		{"unparseable_body", "not go code {", "true", "return", "parse body"},
 		{"not_a_func", "type T struct{}", "true", "return", "not a function declaration"},
+		{"already_applied", "func F() {\n\tif x < 0 {\n\t\treturn nil\n\t}\n\tdo()\n}", "x < 0", "return nil", "already be applied"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

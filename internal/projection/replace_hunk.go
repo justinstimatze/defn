@@ -28,6 +28,12 @@ import (
 //
 // Empty `old` is rejected. Empty `replacement` deletes the matched
 // hunk.
+//
+// Stale-anchor detection: when `old` isn't found anywhere in `body` but
+// `replacement` already is, the error says so explicitly ("may already
+// be applied") instead of a bare "not found" — the two look identical to
+// a caller retrying a batch after a partial failure, but only one of
+// them means the edit already landed.
 func ReplaceHunk(body, old, replacement string, index int) (string, error) {
 	if body == "" {
 		return "", fmt.Errorf("replace-hunk: body is empty")
@@ -49,6 +55,9 @@ func ReplaceHunk(body, old, replacement string, index int) (string, error) {
 		off = off + i + len(old)
 	}
 	if len(offsets) == 0 {
+		if replacement != "" && strings.Contains(body, replacement) {
+			return "", fmt.Errorf("replace-hunk: old not found, but replacement already present in body — this hunk may already be applied")
+		}
 		return "", fmt.Errorf("replace-hunk: hunk not found in body")
 	}
 	if len(offsets) > 1 && index == 0 {

@@ -2489,6 +2489,7 @@ func (s *server) autoEmitAndBuildWithOpts(opts emit.Opts) string {
 			sb.WriteString("\n\n")
 		}
 		sb.WriteString(fmt.Sprintf("BUILD FAILED:\n%s", string(out)))
+		sb.WriteString(s.suggestMissingImportFixes(string(out)))
 	}
 	return sb.String()
 }
@@ -4723,6 +4724,18 @@ func (s *server) handlePatch(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 // astRename renames identifiers in Go source using go/parser.
 // Only renames *ast.Ident nodes — comments and string literals are preserved.
 // Falls back to string replacement if the source can't be parsed.
+//
+// KNOWN LIMITATION, not a bug to chase here: this operates per-caller-body
+// with no type information, unlike an LSP rename (which resolves via
+// go/types Uses/Defs before touching anything). It renames every
+// non-locally-shadowed *ast.Ident matching oldName in the body — including
+// an unrelated selector `x.oldName` on some other receiver that merely
+// shares the name. The caller SET passed in is correct (handleApply/
+// handleRename get it from the type-checked refs graph), but a caller
+// whose body coincidentally also references a different symbol of the
+// same name will have that unrelated reference renamed too. Fixing this
+// properly requires plumbing go/types occurrence positions through to
+// rename time, not a quick patch — accepted, documented gap for now.
 func astRename(body, oldName, newName string) (string, int) {
 	src := "package x\n" + body
 	fset := token.NewFileSet()
@@ -7026,3 +7039,57 @@ func (s *server) patchImportOnDisk(moduleID int64, file, importPath, alias strin
 	_ = s.backend.SetFileSource(moduleID, file, updatedSrc)
 	return true, nil
 }
+
+// suggestMissingImportFixes scans a `go build` failure for Go's
+// "undefined: X" diagnostic and, when X is defined by exactly one
+// definition elsewhere in this project, appends a ready-to-use
+// add-import hint -- the code-action-style quick fix an LSP would
+// offer inline, adapted to defn's op vocabulary since there's no
+// editor UI to click through.
+func (s *server) suggestMissingImportFixes(buildOutput string) string {
+	var hints []string
+	seen := map[string]bool{}
+	for _, line := range strings.Split(buildOutput, "\n") {
+		m := undefinedRe.FindStringSubmatch(strings.TrimSpace(line))
+		if m == nil {
+			continue
+		}
+		// go build paths for the current directory's own package commonly
+		// carry a "./" prefix that source_file never does -- strip it so
+		// both the DB lookup and the hint's own file: param stay usable.
+		file := strings.TrimPrefix(m[1], "./")
+		name := m[4]
+		key := file + ":" + name
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+
+		def, err := s.backend.GetDefinitionByName(name, "")
+		if err != nil || !def.Exported {
+			continue
+		}
+		modPath := s.modulePath(def.ModuleID)
+		if modPath == "" {
+			continue
+		}
+		dir := ""
+		if idx := strings.LastIndex(file, "/"); idx >= 0 {
+			dir = file[:idx]
+		}
+		if failingDefs, _ := s.backend.FindDefinitionsByFile(dir, file, 0); len(failingDefs) > 0 {
+			if s.modulePath(failingDefs[0].ModuleID) == modPath {
+				continue
+			}
+		}
+		hints = append(hints, fmt.Sprintf("HINT: %q is undefined in %s -- found in package %q. Try code(op:\"add-import\", file:%q, import_path:%q).", name, file, modPath, file, modPath))
+	}
+	if len(hints) == 0 {
+		return ""
+	}
+	return "\n\n" + strings.Join(hints, "\n")
+}
+
+// undefinedRe matches go build's "undefined: X" diagnostic line:
+// path/to/file.go:line:col: undefined: X
+var undefinedRe = regexp.MustCompile(`^(\S+\.go):(\d+):(\d+): undefined: (\w+)$`)

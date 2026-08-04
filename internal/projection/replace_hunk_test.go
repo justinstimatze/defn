@@ -257,6 +257,7 @@ func TestReplaceHunk_ErrorCases(t *testing.T) {
 		{"empty_body", "", "return nil", "return err", 0, "body is empty"},
 		{"empty_old", simple, "", "return err", 0, "old is required"},
 		{"not_found", simple, "return 42", "return err", 0, "hunk not found"},
+		{"already_applied", simple, "return 42", "return nil", 0, "already be applied"},
 		{"ambiguous_no_index", repeated, "\t\treturn err\n", "return nil\n", 0, "hunk occurs 2 times"},
 		{"index_out_of_range", repeated, "\t\treturn err\n", "return nil\n", 5, "exceeds 2 match"},
 		{"negative_index", simple, "return nil", "return err", -1, "index must be >= 1"},
