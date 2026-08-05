@@ -14,27 +14,18 @@ package projection
 
 import (
 	"fmt"
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"strings"
 )
 
-// ReplaceSlice replaces the Nth (1-based) match of the given slice kind
-// with replacement verbatim. Refuses if interior comments would be
-// silently discarded — use ReplaceSliceForce to override.
-//
-// Byte-exact PUTGET (when interior comments absent): the returned string
-// is exactly body[:s.StartOff] + replacement + body[s.EndOff:] where s =
-// Slices(body, kind)[index-1].
-//
-// Interior comment defense: if the replaced range contains a comment
-// whose text is NOT present in the replacement, returns an error listing
-// the discarded comment text. Defends against silent data loss when the
-// caller (typically an LLM agent) has not audited the original body
-// before submitting a replacement.
 func ReplaceSlice(body, kind string, index int, replacement string) (string, error) {
 	t, err := replaceSliceRange(body, kind, index)
 	if err != nil {
+		return "", err
+	}
+	if err := validateReplacementShape(kind, replacement); err != nil {
 		return "", err
 	}
 	comments, err := interiorComments(body, t.StartOff, t.EndOff)
@@ -53,13 +44,12 @@ func ReplaceSlice(body, kind string, index int, replacement string) (string, err
 	return body[:t.StartOff] + replacement + body[t.EndOff:], nil
 }
 
-// ReplaceSliceForce matches v1 behavior: byte-exact splice with no
-// comment defense. Any interior comments in the replaced range are
-// discarded silently. Use only when the caller has explicitly
-// acknowledged this — e.g. an LLM agent that has read the original body.
 func ReplaceSliceForce(body, kind string, index int, replacement string) (string, error) {
 	t, err := replaceSliceRange(body, kind, index)
 	if err != nil {
+		return "", err
+	}
+	if err := validateReplacementShape(kind, replacement); err != nil {
 		return "", err
 	}
 	return body[:t.StartOff] + replacement + body[t.EndOff:], nil
@@ -112,4 +102,34 @@ func interiorComments(body string, start, end int) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// validateReplacementShape defends against mangled caller text that is
+// syntactically valid Go but not the single statement the slice kind
+// implies. return/loop/error-branch slices are each always exactly one
+// AST statement; a stray literal ";" (e.g. from an HTML-escaped operator
+// like "&lt;" -- "&", "lt", ";") can split replacement into two
+// syntactically-valid top-level statements that go/parser accepts
+// without complaint, since "expression statement must be a call" is a
+// type-check rule, not a parse rule, and projection ops skip go build
+// (#148). signature/doc/body aren't single-statement shapes, so they're
+// skipped.
+func validateReplacementShape(kind, replacement string) error {
+	switch kind {
+	case "return", "loop", "error-branch":
+	default:
+		return nil
+	}
+	f, err := parser.ParseFile(token.NewFileSet(), "", "package p\nfunc f() {\n"+replacement+"\n}", 0)
+	if err != nil {
+		return fmt.Errorf("replace-slice: replacement has a syntax error: %w", err)
+	}
+	fn, ok := f.Decls[0].(*ast.FuncDecl)
+	if !ok || fn.Body == nil {
+		return fmt.Errorf("replace-slice: replacement did not parse as a statement")
+	}
+	if n := len(fn.Body.List); n != 1 {
+		return fmt.Errorf("replace-slice: replacement parses as %d statement(s), expected exactly 1 for slice kind %q -- this usually means it contains invalid syntax (e.g. an HTML-escaped operator like \"&lt;\" instead of \"<\") that splits it into multiple statements", n, kind)
+	}
+	return nil
 }

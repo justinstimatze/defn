@@ -114,6 +114,8 @@ func TestWrapInDefer_ErrorCases(t *testing.T) {
 		{"not_a_func", "type T struct{}", 1, "close()", "not a function declaration"},
 		{"index_too_big", "func F() {\n\ta()\n}", 5, "close()", "exceeds 1 statement"},
 		{"already_applied", "func F() {\n\tdefer close()\n\ta()\n}", 2, "close()", "already be applied"},
+		{"html_escaped_operator", "func F(a int) {}", 1, "a &lt; 0", "not a valid expression"},
+		{"non_call_expression", "func F() {}", 1, "1 + 1", "must be a call expression"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

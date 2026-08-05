@@ -8,21 +8,25 @@ import (
 	"strings"
 )
 
-// WrapInDefer inserts a `defer <deferBody>` statement immediately before
-// the Nth (1-based) top-level statement in the function body. If the
-// body has no statements, defer is inserted between the braces. If
-// stmtIndex is 0 or 1, defer is inserted at the very top of the body.
-//
-// Byte-exact PUTGET: existing body is preserved verbatim except for the
-// inserted defer line (indented one tab beyond the function).
-//
-// Indent assumption: body describes a top-level function (column 0).
 func WrapInDefer(body string, stmtIndex int, deferBody string) (string, error) {
 	if body == "" {
 		return "", fmt.Errorf("wrap-in-defer: body is empty")
 	}
 	if deferBody == "" {
 		return "", fmt.Errorf("wrap-in-defer: defer_body is required")
+	}
+	// Malformed-fragment defense: defer's operand must be a single call
+	// expression. Validating deferBody in isolation (rather than only
+	// reparsing the assembled body) catches mangled text -- e.g. an
+	// HTML-escaped operator like "&lt;" -- that would otherwise parse as
+	// a syntactically-valid-but-wrong expression or spill into a second
+	// top-level statement, since "expression statement must be a call"
+	// is a type-check rule, not a parse rule, and projection ops skip
+	// go build (#148).
+	if expr, err := parser.ParseExpr(deferBody); err != nil {
+		return "", fmt.Errorf("defer_body %q is not a valid expression: %w", deferBody, err)
+	} else if _, ok := expr.(*ast.CallExpr); !ok {
+		return "", fmt.Errorf("defer_body %q must be a call expression (defer requires a function/method call)", deferBody)
 	}
 	const prefix = "package p\n"
 	fset := token.NewFileSet()

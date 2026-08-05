@@ -649,6 +649,7 @@ func TestReplaceSlice_ErrorCases(t *testing.T) {
 		{"index_zero", simple, "return", 0, "return nil", "index must be >= 1"},
 		{"index_out_of_range", simple, "return", 5, "return nil", "exceeds 1 match"},
 		{"no_matches", `func F() {}`, "return", 1, "return", "no return slices found"},
+		{"html_escaped_operator_splits_statement", simple, "return", 1, `return "other" &lt; nil`, "expected exactly 1"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
