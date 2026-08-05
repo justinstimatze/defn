@@ -66,6 +66,7 @@ defn ingest . && defn emit /tmp/out && cd /tmp/out && go build ./cmd/defn/
 cmd/defn/           CLI. init, ingest, emit, serve, impact, untested, lint, query.
 cmd/defn-test/      Integration tests against chi, mux, gin, toml.
 cmd/defn-bench/     Token/tool-call benchmark (files vs defn).
+db/                 PUBLIC Go library API (github.com/justinstimatze/defn/db). External consumers import this directly -- see the warning below before touching it.
 internal/store/     SQLite storage (modernc.org/sqlite, pure Go). Definitions, bodies, references, imports, modules.
 internal/ingest/    Parses Go via go/ast + go/types. Stores definitions, imports, embeds, tests.
 internal/resolve/   Reference graph via go/types (test packages included, receiver-qualified lookups).
@@ -78,6 +79,7 @@ testdata/           Test fixtures.
 
 ## Conventions
 
+- **`db/` is a public API, not an internal package — never delete or move it without a replacement + deprecation path.** It's the only importable Go library surface defn ships (everything else public-facing is `internal/` or the CLI); providing that library surface is part of the product, not incidental. A repo-local grep for importers proves nothing about external consumers and is NOT sufficient justification for deleting or moving anything under `db/` — this was gotten wrong once already (v0.26.2 shipped without `db/`, breaking an external consumer's build within the hour; see the `db: restore the public db/ package` commit). Before touching `db/`: check its own git history/doc comments for what it's actually coupled to (not assumptions from an unrelated cleanup pass), and if in doubt, ask rather than delete.
 - **All comments are preserved** on round-trip — doc comments, inline comments, and comments between statements. The database is a lossless representation of the source.
 - All Go dependencies MIT, BSD-2, or Apache 2.0 licensed.
 - `internal/store/schema_sqlite.sql` is the schema source of truth (embedded via `//go:embed`).
