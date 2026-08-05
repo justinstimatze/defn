@@ -78,3 +78,27 @@ func TestWriteMCPConfigForProject_NoSummariesStickyAcrossPlainIngest(t *testing.
 		t.Errorf("expected DEFN_LLM_OPS=0 to survive a later noSummaries=false call, got: %+v", env)
 	}
 }
+
+// TestMaybeWriteIngestConfig_ReindexSkipsWrites is the regression test
+// for --reindex: reindex=true must write nothing, reindex=false must
+// write the same config a plain ingest always has.
+func TestMaybeWriteIngestConfig_ReindexSkipsWrites(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn", "defn.db")
+
+	maybeWriteIngestConfig(true, dir, dbPath)
+	if _, err := os.Stat(filepath.Join(dir, ".mcp.json")); !os.IsNotExist(err) {
+		t.Errorf("reindex=true: expected no .mcp.json, stat err: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "CLAUDE.md")); !os.IsNotExist(err) {
+		t.Errorf("reindex=true: expected no CLAUDE.md, stat err: %v", err)
+	}
+
+	maybeWriteIngestConfig(false, dir, dbPath)
+	if _, err := os.Stat(filepath.Join(dir, ".mcp.json")); err != nil {
+		t.Errorf("reindex=false: expected .mcp.json to be written: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "CLAUDE.md")); err != nil {
+		t.Errorf("reindex=false: expected CLAUDE.md to be written: %v", err)
+	}
+}

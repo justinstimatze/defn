@@ -217,9 +217,8 @@ func logMem(phase string) {
 // After this change: both commands do the right thing, always,
 // unless the caller passes --reindex (skip config writes for perf on
 // hot rebuilds, or for a throwaway/scratch DB where writing into
-// tracked files would be a surprise -- see winze's #dispatch report,
-// 2026-08-05: DEFN_DB pointed at a scratch path still wrote .mcp.json
-// and CLAUDE.md into the real repo).
+// tracked files would be a surprise, e.g. DEFN_DB pointed at a
+// scratch path outside the project being measured).
 //
 // Always passes noSummaries=false to writeProjectConfig -- `ingest`'s
 // CLI doesn't parse --no-summaries. This is safe: writeMCPConfigForProject
@@ -253,10 +252,7 @@ func cmdIngest(modulePath string, reindex bool) {
 		// first-time users of `defn ingest` on an unconfigured project
 		// still get CLAUDE.md + .mcp.json. Cheap: idempotent no-ops
 		// once the files exist. Skipped when reindex is set.
-		if !reindex {
-			absDB, _ := filepath.Abs(dbPath)
-			writeProjectConfig(modulePath, defnBinaryPath(), absDB, false)
-		}
+		maybeWriteIngestConfig(reindex, modulePath, dbPath)
 		return
 	}
 
@@ -297,10 +293,19 @@ func cmdIngest(modulePath string, reindex bool) {
 
 	fmt.Fprintf(os.Stderr, "done. root hash: %s\n", hash[:16])
 
-	if !reindex {
-		absDB, _ := filepath.Abs(dbPath)
-		writeProjectConfig(modulePath, defnBinaryPath(), absDB, false)
+	maybeWriteIngestConfig(reindex, modulePath, dbPath)
+}
+
+// maybeWriteIngestConfig writes project config (CLAUDE.md, .mcp.json,
+// .gitignore, .codex config) via writeProjectConfig unless reindex is
+// set. Factored out of cmdIngest since both the incremental and full
+// ingest paths need the identical skip-on-reindex guard.
+func maybeWriteIngestConfig(reindex bool, modulePath, dbPath string) {
+	if reindex {
+		return
 	}
+	absDB, _ := filepath.Abs(dbPath)
+	writeProjectConfig(modulePath, defnBinaryPath(), absDB, false)
 }
 
 // isCorruptDBError reports whether err looks like a corrupt embedded
