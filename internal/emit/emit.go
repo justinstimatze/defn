@@ -78,6 +78,19 @@ type Opts struct {
 	// skipped — callers using TouchedFiles are the singleton-mutation
 	// paths that don't consume the loc index and never touch go.mod.
 	TouchedFiles []string
+
+	// SkipGoimports skips the goimports subprocess entirely when the
+	// caller has independently proven this edit's marginal contribution
+	// to the file's import-need equation is zero-delta -- e.g. a
+	// sig-stable body edit whose set of package-selector references is
+	// unchanged (see bodyImportFootprintUnchanged in internal/mcp).
+	// goimports is a subprocess spawn that runs unconditionally
+	// otherwise; measured at ~25% of a warm sig-stable edit's wall even
+	// when it had nothing to fix (2026-08-04 measure-edit spike).
+	// Skipping it also skips goimports' gofmt-equivalent formatting pass
+	// -- only set this when the incoming body is already well-formatted,
+	// or accept minor cosmetic drift until the next non-skipped emit.
+	SkipGoimports bool
 }
 
 // Emit writes all definitions from the database as .go files into outDir.
@@ -203,52 +216,60 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, []
 	}
 	timeIt("module-writes", t)
 
-	// Run goimports to fix unused imports and formatting.
+	// Run goimports to fix unused imports and formatting -- unless the
+	// caller has proven this edit can't need it (Opts.SkipGoimports).
+	// goimports is a subprocess spawn; measured at ~25% of a warm
+	// sig-stable edit's wall even when it had nothing to fix (2026-08-04
+	// measure-edit spike on receiverName).
 	t = time.Now()
-	goimports, err := exec.LookPath("goimports")
-	if err != nil {
-		return nil, nil, fmt.Errorf("goimports not found — install with: go install golang.org/x/tools/cmd/goimports@latest")
-	}
-	// #109 pass 3: prefer scoped goimports when the caller has named
-	// touched files. Falls back to the full recursive walk when the
-	// list is empty (existing behavior).
-	args := []string{"-w"}
-	if len(opts.GoimportsFiles) > 0 {
-		for _, rel := range opts.GoimportsFiles {
-			// Sanitize as we do for project files above — no absolute paths,
-			// no traversal.
-			clean := filepath.Clean(rel)
-			if filepath.IsAbs(clean) || strings.Contains(clean, "..") {
-				continue
-			}
-			// #117 followup: emit's output path for a source_file can diverge
-			// from the source_file's project-relative path (single-module
-			// projects where the module root == package root strip prefixes;
-			// cli/cli's "command/root.go" writes to outDir/root.go, not
-			// outDir/command/root.go). goimports does NOT tolerate missing
-			// paths — it errors "stat X: no such file". Stat before adding
-			// and try a Base-only fallback. If neither exists, silently
-			// skip: goimports has nothing to do for a file that isn't there,
-			// and correctness is preserved (the file was never written by
-			// this emit).
-			joined := filepath.Join(outDir, clean)
-			if _, err := os.Stat(joined); err == nil {
-				args = append(args, joined)
-				continue
-			}
-			// Fallback: emit may have written the basename at outDir root.
-			baseJoined := filepath.Join(outDir, filepath.Base(clean))
-			if _, err := os.Stat(baseJoined); err == nil {
-				args = append(args, baseJoined)
-			}
-		}
+	if opts.SkipGoimports {
+		timeIt("goimports-skipped", t)
 	} else {
-		args = append(args, outDir)
+		goimports, err := exec.LookPath("goimports")
+		if err != nil {
+			return nil, nil, fmt.Errorf("goimports not found — install with: go install golang.org/x/tools/cmd/goimports@latest")
+		}
+		// #109 pass 3: prefer scoped goimports when the caller has named
+		// touched files. Falls back to the full recursive walk when the
+		// list is empty (existing behavior).
+		args := []string{"-w"}
+		if len(opts.GoimportsFiles) > 0 {
+			for _, rel := range opts.GoimportsFiles {
+				// Sanitize as we do for project files above — no absolute paths,
+				// no traversal.
+				clean := filepath.Clean(rel)
+				if filepath.IsAbs(clean) || strings.Contains(clean, "..") {
+					continue
+				}
+				// #117 followup: emit's output path for a source_file can diverge
+				// from the source_file's project-relative path (single-module
+				// projects where the module root == package root strip prefixes;
+				// cli/cli's "command/root.go" writes to outDir/root.go, not
+				// outDir/command/root.go). goimports does NOT tolerate missing
+				// paths — it errors "stat X: no such file". Stat before adding
+				// and try a Base-only fallback. If neither exists, silently
+				// skip: goimports has nothing to do for a file that isn't there,
+				// and correctness is preserved (the file was never written by
+				// this emit).
+				joined := filepath.Join(outDir, clean)
+				if _, err := os.Stat(joined); err == nil {
+					args = append(args, joined)
+					continue
+				}
+				// Fallback: emit may have written the basename at outDir root.
+				baseJoined := filepath.Join(outDir, filepath.Base(clean))
+				if _, err := os.Stat(baseJoined); err == nil {
+					args = append(args, baseJoined)
+				}
+			}
+		} else {
+			args = append(args, outDir)
+		}
+		if out, err := exec.Command(goimports, args...).CombinedOutput(); err != nil {
+			return nil, nil, fmt.Errorf("goimports: %s", out)
+		}
+		timeIt("goimports", t)
 	}
-	if out, err := exec.Command(goimports, args...).CombinedOutput(); err != nil {
-		return nil, nil, fmt.Errorf("goimports: %s", out)
-	}
-	timeIt("goimports", t)
 
 	// Refresh file_sources with the post-goimports bytes so it stays in
 	// sync with disk. Without this, the authoritative raw source drifts

@@ -1728,3 +1728,33 @@ func TestEmitProjectFileDiskDriftWarning(t *testing.T) {
 		t.Fatalf("expected DB content to overwrite drifted disk content, got:\n%s", final)
 	}
 }
+
+func TestEmitOptsSkipGoimportsSkipsTheGoimportsPass(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test/pkg", "pkg", "")
+	db.EnsureModule("example.com/test/other", "other", "")
+
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true,
+		Body:       "func Foo() { strings.TrimSpace(\"x\") }",
+		SourceFile: "pkg.go",
+	})
+
+	outDir := t.TempDir()
+	if _, err := EmitWithOpts(db, outDir, Opts{
+		TouchedFiles:   []string{"pkg.go"},
+		GoimportsFiles: []string{"pkg.go"},
+		SkipGoimports:  true,
+	}); err != nil {
+		t.Fatalf("EmitWithOpts: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(outDir, "pkg", "pkg.go"))
+	if err != nil {
+		t.Fatalf("file not found: %v", err)
+	}
+	content := string(data)
+	if strings.Contains(content, `"strings"`) {
+		t.Fatalf("goimports ran despite SkipGoimports:true -- strings import got added:\n%s", content)
+	}
+}

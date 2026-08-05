@@ -2079,6 +2079,7 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 	// AST-canonicalized (d.Signature from ingest has doc-comment prefix
 	// lines; extractSignature strips them — comparing them directly
 	// false-positives "sig changed" on every doc-adjacent edit).
+	oldBody := d.Body
 	oldSignature := extractSignature(d.Body)
 	d.Body = args.NewBody
 	d.Signature = extractSignature(args.NewBody)
@@ -2096,7 +2097,19 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 	sigStable := oldSignature == d.Signature
 	var buildResult string
 	if sigStable {
-		buildResult = s.autoEmitOnly(d.SourceFile)
+		opts := emit.Opts{}
+		if d.SourceFile != "" {
+			opts.GoimportsFiles = []string{d.SourceFile}
+			opts.TouchedFiles = []string{d.SourceFile}
+			// Quick win (2026-08-04 spike): a sig-stable body edit whose
+			// package-selector references are unchanged can't have
+			// changed what this file needs to import -- skip goimports'
+			// subprocess spawn entirely rather than running it as a
+			// guaranteed no-op. See Opts.SkipGoimports and
+			// bodyImportFootprintUnchanged.
+			opts.SkipGoimports = bodyImportFootprintUnchanged(oldBody, args.NewBody)
+		}
+		buildResult = s.autoEmitOnlyWithOpts(opts)
 	} else {
 		if os.Getenv("DEFN_MEASURE_TIMING") == "1" {
 			fmt.Fprintf(os.Stderr, "  [edit] signature changed, build required:\n    old: %q\n    new: %q\n", oldSignature, d.Signature)
