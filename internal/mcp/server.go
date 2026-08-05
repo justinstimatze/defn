@@ -5287,6 +5287,10 @@ func (s *server) handleFileDefs(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 		StartLine int    `json:"start_line"`
 		EndLine   int    `json:"end_line"`
 	}
+	total := len(defs)
+	if total > fileDefsCap {
+		defs = defs[:fileDefsCap]
+	}
 	var results []defSummary
 	for _, d := range defs {
 		results = append(results, defSummary{
@@ -5297,6 +5301,9 @@ func (s *server) handleFileDefs(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 	text, err := toJSON(results)
 	if err != nil {
 		return errResult(err)
+	}
+	if total > fileDefsCap {
+		return textResult(fmt.Sprintf("%d of %d definitions in %s (showing first %d — pass a narrower file/query for the rest):\n\n%s", len(results), total, file, fileDefsCap, text)), nil, nil
 	}
 	return textResult(fmt.Sprintf("%d definitions in %s:\n\n%s", len(results), file, text)), nil, nil
 }
@@ -5386,7 +5393,12 @@ func (s *server) handleTraverse(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 	}
 
 	currentDepth := 0
+	rendered := 0
 	for _, r := range results {
+		if rendered >= traverseResultCap {
+			fmt.Fprintf(&sb, "\n… (%d more results omitted; pass format:\"json\" for the full list)\n", len(results)-rendered)
+			break
+		}
 		if r.Depth != currentDepth {
 			currentDepth = r.Depth
 			count := 0
@@ -5406,6 +5418,7 @@ func (s *server) handleTraverse(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 			testMark = " [test]"
 		}
 		fmt.Fprintf(&sb, "- %s (%s)%s — %s\n", name, r.Definition.Kind, testMark, r.Definition.SourceFile)
+		rendered++
 	}
 	return textResult(sb.String()), nil, nil
 }
@@ -5472,8 +5485,17 @@ func (s *server) handlePragmas(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 		comments = filtered
 	}
 
+	total := len(comments)
+	if total > pragmasCap {
+		comments = comments[:pragmasCap]
+	}
+
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "## Pragmas matching %q (%d results)\n\n", pragmaKey, len(comments))
+	if total > pragmasCap {
+		fmt.Fprintf(&sb, "## Pragmas matching %q (showing %d of %d results — pass file: or a narrower pattern for the rest)\n\n", pragmaKey, len(comments), total)
+	} else {
+		fmt.Fprintf(&sb, "## Pragmas matching %q (%d results)\n\n", pragmaKey, len(comments))
+	}
 	for _, c := range comments {
 		defName := c.DefName
 		if defName == "" {
@@ -7214,3 +7236,21 @@ func isGeneratedSource(raw string) bool {
 	}
 	return false
 }
+
+// fileDefsCap bounds code(op:"file-defs") -- previously uncapped, so a
+// huge file (not least a generated one, see isGeneratedSource) could
+// dump hundreds of defs in one response with no truncation.
+const fileDefsCap = 50
+
+// pragmasCap bounds code(op:"pragmas") -- previously uncapped, and the
+// default pattern ("%") matches every pragma comment in the project.
+const pragmasCap = 30
+
+// traverseResultCap bounds the default markdown rendering of
+// code(op:"traverse") -- unlike impact/search, traverse had no cap at
+// all before this: a densely-connected def walked 10 hops deep (the
+// default max_depth) could render an unbounded number of results.
+// format:"json" remains the intentional full-data escape hatch,
+// mirroring handleImpact's convention -- only the default rendering is
+// capped.
+const traverseResultCap = 50

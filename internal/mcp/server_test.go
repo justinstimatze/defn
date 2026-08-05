@@ -4056,3 +4056,123 @@ func TestHandleOverview_CollapsesGeneratedFile(t *testing.T) {
 		t.Errorf("expected main.go still individually listed, got:\n%s", text)
 	}
 }
+
+// TestHandleFileDefs_CapsLargeFile verifies file-defs truncates a file
+// with more defs than fileDefsCap instead of dumping all of them.
+func TestHandleFileDefs_CapsLargeFile(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	var sb strings.Builder
+	sb.WriteString("package main\n\n")
+	const n = 60
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&sb, "func Big%d() {}\n", i)
+	}
+	bigPath := filepath.Join(projDir, "big.go")
+	if err := os.WriteFile(bigPath, []byte(sb.String()), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ingest.IngestFile(db, projDir, bigPath); err != nil {
+		t.Fatal("ingest big.go:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	result, _, err := s.handleFileDefs(context.Background(), nil, codeParam{File: "big.go"})
+	if err != nil {
+		t.Fatalf("file-defs: %v", err)
+	}
+	text := resultText(t, result)
+
+	if !strings.Contains(text, fmt.Sprintf("%d of %d definitions", fileDefsCap, n)) {
+		t.Errorf("expected cap message '%d of %d definitions', got:\n%s", fileDefsCap, n, text)
+	}
+	if strings.Count(text, "\"name\":") > fileDefsCap {
+		t.Errorf("expected at most %d entries in output, got more:\n%s", fileDefsCap, text)
+	}
+}
+
+// TestHandlePragmas_CapsManyMatches verifies pragmas truncates a match
+// set larger than pragmasCap instead of dumping all of them.
+func TestHandlePragmas_CapsManyMatches(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	var sb strings.Builder
+	sb.WriteString("package main\n\n")
+	const n = 35
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&sb, "//test:pragma\nfunc PragmaTarget%d() {}\n\n", i)
+	}
+	pragmaPath := filepath.Join(projDir, "pragmas.go")
+	if err := os.WriteFile(pragmaPath, []byte(sb.String()), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	result, _, err := s.handlePragmas(context.Background(), nil, codeParam{Pattern: "test:pragma"})
+	if err != nil {
+		t.Fatalf("pragmas: %v", err)
+	}
+	text := resultText(t, result)
+
+	if !strings.Contains(text, fmt.Sprintf("showing %d of %d", pragmasCap, n)) {
+		t.Errorf("expected cap message 'showing %d of %d', got:\n%s", pragmasCap, n, text)
+	}
+	if got := strings.Count(text, "`test:pragma`"); got > pragmasCap {
+		t.Errorf("expected at most %d pragma lines, got %d:\n%s", pragmasCap, got, text)
+	}
+}
+
+// TestHandleTraverse_CapsManyCallers verifies traverse's default
+// (markdown) rendering truncates when a def has more callers than
+// traverseResultCap, while format:"json" remains the uncapped escape
+// hatch (mirroring handleImpact's convention).
+func TestHandleTraverse_CapsManyCallers(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	var sb strings.Builder
+	sb.WriteString("package main\n\nfunc Target() {}\n\n")
+	const n = 55
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&sb, "func Wrap%d() { Target() }\n", i)
+	}
+	wrapPath := filepath.Join(projDir, "wrappers.go")
+	if err := os.WriteFile(wrapPath, []byte(sb.String()), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	result, _, err := s.handleTraverse(context.Background(), nil, codeParam{Name: "Target", Direction: "callers", Depth: 1})
+	if err != nil {
+		t.Fatalf("traverse: %v", err)
+	}
+	text := resultText(t, result)
+
+	if !strings.Contains(text, "more results omitted") {
+		t.Errorf("expected a cap/omission note for %d callers (cap %d), got:\n%s", n, traverseResultCap, text)
+	}
+	if got := strings.Count(text, "Wrap"); got > traverseResultCap {
+		t.Errorf("expected at most %d rendered callers, got %d:\n%s", traverseResultCap, got, text)
+	}
+
+	// format:"json" remains uncapped -- the full-data escape hatch.
+	jsonResult, _, err := s.handleTraverse(context.Background(), nil, codeParam{Name: "Target", Direction: "callers", Depth: 1, Format: "json"})
+	if err != nil {
+		t.Fatalf("traverse json: %v", err)
+	}
+	jsonText := resultText(t, jsonResult)
+	if got := strings.Count(jsonText, "\"name\":\"Wrap"); got != n {
+		t.Errorf("expected format:json to return all %d callers uncapped, got %d in:\n%s", n, got, jsonText)
+	}
+}
