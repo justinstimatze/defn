@@ -17,7 +17,7 @@ fi
 if [ ! -d ".defn" ]; then
     # First time: full init.
     DEFN_DB=.defn "$DEFN_BIN" init . >&2
-elif [ "go.mod" -nt ".defn/.dolt/repo_state.json" ]; then
+elif [ "go.mod" -nt ".defn/defn.db" ]; then
     # go.mod is newer than the database — re-ingest.
     DEFN_DB=.defn "$DEFN_BIN" ingest . >&2
 fi
