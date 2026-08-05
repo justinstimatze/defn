@@ -88,6 +88,15 @@ func dedupOpKey(args codeParam) (string, string, bool) {
 		return "read-file", args.File, true
 	case "file-defs":
 		return "file-defs", args.File, true
+	// 2026-08-04: search/find were exempt from dedup despite showing real
+	// repeat patterns in a corpus read-locality analysis (e.g. the same
+	// search pattern re-run, or find re-run on the same file, within one
+	// session). Both are deterministic given the DB's current content, so
+	// the same correctness argument as the other read-family ops applies.
+	case "search":
+		return "search", fmt.Sprintf("%s|%d|%v", args.Pattern, args.Limit, args.Rank), true
+	case "find":
+		return "find", fmt.Sprintf("%s|%d", args.File, args.Line), true
 	// #152 extensions: structural / summary ops the model re-asks when
 	// verifying a plan across turns. Same session-scoped dedup shape.
 	case "impact":
@@ -268,6 +277,14 @@ func (c *respCache) invalidateNames(sess *sdkmcp.ServerSession, names, files []s
 	}
 	delete(sc.entries, "overview|project")
 	for key := range sc.entries {
+		// search's cache key is pattern text, not a def/file identity --
+		// any determinable write could shift what a pattern matches
+		// anywhere in the DB, so (like overview|project) it's always
+		// cleared rather than attempting per-pattern staleness analysis.
+		if strings.HasPrefix(key, "search|") {
+			delete(sc.entries, key)
+			continue
+		}
 		for _, name := range names {
 			for _, op := range readOpsWithNameKey {
 				prefix := op + "|" + name
@@ -277,7 +294,7 @@ func (c *respCache) invalidateNames(sess *sdkmcp.ServerSession, names, files []s
 			}
 		}
 		for _, file := range files {
-			if key == "read-file|"+file || key == "file-defs|"+file || key == "overview|file:"+file {
+			if key == "read-file|"+file || key == "file-defs|"+file || key == "overview|file:"+file || strings.HasPrefix(key, "find|"+file+"|") {
 				delete(sc.entries, key)
 			}
 		}

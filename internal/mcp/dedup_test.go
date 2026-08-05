@@ -163,8 +163,9 @@ func TestDedupOpKey_Mapping(t *testing.T) {
 		{codeParam{Op: "expand", Name: "Foo", Include: []string{"body", "callers"}}, "expand", true},
 		{codeParam{Op: "methods", Name: "Server"}, "methods", true},
 		{codeParam{Op: "explain", Name: "Foo"}, "explain", true},
+		{codeParam{Op: "search", Pattern: "auth"}, "search", true},
+		{codeParam{Op: "find", File: "main.go"}, "find", true},
 		// Not cached:
-		{codeParam{Op: "search", Pattern: "auth"}, "", false},
 		{codeParam{Op: "similar", Name: "Foo"}, "", false},
 		{codeParam{Op: "edit", Name: "Foo"}, "", false},
 	}
@@ -381,5 +382,37 @@ func TestWriteTargets(t *testing.T) {
 				t.Errorf("files = %v, want %v", files, c.wantFiles)
 			}
 		})
+	}
+}
+
+func TestInvalidateNames_FindScopedToFile(t *testing.T) {
+	c := newRespCache()
+	sess := &sdkmcp.ServerSession{}
+	a := mkPayload("find-a")
+	b := mkPayload("find-b")
+
+	c.dedup(sess, "find", "pkg/a.go|0", mkText(a))
+	c.dedup(sess, "find", "pkg/b.go|0", mkText(b))
+
+	c.invalidateNames(sess, nil, []string{"pkg/a.go"})
+
+	if r := c.dedup(sess, "find", "pkg/a.go|0", mkText(a)); strings.Contains(r.Content[0].(*sdkmcp.TextContent).Text, "cached") {
+		t.Errorf("find entries for the touched file should be cleared, got a cache-hit stub")
+	}
+	if r := c.dedup(sess, "find", "pkg/b.go|0", mkText(b)); !strings.Contains(r.Content[0].(*sdkmcp.TextContent).Text, "cached") {
+		t.Errorf("find entries for an untouched file should survive, got full content instead of a cache-hit stub")
+	}
+}
+
+func TestInvalidateNames_SearchAlwaysCleared(t *testing.T) {
+	c := newRespCache()
+	sess := &sdkmcp.ServerSession{}
+	res := mkPayload("search-results")
+
+	c.dedup(sess, "search", "auth|10|false", mkText(res))
+	c.invalidateNames(sess, []string{"SomeUnrelatedDef"}, nil)
+
+	if r := c.dedup(sess, "search", "auth|10|false", mkText(res)); strings.Contains(r.Content[0].(*sdkmcp.TextContent).Text, "cached") {
+		t.Errorf("search entries should always be cleared by any determinable write, got a cache-hit stub")
 	}
 }
