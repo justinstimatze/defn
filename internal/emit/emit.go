@@ -384,6 +384,22 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	// #11: struct fields are indexed as their own "field" kind
+	// definitions for Type.Field lookup, but they aren't independent
+	// top-level declarations -- a field only exists syntactically
+	// inside its struct's braces, and the struct's own Body already
+	// contains it as text. Passing a field def into the per-file decl
+	// assembly below (writeFile/mergeDeclsIntoSource) would inject its
+	// bare Body (e.g. "Port int") as a bogus floating top-level
+	// statement and corrupt the emitted file. Exclude before anything
+	// downstream sees them.
+	fieldFree := defs[:0]
+	for _, d := range defs {
+		if d.Kind != "field" {
+			fieldFree = append(fieldFree, d)
+		}
+	}
+	defs = fieldFree
 	if len(defs) == 0 {
 		// No definitions — clean up any previously emitted files for this
 		// module. Scoped emit skips this cleanup: a singleton rename/edit

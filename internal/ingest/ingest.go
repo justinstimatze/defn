@@ -417,9 +417,19 @@ func ingestComments(db store.Backend, fset *token.FileSet, file *ast.File, sourc
 	if err != nil {
 		return fmt.Errorf("find defs for comments: %w", err)
 	}
-	// Build a map from startLine to defID for matching.
+	// Build a map from startLine to defID for matching. Struct fields
+	// (#11) are excluded: a one-line struct decl (e.g. "type X struct{
+	// V int }") gives its field the same start_line as the struct
+	// itself, and letting a field def compete for that line silently
+	// clobbers the type's entry depending on map iteration order --
+	// misattributing the struct's leading pragma/doc comment to its
+	// field instead. Fields aren't independent comment-attachable
+	// declarations anyway.
 	defByLine := make(map[int]int64)
 	for _, d := range defs {
+		if d.Kind == "field" {
+			continue
+		}
 		defByLine[int(d.StartLine)] = d.ID
 	}
 	// Assign defIDs to intervals by matching: the DB's startLine should be
@@ -655,6 +665,14 @@ func ingestGenDecl(db store.Backend, fset *token.FileSet, mod *store.Module, fil
 			}
 			state.enqueueDef(def)
 
+			// #11: struct fields get their own "field" kind definitions,
+			// Name=field, Receiver=declaring type -- the same shape methods
+			// already use, so Type.Field resolves via the existing
+			// receiver.method name-lookup path with no resolver changes.
+			if st, ok := s.Type.(*ast.StructType); ok {
+				ingestStructFields(fset, mod, st, s.Name.Name, isTest, sourceFile, state)
+			}
+
 		case *ast.ValueSpec:
 			c := &valueSpecCtx{
 				db: db, fset: fset, mod: mod, gd: gd,
@@ -729,4 +747,48 @@ func firstNonBlankName(names []*ast.Ident) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// ingestStructFields enqueues one "field" kind definition per named
+// field of a struct type declaration (#11). Name is the field name,
+// Receiver is the declaring struct's type name, mirroring how method
+// definitions already use Receiver -- so a "Type.Field" lookup
+// resolves via the same receiver.method name-parsing path
+// GetDefinitionByName already has for methods, with no resolver
+// changes needed. Anonymous/embedded fields are skipped; the issue
+// calls those a bonus, not a requirement.
+func ingestStructFields(fset *token.FileSet, mod *store.Module, st *ast.StructType, typeName string, isTest bool, sourceFile string, state *ingestState) {
+	if st.Fields == nil {
+		return
+	}
+	for _, field := range st.Fields.List {
+		if len(field.Names) == 0 {
+			continue
+		}
+		start := fset.Position(field.Pos())
+		end := fset.Position(field.End())
+		doc := field.Doc.Text()
+		if doc == "" {
+			doc = field.Comment.Text()
+		}
+		sig := renderNode(fset, field.Type)
+		body := renderNode(fset, field)
+		for _, name := range field.Names {
+			def := &store.Definition{
+				ModuleID:   mod.ID,
+				Name:       name.Name,
+				Kind:       "field",
+				Exported:   name.IsExported(),
+				Test:       isTest,
+				Receiver:   typeName,
+				Signature:  sig,
+				Body:       body,
+				Doc:        doc,
+				StartLine:  start.Line,
+				EndLine:    end.Line,
+				SourceFile: sourceFile,
+			}
+			state.enqueueDef(def)
+		}
+	}
 }

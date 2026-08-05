@@ -2,6 +2,8 @@ package emit
 
 import (
 	"bytes"
+	"go/parser"
+	"go/token"
 	"io"
 	"os"
 	"os/exec"
@@ -1756,5 +1758,42 @@ func TestEmitOptsSkipGoimportsSkipsTheGoimportsPass(t *testing.T) {
 	content := string(data)
 	if strings.Contains(content, `"strings"`) {
 		t.Fatalf("goimports ran despite SkipGoimports:true -- strings import got added:\n%s", content)
+	}
+}
+
+// TestEmitExcludesFieldKindFromTopLevelDecls is the regression test for
+// the #11 emit-corruption risk: a "field" kind definition's Body (e.g.
+// "Port int") is not a standalone top-level declaration -- it only
+// exists inside its struct's braces, which the struct's own Body
+// already contains as text. Emit must exclude field defs from the
+// per-file decl assembly, or it would inject a bare field line as a
+// floating top-level statement and produce unparseable Go.
+func TestEmitExcludesFieldKindFromTopLevelDecls(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/fields", "fields", "")
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Config", Kind: "type", Exported: true,
+		Body: "type Config struct {\n\tPort int\n}", SourceFile: "fields.go",
+	})
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Port", Kind: "field", Exported: true,
+		Receiver: "Config", Signature: "int", Body: "Port int", SourceFile: "fields.go",
+	})
+
+	outDir := t.TempDir()
+	if err := Emit(db, outDir); err != nil {
+		t.Fatal(err)
+	}
+	out, err := os.ReadFile(filepath.Join(outDir, "fields.go"))
+	if err != nil {
+		t.Fatalf("read emitted file: %v", err)
+	}
+
+	fset := token.NewFileSet()
+	if _, err := parser.ParseFile(fset, "fields.go", out, 0); err != nil {
+		t.Fatalf("emitted file is not valid Go: %v\n--- content ---\n%s", err, out)
+	}
+	if strings.Count(string(out), "Port int") != 1 {
+		t.Errorf("expected exactly one 'Port int' (inside the struct, not floating), got:\n%s", out)
 	}
 }

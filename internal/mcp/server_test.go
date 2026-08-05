@@ -4220,3 +4220,45 @@ func TestIsStaleProjectDirError_RealGoListFailure(t *testing.T) {
 		t.Error("expected isStaleProjectDirError to be false for an unrelated error")
 	}
 }
+
+// TestProjectOverview_ExcludesFieldsFromCountAndExemplars is the
+// regression test for #11's blast-radius fix: struct fields are real
+// definitions now, but projectOverview must keep excluding them from
+// its def count and exemplar preview so the project-wide orientation
+// view isn't crowded with field names instead of real API surface.
+func TestProjectOverview_ExcludesFieldsFromCountAndExemplars(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "fieldproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module fieldproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package main
+
+type Config struct {
+	AlphaField string
+	BetaField  int
+}
+
+func main() {}
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+
+	s := &server{backend: db}
+	result, _, _ := s.projectOverview(context.Background())
+	text := resultText(t, result)
+
+	if strings.Contains(text, "AlphaField") || strings.Contains(text, "BetaField") {
+		t.Errorf("expected field names excluded from project overview exemplars, got %q", text)
+	}
+	if !strings.Contains(text, "1 exported") {
+		t.Errorf("expected exactly 1 exported def (Config; fields excluded), got %q", text)
+	}
+}

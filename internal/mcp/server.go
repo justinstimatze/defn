@@ -4537,7 +4537,18 @@ func (s *server) projectOverview(ctx context.Context) (*sdkmcp.CallToolResult, a
 	shown := 0
 	totalDefs := 0
 	for _, m := range mods {
-		defs, _ := s.backend.GetModuleDefinitions(m.ID)
+		allDefs, _ := s.backend.GetModuleDefinitions(m.ID)
+		// #11: struct fields are real definitions (Type.Field lookup)
+		// but not top-level API surface -- counting/exemplifying them
+		// here would crowd out real symbols and inflate the def count
+		// this project-wide summary reports. Fully visible via
+		// search/outline/read; just excluded from this orientation view.
+		defs := make([]store.Definition, 0, len(allDefs))
+		for _, d := range allDefs {
+			if d.Kind != "field" {
+				defs = append(defs, d)
+			}
+		}
 		totalDefs += len(defs)
 		if shown >= projectOverviewModuleCap {
 			continue

@@ -315,3 +315,44 @@ type FormedAt struct{ V int }
 		t.Errorf("winze:functional should carry FormedAt's def_id (%d) after IngestFile, got %+v", formedAt.ID, comments[0])
 	}
 }
+
+// TestIngestStructFields is the regression test for #11: struct fields
+// get their own "field" kind definitions, and Type.Field resolves via
+// the same receiver.method name-lookup path methods already use.
+func TestIngestStructFields(t *testing.T) {
+	path := testdataPath("edgecases")
+	if _, err := os.Stat(filepath.Join(path, "go.mod")); err != nil {
+		t.Skip("testdata/edgecases not found")
+	}
+	db := testDB(t)
+	if err := Ingest(db, path); err != nil {
+		t.Fatal(err)
+	}
+
+	port, err := db.GetDefinitionByName("Server.Port", "")
+	if err != nil {
+		t.Fatalf("Server.Port not resolved via Type.Field lookup: %v", err)
+	}
+	if port.Kind != "field" {
+		t.Errorf("Server.Port: kind=%s, want field", port.Kind)
+	}
+	if port.Receiver != "Server" {
+		t.Errorf("Server.Port: receiver=%s, want Server", port.Receiver)
+	}
+	if port.Name != "Port" {
+		t.Errorf("Server.Port: name=%s, want Port", port.Name)
+	}
+	if !strings.Contains(port.Signature, "int") {
+		t.Errorf("Server.Port: signature=%q, want it to contain int", port.Signature)
+	}
+
+	// The struct type itself must still resolve to "type", not get
+	// shadowed or altered by its own field's definition.
+	server, err := db.GetDefinitionByName("Server", "")
+	if err != nil {
+		t.Fatal("Server type not found")
+	}
+	if server.Kind != "type" {
+		t.Errorf("Server: kind=%s, want type", server.Kind)
+	}
+}
