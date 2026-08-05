@@ -1037,6 +1037,20 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 
 	switch args.Op {
 	case "read":
+		// Cross-def context reuse, symmetric with outline's below: a
+		// non-full read's best case IS the full body, so if that body was
+		// already served this session via read(full:true), a later plain
+		// read (no full:true, no query) can only return the same content
+		// or a downgraded subset -- never more. Bypassed when full:true or
+		// a query is set: those aren't redundant with a prior plain-args
+		// full-body serve check the same way outline's bypass works.
+		if !args.Full && req != nil && s.respCache != nil && strings.TrimSpace(args.Query) == "" && s.respCache.hasBodyServed(req.Session, args.Name) {
+			stub := fmt.Sprintf(
+				"[%s's full body was already read in this session (read with full:true) -- a plain read would return the same content or a downgraded subset, never more. Nothing new here. If the def may have changed since, call code(op:\"sync\") first.]\n",
+				args.Name,
+			)
+			return textResult(stub), nil, nil
+		}
 		return wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name, Full: args.Full, Query: args.Query, Mode: args.Mode}))
 	case "resummarize":
 		return s.handleResummarize(ctx, req, args)
@@ -1061,6 +1075,15 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		}
 		return wrapStale(s.handleOutline(ctx, req, nameParam{Name: args.Name, Query: args.Query}))
 	case "slice":
+		// Same cross-def context reuse as read/outline above: any slice
+		// kind is a strict subset of the full body already served.
+		if req != nil && s.respCache != nil && s.respCache.hasBodyServed(req.Session, args.Name) {
+			stub := fmt.Sprintf(
+				"[%s's full body was already read in this session (read with full:true) -- any slice is a strict subset of that body. Nothing new here. If the def may have changed since, call code(op:\"sync\") first.]\n",
+				args.Name,
+			)
+			return textResult(stub), nil, nil
+		}
 		return wrapStale(s.handleSlice(ctx, req, args))
 	case "insert-precondition":
 		return s.handleInsertPrecondition(ctx, req, args)

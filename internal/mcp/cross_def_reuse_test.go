@@ -240,3 +240,52 @@ func TestHandleCode_OutlineSuppressionSurvivesUnrelatedWrite(t *testing.T) {
 		t.Errorf("expected suppression state to SURVIVE an unrelated write (add-import), got:\n%s", outlineText)
 	}
 }
+
+// TestHandleCode_PlainReadSuppressedAfterFullBodyRead generalizes #176:
+// a plain read() (no full:true) on a def whose full body was already
+// read this session should return a compact stub instead of
+// re-transmitting the same content, since a plain read's best case IS
+// that same full body (2026-08-04).
+func TestHandleCode_PlainReadSuppressedAfterFullBodyRead(t *testing.T) {
+	s, req := setupCrossDefReuseServer(t)
+
+	if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "Chunky", Full: true}); err != nil {
+		t.Fatalf("read full:true: %v", err)
+	}
+
+	readResult, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "Chunky"})
+	if err != nil {
+		t.Fatalf("plain read: %v", err)
+	}
+	readText := resultText(t, readResult)
+	if !strings.Contains(readText, "already read") {
+		t.Errorf("expected suppression stub mentioning prior full read, got:\n%s", readText)
+	}
+	if strings.Contains(readText, "total++") {
+		t.Errorf("expected plain read to be suppressed (no re-transmitted body), got:\n%s", readText)
+	}
+}
+
+// TestHandleCode_SliceSuppressedAfterFullBodyRead generalizes #176: any
+// slice() on a def whose full body was already read this session
+// should return a compact stub, since a slice is always a strict
+// subset of the full body (2026-08-04).
+func TestHandleCode_SliceSuppressedAfterFullBodyRead(t *testing.T) {
+	s, req := setupCrossDefReuseServer(t)
+
+	if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "Chunky", Full: true}); err != nil {
+		t.Fatalf("read full:true: %v", err)
+	}
+
+	sliceResult, _, err := s.handleCode(context.Background(), req, codeParam{Op: "slice", Name: "Chunky", Slice: "body"})
+	if err != nil {
+		t.Fatalf("slice: %v", err)
+	}
+	sliceText := resultText(t, sliceResult)
+	if !strings.Contains(sliceText, "already read") {
+		t.Errorf("expected suppression stub mentioning prior full read, got:\n%s", sliceText)
+	}
+	if strings.Contains(sliceText, "total++") {
+		t.Errorf("expected slice to be suppressed (no re-transmitted body), got:\n%s", sliceText)
+	}
+}
