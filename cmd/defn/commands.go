@@ -317,10 +317,10 @@ func isCorruptDBError(err error) bool {
 	return false
 }
 
-// compactEmbedded runs DOLT_GC on embedded (filesystem-path) databases.
-// Skips DSN-backed databases where the running sql-server owns GC.
-// After a fresh ingest this typically reclaims 99% of the journal
-// chunks (e.g. 193 MB → 1.5 MB on defn itself).
+// compactEmbedded runs a WAL checkpoint on embedded (filesystem-path)
+// databases via the backend's GC method. Skips DSN-shaped paths — no
+// remote backend is currently wired up, but a caller may still set
+// DEFN_DB to a DSN-looking string.
 //
 // Respects DEFN_SKIP_GC=1 for ingest flows that want to skip the
 // post-ingest compact (e.g. scripted workflows that run many ingests
@@ -711,18 +711,16 @@ func (a cliBodySource) CountDefinitions() (int, error)       { return a.db.Count
 func (a cliBodySource) SampleBodies(n int) ([]string, error) { return a.db.SampleBodies(n) }
 
 // cmdRepair deletes the embedded .defn/ database and re-ingests from
-// source. Useful when the Dolt journal or indexes get corrupted — since
+// source. Useful when the embedded database gets corrupted — since
 // .defn/ is a derived artifact, it can always be rebuilt from .go files.
 //
 // Preserves .mcp.json, CLAUDE.md, .codex/, and .defn-server/ (server
 // mode has its own repair path — drop the database and reingest via
 // 'defn ingest --server').
 func cmdRepair(modulePath string) {
-	// Refuse to repair a server-backed DB — Dolt server has its own
-	// tools for that; our job here is just the embedded cache.
-	if dsn := os.Getenv("DEFN_DSN"); dsn != "" {
-		fatal(fmt.Errorf("repair is for embedded .defn/ only — unset DEFN_DSN to repair embedded, or use dolt tooling to repair the server"))
-	}
+	// No remote/DSN backend is currently wired up (see store.OpenBackend),
+	// but refuse anyway if DEFN_DB looks DSN-shaped rather than silently
+	// mkdir-ing a bogus embedded path.
 	if p := os.Getenv("DEFN_DB"); p != "" && strings.Contains(p, "@") {
 		fatal(fmt.Errorf("repair is for embedded .defn/ only — DEFN_DB points to a DSN (%s)", p))
 	}
@@ -780,8 +778,8 @@ func cmdRepair(modulePath string) {
 
 // serveLock records a running defn serve process holding the embedded
 // .defn/ lock. Other CLI commands read this before opening embedded so
-// they can surface an actionable error instead of a bare "database is
-// read only" from Dolt.
+// they can surface an actionable error instead of a generic
+// driver-level lock/busy error.
 //
 // Liveness is enforced via syscall.Flock on the lockfile, not a PID
 // alive-check — the kernel releases the flock when the serve process
@@ -800,7 +798,8 @@ type serveLock struct {
 // sync.Once; safe to call from both a defer and a signal handler.
 //
 // If another defn serve already holds the flock, the process aborts
-// via fatal — two serves on the same embedded DB would corrupt noms.
+// via fatal — two serves on the same embedded DB would corrupt the
+// SQLite WAL.
 func writeServeLock(dbPath, httpAddr string) func() {
 	if strings.Contains(dbPath, "@") {
 		return func() {} // DSN-backed: no embedded lock to advertise
@@ -914,7 +913,6 @@ func embeddedLockStatus(dbPath string) (msg string, held bool) {
 	sb.WriteString("  to run this command concurrently, either:\n")
 	sb.WriteString("    - stop the server and retry\n")
 	sb.WriteString("    - run against an isolated worktree: defn worktree <branch> <path>\n")
-	sb.WriteString("    - set DEFN_DSN to a running dolt sql-server\n")
 	return sb.String(), true
 }
 
@@ -945,8 +943,8 @@ func fetchServerVersion(addr string) string {
 
 // checkEmbeddedAvailable aborts with an actionable message if a defn
 // serve process is holding the embedded DB at dbPath. Called by CLI
-// commands that want to open embedded before they pay for a Dolt
-// manifest error.
+// commands that want to open embedded before they pay for a confusing
+// low-level open error.
 func checkEmbeddedAvailable(dbPath string) {
 	if msg, held := embeddedLockStatus(dbPath); held {
 		fmt.Fprint(os.Stderr, msg)
@@ -955,10 +953,11 @@ func checkEmbeddedAvailable(dbPath string) {
 }
 
 func cmdServe(httpAddr string) {
-	// Cap Go heap so Dolt's embedded caches scale down (v1.86.2+ reads
-	// GOMEMLIMIT via its memlimit package). 1 GiB is plenty for the MCP
-	// server; without this the noms chunk store + prolly node cache +
-	// memtable balloon to ~544 MB at defaults.
+	// Caps Go heap via GOMEMLIMIT (unless the caller already set one).
+	// Originally sized for Dolt's noms chunk store + prolly caches, which
+	// no longer exist under the SQLite backend — kept as a general safety
+	// ceiling for the long-running MCP server process. Whether 1 GiB is
+	// still the right number for SQLite hasn't been re-measured.
 	if os.Getenv("GOMEMLIMIT") == "" {
 		debug.SetMemoryLimit(1 << 30) // 1 GiB
 	}
@@ -1484,13 +1483,13 @@ func countDBSourceFiles(db store.Backend) (int, error) {
 // runs in 200ms–1s.
 const incrementalIngestThreshold = 50
 
-// incrementalCompactInterval triggers a Dolt journal compaction after
-// this many successful incremental ingests. The full path runs
-// compactEmbedded on every call (reclaims ~99% of journal chunks);
-// the fast path commits without compacting, so we periodically catch
-// up to keep .defn/ bounded for projects driven mostly by editor-save
-// hooks. Stored as a meta counter ("defn:incremental_count") so it
-// survives across CLI invocations.
+// incrementalCompactInterval triggers a WAL checkpoint (via
+// compactEmbedded) after this many successful incremental ingests. The
+// full path runs compactEmbedded on every call; the fast path commits
+// without checkpointing, so we periodically catch up to keep .defn/
+// bounded for projects driven mostly by editor-save hooks. Stored as a
+// meta counter ("defn:incremental_count") so it survives across CLI
+// invocations.
 const incrementalCompactInterval = 50
 
 // incrementalCounterMeta is a defn-managed internal meta key (no
@@ -1932,7 +1931,7 @@ func collectStatus(dbPath string) statusReport {
 	}
 
 	// Skip DB stats when the flock is held on an embedded path — we
-	// can't open it without racing Dolt's own manifest lock.
+	// can't open it without racing the running serve's SQLite connection.
 	embeddedAndLocked := r.RunningServe != nil && !strings.Contains(dbPath, "@")
 	if embeddedAndLocked {
 		return r

@@ -2223,8 +2223,8 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 // completed (or a hard timeout hits). Write handlers must call this so
 // their SQL statements don't share the pinned *sql.Conn with the async
 // ingest — Go's database/sql doesn't synchronize concurrent Conn use,
-// and Dolt's session-level working set gets clobbered under the race
-// (rename UPDATE silently discarded, ingest re-inserts stale defs).
+// and the shared connection's session state gets corrupted under the
+// race (rename UPDATE silently discarded, ingest re-inserts stale defs).
 //
 // Timeout guards against a stuck LoadAll on a huge repo taking the
 // serve down; 5 minutes is far above any legitimate startup and lets
@@ -2339,7 +2339,7 @@ func (s *server) startGCTicker(ctx context.Context) {
 func (s *server) ingestAndResolve() error {
 	// packages.Load + go/types peaks far above the steady-state heap —
 	// ~2-3 GB type-checking a medium module. cmdServe pins a low GOMEMLIMIT
-	// (1 GiB) to keep Dolt's caches small at idle, but enforcing that
+	// (1 GiB) to keep the process's idle heap small, but enforcing that
 	// ceiling during the load drives the GC into a back-to-back collection
 	// spiral that pegs every core (and starves MCP requests into timeouts).
 	// Lift the limit for the duration of the load, then restore it so idle
@@ -3996,8 +3996,8 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// newMCPServer launches ingestAndResolve() in a goroutine and marks
 	// s.ready=true after. Both goroutines call execContext on the same
 	// pinned sql.Conn; Go's database/sql does not synchronize concurrent
-	// use of *sql.Conn, and under the race Dolt's session-level working
-	// set is corrupted. Waiting for ready serializes them.
+	// use of *sql.Conn, and under the race the shared connection's session
+	// state gets corrupted. Waiting for ready serializes them.
 	s.waitReady()
 
 	d, err := s.backend.GetDefinitionByName(args.OldName, "")
@@ -4357,35 +4357,23 @@ func (s *server) handleEmit(_ context.Context, _ *sdkmcp.CallToolRequest, args c
 	return textResult(fmt.Sprintf("Emitted %d definitions to %s.", len(locs), out)), nil, nil
 }
 
-// handleGC runs Dolt GC to compact the noms store. Safe to invoke
-// while the serve is running — DOLT_GC kills the pinned conn but the
-// pool reconnects on the next query (see store.Ping).
+// handleGC runs a WAL checkpoint (folds defn.db-wal back into
+// defn.db) via the backend's GC method. Safe to invoke while the
+// serve is running — PRAGMA wal_checkpoint(PASSIVE) doesn't block
+// concurrent readers/writers.
 func (s *server) handleGC(_ context.Context, _ *sdkmcp.CallToolRequest, _ codeParam) (*sdkmcp.CallToolResult, any, error) {
-	noms := filepath.Join(s.projectDir, ".defn", "defn", ".dolt", "noms")
-	before := nomsSize(noms)
+	dbDir := filepath.Join(s.projectDir, ".defn")
+	before := dbDirSize(dbDir)
 	start := time.Now()
 	if err := s.backend.GC(); err != nil {
 		return errResult(fmt.Errorf("gc: %w", err))
 	}
-	after := nomsSize(noms)
+	after := dbDirSize(dbDir)
 	return textResult(fmt.Sprintf(
-		"GC complete in %s. noms size: %s → %s (saved %s).",
+		"GC complete in %s. db size: %s → %s (saved %s).",
 		time.Since(start).Truncate(time.Millisecond),
 		humanSize(before), humanSize(after), humanSize(before-after),
 	)), nil, nil
-}
-
-// nomsSize returns the total size in bytes of the noms directory, or 0
-// on error. Used for reporting GC savings; not load-bearing.
-func nomsSize(dir string) int64 {
-	var total int64
-	filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
-		if err == nil && !info.IsDir() {
-			total += info.Size()
-		}
-		return nil
-	})
-	return total
 }
 
 func humanSize(n int64) string {
@@ -7254,3 +7242,17 @@ const pragmasCap = 30
 // mirroring handleImpact's convention -- only the default rendering is
 // capped.
 const traverseResultCap = 50
+
+// dbDirSize returns the total size in bytes of everything under dir,
+// or 0 on error. Used for reporting GC before/after size; not
+// load-bearing.
+func dbDirSize(dir string) int64 {
+	var total int64
+	filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
