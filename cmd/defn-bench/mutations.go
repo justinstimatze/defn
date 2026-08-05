@@ -340,7 +340,14 @@ func runMutationCase(scratch, defnBin string, m mutation, mode string) mutationR
 	}
 
 	start := time.Now()
-	args := []string{"-p", "--strict-mcp-config", "--verbose", "--output-format", "stream-json"}
+	// --model pinned: without it, Claude Code's default model routing
+	// on an account with no prior interactive session picked a variant
+	// that silently ignored the `code` tool's alwaysLoad _meta hint,
+	// still paying a ToolSearch round-trip every case. An explicit
+	// --model sonnet run confirmed alwaysLoad works correctly -- this
+	// pin makes that the bench's actual, reproducible behavior instead
+	// of leaving it to whatever the CLI defaults to on a given host.
+	args := []string{"-p", "--strict-mcp-config", "--model", "sonnet", "--verbose", "--output-format", "stream-json"}
 	if mode == "defn" {
 		args = append(args, "--mcp-config", ".mcp.json")
 	}
