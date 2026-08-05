@@ -84,7 +84,8 @@ func logBackend(msg string) {
 // source. Idempotent — safe to run any time. `defn ingest` is an
 // alias for this today: both do the same thing, both are safe on a
 // bare project or a re-run. Advanced users who only want to refresh
-// the DB (skip config writes) can pass --reindex.
+// the DB (skip config writes) can run `defn ingest --reindex`
+// instead of this command.
 //
 // noSummaries (--no-summaries) persists DEFN_LLM_OPS=0 into .mcp.json
 // (#201) so every future session's spawned `defn serve` opts out of
@@ -206,21 +207,25 @@ func logMem(phase string) {
 
 // cmdIngest is a functional alias for cmdInit — both write project
 // config (CLAUDE.md, .mcp.json, .gitignore, .codex) AND ingest the
-// source tree. The historic split between "init sets up, ingest
-// refreshes" was a semantic footgun: users adopting an existing
-// project would rationally reach for `ingest` and end up without a
-// CLAUDE.md — the model then wouldn't discover mcp__defn__code, and
-// defn silently underperformed (see #168 receipt).
+// source tree, unless reindex is true. The historic split between
+// "init sets up, ingest refreshes" was a semantic footgun: users
+// adopting an existing project would rationally reach for `ingest`
+// and end up without a CLAUDE.md — the model then wouldn't discover
+// mcp__defn__code, and defn silently underperformed (see #168
+// receipt).
 //
-// After this change: both commands do the right thing, always. Users
-// who want the pure DB-refresh path (skip config writes for perf on
-// hot rebuilds) can use `defn reindex`.
+// After this change: both commands do the right thing, always,
+// unless the caller passes --reindex (skip config writes for perf on
+// hot rebuilds, or for a throwaway/scratch DB where writing into
+// tracked files would be a surprise -- see winze's #dispatch report,
+// 2026-08-05: DEFN_DB pointed at a scratch path still wrote .mcp.json
+// and CLAUDE.md into the real repo).
 //
 // Always passes noSummaries=false to writeProjectConfig -- `ingest`'s
 // CLI doesn't parse --no-summaries. This is safe: writeMCPConfigForProject
 // (#201) preserves a prior --no-summaries opt-out already recorded in
 // .mcp.json rather than clearing it on every plain re-ingest.
-func cmdIngest(modulePath string) {
+func cmdIngest(modulePath string, reindex bool) {
 	if abs, err := filepath.Abs(modulePath); err == nil {
 		modulePath = abs
 	}
@@ -247,9 +252,11 @@ func cmdIngest(modulePath string) {
 		// Config writes still fire in the incremental path so
 		// first-time users of `defn ingest` on an unconfigured project
 		// still get CLAUDE.md + .mcp.json. Cheap: idempotent no-ops
-		// once the files exist.
-		absDB, _ := filepath.Abs(dbPath)
-		writeProjectConfig(modulePath, defnBinaryPath(), absDB, false)
+		// once the files exist. Skipped when reindex is set.
+		if !reindex {
+			absDB, _ := filepath.Abs(dbPath)
+			writeProjectConfig(modulePath, defnBinaryPath(), absDB, false)
+		}
 		return
 	}
 
@@ -290,8 +297,10 @@ func cmdIngest(modulePath string) {
 
 	fmt.Fprintf(os.Stderr, "done. root hash: %s\n", hash[:16])
 
-	absDB, _ := filepath.Abs(dbPath)
-	writeProjectConfig(modulePath, defnBinaryPath(), absDB, false)
+	if !reindex {
+		absDB, _ := filepath.Abs(dbPath)
+		writeProjectConfig(modulePath, defnBinaryPath(), absDB, false)
+	}
 }
 
 // isCorruptDBError reports whether err looks like a corrupt embedded
@@ -509,7 +518,7 @@ func inPlaceSuffix(inPlace bool) string {
 
 func cmdSync(file string) {
 	if file == "" {
-		cmdIngest(".")
+		cmdIngest(".", false)
 		return
 	}
 	dbPath := getDBPath()

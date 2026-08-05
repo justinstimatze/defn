@@ -58,6 +58,8 @@ To remove everything: `rm -rf .defn`
 
 Requires Go 1.26+ and `goimports`. Pure-Go build — no CGO, no icu4c, no external database. The `.defn/defn.db` SQLite file is a rebuildable artifact of `defn ingest`.
 
+Upgrading the binary (`go install .../defn@latest`) doesn't affect an already-running `defn serve` — it keeps executing the old image until restarted. Run `defn status` to check for version skew, or `defn restart` to pick up the new binary.
+
 ## How it works
 
 One MCP tool — `code` — with an `op` field. Your AI agent calls it naturally:

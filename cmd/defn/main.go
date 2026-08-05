@@ -42,10 +42,16 @@ func main() {
 		cmdRepair(dir)
 	case "ingest":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: defn ingest <path>")
+			fmt.Fprintln(os.Stderr, "usage: defn ingest <path> [--reindex]")
 			os.Exit(1)
 		}
-		cmdIngest(os.Args[2])
+		reindex := false
+		for _, a := range os.Args[3:] {
+			if a == "--reindex" {
+				reindex = true
+			}
+		}
+		cmdIngest(os.Args[2], reindex)
 	case "ingest-upstream":
 		cmdIngestUpstream(os.Args[2:])
 	case "sync":
