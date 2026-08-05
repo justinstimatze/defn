@@ -295,20 +295,22 @@ func cmdIngest(modulePath string) {
 }
 
 // isCorruptDBError reports whether err looks like a corrupt embedded
-// Dolt database (manifest/journal damaged). These are the cases where
-// `defn repair` is the right escape hatch — the error text is the only
-// signal Dolt gives us.
+// SQLite database. Patterns verified empirically (2026-08-05) against
+// modernc.org/sqlite's real error text across several corruption
+// shapes (truncated file, zeroed header page, garbage header, mid-file
+// truncation) -- see the SQLite result codes these come from:
+// SQLITE_CORRUPT (11, "database disk image is malformed") and
+// SQLITE_NOTADB (26, "file is not a database"). These are the cases
+// where `defn repair` is the right escape hatch — the error text is
+// the only signal SQLite gives us.
 func isCorruptDBError(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
 	for _, pat := range []string{
-		"corrupt manifest",
-		"journal index is malformed",
-		"bad index checksum",
-		"malformed journal",
-		"failed to load database",
+		"database disk image is malformed",
+		"file is not a database",
 	} {
 		if strings.Contains(msg, pat) {
 			return true
