@@ -470,9 +470,7 @@ const mutationFilesPreamble = `You are editing a Go file in the current director
 
 const mutationDefnPreamble = `You are editing a Go file in the current directory. This project uses the defn MCP tool for Go edits — prefer it over Read/Edit for any Go source change.
 
-FIRST STEP: call ToolSearch with query "select:mcp__defn__code" to load the defn "code" tool schema before doing anything else. Deferred MCP tools are not available until their schema is fetched — skipping this makes the rest of the plan impossible.
-
-Then use one of these ops:
+Use one of these ops:
 
 - code(op:"insert-precondition", condition:"x < 0", ret:"return err") — inserts if <cond> { <ret> } at function entry (name inferred if only one non-test function)
 - code(op:"replace-slice", slice:"return", index:1, new:"return nil") — replaces the Nth match of a slice kind (return, error-branch, loop, signature, body, doc)

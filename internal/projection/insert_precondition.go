@@ -8,23 +8,6 @@ import (
 	"strings"
 )
 
-// InsertPrecondition inserts an `if <condition> { <ret> }` block at the
-// start of the function body, immediately after the opening brace. The
-// existing body is preserved verbatim.
-//
-// Byte-exact PUTGET: for any well-formed (body, condition, ret) the
-// output is exactly body[:lbrace+1] + "\n\tif <cond> {\n\t\t<ret>\n\t}"
-// + body[lbrace+1:]. The function makes no formatting changes to the
-// input body outside the inserted block.
-//
-// Indent assumption: body describes a top-level function or method
-// (column 0), so the inserted `if` is at one tab and its inner statement
-// is at two tabs. Callers passing nested function bodies will get an
-// under-indented block — v1 does not compensate.
-//
-// Idempotency: if the exact same block is already present at the
-// insertion point (a retried or duplicate call), returns an error
-// saying so instead of silently inserting it a second time.
 func InsertPrecondition(body, condition, ret string) (string, error) {
 	if body == "" {
 		return "", fmt.Errorf("insert-precondition: body is empty")
@@ -62,5 +45,37 @@ func InsertPrecondition(body, condition, ret string) (string, error) {
 	if strings.HasPrefix(body[lbraceOff+1:], block) {
 		return "", fmt.Errorf("insert-precondition: this exact precondition already present at the top of the body -- may already be applied")
 	}
-	return body[:lbraceOff+1] + block + body[lbraceOff+1:], nil
+	newBody := body[:lbraceOff+1] + block + body[lbraceOff+1:]
+
+	// Malformed-condition defense: Go's `if init; cond {}` two-clause
+	// grammar means garbage like "a &lt; 0" (stray "&", ident "lt",
+	// ";") can still parse -- as a two-clause if whose Init is the
+	// nonsense expression statement "a & lt" and whose Cond is "0".
+	// go/parser accepts this (statement-shape validity is a parser
+	// concern; "expression statement must be a call" is a type-check
+	// concern go build would catch -- but #148 skips go build for
+	// projection ops). Since InsertPrecondition only ever emits a
+	// single-clause `if condition { ret }`, a non-nil Init on the
+	// inserted statement is conclusive proof condition was mangled,
+	// not a plain boolean expression.
+	f2, err := parser.ParseFile(token.NewFileSet(), "", prefix+newBody, 0)
+	if err != nil {
+		return "", fmt.Errorf("insert-precondition: resulting body has a syntax error: %w", err)
+	}
+	for _, decl := range f2.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok || fd.Body == nil || len(fd.Body.List) == 0 {
+			continue
+		}
+		ifStmt, ok := fd.Body.List[0].(*ast.IfStmt)
+		if !ok {
+			continue
+		}
+		if ifStmt.Init != nil {
+			return "", fmt.Errorf("insert-precondition: condition %q is not a single boolean expression -- it parses as a two-clause if-init, which usually means it contains invalid syntax (e.g. an HTML-escaped operator like \"&lt;\" instead of \"<\")", condition)
+		}
+		break
+	}
+
+	return newBody, nil
 }
