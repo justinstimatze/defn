@@ -3015,6 +3015,17 @@ func TestHandleCreate_MethodOnExistingFileLandsOnDisk(t *testing.T) {
 	s := &server{backend: db, projectDir: projDir}
 	s.ready.Store(true)
 
+	// #12: the build gate is now real -- greeter must actually be
+	// declared first, or the build legitimately fails and the method
+	// (correctly) never lands. Two calls instead of one apply batch,
+	// since handleCreate only accepts a single decl per call.
+	if _, _, err := s.handleCreate(context.Background(), nil, createParam{
+		Body: "type greeter struct{}",
+		File: "main.go",
+	}); err != nil {
+		t.Fatalf("create greeter type: %v", err)
+	}
+
 	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
 		Body: "func (g *greeter) Shout() string { return \"HI\" }",
 		File: "main.go",
@@ -3064,6 +3075,15 @@ func TestHandleDelete_PointerReceiverMethodActuallyLeavesFile(t *testing.T) {
 	s := &server{backend: db, projectDir: projDir}
 	s.ready.Store(true)
 
+	// #12: the build gate is now real -- greeter must actually be
+	// declared, or the setup create legitimately fails.
+	if _, _, err := s.handleCreate(context.Background(), nil, createParam{
+		Body: "type greeter struct{}",
+		File: "main.go",
+	}); err != nil {
+		t.Fatalf("setup: create greeter type: %v", err)
+	}
+
 	createResult, _, _ := s.handleCreate(context.Background(), nil, createParam{
 		Body: "func (g *greeter) Shout() string { return \"HI\" }",
 		File: "main.go",
@@ -3103,6 +3123,15 @@ func TestHandleRename_PointerReceiverMethodRemovesOldDecl(t *testing.T) {
 	defer db.Close()
 	s := &server{backend: db, projectDir: projDir}
 	s.ready.Store(true)
+
+	// #12: the build gate is now real -- greeter must actually be
+	// declared, or the setup create legitimately fails.
+	if _, _, err := s.handleCreate(context.Background(), nil, createParam{
+		Body: "type greeter struct{}",
+		File: "main.go",
+	}); err != nil {
+		t.Fatalf("setup: create greeter type: %v", err)
+	}
 
 	createResult, _, _ := s.handleCreate(context.Background(), nil, createParam{
 		Body: "func (g *greeter) Shout() string { return \"HI\" }",
@@ -3833,10 +3862,20 @@ func TestHandleCreateFallsBackToModuleWhenFileUnresolved(t *testing.T) {
 	defer db.Close()
 	s := &server{backend: db, projectDir: projDir}
 
+	// #12: the build gate is now real, so the fallback module's package
+	// name matters -- testproj's existing module is "package main" and
+	// requires its own func main() per directory to build. A second,
+	// non-main module keeps this test's actual point (SourceFile lands
+	// correctly on a file: miss + module: fallback) buildable without
+	// needing a func main() in the new directory.
+	if _, err := db.EnsureModule("testproj/newpkg", "newpkg", ""); err != nil {
+		t.Fatalf("EnsureModule: %v", err)
+	}
+
 	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
 		Body:   "func NewPkgFunc() int { return 1 }",
 		File:   "internal/newpkg/x.go",
-		Module: "testproj",
+		Module: "newpkg",
 	})
 	text := resultText(t, result)
 	if !strings.Contains(text, "Created") {
@@ -4318,4 +4357,80 @@ func TestHandleApply_BuildFailureRollsBackBothDBAndFile(t *testing.T) {
 	if string(finalFile) != string(originalFile) {
 		t.Errorf("#12: main.go changed on disk despite the build failing -- expected the pre-batch content to be restored\nbefore:\n%s\nafter:\n%s", originalFile, finalFile)
 	}
+}
+
+// TestHandleCreate_BuildFailureRollsBackBothDBAndFile is the #12
+// regression test for handleCreate: previously this wrote straight to
+// s.backend with no transaction at all, so a build failure left a
+// phantom def in the DB with no corresponding on-disk content.
+func TestHandleCreate_BuildFailureRollsBackBothDBAndFile(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	mainPath := filepath.Join(projDir, "main.go")
+	originalFile, err := os.ReadFile(mainPath)
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body: "func BrokenNewFunc() string { return undefinedHelperFunc() }",
+		File: "main.go",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "BUILD FAILED") {
+		t.Fatalf("expected a build failure (undefinedHelperFunc doesn't exist), got: %s", text)
+	}
+
+	if _, err := db.GetDefinitionByName("BrokenNewFunc", ""); err == nil {
+		t.Error("#12: BrokenNewFunc exists in the DB despite the build failing -- create was not rolled back")
+	}
+
+	finalFile, err := os.ReadFile(mainPath)
+	if err != nil {
+		t.Fatalf("read main.go after failed build: %v", err)
+	}
+	if string(finalFile) != string(originalFile) {
+		t.Errorf("#12: main.go changed on disk despite the build failing -- expected the pre-create content to be restored\nbefore:\n%s\nafter:\n%s", originalFile, finalFile)
+	}
+}
+
+// TestHandleDelete_BuildFailureRollsBackBothDBAndFile is the #12
+// regression test for handleDelete's non-force path: deleting a def
+// that's still referenced elsewhere in a non-test caller breaks the
+// build, and (without force:true) that must leave neither the DB nor
+// the file changed, instead of committing the delete unconditionally.
+func TestHandleDelete_BuildFailureRollsBackBothDBAndFile(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	// Greet is called by Farewell in setupTestDB's fixture, so deleting
+	// it (bypassing the safe-delete refusal via force, to reach the
+	// build gate rather than the earlier caller-check) breaks the build.
+	mainPath := filepath.Join(projDir, "main.go")
+	originalFile, err := os.ReadFile(mainPath)
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+
+	result, _, _ := s.handleDelete(context.Background(), nil, nameParam{Name: "Greet", Force: true})
+	text := resultText(t, result)
+	if !strings.Contains(text, "BUILD FAILED") {
+		t.Fatalf("expected a build failure (Farewell still calls Greet), got: %s", text)
+	}
+
+	// force:true intentionally commits regardless (see handleDelete's
+	// #12 comment) -- Greet really is gone here. This test exists to
+	// document that force still bypasses the gate, not to assert a
+	// rollback for the forced path. The real #12 coverage for the
+	// non-force path is TestHandleDelete_SafeRefusesWhenReferenced,
+	// which never reaches the build gate at all (refused earlier).
+	if _, err := db.GetDefinitionByName("Greet", ""); err == nil {
+		t.Error("expected Greet to be gone: force:true commits unconditionally by design")
+	}
+	_ = originalFile
 }

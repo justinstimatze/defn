@@ -2875,15 +2875,36 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		Body:       args.Body,
 		SourceFile: args.File,
 	}
-	id, err := s.backend.UpsertDefinition(d)
+
+	// #12: write and build-gate through a transaction so a build
+	// failure leaves neither the DB nor the file changed. Previously
+	// this wrote straight to s.backend (durable immediately) and
+	// treated a later build failure as informational only.
+	tx, commit, rollback, txErr := s.backend.Begin()
+	if txErr != nil {
+		return errResult(txErr)
+	}
+	defer rollback()
+
+	id, err := tx.UpsertDefinition(d)
 	if err != nil {
 		return errResult(err)
 	}
 	d.ID = id
-	s.enqueueSummary(d)
 
-	buildResult := s.autoEmitAndBuildForCreate(args.File, []string{emit.FuncIdentity(name, receiver)})
-	s.autoResolveFile(args.File, mod.Path)
+	var opts emit.Opts
+	if args.File != "" {
+		opts = emit.Opts{
+			GoimportsFiles: []string{args.File},
+			TouchedFiles:   []string{args.File},
+			AllowedAdds:    []string{emit.FuncIdentity(name, receiver)},
+		}
+	}
+	buildResult := s.commitOrRollbackOnBuild(tx, commit, rollback, opts)
+	if buildResult == "" {
+		s.enqueueSummary(d)
+		s.autoResolveFile(args.File, mod.Path)
+	}
 
 	var sb strings.Builder
 	loc := mod.Path
@@ -4005,7 +4026,17 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// Show what we're about to delete.
 	recv := formatReceiver(d.Receiver)
 
-	if err := s.backend.DeleteDefinition(d.ID); err != nil {
+	// #12: delete + build-gate through a transaction so a build failure
+	// leaves neither the DB nor the file changed. Previously
+	// DeleteDefinition wrote straight to s.backend and a later build
+	// failure was informational only.
+	tx, commit, rollback, txErr := s.backend.Begin()
+	if txErr != nil {
+		return errResult(txErr)
+	}
+	defer rollback()
+
+	if err := tx.DeleteDefinition(d.ID); err != nil {
 		return errResult(err)
 	}
 
@@ -4019,7 +4050,21 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		deleteOpts.GoimportsFiles = []string{d.SourceFile}
 		deleteOpts.TouchedFiles = []string{d.SourceFile}
 	}
-	buildResult := s.autoEmitAndBuildWithOpts(deleteOpts)
+	// #12's build gate must not apply when force:true — that flag is an
+	// explicit acknowledgment that this delete may leave dangling
+	// references / a broken build (exactly what the safety check above
+	// would otherwise refuse), so rolling it back on a build failure
+	// the caller already opted into would defeat the point of force.
+	// Commit unconditionally here, same as before #12.
+	var buildResult string
+	if args.Force {
+		if err := commit(); err != nil {
+			return errResult(fmt.Errorf("commit: %w", err))
+		}
+		buildResult = s.emitAndBuildAgainst(s.backend, deleteOpts)
+	} else {
+		buildResult = s.commitOrRollbackOnBuild(tx, commit, rollback, deleteOpts)
+	}
 	// #109 pass 2 (winze op-classification): skip autoResolve on delete.
 	// DeleteDefinition already dropped every refs row where from_def=D
 	// OR to_def=D (store.go:201), so both the def's own outgoing edges
@@ -4027,14 +4072,15 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// D textually, but a full re-resolve would just walk those bodies,
 	// fail to find D in the DB, and skip — no ref changes. Skipping
 	// autoResolve removes the full-project ResolveModule walk on every
-	// delete. Same autocommit + IDF-invalidate as the rename skip path.
-	// force:true delete still applies (safe-delete's caller check gates
-	// unforced deletes at zero-callers anyway).
-	if err := s.autoCommit(); err != nil {
-		fmt.Fprintf(os.Stderr, "defn: auto-commit failed (post-delete): %v\n", err)
-	}
-	if s.idf != nil {
-		s.idf.Invalidate()
+	// delete. force:true delete still applies (safe-delete's caller
+	// check gates unforced deletes at zero-callers anyway).
+	if buildResult == "" {
+		if err := s.autoCommit(); err != nil {
+			fmt.Fprintf(os.Stderr, "defn: auto-commit failed (post-delete): %v\n", err)
+		}
+		if s.idf != nil {
+			s.idf.Invalidate()
+		}
 	}
 
 	var sb strings.Builder
