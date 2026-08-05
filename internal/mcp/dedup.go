@@ -422,11 +422,21 @@ func writeTargets(args codeParam) (names, files []string, ok bool) {
 // staleEpochThreshold is how many compactions a cached "you already have
 // this" claim survives before dedup/subsumption stop trusting it and
 // either let real content through (dedup) or redirect to a richer,
-// guaranteed-correct bundle instead of a stub (subsumption). 1 survives
-// exactly one compaction -- the ordinary case where a read happens and a
-// compaction incidentally follows soon after, before the model has even
-// acted on it, shouldn't instantly distrust something still fresh. Past
-// that, a real cost was measured directly in production transcripts
-// (2026-08-04): a stale suppression stub led to a user-visible wrong
-// answer in one case, and a 3-extra-call workaround scramble in another.
-const staleEpochThreshold = 1
+// guaranteed-correct bundle instead of a stub (subsumption).
+//
+// 2026-08-05: raised from 1 to 4 after a real-data sweep
+// (bench/cache-sim/sweep_stale_threshold.py) against 347 real repeat
+// occurrences from a production transcript. Both known real failures
+// (2026-08-04: a user-visible wrong answer, and a 3-extra-call
+// workaround scramble) occurred at epoch_distance 5 and 54 -- 4 is the
+// highest value that still avoids both, and it cuts repeat-related
+// token cost ~44% versus the prior threshold=1 (193,214 -> 108,930
+// tokens on the swept transcript). This is an evidence-bounded choice,
+// not a proof of safety: "no confirmed failure at distance <=4" is an
+// absence-of-evidence argument from a small sample (n=2 known
+// failures), not confirmation that distance 2-4 is actually safe --
+// risk plausibly increases smoothly with distance rather than stepping
+// cleanly at some threshold. 4 is simply the tightest bound the direct
+// evidence supports; revisit if a larger sample of real repeat-hits
+// surfaces a failure below distance 5.
+const staleEpochThreshold = 4
