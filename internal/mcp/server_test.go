@@ -3977,3 +3977,44 @@ func TestSuggestMissingImportFixes_SamePackageNoHint(t *testing.T) {
 		t.Errorf("expected no hint for same-package undefined, got: %q", hint)
 	}
 }
+
+// TestHandleGetDefinition_JustMutatedSkipsSummaryDefault pins the fix
+// for the mutation-bench gap where a read immediately following a
+// mutation cost an extra call: it must return the full body even
+// though a fresh, non-stale summary exists, because the caller is
+// verifying an edit, not asking "what does this do." The flag is
+// one-shot -- a second read of the same name falls back to summary.
+func TestHandleGetDefinition_JustMutatedSkipsSummaryDefault(t *testing.T) {
+	os.Unsetenv("DEFN_SUMMARY_READ_DEFAULT")
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, respCache: newRespCache()}
+
+	d, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatalf("setup: Greet not found: %v", err)
+	}
+	if err := db.SetDefSummary(d.ID, &store.DefSummary{
+		OneLine:  "Returns a greeting for the given name.",
+		BodyHash: store.HashBodyStructural(d.Body),
+		Model:    "test",
+	}); err != nil {
+		t.Fatalf("SetDefSummary: %v", err)
+	}
+
+	sess := &sdkmcp.ServerSession{}
+	s.respCache.markMutated(sess, "Greet")
+	req := &sdkmcp.CallToolRequest{Session: sess}
+
+	result, _, _ := s.handleGetDefinition(context.Background(), req, nameParam{Name: "Greet"})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Hello, ") {
+		t.Errorf("expected justMutated read to return the full body even with a fresh summary present, got:\n%s", text)
+	}
+
+	result2, _, _ := s.handleGetDefinition(context.Background(), req, nameParam{Name: "Greet"})
+	text2 := resultText(t, result2)
+	if strings.Contains(text2, "Hello, ") {
+		t.Errorf("expected the justMutated flag to be consumed after one read, got full body again:\n%s", text2)
+	}
+}

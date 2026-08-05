@@ -259,3 +259,22 @@ func TestBodyServed_NilSessionSafe(t *testing.T) {
 		t.Error("expected hasBodyServed false for nil session")
 	}
 }
+
+// TestJustMutated_MarkAndTake pins markMutated/takeMutated: false
+// before any mark, true (once) after markMutated, and consumed after
+// the first takeMutated call.
+func TestJustMutated_MarkAndTake(t *testing.T) {
+	c := newRespCache()
+	sess := &sdkmcp.ServerSession{}
+
+	if c.takeMutated(sess, "Foo") {
+		t.Error("expected takeMutated false before any mark")
+	}
+	c.markMutated(sess, "Foo")
+	if !c.takeMutated(sess, "Foo") {
+		t.Error("expected takeMutated true after markMutated")
+	}
+	if c.takeMutated(sess, "Foo") {
+		t.Error("expected takeMutated to be consumed after the first call")
+	}
+}

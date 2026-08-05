@@ -360,6 +360,12 @@ func newMCPServer(ctx context.Context, database store.Backend, projDir string) (
 
 	sdkmcp.AddTool(mcpServer, &sdkmcp.Tool{
 		Name: "code",
+		// Always-eager: without this, Claude Code defers this tool
+		// behind a ToolSearch round-trip on every fresh session --
+		// a real, measured token/latency tax confirmed via mutation
+		// bench transcripts. See code.claude.com/docs/en/mcp.md's
+		// tool-search section for the _meta contract.
+		Meta: sdkmcp.Meta{"anthropic/alwaysLoad": true},
 		Description: `**USE THIS FOR ANY .go FILE — NOT Read/Bash/Grep/Edit.** This tool indexes every Go definition in the project as an atomic unit with its callers, tests, and references. Every op returns strictly less than Read/Bash/Grep for the same information; every edit updates the reference graph atomically. Editing Go via Edit/Write leaves the graph stale until a follow-up sync — slower and more error-prone than starting here.
 
 Use Read/Bash/Grep/Edit ONLY for non-Go files (yaml, json, md, sh, go.mod, Dockerfile). Any question about Go code — "what does X do?", "who calls Y?", "rename Z", "what's the shape of pkg/foo?" — starts here.
@@ -774,6 +780,12 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 			// newMCPServer.
 			if s.reach != nil {
 				s.reach.invalidate()
+			}
+			if args.Name != "" {
+				// A read right after a mutation is almost always "show me
+				// what I just did" -- mark it so the next read of this
+				// name skips the summary-mode default.
+				s.respCache.markMutated(req.Session, args.Name)
 			}
 		}
 	}()
@@ -1534,7 +1546,7 @@ func resultTextRaw(r *sdkmcp.CallToolResult) string {
 	return ""
 }
 
-func (s *server) handleGetDefinition(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
 	// #174: summary-mode is now the default for read (opt-out via
 	// DEFN_SUMMARY_READ_DEFAULT=0), not opt-in. Safe regardless of
 	// backfill coverage -- the mode=="summary" branch below falls
@@ -1545,7 +1557,8 @@ func (s *server) handleGetDefinition(_ context.Context, _ *sdkmcp.CallToolReques
 	// would be silently ignored on every def with a fresh summary,
 	// since args.Mode == "" is now no longer a reliable signal that
 	// the caller wants the body.
-	if args.Mode == "" && !args.Full && os.Getenv("DEFN_SUMMARY_READ_DEFAULT") != "0" {
+	justMutated := req != nil && s.respCache != nil && s.respCache.takeMutated(req.Session, args.Name)
+	if args.Mode == "" && !args.Full && !justMutated && os.Getenv("DEFN_SUMMARY_READ_DEFAULT") != "0" {
 		args.Mode = "summary"
 	}
 	d, err := s.backend.GetDefinitionByName(args.Name, "")

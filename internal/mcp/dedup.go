@@ -43,6 +43,7 @@ type sessionCache struct {
 	turnToken       string          // #209: last-seen turn-token; a change means a new turn started
 	readShapedCount int             // #209: individual read-shaped calls made so far this turn
 	bodyServed      map[string]bool // #176: names whose full body (read full:true) was served this session
+	justMutated     map[string]bool // names changed by the most recent write op; consumed once by the next read to force full body instead of the summary-mode default
 }
 
 type cacheEntry struct {
@@ -211,4 +212,39 @@ func (c *respCache) markBodyServed(sess *sdkmcp.ServerSession, name string) {
 		sc.bodyServed = map[string]bool{}
 	}
 	sc.bodyServed[name] = true
+}
+
+// markMutated records that name was just changed by a write op this
+// session. Consumed once by takeMutated -- the very next read of name
+// gets the full body instead of the summary-mode default, since a read
+// immediately following a mutation is almost always "show me what I
+// just did," not "what does this do."
+func (c *respCache) markMutated(sess *sdkmcp.ServerSession, name string) {
+	if sess == nil || name == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sc := c.getSession(sess)
+	if sc.justMutated == nil {
+		sc.justMutated = map[string]bool{}
+	}
+	sc.justMutated[name] = true
+}
+
+// takeMutated reports whether name was just mutated this session and
+// clears the flag -- a one-shot signal so only the immediate follow-up
+// read is affected, not every future read of name.
+func (c *respCache) takeMutated(sess *sdkmcp.ServerSession, name string) bool {
+	if sess == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sc := c.sessions[sess]
+	if sc == nil || !sc.justMutated[name] {
+		return false
+	}
+	delete(sc.justMutated, name)
+	return true
 }
