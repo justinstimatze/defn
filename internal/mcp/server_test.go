@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/justinstimatze/defn/internal/goload"
 	"github.com/justinstimatze/defn/internal/ingest"
 	"github.com/justinstimatze/defn/internal/resolve"
 	"github.com/justinstimatze/defn/internal/store"
@@ -4181,5 +4182,41 @@ func TestHandleTraverse_CapsManyCallers(t *testing.T) {
 	jsonText := resultText(t, jsonResult)
 	if got := strings.Count(jsonText, "\"name\":\"Wrap"); got != n {
 		t.Errorf("expected format:json to return all %d callers uncapped, got %d in:\n%s", n, got, jsonText)
+	}
+}
+
+// TestIsStaleProjectDirError_RealGoListFailure reproduces the real
+// failure (a directory with no go.mod, matching what happens when
+// s.projectDir was captured at startup and the project has since been
+// moved/renamed) rather than asserting against a hand-typed string.
+func TestIsStaleProjectDirError_RealGoListFailure(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "x.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatalf("write fixture file: %v", err)
+	}
+
+	// goload.LoadAll itself returns a nil error here -- go/packages
+	// reports "no module" per-package (pkg.Errors), not as a top-level
+	// Load error. The real failure winze hit surfaces one layer up, from
+	// ingest.IngestPackages walking those per-package errors.
+	pkgs, err := goload.LoadAll(dir)
+	if err != nil {
+		t.Fatalf("LoadAll: unexpected top-level error: %v", err)
+	}
+
+	db, _ := setupTestDB(t)
+	err = ingest.IngestPackages(db, pkgs, dir)
+	if err == nil {
+		t.Fatal("expected IngestPackages to fail on a directory with no go.mod")
+	}
+	if !isStaleProjectDirError(err) {
+		t.Errorf("expected isStaleProjectDirError(true) for: %v", err)
+	}
+
+	if isStaleProjectDirError(nil) {
+		t.Error("expected isStaleProjectDirError(nil) to be false")
+	}
+	if isStaleProjectDirError(fmt.Errorf("some unrelated error")) {
+		t.Error("expected isStaleProjectDirError to be false for an unrelated error")
 	}
 }

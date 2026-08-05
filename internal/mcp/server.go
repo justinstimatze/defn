@@ -2354,6 +2354,11 @@ func (s *server) ingestAndResolve() error {
 		return fmt.Errorf("load packages: %w", err)
 	}
 	if err := ingest.IngestPackages(s.backend, pkgs, s.projectDir); err != nil {
+		if isStaleProjectDirError(err) {
+			return fmt.Errorf("ingest: %w\n\n%s no longer resolves inside a Go module -- "+
+				"if this project was moved or renamed since 'defn serve' started, run 'defn restart' "+
+				"to pick up the new location", err, s.projectDir)
+		}
 		return fmt.Errorf("ingest: %w", err)
 	}
 	if err := resolve.ResolvePackages(s.backend, pkgs, s.projectDir); err != nil {
@@ -7262,4 +7267,14 @@ func dbDirSize(dir string) int64 {
 		return nil
 	})
 	return total
+}
+
+// isStaleProjectDirError reports whether err looks like packages.Load
+// failing because its Dir no longer resolves inside a Go module --
+// the shape produced when a project is moved or renamed on disk after
+// 'defn serve' captured s.projectDir at startup and never revalidates
+// it. Verified empirically (2026-08-05) against cmd/go's real error
+// text for a directory outside any module.
+func isStaleProjectDirError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "does not contain main module")
 }

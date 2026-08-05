@@ -59,9 +59,8 @@ func FilterPackages(pkgs []*packages.Package) []*packages.Package {
 // never transitive deps. Without NeedDeps, the type checker still loads
 // types.Package for imports via compiled export data from GOCACHE —
 // cheap compared to loading full AST + type info for every dep. On a
-// heavy module (e.g. defn itself, which imports Dolt) this drops peak
-// RSS from ~5 GB to under 1 GB without losing cross-module ref
-// resolution.
+// heavy module with many third-party dependencies, this drops peak
+// RSS substantially without losing cross-module ref resolution.
 func LoadPattern(dir, pattern string) ([]*packages.Package, error) {
 	cfg := &packages.Config{
 		Mode: packages.NeedName |

@@ -69,18 +69,18 @@ func IngestPackages(db store.Backend, pkgs []*packages.Package, modulePath strin
 		}
 	}
 
-	// Each UpsertDefinition forces Dolt to materialize a noms chunk that
-	// sticks in the in-memory chunk cache until DOLT_GC runs — DOLT_COMMIT
-	// alone does NOT release it (verified empirically on chi: a mid-ingest
-	// COMMIT dropped heap_alloc from 473 MB → 471 MB; a mid-ingest GC
-	// dropped it to 30 MB). Without intervention, peak retention scales
-	// linearly with (rows × avg body size).
+	// Each UpsertDefinition allocates row/body data that stays live in
+	// the process heap until a GC (db.GC() below runs a WAL checkpoint
+	// on the SQLite backend). Without intervention, peak retention
+	// scales roughly linearly with (rows × avg body size) on a large
+	// module.
 	//
-	// Strategy: rely on the end-of-IngestPackages GC below for the common
-	// case (small/medium projects). Only trigger mid-loop GC when the heap
-	// is truly large (>1 GB) — DOLT_GC time grows with chunk count, so
-	// each mid-loop GC costs ~10-20s; doing one for every 200 MB of writes
-	// makes ingest slower than just running with high RSS to the end.
+	// Strategy: rely on the end-of-IngestPackages GC below for the
+	// common case (small/medium projects). Only trigger mid-loop GC
+	// when the heap is truly large (>1 GB) -- these Dolt-era thresholds
+	// (1 GB trigger, ~10-20s per checkpoint) haven't been re-measured
+	// against the SQLite backend's WAL checkpoint cost, which is
+	// typically far cheaper than Dolt's chunk-store GC was.
 	const midLoopGCThresholdBytes = 1 << 30 // 1 GB
 	filtered := goload.FilterPackages(pkgs)
 	var m runtime.MemStats
