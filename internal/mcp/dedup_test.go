@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -276,5 +277,109 @@ func TestJustMutated_MarkAndTake(t *testing.T) {
 	}
 	if c.takeMutated(sess, "Foo") {
 		t.Error("expected takeMutated to be consumed after the first call")
+	}
+}
+
+func TestInvalidateNames_PreservesUnrelatedEntries(t *testing.T) {
+	c := newRespCache()
+	sess := &sdkmcp.ServerSession{}
+	foo := mkPayload("foo-body")
+	bar := mkPayload("bar-body")
+	proj := mkPayload("project-overview")
+
+	c.dedup(sess, "read", "Foo", mkText(foo))
+	c.dedup(sess, "read", "Bar", mkText(bar))
+	c.dedup(sess, "overview", "project", mkText(proj))
+
+	c.invalidateNames(sess, []string{"Foo"}, nil)
+
+	// Foo's entry is gone: a repeat read of Foo should NOT hit the stub.
+	if r := c.dedup(sess, "read", "Foo", mkText(foo)); strings.Contains(r.Content[0].(*sdkmcp.TextContent).Text, "cached") {
+		t.Errorf("Foo should have been invalidated; got a cache-hit stub")
+	}
+
+	// Bar's entry survives: a repeat read of Bar SHOULD hit the stub.
+	if r := c.dedup(sess, "read", "Bar", mkText(bar)); !strings.Contains(r.Content[0].(*sdkmcp.TextContent).Text, "cached") {
+		t.Errorf("Bar should NOT have been invalidated; got full content instead of a cache-hit stub")
+	}
+
+	// overview|project always gets cleared by any determinable-blast-radius write.
+	if r := c.dedup(sess, "overview", "project", mkText(proj)); strings.Contains(r.Content[0].(*sdkmcp.TextContent).Text, "cached") {
+		t.Errorf("overview|project should always be invalidated; got a cache-hit stub")
+	}
+}
+
+func TestWriteTargets(t *testing.T) {
+	cases := []struct {
+		name      string
+		args      codeParam
+		wantNames []string
+		wantFiles []string
+		wantOK    bool
+	}{
+		{
+			name:      "edit_scopes_to_name",
+			args:      codeParam{Op: "edit", Name: "Foo"},
+			wantNames: []string{"Foo"},
+			wantOK:    true,
+		},
+		{
+			name:      "rename_scopes_to_old_and_new",
+			args:      codeParam{Op: "rename", OldName: "Foo", NewName: "Bar"},
+			wantNames: []string{"Foo", "Bar"},
+			wantOK:    true,
+		},
+		{
+			name:      "create_scopes_to_file",
+			args:      codeParam{Op: "create", File: "pkg/x.go"},
+			wantFiles: []string{"pkg/x.go"},
+			wantOK:    true,
+		},
+		{
+			name:      "add_import_scopes_to_file",
+			args:      codeParam{Op: "add-import", File: "pkg/x.go"},
+			wantFiles: []string{"pkg/x.go"},
+			wantOK:    true,
+		},
+		{
+			name:   "sync_is_not_determinable",
+			args:   codeParam{Op: "sync"},
+			wantOK: false,
+		},
+		{
+			name: "apply_batch_mixes_names_and_files",
+			args: codeParam{Op: "apply", Operations: []applyOp{
+				{Op: "edit", Name: "Foo"},
+				{Op: "create", File: "pkg/y.go"},
+			}},
+			wantNames: []string{"Foo"},
+			wantFiles: []string{"pkg/y.go"},
+			wantOK:    true,
+		},
+		{
+			name: "apply_batch_with_unrecognized_op_is_not_determinable",
+			args: codeParam{Op: "apply", Operations: []applyOp{
+				{Op: "edit", Name: "Foo"},
+				{Op: "sync"},
+			}},
+			wantOK: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			names, files, ok := writeTargets(c.args)
+			if ok != c.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, c.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if !reflect.DeepEqual(names, c.wantNames) && !(len(names) == 0 && len(c.wantNames) == 0) {
+				t.Errorf("names = %v, want %v", names, c.wantNames)
+			}
+			if !reflect.DeepEqual(files, c.wantFiles) && !(len(files) == 0 && len(c.wantFiles) == 0) {
+				t.Errorf("files = %v, want %v", files, c.wantFiles)
+			}
+		})
 	}
 }

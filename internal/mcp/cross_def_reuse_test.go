@@ -141,9 +141,14 @@ func TestHandleCode_OutlineSuppressedAfterFullBodyRead(t *testing.T) {
 }
 
 // TestHandleCode_OutlineSuppressionClearsAfterWrite confirms the
-// suppression state is invalidated by any write op, same as respCache's
-// existing dedup entries -- otherwise a stale "already read" stub
-// could hide a def that has since changed shape.
+// suppression state is invalidated when a write op actually touches the
+// def in question -- otherwise a stale "already read" stub could hide a
+// def that has since changed shape. (2026-08-04: invalidation is now
+// scoped to the write's determined blast radius rather than the whole
+// session -- see writeTargets/invalidateNames -- so this uses a write
+// that names Chunky directly. See
+// TestHandleCode_OutlineSuppressionSurvivesUnrelatedWrite for the flip
+// side: a write that does NOT touch Chunky must NOT clear it.)
 func TestHandleCode_OutlineSuppressionClearsAfterWrite(t *testing.T) {
 	s, req := setupCrossDefReuseServer(t)
 
@@ -151,11 +156,9 @@ func TestHandleCode_OutlineSuppressionClearsAfterWrite(t *testing.T) {
 		t.Fatalf("read full:true: %v", err)
 	}
 
-	// Any write op invalidates the whole session cache -- add-import on
-	// the existing file is a clean, side-effect-free-enough write to
-	// trigger it.
-	if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "add-import", File: "main.go", ImportPath: "errors"}); err != nil {
-		t.Fatalf("add-import: %v", err)
+	editedBody := "func Chunky(items []string) (int, error) {\n\ttotal := 0\n\t// edited\n\tfor _, item := range items {\n\t\tif item == \"\" {\n\t\t\tcontinue\n\t\t}\n\t\ttotal++\n\t}\n\tif total == 0 {\n\t\treturn 0, nil\n\t}\n\tdefer func() {\n\t\ttotal = 0\n\t}()\n\tgo func() {\n\t\tprocess(items)\n\t}()\n\tselect {\n\tcase <-done:\n\t}\n\treturn total, nil\n}"
+	if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "edit", Name: "Chunky", NewBody: editedBody}); err != nil {
+		t.Fatalf("edit Chunky: %v", err)
 	}
 
 	outlineResult, _, err := s.handleCode(context.Background(), req, codeParam{Op: "outline", Name: "Chunky"})
@@ -164,7 +167,7 @@ func TestHandleCode_OutlineSuppressionClearsAfterWrite(t *testing.T) {
 	}
 	outlineText := resultText(t, outlineResult)
 	if strings.Contains(outlineText, "already read") {
-		t.Errorf("expected suppression state to be cleared after a write op, got:\n%s", outlineText)
+		t.Errorf("expected suppression state to be cleared after a write that touches Chunky, got:\n%s", outlineText)
 	}
 }
 
@@ -183,4 +186,57 @@ func setupCrossDefReuseServer(t *testing.T) (*server, *sdkmcp.CallToolRequest) {
 	s.ready.Store(true)
 	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
 	return s, req
+}
+
+// TestHandleCode_EditDoesNotInvalidateUnrelatedDefsCache is the
+// end-to-end proof of the invalidate-scoping fix (2026-08-04): editing
+// one def must not erase the dedup cache entry for a completely
+// unrelated def read earlier in the same session.
+func TestHandleCode_EditDoesNotInvalidateUnrelatedDefsCache(t *testing.T) {
+	s, req := setupCrossDefReuseServer(t)
+	ctx := context.Background()
+
+	if _, _, err := s.handleCode(ctx, req, codeParam{Op: "read", Name: "Chunky"}); err != nil {
+		t.Fatalf("first read Chunky: %v", err)
+	}
+
+	if _, _, err := s.handleCode(ctx, req, codeParam{Op: "edit", Name: "process", NewBody: "func process(_ []string) {\n\t// touched\n}"}); err != nil {
+		t.Fatalf("edit process: %v", err)
+	}
+
+	result, _, err := s.handleCode(ctx, req, codeParam{Op: "read", Name: "Chunky"})
+	if err != nil {
+		t.Fatalf("second read Chunky: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "cached") {
+		t.Errorf("editing an unrelated def (process) should not invalidate Chunky's dedup cache; got full content instead of the cached stub:\n%s", text)
+	}
+}
+
+// TestHandleCode_OutlineSuppressionSurvivesUnrelatedWrite is the flip
+// side of TestHandleCode_OutlineSuppressionClearsAfterWrite: a write
+// whose determined blast radius doesn't include Chunky (add-import on
+// its file, which doesn't change Chunky's body or signature) must NOT
+// clear Chunky's suppression state -- matching the scoped invalidation
+// contract (writeTargets/invalidateNames, 2026-08-04).
+func TestHandleCode_OutlineSuppressionSurvivesUnrelatedWrite(t *testing.T) {
+	s, req := setupCrossDefReuseServer(t)
+
+	if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "Chunky", Full: true}); err != nil {
+		t.Fatalf("read full:true: %v", err)
+	}
+
+	if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "add-import", File: "main.go", ImportPath: "errors"}); err != nil {
+		t.Fatalf("add-import: %v", err)
+	}
+
+	outlineResult, _, err := s.handleCode(context.Background(), req, codeParam{Op: "outline", Name: "Chunky"})
+	if err != nil {
+		t.Fatalf("outline: %v", err)
+	}
+	outlineText := resultText(t, outlineResult)
+	if !strings.Contains(outlineText, "already read") {
+		t.Errorf("expected suppression state to SURVIVE an unrelated write (add-import), got:\n%s", outlineText)
+	}
 }

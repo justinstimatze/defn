@@ -772,7 +772,21 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 			return
 		}
 		if isWriteOp(args.Op) {
-			s.respCache.invalidate(req.Session)
+			// Scope invalidation to what this write actually touched when
+			// we can determine it, instead of wiping every other def's
+			// cached reads in the session too. Falls back to the full
+			// wipe when the blast radius isn't determinable (sync/resolve/
+			// merge/checkout/commit/merge-abort, or an apply batch
+			// containing an unrecognized op). Measured motivation
+			// (2026-08-04): a read-locality analysis of 257 real sessions
+			// on this repo found edits interleaved constantly with reads
+			// of OTHER, unrelated defs -- the old blanket invalidate
+			// erased the dedup benefit for all of them on every mutation.
+			if names, files, ok := writeTargets(args); ok {
+				s.respCache.invalidateNames(req.Session, names, files)
+			} else {
+				s.respCache.invalidate(req.Session)
+			}
 			// #154: reachability cache is a graph snapshot; any
 			// mutation invalidates. Next impact/batch-impact will
 			// scan refs to rebuild. Nil-safe for Measure* paths

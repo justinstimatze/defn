@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"sync"
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -247,4 +248,123 @@ func (c *respCache) takeMutated(sess *sdkmcp.ServerSession, name string) bool {
 	}
 	delete(sc.justMutated, name)
 	return true
+}
+
+// invalidateNames clears only the dedup and bodyServed entries anchored
+// on the given names and files, plus the project-wide overview (its
+// content spans every def, so any determinable-blast-radius write still
+// invalidates it). This is the scoped counterpart to invalidate -- use
+// it whenever writeTargets can determine the write's blast radius;
+// fall back to invalidate (full wipe) when it can't.
+func (c *respCache) invalidateNames(sess *sdkmcp.ServerSession, names, files []string) {
+	if sess == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sc, ok := c.sessions[sess]
+	if !ok {
+		return
+	}
+	delete(sc.entries, "overview|project")
+	for key := range sc.entries {
+		for _, name := range names {
+			for _, op := range readOpsWithNameKey {
+				prefix := op + "|" + name
+				if key == prefix || strings.HasPrefix(key, prefix+"|") {
+					delete(sc.entries, key)
+				}
+			}
+		}
+		for _, file := range files {
+			if key == "read-file|"+file || key == "file-defs|"+file || key == "overview|file:"+file {
+				delete(sc.entries, key)
+			}
+		}
+	}
+	for _, name := range names {
+		delete(sc.bodyServed, name)
+	}
+}
+
+// readOpsWithNameKey lists dedup ops whose cache key is anchored on a
+// def name, possibly followed by a "|"-separated suffix (read's
+// "|full" variant, slice's "|<kind>[|<index>]", expand's "|<include>")
+// -- used by invalidateNames to recognize which keys belong to a given
+// name without needing to reconstruct dedupOpKey's exact suffix rules.
+var readOpsWithNameKey = []string{"read", "outline", "slice", "impact", "expand", "methods", "explain"}
+
+// writeTargets returns the def names and files a write op is known to
+// touch, so invalidate can be scoped to just those dedup/bodyServed
+// entries instead of wiping the whole session cache on every mutation.
+// ok=false means the op's blast radius can't be determined from args
+// alone (sync/resolve/merge/checkout/commit/merge-abort -- rarer,
+// structurally significant ops where a full invalidate is the safer
+// default) or an apply batch contains an op this function doesn't
+// recognize -- callers should fall back to a full invalidate in that case.
+//
+// Measured motivation (2026-08-04): a read-locality analysis of 257 real
+// sessions on this repo found edits interleaved constantly with reads of
+// OTHER, unrelated defs -- a blanket per-write invalidate was erasing the
+// dedup benefit for all of them on every single mutation, not just the
+// touched one.
+func writeTargets(args codeParam) (names, files []string, ok bool) {
+	switch args.Op {
+	case "edit", "insert", "insert-precondition", "replace-slice",
+		"replace-hunk", "wrap-in-defer", "rename-param", "delete",
+		"retarget-field-value", "patch":
+		if args.Name == "" {
+			return nil, nil, false
+		}
+		return []string{args.Name}, nil, true
+	case "rename":
+		if args.OldName == "" || args.NewName == "" {
+			return nil, nil, false
+		}
+		return []string{args.OldName, args.NewName}, nil, true
+	case "move":
+		if args.Name == "" {
+			return nil, nil, false
+		}
+		return []string{args.Name}, nil, true
+	case "create", "add-import":
+		if args.File == "" {
+			return nil, nil, false
+		}
+		return nil, []string{args.File}, true
+	case "apply":
+		var allNames, allFiles []string
+		for _, op := range args.Operations {
+			switch op.Op {
+			case "edit", "insert", "insert-precondition", "replace-slice",
+				"replace-hunk", "wrap-in-defer", "rename-param", "delete",
+				"retarget-field-value", "patch":
+				if op.Name == "" {
+					return nil, nil, false
+				}
+				allNames = append(allNames, op.Name)
+			case "rename":
+				// Batch rename uses Name (old) + NewName -- applyOp has no
+				// separate OldName field, unlike top-level codeParam.
+				if op.Name == "" || op.NewName == "" {
+					return nil, nil, false
+				}
+				allNames = append(allNames, op.Name, op.NewName)
+			case "move":
+				if op.Name == "" {
+					return nil, nil, false
+				}
+				allNames = append(allNames, op.Name)
+			case "create", "add-import":
+				if op.File == "" {
+					return nil, nil, false
+				}
+				allFiles = append(allFiles, op.File)
+			default:
+				return nil, nil, false
+			}
+		}
+		return allNames, allFiles, true
+	}
+	return nil, nil, false
 }
