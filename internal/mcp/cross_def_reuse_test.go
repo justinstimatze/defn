@@ -289,3 +289,81 @@ func TestHandleCode_SliceSuppressedAfterFullBodyRead(t *testing.T) {
 		t.Errorf("expected slice to be suppressed (no re-transmitted body), got:\n%s", sliceText)
 	}
 }
+
+// TestHandleCode_OutlineRedirectsToExpandWhenBodyServeIsStale is #227's
+// fix, verified against the real failure it was built to close: once a
+// prior full-body serve has survived more than staleEpochThreshold
+// compactions, don't bet a bare "you already have this" stub on it --
+// redirect to the richer expand bundle instead, which is guaranteed to
+// contain the real content rather than a claim that might be wrong.
+func TestHandleCode_OutlineRedirectsToExpandWhenBodyServeIsStale(t *testing.T) {
+	s, req := setupCrossDefReuseServer(t)
+
+	if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "Chunky", Full: true}); err != nil {
+		t.Fatalf("read full:true: %v", err)
+	}
+
+	s.respCache.mu.Lock()
+	s.respCache.getSession(req.Session).compactionEpoch = staleEpochThreshold + 1
+	s.respCache.mu.Unlock()
+
+	result, _, err := s.handleCode(context.Background(), req, codeParam{Op: "outline", Name: "Chunky"})
+	if err != nil {
+		t.Fatalf("outline: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "already read") {
+		t.Errorf("expected a real expand bundle, not the suppression stub, got:\n%s", text)
+	}
+	if !strings.Contains(text, "total++") {
+		t.Errorf("expected the expand redirect to include the actual body, got:\n%s", text)
+	}
+}
+
+func TestHandleCode_ReadRedirectsToExpandWhenBodyServeIsStale(t *testing.T) {
+	s, req := setupCrossDefReuseServer(t)
+
+	if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "Chunky", Full: true}); err != nil {
+		t.Fatalf("read full:true: %v", err)
+	}
+
+	s.respCache.mu.Lock()
+	s.respCache.getSession(req.Session).compactionEpoch = staleEpochThreshold + 1
+	s.respCache.mu.Unlock()
+
+	result, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "Chunky"})
+	if err != nil {
+		t.Fatalf("plain read: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "already read") {
+		t.Errorf("expected a real expand bundle, not the suppression stub, got:\n%s", text)
+	}
+	if !strings.Contains(text, "total++") {
+		t.Errorf("expected the expand redirect to include the actual body, got:\n%s", text)
+	}
+}
+
+func TestHandleCode_SliceRedirectsToExpandWhenBodyServeIsStale(t *testing.T) {
+	s, req := setupCrossDefReuseServer(t)
+
+	if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "Chunky", Full: true}); err != nil {
+		t.Fatalf("read full:true: %v", err)
+	}
+
+	s.respCache.mu.Lock()
+	s.respCache.getSession(req.Session).compactionEpoch = staleEpochThreshold + 1
+	s.respCache.mu.Unlock()
+
+	result, _, err := s.handleCode(context.Background(), req, codeParam{Op: "slice", Name: "Chunky", Slice: "body"})
+	if err != nil {
+		t.Fatalf("slice: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "already read") {
+		t.Errorf("expected a real expand bundle, not the suppression stub, got:\n%s", text)
+	}
+	if !strings.Contains(text, "total++") {
+		t.Errorf("expected the expand redirect to include the actual body, got:\n%s", text)
+	}
+}

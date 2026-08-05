@@ -1022,6 +1022,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		s.respCache.mu.Lock()
 		sc := s.respCache.getSession(req.Session)
 		s.checkTurnBoundary(sc)
+		s.checkCompactionEpoch(sc)
 		// #210: a single-name expand is not a batch -- only 2+ names (or
 		// context/apply, which always consolidate) count as one. #212:
 		// overview always consolidates (whole project, or every def in a
@@ -1044,12 +1045,22 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		// or a downgraded subset -- never more. Bypassed when full:true or
 		// a query is set: those aren't redundant with a prior plain-args
 		// full-body serve check the same way outline's bypass works.
-		if !args.Full && req != nil && s.respCache != nil && strings.TrimSpace(args.Query) == "" && s.respCache.hasBodyServed(req.Session, args.Name) {
-			stub := fmt.Sprintf(
-				"[%s's full body was already read in this session (read with full:true) -- a plain read would return the same content or a downgraded subset, never more. Nothing new here. If the def may have changed since, call code(op:\"sync\") first.]\n",
-				args.Name,
-			)
-			return textResult(stub), nil, nil
+		if !args.Full && req != nil && s.respCache != nil && strings.TrimSpace(args.Query) == "" {
+			if epochsAgo, ok := s.respCache.bodyServedEpochsAgo(req.Session, args.Name); ok {
+				if epochsAgo <= staleEpochThreshold {
+					stub := fmt.Sprintf(
+						"[%s's full body was already read in this session (read with full:true) -- a plain read would return the same content or a downgraded subset, never more. Nothing new here. If the def may have changed since, call code(op:\"sync\") first.]\n",
+						args.Name,
+					)
+					return textResult(stub), nil, nil
+				}
+				// #227: the earlier full-body serve survived enough
+				// compactions that trusting the caller still has it is
+				// risky. Give the richer expand bundle instead of either a
+				// stub that might be wrong or a narrow read that just
+				// re-derives a subset of what may have been lost.
+				return wrapStale(s.handleExpand(ctx, req, codeParam{Name: args.Name, Include: []string{"outline", "callers", "body"}}))
+			}
 		}
 		return wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name, Full: args.Full, Query: args.Query, Mode: args.Mode}))
 	case "resummarize":
@@ -1066,23 +1077,33 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		// re-transmitting it. Bypassed when a query is set: a
 		// query-filtered outline highlights different callees than a
 		// plain one, so it is not redundant even with the body in hand.
-		if req != nil && s.respCache != nil && strings.TrimSpace(args.Query) == "" && s.respCache.hasBodyServed(req.Session, args.Name) {
-			stub := fmt.Sprintf(
-				"[%s's full body was already read in this session (read with full:true) -- outline would return strictly less information (signature/doc/callers/callees, no body). Nothing new here. If the def may have changed since, call code(op:\"sync\") first.]\n",
-				args.Name,
-			)
-			return textResult(stub), nil, nil
+		if req != nil && s.respCache != nil && strings.TrimSpace(args.Query) == "" {
+			if epochsAgo, ok := s.respCache.bodyServedEpochsAgo(req.Session, args.Name); ok {
+				if epochsAgo <= staleEpochThreshold {
+					stub := fmt.Sprintf(
+						"[%s's full body was already read in this session (read with full:true) -- outline would return strictly less information (signature/doc/callers/callees, no body). Nothing new here. If the def may have changed since, call code(op:\"sync\") first.]\n",
+						args.Name,
+					)
+					return textResult(stub), nil, nil
+				}
+				return wrapStale(s.handleExpand(ctx, req, codeParam{Name: args.Name, Include: []string{"outline", "callers", "body"}}))
+			}
 		}
 		return wrapStale(s.handleOutline(ctx, req, nameParam{Name: args.Name, Query: args.Query}))
 	case "slice":
 		// Same cross-def context reuse as read/outline above: any slice
 		// kind is a strict subset of the full body already served.
-		if req != nil && s.respCache != nil && s.respCache.hasBodyServed(req.Session, args.Name) {
-			stub := fmt.Sprintf(
-				"[%s's full body was already read in this session (read with full:true) -- any slice is a strict subset of that body. Nothing new here. If the def may have changed since, call code(op:\"sync\") first.]\n",
-				args.Name,
-			)
-			return textResult(stub), nil, nil
+		if req != nil && s.respCache != nil {
+			if epochsAgo, ok := s.respCache.bodyServedEpochsAgo(req.Session, args.Name); ok {
+				if epochsAgo <= staleEpochThreshold {
+					stub := fmt.Sprintf(
+						"[%s's full body was already read in this session (read with full:true) -- any slice is a strict subset of that body. Nothing new here. If the def may have changed since, call code(op:\"sync\") first.]\n",
+						args.Name,
+					)
+					return textResult(stub), nil, nil
+				}
+				return wrapStale(s.handleExpand(ctx, req, codeParam{Name: args.Name, Include: []string{"outline", "callers", "body"}}))
+			}
 		}
 		return wrapStale(s.handleSlice(ctx, req, args))
 	case "insert-precondition":

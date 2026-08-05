@@ -233,3 +233,48 @@ func TestCircuitBreaker_OverviewNeverCountsAsSingleton(t *testing.T) {
 		t.Fatalf("overview should reset the counter each call, got %d", sc.readShapedCount)
 	}
 }
+
+func TestCheckCompactionEpoch_AdvancesOnFileChange(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".defn"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	epochPath := filepath.Join(dir, ".defn", ".compaction-epoch")
+	s := &server{projectDir: dir}
+	sc := &sessionCache{entries: map[string]cacheEntry{}}
+
+	if err := os.WriteFile(epochPath, []byte("1"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s.checkCompactionEpoch(sc)
+	if sc.compactionEpoch != 1 {
+		t.Fatalf("expected compactionEpoch=1, got %d", sc.compactionEpoch)
+	}
+
+	// Same value again -- must not regress or error.
+	s.checkCompactionEpoch(sc)
+	if sc.compactionEpoch != 1 {
+		t.Fatalf("re-reading same epoch value should not change it, got %d", sc.compactionEpoch)
+	}
+
+	if err := os.WriteFile(epochPath, []byte("3"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s.checkCompactionEpoch(sc)
+	if sc.compactionEpoch != 3 {
+		t.Fatalf("expected compactionEpoch to advance to 3, got %d", sc.compactionEpoch)
+	}
+}
+
+func TestCheckCompactionEpoch_MissingFileIsNoOp(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".defn"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{projectDir: dir}
+	sc := &sessionCache{entries: map[string]cacheEntry{}, compactionEpoch: 5}
+	s.checkCompactionEpoch(sc)
+	if sc.compactionEpoch != 5 {
+		t.Fatalf("missing epoch file should be a no-op, got %d", sc.compactionEpoch)
+	}
+}

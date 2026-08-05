@@ -144,3 +144,26 @@ func envDisabled(key string) bool {
 		return false
 	}
 }
+
+// checkCompactionEpoch compares the on-disk compaction-epoch counter
+// (bumped once per PreCompact hook fire by hooks/defn-precompact.sh)
+// against what this session last saw, advancing sc.compactionEpoch.
+// Mirrors checkTurnBoundary's pattern for the same reason: the MCP
+// server has no protocol-level signal that compaction happened, so a
+// hook bumping a file is the only way to get one.
+func (s *server) checkCompactionEpoch(sc *sessionCache) {
+	if s.projectDir == "" {
+		return
+	}
+	data, err := os.ReadFile(filepath.Join(s.projectDir, ".defn", ".compaction-epoch"))
+	if err != nil {
+		return
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return
+	}
+	if n > sc.compactionEpoch {
+		sc.compactionEpoch = n
+	}
+}

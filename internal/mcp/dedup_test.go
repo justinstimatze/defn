@@ -416,3 +416,63 @@ func TestInvalidateNames_SearchAlwaysCleared(t *testing.T) {
 		t.Errorf("search entries should always be cleared by any determinable write, got a cache-hit stub")
 	}
 }
+
+func TestBodyServedEpochsAgo(t *testing.T) {
+	c := newRespCache()
+	sess := &sdkmcp.ServerSession{}
+
+	if _, ok := c.bodyServedEpochsAgo(sess, "Foo"); ok {
+		t.Fatal("expected ok=false for a name never marked served")
+	}
+
+	c.markBodyServed(sess, "Foo")
+	epochsAgo, ok := c.bodyServedEpochsAgo(sess, "Foo")
+	if !ok || epochsAgo != 0 {
+		t.Fatalf("expected epochsAgo=0 right after marking, got %d, ok=%v", epochsAgo, ok)
+	}
+
+	c.mu.Lock()
+	c.getSession(sess).compactionEpoch = 2
+	c.mu.Unlock()
+
+	epochsAgo, ok = c.bodyServedEpochsAgo(sess, "Foo")
+	if !ok || epochsAgo != 2 {
+		t.Fatalf("expected epochsAgo=2 after advancing epoch, got %d, ok=%v", epochsAgo, ok)
+	}
+}
+
+func TestDedup_StaleBeyondEpochThreshold(t *testing.T) {
+	c := newRespCache()
+	sess := &sdkmcp.ServerSession{}
+	body := mkPayload("body")
+
+	c.dedup(sess, "read", "Foo", mkText(body))
+	c.mu.Lock()
+	c.getSession(sess).compactionEpoch = staleEpochThreshold + 1
+	c.mu.Unlock()
+
+	r := c.dedup(sess, "read", "Foo", mkText(body))
+	got := r.Content[0].(*sdkmcp.TextContent).Text
+	if strings.Contains(got, "cached") {
+		t.Errorf("expected real content past staleEpochThreshold, got suppression stub instead: %q", got)
+	}
+	if got != body {
+		t.Errorf("expected the real body to pass through unchanged, got %q", got)
+	}
+}
+
+func TestDedup_SurvivesWithinEpochThreshold(t *testing.T) {
+	c := newRespCache()
+	sess := &sdkmcp.ServerSession{}
+	body := mkPayload("body")
+
+	c.dedup(sess, "read", "Foo", mkText(body))
+	c.mu.Lock()
+	c.getSession(sess).compactionEpoch = staleEpochThreshold
+	c.mu.Unlock()
+
+	r := c.dedup(sess, "read", "Foo", mkText(body))
+	if got := r.Content[0].(*sdkmcp.TextContent).Text; !strings.Contains(got, "cached") {
+		t.Errorf("expected suppression within staleEpochThreshold, got full content: %q", got)
+	}
+}

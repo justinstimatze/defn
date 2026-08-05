@@ -40,17 +40,26 @@ type respCache struct {
 type sessionCache struct {
 	seq             int64
 	entries         map[string]cacheEntry
-	starterInjected bool            // #203: true after first orient op has appended the starter bundle
-	turnToken       string          // #209: last-seen turn-token; a change means a new turn started
-	readShapedCount int             // #209: individual read-shaped calls made so far this turn
-	bodyServed      map[string]bool // #176: names whose full body (read full:true) was served this session
-	justMutated     map[string]bool // names changed by the most recent write op; consumed once by the next read to force full body instead of the summary-mode default
+	starterInjected bool   // #203: true after first orient op has appended the starter bundle
+	turnToken       string // #209: last-seen turn-token; a change means a new turn started
+	readShapedCount int    // #209: individual read-shaped calls made so far this turn
+	// compactionEpoch is the last-seen value of .defn/.compaction-epoch,
+	// bumped once per PreCompact hook fire (see checkCompactionEpoch).
+	// cacheEntry.epoch and bodyServed's values are stamped with whatever
+	// this was at creation time, so dedup/subsumption can tell how many
+	// compactions have happened since -- a compaction can silently drop
+	// content from the caller's actual working context even though this
+	// server-side cache entry survives untouched.
+	compactionEpoch int64
+	bodyServed      map[string]int64 // #176/#227: name -> compaction epoch when its full body (read full:true) was served this session
+	justMutated     map[string]bool  // names changed by the most recent write op; consumed once by the next read to force full body instead of the summary-mode default
 }
 
 type cacheEntry struct {
 	hash     string
 	servedAt int64
 	size     int
+	epoch    int64 // compaction epoch active when this entry was created; see sessionCache.compactionEpoch
 }
 
 // dedupMinBytes is the smallest response size we bother deduping. #209:
@@ -176,13 +185,21 @@ func (c *respCache) dedup(sess *sdkmcp.ServerSession, op, argKey string, r *sdkm
 	sc.seq++
 	key := op + "|" + argKey
 	if prev, hit := sc.entries[key]; hit && prev.hash == hash {
-		stub := fmt.Sprintf(
-			"[cached: identical %s response already served in this session at call #%d (hash=%s, %d bytes saved). Nothing has changed since — no need to re-request. If you need a fresh read after external changes, call `code(op:\"sync\")` first. If the earlier response was an outline/size-only note, pass full:true to get the full body instead of repeating this call.]",
-			op, prev.servedAt, hash, prev.size,
-		)
-		return textResult(stub)
+		// #227: a compaction can silently drop this content from the
+		// caller's actual working context even though the entry survives
+		// here (it lives in this server process, not the model's
+		// context). Past staleEpochThreshold compactions since the entry
+		// was created, don't bet on "they still have it" -- let the
+		// already-computed real content (r) through instead of the stub.
+		if sc.compactionEpoch-prev.epoch <= staleEpochThreshold {
+			stub := fmt.Sprintf(
+				"[cached: identical %s response already served in this session at call #%d (hash=%s, %d bytes saved). Nothing has changed since — no need to re-request. If you need a fresh read after external changes, call `code(op:\"sync\")` first. If the earlier response was an outline/size-only note, pass full:true to get the full body instead of repeating this call.]",
+				op, prev.servedAt, hash, prev.size,
+			)
+			return textResult(stub)
+		}
 	}
-	sc.entries[key] = cacheEntry{hash: hash, servedAt: sc.seq, size: len(tc.Text)}
+	sc.entries[key] = cacheEntry{hash: hash, servedAt: sc.seq, size: len(tc.Text), epoch: sc.compactionEpoch}
 	return r
 }
 
@@ -196,16 +213,32 @@ func (c *respCache) dedup(sess *sdkmcp.ServerSession, op, argKey string, r *sdkm
 // downgraded to summary or auto-outline (#174/#184), so it is not a
 // reliable signal that the caller actually has the full body.
 func (c *respCache) hasBodyServed(sess *sdkmcp.ServerSession, name string) bool {
+	_, ok := c.bodyServedEpochsAgo(sess, name)
+	return ok
+}
+
+// bodyServedEpochsAgo reports how many compactions have happened since
+// name's full body was served via read(full:true) this session, and
+// whether it was served at all (ok=false means never -- a normal miss
+// for subsumption purposes). Callers use epochsAgo to decide whether
+// suppressing a later outline/read/slice with a bare stub is still
+// trustworthy (see staleEpochThreshold) or whether the claim has
+// survived too many compactions to bet on.
+func (c *respCache) bodyServedEpochsAgo(sess *sdkmcp.ServerSession, name string) (epochsAgo int64, ok bool) {
 	if sess == nil {
-		return false
+		return 0, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	sc := c.sessions[sess]
 	if sc == nil || sc.bodyServed == nil {
-		return false
+		return 0, false
 	}
-	return sc.bodyServed[name]
+	epoch, hit := sc.bodyServed[name]
+	if !hit {
+		return 0, false
+	}
+	return sc.compactionEpoch - epoch, true
 }
 
 // markBodyServed records that name's full body was served this
@@ -219,9 +252,9 @@ func (c *respCache) markBodyServed(sess *sdkmcp.ServerSession, name string) {
 	defer c.mu.Unlock()
 	sc := c.getSession(sess)
 	if sc.bodyServed == nil {
-		sc.bodyServed = map[string]bool{}
+		sc.bodyServed = map[string]int64{}
 	}
-	sc.bodyServed[name] = true
+	sc.bodyServed[name] = sc.compactionEpoch
 }
 
 // markMutated records that name was just changed by a write op this
@@ -385,3 +418,15 @@ func writeTargets(args codeParam) (names, files []string, ok bool) {
 	}
 	return nil, nil, false
 }
+
+// staleEpochThreshold is how many compactions a cached "you already have
+// this" claim survives before dedup/subsumption stop trusting it and
+// either let real content through (dedup) or redirect to a richer,
+// guaranteed-correct bundle instead of a stub (subsumption). 1 survives
+// exactly one compaction -- the ordinary case where a read happens and a
+// compaction incidentally follows soon after, before the model has even
+// acted on it, shouldn't instantly distrust something still fresh. Past
+// that, a real cost was measured directly in production transcripts
+// (2026-08-04): a stale suppression stub led to a user-visible wrong
+// answer in one case, and a 3-extra-call workaround scramble in another.
+const staleEpochThreshold = 1
