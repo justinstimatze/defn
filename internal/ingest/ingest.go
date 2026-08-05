@@ -670,7 +670,7 @@ func ingestGenDecl(db store.Backend, fset *token.FileSet, mod *store.Module, fil
 			// already use, so Type.Field resolves via the existing
 			// receiver.method name-lookup path with no resolver changes.
 			if st, ok := s.Type.(*ast.StructType); ok {
-				ingestStructFields(fset, mod, st, s.Name.Name, isTest, sourceFile, state)
+				ingestStructFields(&structFieldCtx{fset: fset, mod: mod, isTest: isTest, sourceFile: sourceFile, state: state}, st, s.Name.Name)
 			}
 
 		case *ast.ValueSpec:
@@ -757,7 +757,7 @@ func firstNonBlankName(names []*ast.Ident) (string, bool) {
 // GetDefinitionByName already has for methods, with no resolver
 // changes needed. Anonymous/embedded fields are skipped; the issue
 // calls those a bonus, not a requirement.
-func ingestStructFields(fset *token.FileSet, mod *store.Module, st *ast.StructType, typeName string, isTest bool, sourceFile string, state *ingestState) {
+func ingestStructFields(c *structFieldCtx, st *ast.StructType, typeName string) {
 	if st.Fields == nil {
 		return
 	}
@@ -765,30 +765,40 @@ func ingestStructFields(fset *token.FileSet, mod *store.Module, st *ast.StructTy
 		if len(field.Names) == 0 {
 			continue
 		}
-		start := fset.Position(field.Pos())
-		end := fset.Position(field.End())
+		start := c.fset.Position(field.Pos())
+		end := c.fset.Position(field.End())
 		doc := field.Doc.Text()
 		if doc == "" {
 			doc = field.Comment.Text()
 		}
-		sig := renderNode(fset, field.Type)
-		body := renderNode(fset, field)
+		sig := renderNode(c.fset, field.Type)
+		body := renderNode(c.fset, field)
 		for _, name := range field.Names {
 			def := &store.Definition{
-				ModuleID:   mod.ID,
+				ModuleID:   c.mod.ID,
 				Name:       name.Name,
 				Kind:       "field",
 				Exported:   name.IsExported(),
-				Test:       isTest,
+				Test:       c.isTest,
 				Receiver:   typeName,
 				Signature:  sig,
 				Body:       body,
 				Doc:        doc,
 				StartLine:  start.Line,
 				EndLine:    end.Line,
-				SourceFile: sourceFile,
+				SourceFile: c.sourceFile,
 			}
-			state.enqueueDef(def)
+			c.state.enqueueDef(def)
 		}
 	}
+}
+
+// structFieldCtx bundles the per-type parameters ingestStructFields
+// needs, matching valueSpecCtx's rationale: too many positional args.
+type structFieldCtx struct {
+	fset       *token.FileSet
+	mod        *store.Module
+	isTest     bool
+	sourceFile string
+	state      *ingestState
 }
