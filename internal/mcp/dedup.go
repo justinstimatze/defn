@@ -126,6 +126,17 @@ func dedupOpKey(args codeParam) (string, string, bool) {
 		return "methods", args.Name, true
 	case "explain":
 		return "explain", args.Name, true
+	// 2026-08-05: context was defn's most expensive uncovered op --
+	// potentially a top-N-defs outline + refs graph + Sonnet synthesis
+	// bundle -- yet had zero dedup coverage. Confirmed against a real
+	// transcript before adding this: 18 context calls in one session,
+	// only 15 distinct questions, one exact question asked 4 times.
+	// Keyed on the raw question text, same convention as search's
+	// pattern -- exact match only, no normalization (no evidence yet of
+	// near-duplicate-but-not-identical questions being common enough to
+	// justify that extra complexity).
+	case "context":
+		return "context", args.Question, true
 	}
 	return "", "", false
 }

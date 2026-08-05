@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"reflect"
 	"strings"
 	"testing"
@@ -165,6 +166,7 @@ func TestDedupOpKey_Mapping(t *testing.T) {
 		{codeParam{Op: "explain", Name: "Foo"}, "explain", true},
 		{codeParam{Op: "search", Pattern: "auth"}, "search", true},
 		{codeParam{Op: "find", File: "main.go"}, "find", true},
+		{codeParam{Op: "context", Question: "how does routing work"}, "context", true},
 		// Not cached:
 		{codeParam{Op: "similar", Name: "Foo"}, "", false},
 		{codeParam{Op: "edit", Name: "Foo"}, "", false},
@@ -474,5 +476,43 @@ func TestDedup_SurvivesWithinEpochThreshold(t *testing.T) {
 	r := c.dedup(sess, "read", "Foo", mkText(body))
 	if got := r.Content[0].(*sdkmcp.TextContent).Text; !strings.Contains(got, "cached") {
 		t.Errorf("expected suppression within staleEpochThreshold, got full content: %q", got)
+	}
+}
+
+// TestHandleCode_ContextRepeatHitsDedupStub verifies the fix: context
+// was defn's most expensive uncovered op (a full context bundle,
+// potentially including Sonnet synthesis) with zero dedup coverage
+// before this. Confirmed against a real transcript first (2026-08-05):
+// one exact question repeated 4 times in a single session with no
+// caching at all.
+func TestHandleCode_ContextRepeatHitsDedupStub(t *testing.T) {
+	s, req := setupCrossDefReuseServer(t)
+
+	first, _, err := s.handleCode(context.Background(), req, codeParam{Op: "context", Question: "how does Chunky process items"})
+	if err != nil {
+		t.Fatalf("first context call: %v", err)
+	}
+	firstText := resultText(t, first)
+	if strings.Contains(firstText, "cached") {
+		t.Fatalf("first call should not be a dedup hit, got:\n%s", firstText)
+	}
+
+	second, _, err := s.handleCode(context.Background(), req, codeParam{Op: "context", Question: "how does Chunky process items"})
+	if err != nil {
+		t.Fatalf("second context call: %v", err)
+	}
+	secondText := resultText(t, second)
+	if !strings.Contains(secondText, "cached") {
+		t.Errorf("expected the identical repeat context call to hit the dedup stub, got full content:\n%s", secondText)
+	}
+
+	// A genuinely different question must NOT be suppressed.
+	third, _, err := s.handleCode(context.Background(), req, codeParam{Op: "context", Question: "how does process work"})
+	if err != nil {
+		t.Fatalf("third context call: %v", err)
+	}
+	thirdText := resultText(t, third)
+	if strings.Contains(thirdText, "cached: identical") {
+		t.Errorf("a different question should not hit the dedup stub, got:\n%s", thirdText)
 	}
 }
