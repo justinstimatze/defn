@@ -104,12 +104,57 @@ def load_events(path):
     return events
 
 
-def simulate(events, ttl_seconds, read_mult=0.10, write_mult=2.0):
+def estimate_write_inflation(events, safe_gap_seconds=60.0):
+    """Estimates how much MORE real cache_creation is charged on a hit turn
+    than the naive "just this turn's new content" model predicts.
+
+    Measured directly (2026-08-05): on turns with a gap < 60s since the
+    prior turn -- unambiguously within ANY TTL tier, so unambiguously a
+    cache hit -- real cache_creation summed 5.07x higher than new_tokens
+    summed, on the defn mega-session. This isn't noise: cache breakpoints
+    aren't replanted fresh every single turn, so a growing tail since the
+    last TRUE breakpoint likely gets rewritten repeatedly across several
+    consecutive turns before it settles into a stable read-only prefix --
+    the same new content gets billed as a write more than once before
+    it's fully absorbed. Ruled out first: schema churn from mid-session
+    defn serve restarts (turns after a commit showed LOWER residuals than
+    baseline, the opposite of what that hypothesis predicts).
+
+    Returns 1.0 (no inflation) if there's no safe-gap data to measure
+    from, rather than guessing.
+    """
+    last_ts = None
+    sum_new = 0
+    sum_real_cc = 0
+    for e in events:
+        if e["is_compaction"]:
+            last_ts = e["ts"]
+            continue
+        if last_ts is not None:
+            gap = (e["ts"] - last_ts).total_seconds()
+            if 0 < gap < safe_gap_seconds:
+                sum_new += max(0, e["new_tokens"])
+                sum_real_cc += e["real_cache_creation"]
+        last_ts = e["ts"]
+    if sum_new == 0:
+        return 1.0
+    return sum_real_cc / sum_new
+
+
+def simulate(events, ttl_seconds, read_mult=0.10, write_mult=2.0, write_inflation=1.0):
     """Replays events under the given TTL/pricing assumption. Returns
     (total_simulated_cost, per_turn list of (sim_read_cost, sim_write_cost)).
     Cost units are relative to base input price (read_mult/write_mult are
     the multipliers, e.g. 0.10 and 2.0 for the 1h tier per Anthropic's
-    published pricing at time of writing)."""
+    published pricing at time of writing).
+
+    write_inflation multiplies the write cost of a turn's NEW content on
+    a cache hit (not a full-rebuild miss, which already pays for the
+    whole accumulated context and isn't further inflated) -- see
+    estimate_write_inflation. Defaults to 1.0 (no inflation, the original
+    naive model) for backward compatibility; pass the estimated value to
+    use the calibrated model.
+    """
     total_cost = 0.0
     accumulated = 0
     last_ts = None
@@ -131,7 +176,7 @@ def simulate(events, ttl_seconds, read_mult=0.10, write_mult=2.0):
         new_tokens = e["new_tokens"]
         if last_ts is not None and (e["ts"] - last_ts).total_seconds() < ttl_seconds:
             read_cost = accumulated * read_mult
-            write_cost = new_tokens * write_mult
+            write_cost = new_tokens * write_mult * write_inflation
         else:
             read_cost = 0.0
             write_cost = (accumulated + new_tokens) * write_mult
@@ -156,15 +201,22 @@ def real_cost(events, read_mult=0.10, write_mult=2.0):
 
 CALIBRATION_CAVEAT = """\
 ================================================================================
-CAVEAT (2026-08-05, still open): this simulator's cost model is calibrated
-to ~14% error vs. real recorded cache_read/cache_creation totals on the one
-session it's been validated against, even after fixing the compaction
-write-cost omission. Leading unverified hypothesis: rebuilding/restarting
-defn serve mid-session changes the registered `code` tool's schema, which
-busts Anthropic's prompt cache invisibly to this model's size-based
-compaction detector (it only catches context SHRINKING, not schema churn
-at similar size). NOT confirmed -- treat all numbers from this tool as
-DIRECTIONAL ONLY until that gap is chased down and closed. See
+CALIBRATION STATUS (2026-08-05): the naive model (write_inflation=1.0, "a
+hit only pays for its own marginal new content") underestimated real
+recorded cost by ~14%. Root cause: on turns unambiguously within any TTL
+window (gap < 60s), real cache_creation was measured at ~5x the naive
+model's prediction -- cache breakpoints aren't replanted fresh every
+turn, so a growing tail since the last true breakpoint gets rewritten
+repeatedly across several consecutive turns before it settles into a
+stable read-only prefix. write_inflation (auto-estimated per session via
+estimate_write_inflation, ~5.07x on the defn mega-session) corrects for
+this: calibration error dropped from -14.0% to +2.6%. RULED OUT along the
+way: mid-session defn serve restarts busting the cache via tool-schema
+churn -- turns after a commit showed LOWER residuals than baseline, the
+opposite of that hypothesis's prediction. +2.6% residual remains
+unexplained but is small enough for directional use; only validated on
+one session (the defn mega-session) -- treat cross-session comparisons
+with proportionate caution until validated on a second one. See
 bench/cache-sim/README.md.
 ================================================================================
 """
@@ -180,6 +232,17 @@ def main():
     ap.add_argument("--read-mult", type=float, default=0.10)
     ap.add_argument("--write-mult", type=float, default=2.0)
     ap.add_argument(
+        "--write-inflation",
+        type=float,
+        default=None,
+        help="Override the auto-estimated write-inflation factor (see estimate_write_inflation)",
+    )
+    ap.add_argument(
+        "--no-inflation",
+        action="store_true",
+        help="Use the naive write_inflation=1.0 model instead of the calibrated one",
+    )
+    ap.add_argument(
         "--calibrate",
         action="store_true",
         help="Compare sim vs real at the given TTL/pricing",
@@ -192,8 +255,20 @@ def main():
         f"Loaded {len(events)} usage-bearing turns, {n_compactions} inferred compactions."
     )
 
+    if args.no_inflation:
+        inflation = 1.0
+    elif args.write_inflation is not None:
+        inflation = args.write_inflation
+    else:
+        inflation = estimate_write_inflation(events)
+    print(
+        f"write_inflation={inflation:.2f}x (estimated from gap<60s turns unless overridden)"
+    )
+
     if args.calibrate:
-        sim_total, _ = simulate(events, args.ttl, args.read_mult, args.write_mult)
+        sim_total, _ = simulate(
+            events, args.ttl, args.read_mult, args.write_mult, inflation
+        )
         real_total = real_cost(events, args.read_mult, args.write_mult)
         err = (
             (sim_total - real_total) / real_total * 100 if real_total else float("nan")
@@ -202,7 +277,9 @@ def main():
             f"TTL={args.ttl:.0f}s  simulated_cost={sim_total:,.0f}  real_cost={real_total:,.0f}  error={err:+.1f}%"
         )
     else:
-        sim_total, _ = simulate(events, args.ttl, args.read_mult, args.write_mult)
+        sim_total, _ = simulate(
+            events, args.ttl, args.read_mult, args.write_mult, inflation
+        )
         print(f"TTL={args.ttl:.0f}s  simulated_cost={sim_total:,.0f} (relative units)")
 
 

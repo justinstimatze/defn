@@ -5,31 +5,35 @@ prompt-cache cost model, so "what if TTL/pricing/policy X were different"
 questions get an actual number computed from real recorded trajectories
 instead of another round of hand-written one-off analysis scripts.
 
-## ⚠️ Known calibration gap — read before trusting any number
+## ⚠️ Calibration status — read before trusting any number
 
 As of 2026-08-05, `simulate.py --calibrate` reproduces real recorded
-cache_read/cache_creation totals to within **~14% error** on the one
-session it's been validated against (the defn project's own long-lived
-mega-session). That is **directional accuracy, not measurement-grade
-accuracy** — good enough for "does A beat B, roughly how much" questions,
-not for precise dollar claims.
+cache_read/cache_creation totals to within **+2.6% error** on the defn
+project's own long-lived mega-session, and **-2.9% error** on an
+independent second session (gas6amus's stope, 223K turns) — cross-session
+validated, not a one-off fit. That is close to measurement-grade for
+"does A beat B, roughly how much" questions, though still not exact
+enough for precise dollar claims.
 
-**Leading unverified hypothesis for the gap:** the session this was
-calibrated against repeatedly rebuilt and restarted `defn serve`
-mid-session (active development of the very MCP tool being used). Each
-restart likely changes the registered `code` tool's schema, which busts
-Anthropic's prompt cache — a different tool schema is a different prefix
-— but the simulator's compaction detector only looks for context
-*shrinking* (`total_context[i] < total_context[i-1]`), so schema churn at
-similar or larger size is invisible to it. **Not confirmed.** Chasing
-this down means checking whether tool-schema hash/version changes
-correlate with the turns where simulated cost diverges most from real
-cost.
+**Root cause of the original ~14% gap, found and fixed:** the naive model
+assumed a cache hit only pays for that turn's own marginal new content.
+Measured directly: on turns unambiguously within any TTL window (gap <
+60s), real cache_creation was ~5x the naive prediction (5.07x on defn,
+5.85x on stope) — cache breakpoints aren't replanted fresh every turn, so
+a growing tail since the last true breakpoint gets rewritten repeatedly
+across several consecutive turns before it settles into a stable
+read-only prefix. `estimate_write_inflation()` measures this per-session
+automatically; `simulate()`'s `write_inflation` parameter corrects for it.
 
-Until that's resolved: use this tool's output as **directional evidence**
-(which of two scenarios costs more, roughly how much) — the same
-epistemic status as the bucketed gap-vs-cache-read-fraction analyses that
-motivated building it in the first place — not as a precise cost oracle.
+**Ruled out along the way:** mid-session `defn serve` restarts busting
+the cache via tool-schema churn (active development of the very MCP tool
+being used, so a real candidate) — turns following a commit showed
+*lower* residuals than baseline, the opposite of what that hypothesis
+predicts. Worth remembering as a ruled-out dead end if this residual ever
+resurfaces, so it isn't re-investigated from scratch.
+
+The remaining ~3% residual on both sessions is unexplained but small
+enough for directional use as-is.
 
 ## Model
 
@@ -45,13 +49,16 @@ naturally from the recorded numbers; no separate marker lookup needed,
 though `isCompactSummary` events in the transcript can cross-validate).
 
 Given that event stream, `simulate(events, ttl_seconds, read_mult,
-write_mult)` replays cost turn by turn: inside the TTL window since the
-last turn, prior accumulated context is a cheap read and only this turn's
-new content pays the write rate; outside the window, the *whole*
-accumulated context plus new content pays the write rate, since the cache
-had fully lapsed. A compaction turn itself pays the write rate on the new
-(smaller) post-compaction size — that omission was the first calibration
-fix (see git history), cutting error from -16.8% to -14.0%.
+write_mult, write_inflation)` replays cost turn by turn: inside the TTL
+window since the last turn, prior accumulated context is a cheap read and
+this turn's new content pays the write rate times `write_inflation`;
+outside the window, the *whole* accumulated context plus new content pays
+the write rate (uninflated -- a full rebuild already accounts for
+everything, once). A compaction turn itself pays the write rate on the
+new (smaller) post-compaction size. Two calibration fixes landed in order
+(see git history): charging compaction turns for their rebuild (-16.8% ->
+-14.0%), then applying the measured write-inflation factor (-14.0% ->
++2.6%).
 
 ## Usage
 
@@ -70,13 +77,15 @@ published multipliers vs. base input price at time of writing). Pass
 
 ## Next steps (not yet built)
 
-- Chase the calibration residual (tool-schema-churn hypothesis above).
+- Chase the remaining ~3% residual (unexplained, but small enough to be
+  low priority relative to the items below).
 - Extend beyond raw Anthropic cache economics to defn's own dedup
   mechanism: sweep `staleEpochThreshold` values against real repeat-target
   data (see the read-locality analysis this tool's motivating
   investigation produced) to check whether 1 is actually the right choice
   or just a reasonable-sounding default.
-- Validate against a second, independent session (e.g. gas6amus's stope)
-  before trusting the calibration error is representative rather than
-  specific to this one session's unusual "developing your own MCP tool
-  while using it" shape.
+- `write_inflation` is auto-estimated per session from its own gap<60s
+  turns, which is a real strength (self-calibrating, no hardcoded
+  constant) -- but its own stability hasn't been checked across dozens of
+  sessions, only two. Worth confirming it clusters (5-6x-ish) rather than
+  varying wildly before leaning on it for cross-session comparisons.
