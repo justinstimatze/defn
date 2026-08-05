@@ -1,0 +1,430 @@
+// Package db provides Go access to a defn database.
+//
+// Reads (Definitions, Search, Refs, Traverse, ...) are the main surface;
+// SetMeta is a narrow exception for durable key/value metadata shared
+// with defn itself (see GetMeta). The database must already exist
+// (created by defn init). This package opens it directly via
+// store.OpenBackend (the embedded SQLite backend) — no server or CLI
+// binary needed. Also accepts a DSN-shaped path for a future remote
+// backend, though none is currently wired up (see store.OpenBackend).
+//
+//	import defndb "github.com/justinstimatze/defn/db"
+//
+//	d, err := defndb.Open(".defn")
+//	defer d.Close()
+//	defs, err := d.Definitions(defndb.DefinitionFilter{Kind: "type"})
+//
+// All methods are safe for concurrent use from multiple goroutines.
+package db
+
+import (
+	"context"
+	"fmt"
+	"io/fs"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+
+	"github.com/justinstimatze/defn/internal/goload"
+	"github.com/justinstimatze/defn/internal/ingest"
+	"github.com/justinstimatze/defn/internal/resolve"
+	"github.com/justinstimatze/defn/internal/store"
+)
+
+// DB is a read-only handle to a defn database.
+type DB struct {
+	mu sync.Mutex
+	s  store.Backend
+}
+
+// Open opens a defn database at the given path (e.g. ".defn").
+// The database must already exist (created by defn init). No remote
+// backend is currently wired up (see store.OpenBackend); path is
+// always treated as a local directory.
+func Open(path string) (*DB, error) {
+	s, err := store.OpenBackend(path)
+	if err != nil {
+		return nil, err
+	}
+	return &DB{s: s}, nil
+}
+
+// Close releases database resources.
+func (db *DB) Close() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.s.Close()
+}
+
+// Ping verifies the database is reachable. Intended for long-running
+// clients (e.g. MCP servers that hold a single Client across hour-plus
+// sessions) that want to notice a broken connection without waiting
+// for the next real query to fail. Returns the underlying driver
+// error on failure — callers can wrap their own retry loop around it.
+func (db *DB) Ping(ctx context.Context) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.s.Ping(ctx)
+}
+
+// Query executes a read-only SQL query and returns rows as maps.
+// Only SELECT, SHOW, DESCRIBE, EXPLAIN, and WITH (CTE) queries are allowed.
+func (db *DB) Query(sql string) ([]map[string]any, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.s.Query(sql)
+}
+
+// GetMeta returns the value stored under key in defn_meta, or "" if
+// the key has not been set. defn_meta is a single-row-per-key key/value
+// store defn uses for database-level metadata (last_ingest, etc.).
+// External callers can use it as a durable place for their own
+// timestamps or markers without inventing a new file or table.
+func (db *DB) GetMeta(key string) (string, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.s.GetMeta(key)
+}
+
+// SetMeta stores value under key in defn_meta. Overwrites any previous
+// value.
+//
+// External keys must contain a ":" namespace separator (e.g.
+// "winze:last_cycle") to prevent collisions with defn-managed keys
+// like last_ingest. Returns an error on unqualified keys rather than
+// silently shadowing internal state.
+func (db *DB) SetMeta(key, value string) error {
+	if !strings.Contains(key, ":") {
+		return fmt.Errorf("SetMeta: key %q must include a namespace prefix (e.g. %q) — "+
+			"unqualified keys are reserved for defn", key, "myapp:"+key)
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.s.SetMeta(key, value)
+}
+
+// --- Definitions ---
+
+// Definition represents a Go definition (function, type, var, const, etc.).
+type Definition struct {
+	ID         int64
+	ModuleID   int64
+	Name       string
+	Kind       string // "function", "method", "type", "interface", "var", "const"
+	Exported   bool
+	Test       bool
+	Receiver   string
+	Signature  string
+	Doc        string
+	StartLine  int
+	EndLine    int
+	SourceFile string
+}
+
+// DefinitionFilter controls which definitions are returned.
+// All fields are optional. String fields support SQL LIKE patterns.
+type DefinitionFilter struct {
+	Name string // LIKE pattern (e.g. "%Handler%")
+	Kind string // exact: "function", "method", "type", "interface", "var", "const"
+	File string // LIKE pattern on source_file (e.g. "%server.go")
+}
+
+// Definitions returns definitions matching the filter.
+func (db *DB) Definitions(f DefinitionFilter) ([]Definition, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	defs, err := db.s.FilterDefinitions(f.Name, f.Kind, f.File, 0)
+	if err != nil {
+		return nil, err
+	}
+	return convertDefs(defs), nil
+}
+
+// DefinitionByID returns a single definition by its ID.
+func (db *DB) DefinitionByID(id int64) (*Definition, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	d, err := db.s.GetDefinition(id)
+	if err != nil {
+		return nil, err
+	}
+	out := convertDef(*d)
+	return &out, nil
+}
+
+// Search runs a FULLTEXT search across definition docs and bodies.
+func (db *DB) Search(query string) ([]Definition, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	defs, err := db.s.SearchDefinitions(query)
+	if err != nil {
+		return nil, err
+	}
+	return convertDefs(defs), nil
+}
+
+// --- Literal Fields ---
+
+// LiteralField represents a field in a composite literal (e.g. Config{Field: "val"}).
+type LiteralField struct {
+	ID         int64
+	DefID      int64  // definition containing the literal
+	DefName    string // name of containing definition
+	TypeName   string // fully qualified (e.g. "github.com/foo/bar.Config")
+	FieldName  string
+	FieldValue string // source text of the value expression
+	Line       int
+}
+
+// LiteralFieldFilter controls which literal fields are returned.
+// All fields are optional. TypeName and Value support SQL LIKE patterns.
+type LiteralFieldFilter struct {
+	TypeName   string   // LIKE pattern (e.g. "%Claim%")
+	FieldName  string   // exact match (e.g. "Subject") — mutually exclusive with FieldNames
+	FieldNames []string // IN match (e.g. []string{"Subject", "Object", "Prov"})
+	Value      string   // LIKE pattern on field_value
+	// DefIDs restricts results to fields owned by one of these
+	// definitions -- an IN-predicate pushed to SQL, so a caller scoping
+	// to a known def set (e.g. a single-entity lookup) doesn't have to
+	// fetch every matching field and filter def-membership in Go.
+	DefIDs []int64
+
+	// SkipOrderBy and SkipDefName are opt-OUT performance flags for bulk
+	// callers that discard ordering and/or the joined definition name.
+	// Zero-value (false) preserves the original behavior for every
+	// existing caller -- setting either to true is a deliberate choice
+	// to trade that behavior away for speed, not a new default.
+	// SkipOrderBy drops the `ORDER BY type_name, field_name` (~103ms on
+	// a 90k-row bulk query); SkipDefName skips the LEFT JOIN definitions
+	// used only to populate DefName (~210ms) -- callers that key off
+	// DefID don't need it.
+	SkipOrderBy bool
+	SkipDefName bool
+}
+
+// LiteralFields returns composite literal fields matching the filter.
+func (db *DB) LiteralFields(f LiteralFieldFilter) ([]LiteralField, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	fields, err := db.s.QueryLiteralFields(f.TypeName, f.FieldName, f.Value, f.FieldNames, f.DefIDs, 0, f.SkipOrderBy, f.SkipDefName)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]LiteralField, len(fields))
+	for i, sf := range fields {
+		out[i] = LiteralField{
+			ID: sf.ID, DefID: sf.DefID, DefName: sf.DefName, TypeName: sf.TypeName,
+			FieldName: sf.FieldName, FieldValue: sf.FieldValue, Line: sf.Line,
+		}
+	}
+	return out, nil
+}
+
+// --- Pragmas ---
+
+// Pragma represents a comment pragma (e.g. //go:generate, //winze:contested).
+type Pragma struct {
+	ID         int64
+	DefID      *int64 // nil for file-level pragmas
+	DefName    string // name of associated definition (empty if file-level)
+	SourceFile string
+	Line       int
+	Text       string // full comment text
+	Key        string // e.g. "go:generate", "winze:contested"
+	Value      string // rest of line after the key
+}
+
+// Pragmas returns pragma comments matching the key pattern.
+// keyPattern supports SQL LIKE (e.g. "winze:%" for all winze pragmas).
+func (db *DB) Pragmas(keyPattern string) ([]Pragma, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	comments, err := db.s.GetCommentsByPragma(keyPattern)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Pragma, len(comments))
+	for i, c := range comments {
+		out[i] = Pragma{
+			ID: c.ID, DefID: c.DefID, DefName: c.DefName, SourceFile: c.SourceFile,
+			Line: c.Line, Text: c.Text, Key: c.PragmaKey, Value: c.PragmaVal,
+		}
+	}
+	return out, nil
+}
+
+// --- References ---
+
+// Ref represents a reference edge between two definitions.
+type Ref struct {
+	FromDef int64
+	ToDef   int64
+	Kind    string // "call", "type_ref", "field_access", "constructor", "embed", "interface_dispatch", "implements"
+}
+
+// RefFilter controls which references are returned.
+// All fields are optional. Name fields support SQL LIKE patterns.
+type RefFilter struct {
+	FromName string // LIKE pattern on source definition name
+	ToName   string // LIKE pattern on target definition name
+	Kind     string // exact match (e.g. "embed", "call")
+}
+
+// Refs returns references matching the filter.
+func (db *DB) Refs(f RefFilter) ([]Ref, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	refs, err := db.s.QueryRefs(f.FromName, f.ToName, f.Kind, 0)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Ref, len(refs))
+	for i, r := range refs {
+		out[i] = Ref{FromDef: r.FromDef, ToDef: r.ToDef, Kind: r.Kind}
+	}
+	return out, nil
+}
+
+// --- Traversal ---
+
+// TraverseResult holds a definition found during graph traversal.
+type TraverseResult struct {
+	Definition Definition
+	Depth      int
+	Path       []string // definition names from root to this node
+}
+
+// Traverse performs a BFS traversal of the reference graph.
+// direction: "callers" (who references me) or "callees" (what I reference).
+// refKinds filters by ref kind (nil = all). maxDepth caps BFS depth (0 = default 10, max 50).
+func (db *DB) Traverse(name, direction string, refKinds []string, maxDepth int) ([]TraverseResult, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	d, err := db.s.GetDefinitionByName(name, "")
+	if err != nil {
+		return nil, err
+	}
+	results, err := db.s.Traverse(d.ID, direction, refKinds, maxDepth)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]TraverseResult, len(results))
+	for i, r := range results {
+		out[i] = TraverseResult{
+			Definition: convertDef(r.Definition),
+			Depth:      r.Depth,
+			Path:       r.Path,
+		}
+	}
+	return out, nil
+}
+
+// --- Staleness ---
+
+// StaleFiles returns paths of .go files under projectDir that have been
+// modified more recently than the last ingest. Empty slice means the
+// database is in sync with the filesystem (or no ingest timestamp has
+// been recorded — e.g. databases created before this feature).
+//
+// Walks projectDir recursively, skipping .defn/, .git/, vendor/,
+// node_modules/, and testdata/ directories.
+func (db *DB) StaleFiles(projectDir string) ([]string, error) {
+	db.mu.Lock()
+	lastIngestStr, err := db.s.GetMeta("last_ingest")
+	db.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	if lastIngestStr == "" {
+		return nil, nil
+	}
+	lastIngest, err := strconv.ParseInt(lastIngestStr, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("parse last_ingest: %w", err)
+	}
+
+	var stale []string
+	err = filepath.WalkDir(projectDir, func(path string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if name == ".defn" || name == ".git" || name == "vendor" ||
+				name == "node_modules" || name == "testdata" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil // skip unreadable files
+		}
+		if info.ModTime().Unix() > lastIngest {
+			stale = append(stale, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return stale, nil
+}
+
+// --- Helpers ---
+
+func convertDef(d store.Definition) Definition {
+	return Definition{
+		ID: d.ID, ModuleID: d.ModuleID, Name: d.Name, Kind: d.Kind,
+		Exported: d.Exported, Test: d.Test, Receiver: d.Receiver,
+		Signature: d.Signature, Doc: d.Doc, StartLine: d.StartLine,
+		EndLine: d.EndLine, SourceFile: d.SourceFile,
+	}
+}
+
+func convertDefs(defs []store.Definition) []Definition {
+	out := make([]Definition, len(defs))
+	for i, d := range defs {
+		out[i] = convertDef(d)
+	}
+	return out
+}
+
+// Sync ingests projectDir into the database in-process, letting an
+// embedder build or refresh a .defn database without shelling out to
+// the defn CLI binary. Always does a full re-ingest (packages.Load +
+// IngestPackages + ResolvePackages) over the whole module ("./...") --
+// see SyncPattern to scope this to a single package. No incremental
+// fast path yet; that machinery is CLI-internal (cmd/defn's
+// incrementalPreflight/applyIncrementalIngest) and worth extracting
+// only once an embedder with a corpus large enough to need it shows up.
+func (db *DB) Sync(projectDir string) error {
+	return db.SyncPattern(projectDir, "./...")
+}
+
+// SyncPattern is Sync scoped to a package pattern (e.g. "." for just
+// the root package) instead of the whole module ("./..."). An
+// embedder whose corpus is a single declarative package pays
+// full-module type-checking on every Sync otherwise -- editing any
+// unrelated package in the module marks the DB stale and forces a
+// whole-module re-Sync on the next reader, for no benefit to that
+// embedder's own package.
+func (db *DB) SyncPattern(projectDir, pattern string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	pkgs, err := goload.LoadPattern(projectDir, pattern)
+	if err != nil {
+		return fmt.Errorf("load packages: %w", err)
+	}
+	if err := ingest.IngestPackages(db.s, pkgs, projectDir); err != nil {
+		return fmt.Errorf("ingest: %w", err)
+	}
+	if err := resolve.ResolvePackages(db.s, pkgs, projectDir); err != nil {
+		return fmt.Errorf("resolve: %w", err)
+	}
+	return nil
+}
