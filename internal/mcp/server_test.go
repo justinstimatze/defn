@@ -2589,6 +2589,13 @@ func TestSearchShapedSQLRedirect(t *testing.T) {
 		// Direct name lookup
 		{"name_eq", "SELECT * FROM definitions WHERE name = 'GetJobs'", "op:\"read\"", false},
 		{"d_name_eq", "SELECT d.name, b.body FROM definitions d JOIN bodies b ON b.def_id=d.id WHERE d.name = 'GetJobs'", "op:\"read\"", false},
+		// 2026-08-05: name IN (...) and name LIKE were confirmed (via a
+		// real-transcript corpus scan) to slip past the old =-only regex —
+		// 16/51 post-guard real query calls used exactly this shape.
+		{"name_in", "SELECT name, source_file FROM definitions WHERE name IN ('OpenBackend','OpenSQLite')", "op:\"read\"", false},
+		{"d_name_in", "SELECT d.name, d.receiver, m.path FROM definitions d JOIN modules m ON d.module_id=m.id WHERE d.name IN ('ComputeMinHash','MinHashJaccard')", "op:\"read\"", false},
+		{"name_like", "SELECT id, name, source_file FROM definitions WHERE name LIKE 'TestHandleAddImport%'", "op:\"read\"", false},
+		{"backtick_name_like", "SELECT `name`, `kind`, `receiver`, `source_file` FROM definitions WHERE `name` LIKE '%mport%' LIMIT 20", "op:\"read\"", false},
 
 		// Schema introspection
 		{"show_tables", "SHOW TABLES", "schema is documented", false},

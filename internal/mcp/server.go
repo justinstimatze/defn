@@ -4258,10 +4258,14 @@ func truncateTestOutput(out string) string {
 }
 
 var (
-	sqlBodyGrep    = regexp.MustCompile(`(?i)\bbody\s+LIKE\s+'`)
-	sqlFileScoped  = regexp.MustCompile(`(?i)\b(?:d\.)?source_file\s*(?:LIKE\b|=|\bIN\b)`)
-	sqlInfoSchema  = regexp.MustCompile(`(?i)\bINFORMATION_SCHEMA\b`)
-	sqlNameLookup  = regexp.MustCompile(`(?i)\b(?:d\.)?name\s*=\s*'`)
+	sqlBodyGrep   = regexp.MustCompile(`(?i)\bbody\s+LIKE\s+'`)
+	sqlFileScoped = regexp.MustCompile(`(?i)\b(?:d\.)?source_file\s*(?:LIKE\b|=|\bIN\b)`)
+	sqlInfoSchema = regexp.MustCompile(`(?i)\bINFORMATION_SCHEMA\b`)
+)
+
+var sqlNameLookup = regexp.MustCompile("(?i)\\b(?:d\\.)?`?name`?\\s*(?:=\\s*'|LIKE\\s+'|IN\\s*\\()")
+
+var (
 	sqlSchemaProbe = regexp.MustCompile(`(?i)^\s*(?:SHOW\s+(?:TABLES|DATABASES|COLUMNS)|DESCRIBE\s|DESC\s|EXPLAIN\s)`)
 )
 
@@ -4269,10 +4273,13 @@ func searchShapedSQLRedirect(sql string) string {
 	switch {
 	case sqlBodyGrep.MatchString(sql):
 		return "raw SQL grep on definitions.bodies is a wire-cost anti-pattern — use `code(op:\"search\", pattern:\"<text>\")` instead; it returns compact name+file+line rows, not full bodies. If you truly need SQL analytics (e.g., counts, joins across tables), use `defn query` from the CLI."
-	case sqlNameLookup.MatchString(sql):
-		return "direct name lookup via SQL is a wire-cost anti-pattern — use `code(op:\"read\", name:\"<name>\")` for the body, `code(op:\"outline\", name:\"<name>\")` for the shape, or `code(op:\"impact\", name:\"<name>\")` for callers. All are cheaper on the wire than blob rows."
+	// file-scoped checked before name-lookup: a query combining
+	// source_file + name filters (e.g. "list defs matching X in file Y")
+	// is better served by file-defs than by a single-name read/outline.
 	case sqlFileScoped.MatchString(sql):
 		return "file-scoped SQL against definitions is a wire-cost anti-pattern — use `code(op:\"file-defs\", file:\"<path>\")` to list all defs in a file, `code(op:\"read-file\", file:\"<path>\")` for all bodies in a file, `code(op:\"outline\", name:\"<name>\")` for a single def's shape, or `code(op:\"search\", pattern:\"<text>\")` for symbol/text search. These return compact rows tuned for LLM consumption; raw SQL dumps blobs."
+	case sqlNameLookup.MatchString(sql):
+		return "direct name lookup via SQL is a wire-cost anti-pattern — use `code(op:\"read\", name:\"<name>\")` for the body, `code(op:\"outline\", name:\"<name>\")` for the shape, or `code(op:\"impact\", name:\"<name>\")` for callers. All are cheaper on the wire than blob rows."
 	case sqlSchemaProbe.MatchString(sql) || sqlInfoSchema.MatchString(sql):
 		return "schema introspection via SQL is unnecessary — the DB schema is documented at internal/store/schema.sql. Tables: definitions (name, kind, source_file, start_line, ...), bodies (def_id, body), refs, imports, modules, project_files. Use the graph ops (search/outline/read/impact) instead of raw SQL."
 	}
