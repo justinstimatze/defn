@@ -2537,6 +2537,19 @@ func (s *server) autoEmitOnlyWithOpts(opts emit.Opts) string {
 // was refused or silently skipped one or more requested changes --
 // treat this the same as a failure, not as success with a footnote.
 func (s *server) autoEmitAndBuildWithOpts(opts emit.Opts) string {
+	return s.emitAndBuildAgainst(s.backend, opts)
+}
+
+// emitAndBuildAgainst is autoEmitAndBuildWithOpts generalized to accept
+// the store.Backend to emit against. #12: callers that want the build
+// gate to actually protect their DB write pass a Begin()-scoped tx
+// (which sees the batch's own uncommitted writes, the same way
+// handleApply's existing tx already relies on for cross-op
+// dependencies) instead of s.backend, and only commit it after this
+// returns a clean (empty) result. autoEmitAndBuildWithOpts above is the
+// legacy/unprotected shape, kept for callers that don't (yet) wrap
+// their write in a transaction.
+func (s *server) emitAndBuildAgainst(backend store.Backend, opts emit.Opts) string {
 	if s.projectDir == "" || os.Getenv("DEFN_LEGACY") == "1" {
 		return ""
 	}
@@ -2544,7 +2557,7 @@ func (s *server) autoEmitAndBuildWithOpts(opts emit.Opts) string {
 
 	// Emit to the actual project directory — keeps files in sync.
 	t := time.Now()
-	warnings, err := emit.EmitWithOpts(s.backend, s.projectDir, opts)
+	warnings, err := emit.EmitWithOpts(backend, s.projectDir, opts)
 	if err != nil {
 		return fmt.Sprintf("emit error: %v", err)
 	}
@@ -3681,27 +3694,6 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		}
 		return textResult(sb.String()), nil, nil
 	}
-	if err := commit(); err != nil {
-		return errResult(fmt.Errorf("commit: %w", err))
-	}
-
-	// #233: apply queued add-import disk patches now that the DB write
-	// they mirror is durable. A failure here can't roll back the
-	// already-committed DB state -- same asymmetry autoEmitAndBuildWithOpts
-	// already has for every other op -- so surface it as a warning rather
-	// than an error result.
-	for _, pi := range pendingImports {
-		changed, err := s.patchImportOnDisk(pi.moduleID, pi.file, pi.importPath, pi.alias)
-		switch {
-		case err != nil:
-			sb.WriteString(fmt.Sprintf("WARNING: add-import %q on %s: %v\n", pi.importPath, pi.file, err))
-		case changed:
-			sb.WriteString(fmt.Sprintf("+ added import %q to %s\n", pi.importPath, pi.file))
-		default:
-			sb.WriteString(fmt.Sprintf("= import %q already present in %s\n", pi.importPath, pi.file))
-		}
-	}
-
 	// #114 batch scoping: if we tracked any touched files, run one scoped
 	// emit + goimports + per-file resolve at the tail. Safety valve — if
 	// tracking came up empty AND there were no pending add-import disk
@@ -3712,24 +3704,81 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	// scoped or unscoped: patchImportOnDisk already landed the change,
 	// and running goimports over the file (scoped or project-wide) would
 	// strip the import right back out if nothing uses it yet.
+	//
+	// #12: when the batch has no pending add-import disk patches, commit
+	// is deferred until AFTER the build gate — commitOrRollbackOnBuild
+	// only commits tx if emit+build comes back completely clean, so a
+	// build failure now leaves NEITHER the DB nor the filesystem changed
+	// (previously: commit ran unconditionally, then a build failure was
+	// just a string in the response with no rollback). A batch that DOES
+	// include add-import can't get this protection: patchImportOnDisk
+	// writes directly to disk outside the emit/merge path and needs the
+	// DB write durable first (pre-existing #233 asymmetry, not addressed
+	// here — see #12's issue body for why).
 	var buildResult string
-	if len(touchedFiles) > 0 || len(allowedRemovals) > 0 || len(allowedAdds) > 0 {
+	switch {
+	case len(pendingImports) == 0 && (len(touchedFiles) > 0 || len(allowedRemovals) > 0 || len(allowedAdds) > 0):
 		goimportsFiles := make([]string, 0, len(touchedFiles))
 		for f := range touchedFiles {
 			goimportsFiles = append(goimportsFiles, f)
 		}
-		buildResult = s.autoEmitAndBuildWithOpts(emit.Opts{
+		buildResult = s.commitOrRollbackOnBuild(tx, commit, rollback, emit.Opts{
 			AllowedRemovals: allowedRemovals,
 			AllowedAdds:     allowedAdds,
 			GoimportsFiles:  goimportsFiles,
 			TouchedFiles:    goimportsFiles,
 		})
-		for fp := range resolveSet {
-			s.autoResolveFile(fp.file, fp.module)
+		if buildResult == "" {
+			for fp := range resolveSet {
+				s.autoResolveFile(fp.file, fp.module)
+			}
 		}
-	} else if len(pendingImports) == 0 {
+
+	case len(pendingImports) == 0:
+		// Nothing tracked at all (every op had empty SourceFile) — no
+		// per-file snapshot is possible, so commit unconditionally and
+		// fall back to the full-project emit+build, same as before #12.
+		if err := commit(); err != nil {
+			return errResult(fmt.Errorf("commit: %w", err))
+		}
 		buildResult = s.autoEmitAndBuild()
 		s.autoResolve("")
+
+	default:
+		// add-import is present: commit unconditionally (its disk patch
+		// needs the DB write durable first — #233), then apply the
+		// pending imports, then still run the build for any OTHER
+		// touched files in the same batch — unprotected, pre-existing
+		// #233 asymmetry, unchanged by #12.
+		if err := commit(); err != nil {
+			return errResult(fmt.Errorf("commit: %w", err))
+		}
+		for _, pi := range pendingImports {
+			changed, err := s.patchImportOnDisk(pi.moduleID, pi.file, pi.importPath, pi.alias)
+			switch {
+			case err != nil:
+				sb.WriteString(fmt.Sprintf("WARNING: add-import %q on %s: %v\n", pi.importPath, pi.file, err))
+			case changed:
+				sb.WriteString(fmt.Sprintf("+ added import %q to %s\n", pi.importPath, pi.file))
+			default:
+				sb.WriteString(fmt.Sprintf("= import %q already present in %s\n", pi.importPath, pi.file))
+			}
+		}
+		if len(touchedFiles) > 0 || len(allowedRemovals) > 0 || len(allowedAdds) > 0 {
+			goimportsFiles := make([]string, 0, len(touchedFiles))
+			for f := range touchedFiles {
+				goimportsFiles = append(goimportsFiles, f)
+			}
+			buildResult = s.autoEmitAndBuildWithOpts(emit.Opts{
+				AllowedRemovals: allowedRemovals,
+				AllowedAdds:     allowedAdds,
+				GoimportsFiles:  goimportsFiles,
+				TouchedFiles:    goimportsFiles,
+			})
+			for fp := range resolveSet {
+				s.autoResolveFile(fp.file, fp.module)
+			}
+		}
 	}
 	if buildResult != "" {
 		sb.WriteString("\n" + buildResult)
@@ -7288,4 +7337,97 @@ func dbDirSize(dir string) int64 {
 // text for a directory outside any module.
 func isStaleProjectDirError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "does not contain main module")
+}
+
+// commitOrRollbackOnBuild closes the #12 gap: it snapshots the files
+// opts will touch, runs emit+build against tx (so emit sees the
+// batch's own uncommitted writes), and only commits tx if the result
+// comes back completely clean. A non-empty result -- build failure OR
+// an emit-level WARNING (#218 already treats those as failure-
+// equivalent, since a WARNING means the DB write succeeded but the
+// file write was refused or skipped) -- restores the snapshotted
+// files and lets rollback() undo the DB write, so neither side
+// reflects the failed mutation.
+//
+// Snapshotting is scoped to opts.TouchedFiles (falling back to
+// GoimportsFiles); a caller with neither set gets no file-level
+// protection here -- that's the existing full-project-emit fallback
+// path, already rare, and out of scope for this pass (see #12).
+//
+// Concurrency tradeoff, worth being explicit about: SQLiteDB.Begin()
+// serializes ALL transactions on a single process-wide mutex (txMu).
+// Previously the DB write committed (and released that lock)
+// immediately, before emit+build ran outside it. This function holds
+// tx open for the full emit+build duration instead, so a slow build
+// now also holds the lock that long -- trading some cross-request
+// concurrency for the correctness this closes. Builds are normally
+// scoped to just the touched package(s), so this is expected to be
+// small in practice, but it is a real cost, not a free rearrangement.
+func (s *server) commitOrRollbackOnBuild(tx store.Backend, commit func() error, rollback func(), opts emit.Opts) string {
+	files := opts.TouchedFiles
+	if len(files) == 0 {
+		files = opts.GoimportsFiles
+	}
+	var snaps []fileSnapshot
+	if len(files) > 0 {
+		snaps = snapshotFiles(s.projectDir, files)
+	}
+
+	result := s.emitAndBuildAgainst(tx, opts)
+	if result != "" {
+		restoreFiles(snaps)
+		rollback()
+		return result
+	}
+	if err := commit(); err != nil {
+		restoreFiles(snaps)
+		return fmt.Sprintf("commit error: %v (on-disk changes reverted)", err)
+	}
+	return ""
+}
+
+// fileSnapshot captures a file's pre-mutation on-disk bytes (existed
+// is false when the file didn't exist yet, e.g. a brand-new file from
+// op:"create") so a build failure can restore it (#12).
+type fileSnapshot struct {
+	path    string
+	existed bool
+	content []byte
+}
+
+// restoreFiles reverts each snapshot taken by snapshotFiles: rewrites
+// the original content, or removes the file if it did not exist
+// before the emit being undone (#12). Best-effort -- a restore
+// failure is logged, not returned, since the caller is already on the
+// build-failure path and has no better recovery than reporting it.
+func restoreFiles(snaps []fileSnapshot) {
+	for _, snap := range snaps {
+		if snap.existed {
+			if err := os.WriteFile(snap.path, snap.content, 0o644); err != nil {
+				fmt.Fprintf(os.Stderr, "defn: failed to restore %s after rollback: %v\n", snap.path, err)
+			}
+			continue
+		}
+		if err := os.Remove(snap.path); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "defn: failed to remove %s after rollback: %v\n", snap.path, err)
+		}
+	}
+}
+
+// snapshotFiles reads the current on-disk content of each project-
+// relative file under projectDir, before an emit that might overwrite
+// or create them, so a failed build can restore the pre-mutation
+// state via restoreFiles (#12).
+func snapshotFiles(projectDir string, files []string) []fileSnapshot {
+	snaps := make([]fileSnapshot, 0, len(files))
+	for _, f := range files {
+		path := filepath.Join(projectDir, f)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			snaps = append(snaps, fileSnapshot{path: path, existed: false})
+			continue
+		}
+		snaps = append(snaps, fileSnapshot{path: path, existed: true, content: data})
+	}
+	return snaps
 }

@@ -2975,6 +2975,12 @@ func TestHandleApply_CreateMethodOnExistingFileLandsOnDisk(t *testing.T) {
 
 	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
 		Operations: []applyOp{
+			// #12: the build gate is now real -- greeter must actually be
+			// declared, or the build legitimately fails and the method
+			// (correctly) never lands. Kept as its own op rather than
+			// folded into a shared fixture change, since dozens of other
+			// tests depend on setupTestDB's exact def/exported counts.
+			{Op: "create", Body: "type greeter struct{}", File: "main.go"},
 			{Op: "create", Body: "func (g *greeter) Whisper() string { return \"hi\" }", File: "main.go"},
 		},
 	})
@@ -4260,5 +4266,56 @@ func main() {}
 	}
 	if !strings.Contains(text, "1 exported") {
 		t.Errorf("expected exactly 1 exported def (Config; fields excluded), got %q", text)
+	}
+}
+
+// TestHandleApply_BuildFailureRollsBackBothDBAndFile is the #12
+// regression test: a batch whose build genuinely fails must leave
+// NEITHER the DB nor the on-disk file changed, closing the gap where
+// a build failure previously left the DB committed (phantom/stale
+// defs discoverable via a later outline/read) even though the file
+// itself was correctly left alone or reverted.
+func TestHandleApply_BuildFailureRollsBackBothDBAndFile(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	before, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatalf("setup: Greet not found: %v", err)
+	}
+	originalBody := before.Body
+
+	mainPath := filepath.Join(projDir, "main.go")
+	originalFile, err := os.ReadFile(mainPath)
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "edit", Name: "Greet", NewBody: "func Greet(name string) string { return undefinedHelperFunc(name) }"},
+		},
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "BUILD FAILED") {
+		t.Fatalf("expected a build failure (undefinedHelperFunc doesn't exist), got: %s", text)
+	}
+
+	after, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatalf("Greet vanished after failed build: %v", err)
+	}
+	if after.Body != originalBody {
+		t.Errorf("#12: Greet's DB body changed to %q despite the build failing -- commitOrRollbackOnBuild did not roll back the DB", after.Body)
+	}
+
+	finalFile, err := os.ReadFile(mainPath)
+	if err != nil {
+		t.Fatalf("read main.go after failed build: %v", err)
+	}
+	if string(finalFile) != string(originalFile) {
+		t.Errorf("#12: main.go changed on disk despite the build failing -- expected the pre-batch content to be restored\nbefore:\n%s\nafter:\n%s", originalFile, finalFile)
 	}
 }
