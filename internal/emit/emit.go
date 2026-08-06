@@ -202,7 +202,7 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, []
 
 	// Determine the module root path from go.mod so we can compute
 	// relative directories for each package.
-	moduleRoot := detectModuleRoot(modules)
+	moduleRoot := DetectModuleRoot(modules)
 
 	var writtenFiles []writtenFile
 	for _, mod := range modules {
@@ -343,30 +343,6 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, []
 	timeIt("rebuild-loc-index", t)
 
 	return allLocs, warnings, nil
-}
-
-// detectModuleRoot finds the common module root from the stored module paths.
-// For a Go project, this is the go.mod module path (e.g., "github.com/justinstimatze/defn").
-// We detect it by finding the longest common prefix of all module paths that
-// ends at a "/" boundary, then stripping one more component if the prefix
-// itself is a stored module.
-func detectModuleRoot(modules []store.Module) string {
-	if len(modules) == 0 {
-		return ""
-	}
-	// Find shortest path — it's likely the root or cmd package.
-	// The module root is the prefix shared by all paths.
-	prefix := modules[0].Path
-	for _, m := range modules[1:] {
-		for !strings.HasPrefix(m.Path, prefix) {
-			idx := strings.LastIndex(prefix, "/")
-			if idx < 0 {
-				return ""
-			}
-			prefix = prefix[:idx]
-		}
-	}
-	return prefix
 }
 
 // writtenFile records an emitted file so its post-goimports bytes can be
@@ -1473,4 +1449,28 @@ func FuncIdentity(name, receiver string) string {
 		return name
 	}
 	return receiver + "." + name
+}
+
+// detectModuleRoot finds the common module root from the stored module paths.
+// For a Go project, this is the go.mod module path (e.g., "github.com/justinstimatze/defn").
+// We detect it by finding the longest common prefix of all module paths that
+// ends at a "/" boundary, then stripping one more component if the prefix
+// itself is a stored module.
+func DetectModuleRoot(modules []store.Module) string {
+	if len(modules) == 0 {
+		return ""
+	}
+	// Find shortest path — it's likely the root or cmd package.
+	// The module root is the prefix shared by all paths.
+	prefix := modules[0].Path
+	for _, m := range modules[1:] {
+		for !strings.HasPrefix(m.Path, prefix) {
+			idx := strings.LastIndex(prefix, "/")
+			if idx < 0 {
+				return ""
+			}
+			prefix = prefix[:idx]
+		}
+	}
+	return prefix
 }

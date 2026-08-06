@@ -2852,8 +2852,10 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 
 	// Find module: file: param wins (most specific), then module:, then first.
 	var mod *store.Module
+	fileResolvedDirectly := false
 	if args.File != "" {
 		mod = s.findModuleByFile(args.File)
+		fileResolvedDirectly = mod != nil
 	}
 	if mod == nil && args.Module != "" {
 		mod = s.findModule(args.Module)
@@ -2872,6 +2874,31 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	}
 	if mod == nil {
 		return errResult(fmt.Errorf("no modules found — run defn init first"))
+	}
+
+	// #13: file: named a directory with no existing module -- this is
+	// genuinely new territory, not the same package as whatever module:
+	// fallback we just resolved above. Reusing that fallback module's
+	// Name as the package clause is wrong whenever it differs from what
+	// this new directory's package should actually be named (directory
+	// = package boundary in Go): scaffolding into a brand-new
+	// subdirectory of a "package main" module would emit package main
+	// there too, with no func main() of its own, which can never build.
+	// Ensure a directory-scoped module instead of borrowing the
+	// fallback's identity.
+	if !fileResolvedDirectly && args.File != "" {
+		if dir := filepath.ToSlash(filepath.Dir(args.File)); dir != "" && dir != "." {
+			mods, _ := s.backend.ListModules()
+			newPath := dir
+			if root := emit.DetectModuleRoot(mods); root != "" {
+				newPath = root + "/" + dir
+			}
+			newMod, ensureErr := s.backend.EnsureModule(newPath, filepath.Base(dir), "")
+			if ensureErr != nil {
+				return errResult(fmt.Errorf("create module for new directory %q: %w", dir, ensureErr))
+			}
+			mod = newMod
+		}
 	}
 
 	// Check if a definition with this name AND receiver already exists in

@@ -3862,20 +3862,15 @@ func TestHandleCreateFallsBackToModuleWhenFileUnresolved(t *testing.T) {
 	defer db.Close()
 	s := &server{backend: db, projectDir: projDir}
 
-	// #12: the build gate is now real, so the fallback module's package
-	// name matters -- testproj's existing module is "package main" and
-	// requires its own func main() per directory to build. A second,
-	// non-main module keeps this test's actual point (SourceFile lands
-	// correctly on a file: miss + module: fallback) buildable without
-	// needing a func main() in the new directory.
-	if _, err := db.EnsureModule("testproj/newpkg", "newpkg", ""); err != nil {
-		t.Fatalf("EnsureModule: %v", err)
-	}
-
+	// #13: testproj's only existing module is "package main" -- before
+	// #13's fix this would have reused that Name for the new directory
+	// too, emitting package main with no func main() there, which can
+	// never build. The fix ensures a directory-scoped module ("newpkg")
+	// instead of borrowing testproj's identity, so this now builds.
 	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
 		Body:   "func NewPkgFunc() int { return 1 }",
 		File:   "internal/newpkg/x.go",
-		Module: "newpkg",
+		Module: "testproj",
 	})
 	text := resultText(t, result)
 	if !strings.Contains(text, "Created") {
@@ -3888,6 +3883,14 @@ func TestHandleCreateFallsBackToModuleWhenFileUnresolved(t *testing.T) {
 	}
 	if d.SourceFile != "internal/newpkg/x.go" {
 		t.Errorf("SourceFile = %q, want %q", d.SourceFile, "internal/newpkg/x.go")
+	}
+
+	src, err := os.ReadFile(filepath.Join(projDir, "internal/newpkg/x.go"))
+	if err != nil {
+		t.Fatalf("read emitted file: %v", err)
+	}
+	if !strings.Contains(string(src), "package newpkg") {
+		t.Errorf("#13: expected the new directory's own package name (newpkg), not testproj's \"main\" -- got:\n%s", src)
 	}
 }
 
