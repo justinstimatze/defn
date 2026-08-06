@@ -4498,3 +4498,304 @@ func TestHandleEdit_SignatureChangedBuildFailureRollsBackBothDBAndFile(t *testin
 		t.Errorf("#12: main.go changed on disk despite the build failing\nbefore:\n%s\nafter:\n%s", originalFile, finalFile)
 	}
 }
+
+// TestHandleEdit_ModuleDisambiguatesSameNamedType is the gemot dispatch
+// regression: op:edit name:"Engine" module:"testproj/bft" corrupted an
+// unrelated "Engine" struct in a different package (testproj/chess)
+// instead of updating the intended one, and reported success. Same
+// #219 gap as receiver, just for module:/file: disambiguating a
+// same-named non-method type across packages instead of a same-named
+// method across receivers.
+func TestHandleEdit_ModuleDisambiguatesSameNamedType(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	if err := os.MkdirAll(filepath.Join(projDir, "bft"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(projDir, "chess"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	// chess's Engine deliberately has more references than bft's --
+	// GetDefinitionByName's module-blind fallback is a blast-radius
+	// (most-callers) tiebreak, so a fixture with equal (zero) refs on
+	// both wouldn't actually stress it. This shape is what let gemot's
+	// real report happen: the wrong, more-referenced Engine won.
+	os.WriteFile(filepath.Join(projDir, "bft", "engine.go"), []byte(`package bft
+
+type Engine struct{ Replica string }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "chess", "engine.go"), []byte(`package chess
+
+type Engine struct{ Protocol string }
+
+func NewEngine() *Engine { return &Engine{} }
+func UseA(e *Engine) string { return e.Protocol }
+func UseB(e *Engine) string { return e.Protocol }
+func UseC(e *Engine) string { return e.Protocol }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleEdit(context.Background(), nil, editParam{
+		Name:    "Engine",
+		Module:  "testproj/bft",
+		NewBody: "type Engine struct {\n\tReplica string\n\tTransport string\n}",
+	})
+	if err != nil {
+		t.Fatalf("handleEdit: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "BUILD FAILED") {
+		t.Fatalf("expected a clean edit, got: %s", text)
+	}
+
+	bftSrc, err := os.ReadFile(filepath.Join(projDir, "bft", "engine.go"))
+	if err != nil {
+		t.Fatalf("read bft/engine.go: %v", err)
+	}
+	if !strings.Contains(string(bftSrc), "Transport string") {
+		t.Errorf("expected bft's Engine to gain the Transport field, got:\n%s", bftSrc)
+	}
+
+	chessSrc, err := os.ReadFile(filepath.Join(projDir, "chess", "engine.go"))
+	if err != nil {
+		t.Fatalf("read chess/engine.go: %v", err)
+	}
+	if !strings.Contains(string(chessSrc), "Protocol string") || strings.Contains(string(chessSrc), "Transport") {
+		t.Errorf("gemot dispatch: chess's unrelated Engine was corrupted by an edit scoped to module:\"testproj/bft\", got:\n%s", chessSrc)
+	}
+}
+
+// TestHandleFragmentEdit_ModuleDisambiguatesSameNamedType is
+// TestHandleEdit_ModuleDisambiguatesSameNamedType's fragment-edit
+// counterpart: handleFragmentEdit is a separate handler (the
+// old_fragment/new_fragment shape never funnels through handleEdit)
+// and had the identical gap -- module:/file: (and even receiver:)
+// were available on its own codeParam but never consulted.
+func TestHandleFragmentEdit_ModuleDisambiguatesSameNamedType(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	if err := os.MkdirAll(filepath.Join(projDir, "bft"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(projDir, "chess"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "bft", "engine.go"), []byte(`package bft
+
+type Engine struct{ Replica string }
+`), 0644)
+	// chess's Engine has more references than bft's for the same
+	// blast-radius-tiebreak reason as the handleEdit test.
+	os.WriteFile(filepath.Join(projDir, "chess", "engine.go"), []byte(`package chess
+
+type Engine struct{ Protocol string }
+
+func NewEngine() *Engine { return &Engine{} }
+func UseA(e *Engine) string { return e.Protocol }
+func UseB(e *Engine) string { return e.Protocol }
+func UseC(e *Engine) string { return e.Protocol }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op:          "edit",
+		Name:        "Engine",
+		Module:      "testproj/bft",
+		OldFragment: "Replica string",
+		NewFragment: "Replica string\n\tTransport string",
+	})
+	if err != nil {
+		t.Fatalf("handleCode: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "BUILD FAILED") {
+		t.Fatalf("expected a clean edit, got: %s", text)
+	}
+
+	bftSrc, err := os.ReadFile(filepath.Join(projDir, "bft", "engine.go"))
+	if err != nil {
+		t.Fatalf("read bft/engine.go: %v", err)
+	}
+	if !strings.Contains(string(bftSrc), "Transport string") {
+		t.Errorf("expected bft's Engine to gain the Transport field, got:\n%s", bftSrc)
+	}
+
+	chessSrc, err := os.ReadFile(filepath.Join(projDir, "chess", "engine.go"))
+	if err != nil {
+		t.Fatalf("read chess/engine.go: %v", err)
+	}
+	if !strings.Contains(string(chessSrc), "Protocol string") || strings.Contains(string(chessSrc), "Transport") {
+		t.Errorf("chess's unrelated Engine was corrupted by a fragment edit scoped to module:\"testproj/bft\", got:\n%s", chessSrc)
+	}
+}
+
+// TestHandleFragmentEdit_BuildFailureRollsBackBothDBAndFile is the #12
+// regression test for handleFragmentEdit: this handler was missed
+// entirely when #12 fixed handleEdit/handleCreate/handleDelete/apply,
+// since fragment edits (old_fragment/new_fragment) are a separate
+// handler that never funnels through handleEdit. It wrote straight to
+// s.backend with no transaction, so a build failure left a phantom
+// edit committed with no corresponding on-disk change.
+func TestHandleFragmentEdit_BuildFailureRollsBackBothDBAndFile(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	before, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatalf("setup: Greet not found: %v", err)
+	}
+	originalBody := before.Body
+
+	mainPath := filepath.Join(projDir, "main.go")
+	originalFile, err := os.ReadFile(mainPath)
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op:          "edit",
+		Name:        "Greet",
+		OldFragment: `return "Hello, " + name`,
+		NewFragment: "return undefinedHelperFunc(name)",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "BUILD FAILED") {
+		t.Fatalf("expected a build failure (undefinedHelperFunc doesn't exist), got: %s", text)
+	}
+
+	after, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatalf("Greet vanished after failed build: %v", err)
+	}
+	if after.Body != originalBody {
+		t.Errorf("#12: Greet's DB body changed to %q despite the build failing -- got %q", after.Body, originalBody)
+	}
+
+	finalFile, err := os.ReadFile(mainPath)
+	if err != nil {
+		t.Fatalf("read main.go after failed build: %v", err)
+	}
+	if string(finalFile) != string(originalFile) {
+		t.Errorf("#12: main.go changed on disk despite the build failing\nbefore:\n%s\nafter:\n%s", originalFile, finalFile)
+	}
+}
+
+// TestHandleReplaceHunk_ModuleDisambiguatesSameNamedType covers the
+// same gap TestHandleEdit_ModuleDisambiguatesSameNamedType fixed, for
+// the standalone projection-op handlers (replace-hunk, replace-slice,
+// insert-precondition, wrap-in-defer, rename-param). All five called
+// GetDefinitionByName(name, "") directly -- module:/file:/receiver:
+// were already present on their shared codeParam but never consulted.
+// Found while fixing #edit's gemot-reported case; all five now share
+// resolveEditTarget, so this one stands in for the group rather than
+// duplicating the same fixture five times.
+func TestHandleReplaceHunk_ModuleDisambiguatesSameNamedType(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	if err := os.MkdirAll(filepath.Join(projDir, "bft"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(projDir, "chess"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "bft", "engine.go"), []byte(`package bft
+
+func Run() string {
+	return "bft-original"
+}
+`), 0644)
+	// chess's Run has more references than bft's, same blast-radius
+	// rationale as the edit/fragment-edit tests.
+	os.WriteFile(filepath.Join(projDir, "chess", "engine.go"), []byte(`package chess
+
+func Run() string {
+	return "chess-original"
+}
+
+func UseA() string { return Run() }
+func UseB() string { return Run() }
+func UseC() string { return Run() }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op:     "replace-hunk",
+		Name:   "Run",
+		Module: "testproj/bft",
+		Old:    `"bft-original"`,
+		New:    `"bft-updated"`,
+	})
+	if err != nil {
+		t.Fatalf("handleCode: %v", err)
+	}
+	_ = resultText(t, result)
+
+	bftSrc, err := os.ReadFile(filepath.Join(projDir, "bft", "engine.go"))
+	if err != nil {
+		t.Fatalf("read bft/engine.go: %v", err)
+	}
+	if !strings.Contains(string(bftSrc), "bft-updated") {
+		t.Errorf("expected bft's Run to be updated, got:\n%s", bftSrc)
+	}
+
+	chessSrc, err := os.ReadFile(filepath.Join(projDir, "chess", "engine.go"))
+	if err != nil {
+		t.Fatalf("read chess/engine.go: %v", err)
+	}
+	if !strings.Contains(string(chessSrc), "chess-original") {
+		t.Errorf("chess's unrelated Run was corrupted by a replace-hunk scoped to module:\"testproj/bft\", got:\n%s", chessSrc)
+	}
+}

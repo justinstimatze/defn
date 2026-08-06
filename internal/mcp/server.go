@@ -531,6 +531,16 @@ type editParam struct {
 	// the blast-radius tiebreak in GetDefinitionByName could resolve
 	// to the wrong receiver's method.
 	Receiver string `json:"receiver,omitempty"`
+	// Module/File disambiguate between multiple non-method defs (e.g.
+	// two "Engine" structs) sharing Name across different packages --
+	// the same #219 gap Receiver closed for methods, reported again by
+	// gemot dispatch for bare types: module:/file: were accepted by the
+	// top-level codeParam schema but silently dropped before reaching
+	// handleEdit, so a same-named type in an unrelated package could be
+	// edited instead, with the tool reporting success. File wins when
+	// both are set (most specific), mirroring createParam's precedent.
+	Module string `json:"module,omitempty"`
+	File   string `json:"file,omitempty"`
 }
 
 type createParam struct {
@@ -1152,7 +1162,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if body == "" {
 			body = args.Body
 		}
-		return s.handleEdit(ctx, req, editParam{Name: args.Name, NewBody: body, Receiver: args.Receiver})
+		return s.handleEdit(ctx, req, editParam{Name: args.Name, NewBody: body, Receiver: args.Receiver, Module: args.Module, File: args.File})
 	case "insert":
 		return s.handleInsert(ctx, req, args)
 	case "create":
@@ -2083,31 +2093,16 @@ func (s *server) handleUntested(_ context.Context, _ *sdkmcp.CallToolRequest, _ 
 }
 
 func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args editParam) (*sdkmcp.CallToolResult, any, error) {
-	// #219: an explicit receiver disambiguates between multiple methods
-	// sharing Name across different types -- without this, a bare
-	// GetDefinitionByName falls back to a blast-radius tiebreak that can
-	// silently pick the WRONG receiver's method. Try both with and
-	// without a leading "*" since callers may pass either form.
-	var d *store.Definition
-	var err error
-	if args.Receiver != "" {
-		recv := args.Receiver
-		d, err = s.backend.GetDefinitionByNameAndReceiver(args.Name, "", recv)
-		if err != nil {
-			if alt := strings.TrimPrefix(recv, "*"); alt != recv {
-				d, err = s.backend.GetDefinitionByNameAndReceiver(args.Name, "", alt)
-			} else {
-				d, err = s.backend.GetDefinitionByNameAndReceiver(args.Name, "", "*"+recv)
-			}
-		}
-		if err != nil {
+	// #219/gemot dispatch: receiver disambiguates same-named methods
+	// across different types; module:/file: disambiguate same-named
+	// non-method defs across different packages -- same gap, no
+	// receiver to key off of. See resolveEditTarget.
+	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
+	if err != nil {
+		if args.Receiver != "" {
 			return s.notFoundOrErr(fmt.Sprintf("%s.%s", args.Receiver, args.Name), err)
 		}
-	} else {
-		d, err = s.backend.GetDefinitionByName(args.Name, "")
-		if err != nil {
-			return s.notFoundOrErr(args.Name, err)
-		}
+		return s.notFoundOrErr(args.Name, err)
 	}
 
 	// Validate new body parses as Go.
@@ -2709,8 +2704,15 @@ func extractSignature(body string) string {
 }
 
 func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.backend.GetDefinitionByName(args.Name, "")
+	// #219/gemot dispatch: same disambiguation gap handleEdit had --
+	// receiver/module/file were available on this handler's own
+	// codeParam but never consulted, so GetDefinitionByName's blast-
+	// radius tiebreak could silently target the wrong same-named def.
+	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
+		if args.Receiver != "" {
+			return s.notFoundOrErr(fmt.Sprintf("%s.%s", args.Receiver, args.Name), err)
+		}
 		return s.notFoundOrErr(args.Name, err)
 	}
 
@@ -2749,13 +2751,29 @@ func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest
 	d.Signature = extractSignature(newBody)
 	recv := formatReceiver(d.Receiver)
 
-	id, err := s.backend.UpsertDefinition(d)
+	// #12: write and build-gate through a transaction so a build
+	// failure leaves neither the DB nor the file changed. Previously
+	// this wrote straight to s.backend and a later build failure was
+	// informational only -- missed when #12 fixed handleEdit, since
+	// this is a separate handler for the old_fragment/new_fragment
+	// shape and never funnels through handleEdit.
+	tx, commit, rollback, txErr := s.backend.Begin()
+	if txErr != nil {
+		return errResult(txErr)
+	}
+	defer rollback()
+
+	id, err := tx.UpsertDefinition(d)
 	if err != nil {
 		return errResult(err)
 	}
+	d.ID = id
 
-	buildResult := s.autoEmitAndBuildForFile(d.SourceFile)
-	s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
+	var opts emit.Opts
+	if d.SourceFile != "" {
+		opts = emit.Opts{GoimportsFiles: []string{d.SourceFile}, TouchedFiles: []string{d.SourceFile}}
+	}
+	buildResult := s.commitOrRollbackOnBuild(tx, commit, rollback, opts)
 
 	var sb strings.Builder
 	replaced := "1 occurrence"
@@ -2766,14 +2784,18 @@ func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest
 	if buildResult != "" {
 		sb.WriteString("\n" + buildResult)
 	}
-	if impact, err := s.backend.GetImpact(id); err == nil && len(impact.DirectCallers) > 0 {
-		prodCallers := 0
-		for _, c := range impact.DirectCallers {
-			if !c.Test {
-				prodCallers++
+
+	if buildResult == "" {
+		s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
+		if impact, err := s.backend.GetImpact(id); err == nil && len(impact.DirectCallers) > 0 {
+			prodCallers := 0
+			for _, c := range impact.DirectCallers {
+				if !c.Test {
+					prodCallers++
+				}
 			}
+			sb.WriteString(fmt.Sprintf("\nFYI: %d callers, %d tests affected.\n", prodCallers, len(impact.Tests)))
 		}
-		sb.WriteString(fmt.Sprintf("\nFYI: %d callers, %d tests affected.\n", prodCallers, len(impact.Tests)))
 	}
 	return textResult(sb.String()), nil, nil
 }
@@ -6475,7 +6497,7 @@ func (s *server) handleInsertPrecondition(_ context.Context, req *sdkmcp.CallToo
 		}
 		name = inferred
 	}
-	d, err := s.backend.GetDefinitionByName(name, "")
+	d, err := s.resolveEditTarget(name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", name))
 	}
@@ -6484,7 +6506,7 @@ func (s *server) handleInsertPrecondition(_ context.Context, req *sdkmcp.CallToo
 		return errResult(err)
 	}
 	snippet := fmt.Sprintf("if %s {\n\t%s\n}", args.Condition, args.Ret)
-	return s.applyEditTerse(sessionOf(req), name, "inserted precondition at entry", snippet, newBody)
+	return s.applyEditTerse(sessionOf(req), d, "inserted precondition at entry", snippet, newBody)
 }
 
 // handleAddImport adds a new import (with optional alias) to the given
@@ -6610,7 +6632,7 @@ func (s *server) handleRenameParam(_ context.Context, req *sdkmcp.CallToolReques
 		}
 		name = inferred
 	}
-	d, err := s.backend.GetDefinitionByName(name, "")
+	d, err := s.resolveEditTarget(name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", name))
 	}
@@ -6623,7 +6645,7 @@ func (s *server) handleRenameParam(_ context.Context, req *sdkmcp.CallToolReques
 	if idx := strings.Index(newBody, "\n"); idx > 0 {
 		snippet = newBody[:idx]
 	}
-	return s.applyEditTerse(sessionOf(req), name, action, snippet, newBody)
+	return s.applyEditTerse(sessionOf(req), d, action, snippet, newBody)
 }
 
 // handleWrapInDefer inserts a `defer <defer_body>` statement immediately
@@ -6644,7 +6666,7 @@ func (s *server) handleWrapInDefer(_ context.Context, req *sdkmcp.CallToolReques
 		}
 		name = inferred
 	}
-	d, err := s.backend.GetDefinitionByName(name, "")
+	d, err := s.resolveEditTarget(name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", name))
 	}
@@ -6658,7 +6680,7 @@ func (s *server) handleWrapInDefer(_ context.Context, req *sdkmcp.CallToolReques
 	}
 	action := fmt.Sprintf("inserted defer before stmt #%d", stmtIdx)
 	snippet := fmt.Sprintf("defer %s", args.DeferBody)
-	return s.applyEditTerse(sessionOf(req), name, action, snippet, newBody)
+	return s.applyEditTerse(sessionOf(req), d, action, snippet, newBody)
 }
 
 // handleReplaceSlice replaces the Nth (1-based) match of the given AST
@@ -6693,7 +6715,7 @@ func (s *server) handleReplaceSlice(_ context.Context, req *sdkmcp.CallToolReque
 		}
 		name = inferred
 	}
-	d, err := s.backend.GetDefinitionByName(name, "")
+	d, err := s.resolveEditTarget(name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", name))
 	}
@@ -6707,7 +6729,7 @@ func (s *server) handleReplaceSlice(_ context.Context, req *sdkmcp.CallToolReque
 		return errResult(err)
 	}
 	action := fmt.Sprintf("replaced %s #%d", args.Slice, index)
-	return s.applyEditTerse(sessionOf(req), name, action, args.New, newBody)
+	return s.applyEditTerse(sessionOf(req), d, action, args.New, newBody)
 }
 
 // handleReplaceHunk replaces a byte-exact occurrence of `old` inside
@@ -6736,7 +6758,7 @@ func (s *server) handleReplaceHunk(_ context.Context, req *sdkmcp.CallToolReques
 		}
 		name = inferred
 	}
-	d, err := s.backend.GetDefinitionByName(name, "")
+	d, err := s.resolveEditTarget(name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", name))
 	}
@@ -6748,7 +6770,7 @@ func (s *server) handleReplaceHunk(_ context.Context, req *sdkmcp.CallToolReques
 	if args.Index > 0 {
 		action = fmt.Sprintf("replaced hunk #%d", args.Index)
 	}
-	return s.applyEditTerse(sessionOf(req), name, action, args.New, newBody)
+	return s.applyEditTerse(sessionOf(req), d, action, args.New, newBody)
 }
 
 // applyEditTerse is the projection-op response path: takes a computed
@@ -6765,11 +6787,15 @@ func (s *server) handleReplaceHunk(_ context.Context, req *sdkmcp.CallToolReques
 //
 // Snippet is truncated to ~200 chars / ~6 lines. Skips the caller-count
 // FYI nudge that handleEdit prints (agents can ask for impact if they want).
-func (s *server) applyEditTerse(session *sdkmcp.ServerSession, name, action, snippet, newBody string) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.backend.GetDefinitionByName(name, "")
-	if err != nil {
-		return errResult(fmt.Errorf("definition %q not found", name))
-	}
+func (s *server) applyEditTerse(session *sdkmcp.ServerSession, d *store.Definition, action, snippet, newBody string) (*sdkmcp.CallToolResult, any, error) {
+	// #edit-disambiguation dispatch (gemot): this used to re-resolve its
+	// target by bare name (GetDefinitionByName(name, "")), discarding
+	// the caller's already-disambiguated d and silently undoing whatever
+	// receiver:/module:/file: scoping resolveEditTarget just applied --
+	// the computed newBody came from the RIGHT def, but got written into
+	// whatever this second, blind lookup's blast-radius tiebreak picked.
+	// Taking d directly from the caller removes the redundant lookup
+	// instead of just disambiguating it a second time.
 	src := "package x\n" + newBody
 	if _, parseErr := parser.ParseFile(token.NewFileSet(), "", src, parser.ParseComments); parseErr != nil {
 		return errResult(fmt.Errorf("new_body has syntax error: %v", parseErr))
@@ -6787,25 +6813,48 @@ func (s *server) applyEditTerse(session *sdkmcp.ServerSession, name, action, sni
 	}
 	d.Body = newBody
 	d.Signature = extractSignature(newBody)
-	if _, err := s.backend.UpsertDefinition(d); err != nil {
+
+	// #12: write and emit-gate through a transaction so a failure leaves
+	// neither the DB nor the file changed -- this was missed when #12
+	// fixed handleEdit/handleCreate/handleDelete/apply, since every
+	// projection op (replace-hunk, replace-slice, insert-precondition,
+	// wrap-in-defer, rename-param) funnels through this one function
+	// instead of handleEdit.
+	tx, commit, rollback, txErr := s.backend.Begin()
+	if txErr != nil {
+		return errResult(txErr)
+	}
+	defer rollback()
+
+	if _, err := tx.UpsertDefinition(d); err != nil {
 		return errResult(err)
 	}
-	// #160: fire-and-forget summary regeneration. Body changed → any
-	// existing summary is stale. Worker computes async; if the queue
-	// is full or backend unconfigured we drop silently (the summary
-	// is best-effort, next mutation re-enqueues).
-	s.enqueueSummary(d)
+
 	// #148: projection ops (all callers of applyEditTerse) are AST-
 	// guaranteed sig-stable — skip the go-build gate to actually deliver
 	// the "faster than native because the index is maintained" thesis.
-	// Set DEFN_STRICT_BUILD=1 to force the old per-mutation build.
-	buildResult := s.autoEmitOnly(d.SourceFile)
-	s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
+	// commitOrRollbackOnEmit preserves that (emit-only, no build) while
+	// still gating commit on the result coming back clean. Set
+	// DEFN_STRICT_BUILD=1 to force the old per-mutation build.
+	var opts emit.Opts
+	if d.SourceFile != "" {
+		opts = emit.Opts{GoimportsFiles: []string{d.SourceFile}, TouchedFiles: []string{d.SourceFile}}
+	}
+	buildResult := s.commitOrRollbackOnEmit(tx, commit, rollback, opts)
+
+	if buildResult == "" {
+		// #160: fire-and-forget summary regeneration. Body changed → any
+		// existing summary is stale. Worker computes async; if the queue
+		// is full or backend unconfigured we drop silently (the summary
+		// is best-effort, next mutation re-enqueues).
+		s.enqueueSummary(d)
+		s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
+	}
 
 	recv := formatReceiver(d.Receiver)
 	var sb strings.Builder
 	sb.WriteString(recv)
-	sb.WriteString(name)
+	sb.WriteString(d.Name)
 	sb.WriteString(": ")
 	sb.WriteString(action)
 	sb.WriteString("\n")
@@ -7570,4 +7619,44 @@ func snapshotFiles(projectDir string, files []string) []fileSnapshot {
 		snaps = append(snaps, fileSnapshot{path: path, existed: true, content: data})
 	}
 	return snaps
+}
+
+// resolveEditTarget finds the definition an edit (full-body or
+// fragment) should target, using name plus optional receiver/module/
+// file qualifiers to disambiguate same-named defs. receiver
+// disambiguates methods sharing Name across different types (#219);
+// module/file disambiguate non-method defs (e.g. two "Engine" structs)
+// sharing Name across different packages -- the same gap, reported
+// again by gemot dispatch since receiver alone can't help when there's
+// no receiver at all. File wins when both are set (most specific),
+// mirroring findModuleByFile/findModule's precedence in handleCreate.
+// Both GetDefinitionByName and GetDefinitionByNameAndReceiver already
+// accept a modulePath to scope by -- this was purely a dispatch-layer
+// wiring gap, not a store-layer one.
+func (s *server) resolveEditTarget(name, receiver, module, file string) (*store.Definition, error) {
+	var modulePath string
+	if file != "" {
+		if mod := s.findModuleByFile(file); mod != nil {
+			modulePath = mod.Path
+		}
+	}
+	if modulePath == "" && module != "" {
+		if mod := s.findModule(module); mod != nil {
+			modulePath = mod.Path
+		}
+	}
+
+	if receiver == "" {
+		return s.backend.GetDefinitionByName(name, modulePath)
+	}
+
+	d, err := s.backend.GetDefinitionByNameAndReceiver(name, modulePath, receiver)
+	if err != nil {
+		if alt := strings.TrimPrefix(receiver, "*"); alt != receiver {
+			d, err = s.backend.GetDefinitionByNameAndReceiver(name, modulePath, alt)
+		} else {
+			d, err = s.backend.GetDefinitionByNameAndReceiver(name, modulePath, "*"+receiver)
+		}
+	}
+	return d, err
 }
