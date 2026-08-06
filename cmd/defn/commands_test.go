@@ -73,3 +73,35 @@ func TestIsCorruptDBError_RealSQLiteCorruption(t *testing.T) {
 		})
 	}
 }
+
+// TestResolveIngestDBPath is the #14 regression test: an unset
+// DEFN_DB must anchor to the invocation directory (origCwd) when
+// modulePath is a scoped subtree, not to modulePath itself -- while
+// the common `defn ingest .` case (origCwd == modulePath) and an
+// explicit DEFN_DB override are both unaffected.
+func TestResolveIngestDBPath(t *testing.T) {
+	t.Run("explicit DEFN_DB always wins", func(t *testing.T) {
+		t.Setenv("DEFN_DB", "/explicit/path")
+		got := resolveIngestDBPath("/repo", "/repo/corpus")
+		if got != "/explicit/path" {
+			t.Errorf("got %q, want /explicit/path", got)
+		}
+	})
+
+	t.Run("ingest . (origCwd == modulePath) defaults to relative .defn", func(t *testing.T) {
+		t.Setenv("DEFN_DB", "")
+		got := resolveIngestDBPath("/repo", "/repo")
+		if got != ".defn" {
+			t.Errorf("got %q, want .defn", got)
+		}
+	})
+
+	t.Run("scoped subdirectory anchors the default to the invocation dir", func(t *testing.T) {
+		t.Setenv("DEFN_DB", "")
+		got := resolveIngestDBPath("/repo", "/repo/corpus")
+		want := filepath.Join("/repo", ".defn")
+		if got != want {
+			t.Errorf("got %q, want %q -- #14: the DB must not relocate into the scoped subtree", got, want)
+		}
+	})
+}

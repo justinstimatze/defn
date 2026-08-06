@@ -94,17 +94,23 @@ func logBackend(msg string) {
 // needing the env var set by hand each session.
 func cmdInit(modulePath string, noSummaries bool) {
 	// Operate from the target project dir so .defn/, .mcp.json, etc. all
-	// resolve against modulePath rather than the caller's cwd.
+	// resolve against modulePath rather than the caller's cwd -- except
+	// the DB path itself when modulePath is a subtree of a larger
+	// module scoped out on purpose (#14): resolveIngestDBPath anchors an
+	// unset DEFN_DB's default to the invocation directory in that case,
+	// not modulePath, so the DB doesn't silently relocate into the
+	// scoped subtree.
+	origCwd, _ := os.Getwd()
 	absModulePath, err := filepath.Abs(modulePath)
 	if err != nil {
 		fatal(err)
 	}
+	dbPath := resolveIngestDBPath(origCwd, absModulePath)
 	if err := os.Chdir(absModulePath); err != nil {
 		fatal(err)
 	}
 	modulePath = absModulePath
 
-	dbPath := getDBPath()
 	checkEmbeddedAvailable(dbPath)
 	db, err := store.OpenBackend(dbPath)
 	if err != nil {
@@ -225,13 +231,14 @@ func logMem(phase string) {
 // (#201) preserves a prior --no-summaries opt-out already recorded in
 // .mcp.json rather than clearing it on every plain re-ingest.
 func cmdIngest(modulePath string, reindex bool) {
+	origCwd, _ := os.Getwd()
 	if abs, err := filepath.Abs(modulePath); err == nil {
 		modulePath = abs
 	}
+	dbPath := resolveIngestDBPath(origCwd, modulePath)
 	if err := os.Chdir(modulePath); err != nil {
 		fatal(err)
 	}
-	dbPath := getDBPath()
 	checkEmbeddedAvailable(dbPath)
 	db, err := store.OpenBackend(dbPath)
 	if err != nil {
@@ -2324,4 +2331,31 @@ func printSimpleDiff(oldBody, newBody string) {
 func fatal(err error) {
 	fmt.Fprintf(os.Stderr, "error: %v\n", err)
 	os.Exit(1)
+}
+
+// resolveIngestDBPath computes the DB path for cmdIngest/cmdInit.
+// Prefers an explicit DEFN_DB unconditionally. Otherwise, the default
+// ".defn" is anchored to origCwd (the directory the command was
+// actually invoked from) rather than modulePath whenever the two
+// differ -- #14: cmdIngest/cmdInit chdir into modulePath before
+// resolving an unset DEFN_DB, so the default always landed relative
+// to modulePath. Correct when modulePath IS the project root (`defn
+// ingest .`, the overwhelming common case), but wrong when modulePath
+// is a subtree scoped out of a larger module (`defn ingest corpus`):
+// the DB -- and everything serve derives from it downstream (the
+// build gate's cmd.Dir, emit's output dir, sync's relative paths) --
+// would silently relocate into that subtree instead of staying at the
+// real project root.
+func resolveIngestDBPath(origCwd, modulePath string) string {
+	if p := os.Getenv("DEFN_DB"); p != "" {
+		logBackend("using DEFN_DB=" + p)
+		return p
+	}
+	if origCwd != "" && origCwd != modulePath {
+		dbPath := filepath.Join(origCwd, ".defn")
+		logBackend(fmt.Sprintf("using embedded %s (scoped ingest of %s)", dbPath, modulePath))
+		return dbPath
+	}
+	logBackend("using embedded .defn/")
+	return ".defn"
 }
