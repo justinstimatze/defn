@@ -4434,3 +4434,64 @@ func TestHandleDelete_BuildFailureRollsBackBothDBAndFile(t *testing.T) {
 	}
 	_ = originalFile
 }
+
+// TestHandleEdit_SignatureChangedBuildFailureRollsBackBothDBAndFile is
+// the #12 regression test for handleEdit's signature-changed path
+// (commitOrRollbackOnBuild): previously this wrote straight to
+// s.backend with no transaction, so a build failure left the DB
+// committed with no corresponding on-disk content. The signature-
+// stable path (commitOrRollbackOnEmit) shares the same underlying
+// commitOrRollbackOn mechanism already covered by the apply/create
+// regression tests, so it isn't re-tested per handler here -- its
+// rollback trigger is an emit-level WARNING, not a build failure,
+// since #148 deliberately never runs go build on that path.
+func TestHandleEdit_SignatureChangedBuildFailureRollsBackBothDBAndFile(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	before, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatalf("setup: Greet not found: %v", err)
+	}
+	originalBody := before.Body
+	originalSignature := before.Signature
+
+	mainPath := filepath.Join(projDir, "main.go")
+	originalFile, err := os.ReadFile(mainPath)
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+
+	// Changing the signature (extra int param) forces sigStable=false,
+	// so this reaches commitOrRollbackOnBuild, not the emit-only path.
+	// The undefined helper also makes the build genuinely fail.
+	result, _, _ := s.handleEdit(context.Background(), nil, editParam{
+		Name:    "Greet",
+		NewBody: "func Greet(name string, extra int) string { return undefinedHelperFunc(name, extra) }",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "BUILD FAILED") {
+		t.Fatalf("expected a build failure (undefinedHelperFunc doesn't exist), got: %s", text)
+	}
+
+	after, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatalf("Greet vanished after failed build: %v", err)
+	}
+	if after.Body != originalBody {
+		t.Errorf("#12: Greet's DB body changed despite the build failing -- got %q, want %q", after.Body, originalBody)
+	}
+	if after.Signature != originalSignature {
+		t.Errorf("#12: Greet's DB signature changed despite the build failing -- got %q, want %q", after.Signature, originalSignature)
+	}
+
+	finalFile, err := os.ReadFile(mainPath)
+	if err != nil {
+		t.Fatalf("read main.go after failed build: %v", err)
+	}
+	if string(finalFile) != string(originalFile) {
+		t.Errorf("#12: main.go changed on disk despite the build failing\nbefore:\n%s\nafter:\n%s", originalFile, finalFile)
+	}
+}

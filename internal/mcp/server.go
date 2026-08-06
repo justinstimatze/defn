@@ -2142,13 +2142,22 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 	d.Body = args.NewBody
 	d.Signature = extractSignature(args.NewBody)
 
-	id, err := s.backend.UpsertDefinition(d)
+	// #12: write and build/emit-gate through a transaction so a failure
+	// leaves neither the DB nor the file changed. Previously this wrote
+	// straight to s.backend, and a later failure (a build failure on
+	// the sig-changed path, or an emit-level WARNING on the sig-stable
+	// path) was informational only.
+	tx, commit, rollback, txErr := s.backend.Begin()
+	if txErr != nil {
+		return errResult(txErr)
+	}
+	defer rollback()
+
+	id, err := tx.UpsertDefinition(d)
 	if err != nil {
 		return errResult(err)
 	}
 	d.ID = id
-	// #160: fire-and-forget summary regeneration (see enqueueSummary).
-	s.enqueueSummary(d)
 
 	recv := formatReceiver(d.Receiver)
 
@@ -2167,32 +2176,44 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 			// bodyImportFootprintUnchanged.
 			opts.SkipGoimports = bodyImportFootprintUnchanged(oldBody, args.NewBody)
 		}
-		buildResult = s.autoEmitOnlyWithOpts(opts)
+		// #148's whole point is skipping go build here for perf --
+		// commitOrRollbackOnEmit preserves that (emit-only, no build)
+		// while still gating commit on the result coming back clean.
+		buildResult = s.commitOrRollbackOnEmit(tx, commit, rollback, opts)
 	} else {
 		if os.Getenv("DEFN_MEASURE_TIMING") == "1" {
 			fmt.Fprintf(os.Stderr, "  [edit] signature changed, build required:\n    old: %q\n    new: %q\n", oldSignature, d.Signature)
 		}
-		buildResult = s.autoEmitAndBuildForFile(d.SourceFile)
+		var opts emit.Opts
+		if d.SourceFile != "" {
+			opts = emit.Opts{GoimportsFiles: []string{d.SourceFile}, TouchedFiles: []string{d.SourceFile}}
+		}
+		buildResult = s.commitOrRollbackOnBuild(tx, commit, rollback, opts)
 	}
 
-	// #150: sig-stable body edit → refs graph is safe to defer.
-	//   - Callers unaffected (refs are by def-ID, IDs stable, sig stable
-	//     means dispatch stable too)
-	//   - Interface satisfaction unaffected (sig-driven)
-	//   - Only D's OUTGOING refs may have changed (D calls new funcs /
-	//     stops calling old ones). Those refresh on the next full sync
-	//     or explicit `code(op:"sync")`.
-	// Skips ResolveFile's ~200ms packages.Load + all-file resolve.
-	// Signature-changing edits still eagerly re-resolve (dispatch shifts).
-	//
-	// Set DEFN_STRICT_BUILD=1 to also force eager resolve (same escape
-	// hatch as autoEmitOnly's build gate).
-	if sigStable && os.Getenv("DEFN_STRICT_BUILD") != "1" {
-		if os.Getenv("DEFN_MEASURE_TIMING") == "1" {
-			fmt.Fprintf(os.Stderr, "  [edit] resolve deferred (sig-stable; run code(op:\"sync\") to refresh D's outgoing refs)\n")
+	if buildResult == "" {
+		// #160: fire-and-forget summary regeneration (see enqueueSummary).
+		s.enqueueSummary(d)
+
+		// #150: sig-stable body edit → refs graph is safe to defer.
+		//   - Callers unaffected (refs are by def-ID, IDs stable, sig stable
+		//     means dispatch stable too)
+		//   - Interface satisfaction unaffected (sig-driven)
+		//   - Only D's OUTGOING refs may have changed (D calls new funcs /
+		//     stops calling old ones). Those refresh on the next full sync
+		//     or explicit `code(op:"sync")`.
+		// Skips ResolveFile's ~200ms packages.Load + all-file resolve.
+		// Signature-changing edits still eagerly re-resolve (dispatch shifts).
+		//
+		// Set DEFN_STRICT_BUILD=1 to also force eager resolve (same escape
+		// hatch as commitOrRollbackOnEmit's build gate).
+		if sigStable && os.Getenv("DEFN_STRICT_BUILD") != "1" {
+			if os.Getenv("DEFN_MEASURE_TIMING") == "1" {
+				fmt.Fprintf(os.Stderr, "  [edit] resolve deferred (sig-stable; run code(op:\"sync\") to refresh D's outgoing refs)\n")
+			}
+		} else {
+			s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
 		}
-	} else {
-		s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
 	}
 
 	var sb strings.Builder
@@ -2201,16 +2222,19 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 		sb.WriteString("\n" + buildResult)
 	}
 
-	// Impact nudge: show callers if this definition has any.
-	if impact, err := s.backend.GetImpact(id); err == nil && len(impact.DirectCallers) > 0 {
-		prodCallers := 0
-		for _, c := range impact.DirectCallers {
-			if !c.Test {
-				prodCallers++
+	// Impact nudge: show callers if this definition has any. Only on
+	// success -- a rolled-back edit's id may no longer exist.
+	if buildResult == "" {
+		if impact, err := s.backend.GetImpact(id); err == nil && len(impact.DirectCallers) > 0 {
+			prodCallers := 0
+			for _, c := range impact.DirectCallers {
+				if !c.Test {
+					prodCallers++
+				}
 			}
+			sb.WriteString(fmt.Sprintf("\nFYI: %d callers, %d tests affected. Run code(op:\"test\", name:\"%s\") to verify.\n",
+				prodCallers, len(impact.Tests), d.Name))
 		}
-		sb.WriteString(fmt.Sprintf("\nFYI: %d callers, %d tests affected. Run code(op:\"test\", name:\"%s\") to verify.\n",
-			prodCallers, len(impact.Tests), d.Name))
 	}
 	return textResult(sb.String()), nil, nil
 }
@@ -2498,8 +2522,14 @@ func (s *server) autoEmitOnly(sourceFile string) string {
 // autoEmitOnlyWithOpts is the multi-file variant used by handleRename,
 // which touches the def's own file plus each caller's file.
 func (s *server) autoEmitOnlyWithOpts(opts emit.Opts) string {
+	return s.emitOnlyAgainst(s.backend, opts)
+}
+
+// emitOnlyAgainst is autoEmitOnlyWithOpts generalized to accept the
+// store.Backend to emit against, mirroring emitAndBuildAgainst (#12).
+func (s *server) emitOnlyAgainst(backend store.Backend, opts emit.Opts) string {
 	if os.Getenv("DEFN_STRICT_BUILD") == "1" {
-		return s.autoEmitAndBuildWithOpts(opts)
+		return s.emitAndBuildAgainst(backend, opts)
 	}
 	if s.projectDir == "" || os.Getenv("DEFN_LEGACY") == "1" {
 		return ""
@@ -2507,7 +2537,7 @@ func (s *server) autoEmitOnlyWithOpts(opts emit.Opts) string {
 	timing := os.Getenv("DEFN_MEASURE_TIMING") == "1"
 
 	t := time.Now()
-	warnings, err := emit.EmitWithOpts(s.backend, s.projectDir, opts)
+	warnings, err := emit.EmitWithOpts(backend, s.projectDir, opts)
 	if err != nil {
 		return fmt.Sprintf("emit error: %v", err)
 	}
@@ -7410,6 +7440,43 @@ func isStaleProjectDirError(err error) bool {
 // scoped to just the touched package(s), so this is expected to be
 // small in practice, but it is a real cost, not a free rearrangement.
 func (s *server) commitOrRollbackOnBuild(tx store.Backend, commit func() error, rollback func(), opts emit.Opts) string {
+	return s.commitOrRollbackOn(tx, commit, rollback, opts, s.emitAndBuildAgainst)
+}
+
+// commitOrRollbackOnEmit is commitOrRollbackOnBuild's emit-only
+// counterpart, for callers that deliberately skip the go build check
+// for performance (handleEdit's #148 signature-stable path) but still
+// want the same snapshot/rollback protection against an emit-level
+// WARNING -- #218 already treats those as failure-equivalent, since a
+// WARNING means a requested change wasn't actually written to disk.
+func (s *server) commitOrRollbackOnEmit(tx store.Backend, commit func() error, rollback func(), opts emit.Opts) string {
+	return s.commitOrRollbackOn(tx, commit, rollback, opts, s.emitOnlyAgainst)
+}
+
+// commitOrRollbackOn is the shared #12 mechanism behind both
+// commitOrRollbackOnBuild and commitOrRollbackOnEmit: snapshot the
+// files opts will touch, run the given emit variant against tx (so it
+// sees the caller's own uncommitted writes), and commit tx only if
+// the result comes back completely clean. A non-empty result restores
+// the snapshotted files and lets rollback() undo the DB write, so
+// neither side reflects the failed mutation.
+//
+// Snapshotting is scoped to opts.TouchedFiles (falling back to
+// GoimportsFiles); a caller with neither set gets no file-level
+// protection here -- that's the existing full-project-emit fallback
+// path, already rare, and out of scope for this pass (see #12).
+//
+// Concurrency tradeoff, worth being explicit about: SQLiteDB.Begin()
+// serializes ALL transactions on a single process-wide mutex (txMu).
+// Previously the DB write committed (and released that lock)
+// immediately, before emit (+ build, where applicable) ran outside
+// it. This holds tx open for the full emit/build duration instead, so
+// a slow build now also holds the lock that long -- trading some
+// cross-request concurrency for the correctness this closes. Builds
+// are normally scoped to just the touched package(s), so this is
+// expected to be small in practice, but it is a real cost, not a free
+// rearrangement.
+func (s *server) commitOrRollbackOn(tx store.Backend, commit func() error, rollback func(), opts emit.Opts, run func(store.Backend, emit.Opts) string) string {
 	files := opts.TouchedFiles
 	if len(files) == 0 {
 		files = opts.GoimportsFiles
@@ -7419,7 +7486,7 @@ func (s *server) commitOrRollbackOnBuild(tx store.Backend, commit func() error, 
 		snaps = snapshotFiles(s.projectDir, files)
 	}
 
-	result := s.emitAndBuildAgainst(tx, opts)
+	result := run(tx, opts)
 	if result != "" {
 		restoreFiles(snaps)
 		rollback()
