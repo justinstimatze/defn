@@ -1004,6 +1004,12 @@ func cmdServe(httpAddr string) {
 		defer db.Close()
 		defer writeServeLock(dbPath, httpAddr)()
 		projDir := serveProjectDir()
+		// #12/#13 winze dispatch: projectDir determines where every
+		// build/emit/sync runs, derived from DEFN_DB's dirname -- a stale
+		// or misconfigured DEFN_DB (e.g. left pointing at a throwaway
+		// scratch path) silently mis-scopes everything with no way for a
+		// consumer to notice short of reading /proc. Log it plainly.
+		fmt.Fprintf(os.Stderr, "defn: project directory: %s\n", projDir)
 		if err := mcpserver.RunHTTP(ctx, db, projDir, httpAddr); err != nil {
 			fatal(err)
 		}
@@ -1023,6 +1029,9 @@ func cmdServe(httpAddr string) {
 	// /identity endpoint until we find our own project's serve or
 	// a free slot.
 	projDir := serveProjectDir()
+	// #12/#13 winze dispatch: see the --http branch's comment above --
+	// same rationale, same fix.
+	fmt.Fprintf(os.Stderr, "defn: project directory: %s\n", projDir)
 	wantIdentity, _ := filepath.Abs(projDir)
 	primary := portForDB(dbPath)
 
@@ -1889,6 +1898,14 @@ type runningServeInfo struct {
 	StartedUnix   int64  `json:"started_unix,omitempty"`
 	UptimeSeconds int64  `json:"uptime_seconds,omitempty"`
 	Version       string `json:"version,omitempty"`
+	// ProjectDir is the directory this serve resolved at startup (via
+	// serveProjectDir, fetched over /identity) -- everything it builds,
+	// emits, and syncs runs relative to this, not necessarily the
+	// caller's own cwd or the true Go module root. #12/#13 winze
+	// dispatch: a stale/misconfigured DEFN_DB silently mis-scopes
+	// everything with no way to tell short of reading /proc; surfacing
+	// it here closes that gap.
+	ProjectDir string `json:"project_dir,omitempty"`
 }
 
 type versionSkewInfo struct {
@@ -1942,6 +1959,7 @@ func collectStatus(dbPath string) statusReport {
 					r.VersionSkew = &versionSkewInfo{Running: v, OnDisk: mcpserver.Version}
 				}
 			}
+			info.ProjectDir = defnIdentityAt(lock.HTTPAddr)
 		}
 		r.RunningServe = info
 	}
@@ -1993,6 +2011,9 @@ func printStatus(r statusReport) {
 			} else {
 				fmt.Printf("  version:    %s\n", s.Version)
 			}
+		}
+		if s.ProjectDir != "" {
+			fmt.Printf("  project:    %s\n", s.ProjectDir)
 		}
 		fmt.Println()
 		if r.VersionSkew != nil {
