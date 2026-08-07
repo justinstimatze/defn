@@ -72,13 +72,31 @@ ALLOWED_TOOLS = "mcp__defn__code TodoWrite"
 # (35%) of measured wire went to these off-tool paths, invisibly diluting
 # every defn-side lever we measured. Closing them here so the "defn arm"
 # actually is defn-only.
+#
+# 2026-08-07: found the hard way that this list goes stale every time
+# Claude Code ships a new tool -- Monitor didn't exist when this list was
+# written, wasn't in it, and the agent found it via ToolSearch after
+# Bash was blocked (literally searched "select:Bash,BashOutput" then
+# "write file shell command execute"), then used Monitor's `command`
+# param as a full shell escape hatch: go install, git checkout --, raw
+# Python file edits, gofmt -w. The "defn arm" was paying for BOTH defn's
+# code tool AND unrestricted shell. Also found --allowedTools does NOT
+# act as an exclusive allowlist under --permission-mode bypassPermissions
+# -- only --disallowedTools actually excludes a tool from being callable.
+# So this list must stay a superset of every tool NOT in ALLOWED_TOOLS,
+# not a hand-picked "the dangerous ones" list -- re-check against
+# `claude -p ... -- "list your tools"` output before trusting any future
+# run's arm isolation.
 DISALLOWED_TOOLS = (
     "Read Write Edit MultiEdit NotebookEdit Bash "
     "Grep Glob "
     "Agent Task TaskCreate TaskUpdate TaskGet TaskList TaskOutput TaskStop "
     "mcp__dispatch__dispatch mcp__dispatch__peek mcp__dispatch__ack "
     "mcp__dispatch__who mcp__dispatch__subscribe mcp__dispatch__unsubscribe "
-    "SendMessage WebFetch WebSearch"
+    "SendMessage WebFetch WebSearch "
+    "CronCreate CronDelete CronList DesignSync EnterWorktree ExitWorktree "
+    "ListAgents Monitor PushNotification ReportFindings ScheduleWakeup "
+    "Skill ToolSearch Workflow"
 )
 
 SYSTEM_APPEND = """
@@ -119,11 +137,18 @@ almost never surface new information — you already have what you need.
 # Bash for `go build`/`go test`. Same off-tool escape hatches closed as the
 # defn arm, for parity.
 FILES_ALLOWED_TOOLS = "Read Write Edit MultiEdit Bash Grep Glob TodoWrite"
+# Same staleness caveat as DISALLOWED_TOOLS above -- Monitor is less of a
+# functional escape here (Bash is already allowed) but EnterWorktree/
+# Workflow could still move work outside the measured workdir or spawn a
+# subagent with a different tool set, so closed for parity.
 FILES_DISALLOWED_TOOLS = (
     "Agent Task TaskCreate TaskUpdate TaskGet TaskList TaskOutput TaskStop "
     "mcp__dispatch__dispatch mcp__dispatch__peek mcp__dispatch__ack "
     "mcp__dispatch__who mcp__dispatch__subscribe mcp__dispatch__unsubscribe "
-    "SendMessage WebFetch WebSearch"
+    "SendMessage WebFetch WebSearch "
+    "CronCreate CronDelete CronList DesignSync EnterWorktree ExitWorktree "
+    "ListAgents Monitor PushNotification ReportFindings ScheduleWakeup "
+    "Skill ToolSearch Workflow"
 )
 
 FILES_SYSTEM_APPEND = """
