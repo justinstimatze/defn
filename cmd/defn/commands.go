@@ -1897,6 +1897,13 @@ type statusReport struct {
 	// path (as opposed to Database being nil because it's locked by a
 	// running serve) — status must not create one just to check.
 	NoDatabase bool `json:"no_database,omitempty"`
+	// LegacyDoltPath/LegacyDoltBytes surface an orphaned Dolt-era
+	// storage tree left behind by the Phase 4 SQLite migration (#16) —
+	// the current binary never reads from it, but nothing warned it was
+	// still consuming disk. One dogfood session found 5.9GB of this
+	// across 41 repos before anyone noticed. Empty/zero when none found.
+	LegacyDoltPath  string `json:"legacy_dolt_path,omitempty"`
+	LegacyDoltBytes int64  `json:"legacy_dolt_bytes,omitempty"`
 	// Freshness is nil when we couldn't check (e.g. the embedded DB is
 	// locked by the running serve). Scripts should treat a missing
 	// field as "unknown", not "up to date".
@@ -1975,6 +1982,18 @@ func collectStatus(dbPath string) statusReport {
 		r.RunningServe = info
 	}
 
+	// #16: orphaned Dolt-era data check runs unconditionally for local
+	// paths -- pure filesystem check, safe even when a running serve
+	// holds the SQLite file locked, and matters most exactly when there's
+	// no live database to report on (an orphaned .dolt tree with no
+	// meaningful defn.db).
+	if !strings.Contains(dbPath, "@") {
+		if path, bytes := legacyDoltSize(dbPath); bytes > 0 {
+			r.LegacyDoltPath = path
+			r.LegacyDoltBytes = bytes
+		}
+	}
+
 	// Skip DB stats when the flock is held on an embedded path — we
 	// can't open it without racing the running serve's SQLite connection.
 	embeddedAndLocked := r.RunningServe != nil && !strings.Contains(dbPath, "@")
@@ -2015,6 +2034,11 @@ func collectStatus(dbPath string) statusReport {
 }
 
 func printStatus(r statusReport) {
+	if r.LegacyDoltBytes > 0 {
+		fmt.Fprintf(os.Stderr, "Orphaned Dolt-era data found: %s (%s) — the current binary never reads this. Run 'defn repair' to clear it.\n\n",
+			r.LegacyDoltPath, humanSize(r.LegacyDoltBytes))
+	}
+
 	if s := r.RunningServe; s != nil {
 		fmt.Println("Running serve:")
 		fmt.Printf("  pid:        %d\n", s.PID)
@@ -2377,4 +2401,38 @@ func resolveIngestDBPath(origCwd, modulePath string) string {
 	}
 	logBackend("using embedded .defn/")
 	return ".defn"
+}
+
+// humanSize formats a byte count for display (e.g. "5.9 GiB").
+func humanSize(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for n2 := n / unit; n2 >= unit; n2 /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+// legacyDoltSize reports the on-disk size of an orphaned Dolt-era
+// storage tree at dbPath/defn/.dolt, left behind by the Phase 4
+// SQLite migration (#16). The current binary never reads from this
+// path. Returns ("", 0) when none is found.
+func legacyDoltSize(dbPath string) (string, int64) {
+	legacy := filepath.Join(dbPath, "defn", ".dolt")
+	info, err := os.Stat(legacy)
+	if err != nil || !info.IsDir() {
+		return "", 0
+	}
+	var total int64
+	filepath.Walk(legacy, func(_ string, fi os.FileInfo, walkErr error) error {
+		if walkErr == nil && !fi.IsDir() {
+			total += fi.Size()
+		}
+		return nil
+	})
+	return legacy, total
 }

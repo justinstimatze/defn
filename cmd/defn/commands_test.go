@@ -121,3 +121,35 @@ func TestCollectStatus_NoDatabaseDoesNotCreateOne(t *testing.T) {
 		t.Fatalf("collectStatus must not create defn.db as a side effect of a status check; stat err=%v", err)
 	}
 }
+
+func TestCollectStatus_DetectsOrphanedDoltTree(t *testing.T) {
+	dir := t.TempDir()
+	legacy := filepath.Join(dir, "defn", ".dolt", "noms")
+	if err := os.MkdirAll(legacy, 0755); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("orphaned dolt bytes")
+	if err := os.WriteFile(filepath.Join(legacy, "chunk"), payload, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := collectStatus(dir)
+
+	if r.LegacyDoltBytes != int64(len(payload)) {
+		t.Fatalf("expected LegacyDoltBytes=%d, got %d", len(payload), r.LegacyDoltBytes)
+	}
+	wantPath := filepath.Join(dir, "defn", ".dolt")
+	if r.LegacyDoltPath != wantPath {
+		t.Fatalf("expected LegacyDoltPath=%q, got %q", wantPath, r.LegacyDoltPath)
+	}
+}
+
+func TestCollectStatus_NoLegacyDoltTreeStaysZero(t *testing.T) {
+	dir := t.TempDir()
+
+	r := collectStatus(dir)
+
+	if r.LegacyDoltBytes != 0 || r.LegacyDoltPath != "" {
+		t.Fatalf("expected no legacy dolt fields set, got path=%q bytes=%d", r.LegacyDoltPath, r.LegacyDoltBytes)
+	}
+}
