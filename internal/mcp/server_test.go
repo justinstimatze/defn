@@ -4935,3 +4935,92 @@ func UseC() string { return Run() }
 		t.Errorf("chess's unrelated Run was corrupted by a replace-hunk scoped to module:\"testproj/bft\", got:\n%s", chessSrc)
 	}
 }
+
+// TestHandleCode_ReadScopedByModuleBypassesBodyServedShortcut is a
+// follow-up finding from an independent review of #15: the respCache
+// "already read this session" shortcut (bodyServedEpochsAgo/
+// markBodyServed) was keyed by bare name only, with no module/file
+// component. Without a bypass, an earlier unscoped read(full:true)
+// resolving to chess's Engine would mark bare "Engine" as served, and
+// a LATER correctly-disambiguated read(module:"testproj/bft") would
+// get short-circuited to the stale "already read" stub instead of
+// ever reaching resolveEditTarget -- reopening the exact silent
+// wrong-resolution bug #15 closed, one layer up in handleCode's
+// dispatch rather than in the handler itself. Goes through
+// s.handleCode (not the handler directly), since that's where the
+// shortcut lives.
+func TestHandleCode_ReadScopedByModuleBypassesBodyServedShortcut(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	if err := os.MkdirAll(filepath.Join(projDir, "bft"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(projDir, "chess"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "bft", "engine.go"), []byte(`package bft
+
+type Engine struct{ Replica string }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "chess", "engine.go"), []byte(`package chess
+
+type Engine struct{ Protocol string }
+
+func NewEngine() *Engine { return &Engine{} }
+func UseA(e *Engine) string { return e.Protocol }
+func UseB(e *Engine) string { return e.Protocol }
+func UseC(e *Engine) string { return e.Protocol }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
+	ctx := context.Background()
+
+	// Unscoped full read: resolves to chess's Engine (blast-radius
+	// tiebreak) and, pre-fix, would mark bare "Engine" as body-served.
+	first, _, err := s.handleCode(ctx, req, codeParam{Op: "read", Name: "Engine", Full: true})
+	if err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	firstText := resultText(t, first)
+	if !strings.Contains(firstText, "Protocol string") {
+		t.Fatalf("expected the unscoped read to resolve to chess's Engine, got:\n%s", firstText)
+	}
+
+	// Same-session, correctly-disambiguated follow-up: NOT full:true,
+	// since the shortcut only fires for plain (non-full) reads -- must
+	// resolve to bft's Engine via resolveEditTarget, not get
+	// short-circuited to the "already read" stub. Mode:"body" forces
+	// body content into the response regardless of summary-mode
+	// defaults, so the field-name assertions below are meaningful.
+	second, _, err := s.handleCode(ctx, req, codeParam{Op: "read", Name: "Engine", Module: "testproj/bft", Mode: "body"})
+	if err != nil {
+		t.Fatalf("second read: %v", err)
+	}
+	secondText := resultText(t, second)
+	if strings.Contains(secondText, "already read in this session") {
+		t.Fatalf("module-scoped read was short-circuited by the bare-name bodyServed shortcut instead of resolving via resolveEditTarget:\n%s", secondText)
+	}
+	if !strings.Contains(secondText, "Replica string") {
+		t.Errorf("expected bft's Engine (Replica field), got:\n%s", secondText)
+	}
+	if strings.Contains(secondText, "Protocol string") {
+		t.Errorf("module-scoped read returned chess's Engine instead of bft's:\n%s", secondText)
+	}
+}

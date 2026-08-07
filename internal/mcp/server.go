@@ -779,7 +779,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		// can be silently downgraded to summary or auto-outline mode
 		// (#174/#184), and a query-filtered read elides statements, so
 		// neither is a reliable "the caller has everything" signal.
-		if args.Op == "read" && args.Full && strings.TrimSpace(args.Query) == "" {
+		if args.Op == "read" && args.Full && strings.TrimSpace(args.Query) == "" && args.Module == "" && args.File == "" {
 			s.respCache.markBodyServed(req.Session, args.Name)
 		}
 		if op, argKey, ok := dedupOpKey(args); ok {
@@ -1060,7 +1060,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		// or a downgraded subset -- never more. Bypassed when full:true or
 		// a query is set: those aren't redundant with a prior plain-args
 		// full-body serve check the same way outline's bypass works.
-		if !args.Full && req != nil && s.respCache != nil && strings.TrimSpace(args.Query) == "" {
+		if !args.Full && req != nil && s.respCache != nil && strings.TrimSpace(args.Query) == "" && args.Module == "" && args.File == "" {
 			if epochsAgo, ok := s.respCache.bodyServedEpochsAgo(req.Session, args.Name); ok {
 				if epochsAgo <= staleEpochThreshold {
 					stub := fmt.Sprintf(
@@ -1092,7 +1092,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		// re-transmitting it. Bypassed when a query is set: a
 		// query-filtered outline highlights different callees than a
 		// plain one, so it is not redundant even with the body in hand.
-		if req != nil && s.respCache != nil && strings.TrimSpace(args.Query) == "" {
+		if req != nil && s.respCache != nil && strings.TrimSpace(args.Query) == "" && args.Module == "" && args.File == "" {
 			if epochsAgo, ok := s.respCache.bodyServedEpochsAgo(req.Session, args.Name); ok {
 				if epochsAgo <= staleEpochThreshold {
 					stub := fmt.Sprintf(
@@ -1108,7 +1108,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "slice":
 		// Same cross-def context reuse as read/outline above: any slice
 		// kind is a strict subset of the full body already served.
-		if req != nil && s.respCache != nil {
+		if req != nil && s.respCache != nil && args.Module == "" && args.File == "" {
 			if epochsAgo, ok := s.respCache.bodyServedEpochsAgo(req.Session, args.Name); ok {
 				if epochsAgo <= staleEpochThreshold {
 					stub := fmt.Sprintf(

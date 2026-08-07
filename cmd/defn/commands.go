@@ -2406,6 +2406,9 @@ func resolveIngestDBPath(origCwd, modulePath string) string {
 // humanSize formats a byte count for display (e.g. "5.9 GiB").
 func humanSize(n int64) string {
 	const unit = 1024
+	if n < 0 {
+		return "-" + humanSize(-n)
+	}
 	if n < unit {
 		return fmt.Sprintf("%d B", n)
 	}
