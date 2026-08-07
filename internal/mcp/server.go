@@ -519,6 +519,11 @@ type nameParam struct {
 	// one-line intent summary if one exists, else falls back to the
 	// full body with a header noting the summary is unavailable.
 	Mode string `json:"mode,omitempty"`
+	// Module/File disambiguate same-named defs across packages (#15),
+	// same precedent as editParam's fields for the mutation path. File
+	// wins when both are set, mirroring resolveEditTarget's precedence.
+	Module string `json:"module,omitempty"`
+	File   string `json:"file,omitempty"`
 }
 
 type editParam struct {
@@ -1069,10 +1074,10 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 				// risky. Give the richer expand bundle instead of either a
 				// stub that might be wrong or a narrow read that just
 				// re-derives a subset of what may have been lost.
-				return wrapStale(s.handleExpand(ctx, req, codeParam{Name: args.Name, Include: []string{"outline", "callers", "body"}}))
+				return wrapStale(s.handleExpand(ctx, req, codeParam{Name: args.Name, Include: []string{"outline", "callers", "body"}, Module: args.Module, File: args.File}))
 			}
 		}
-		return wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name, Full: args.Full, Query: args.Query, Mode: args.Mode}))
+		return wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name, Full: args.Full, Query: args.Query, Mode: args.Mode, Module: args.Module, File: args.File}))
 	case "resummarize":
 		return s.handleResummarize(ctx, req, args)
 	case "read-and-verify":
@@ -1096,10 +1101,10 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 					)
 					return textResult(stub), nil, nil
 				}
-				return wrapStale(s.handleExpand(ctx, req, codeParam{Name: args.Name, Include: []string{"outline", "callers", "body"}}))
+				return wrapStale(s.handleExpand(ctx, req, codeParam{Name: args.Name, Include: []string{"outline", "callers", "body"}, Module: args.Module, File: args.File}))
 			}
 		}
-		return wrapStale(s.handleOutline(ctx, req, nameParam{Name: args.Name, Query: args.Query}))
+		return wrapStale(s.handleOutline(ctx, req, nameParam{Name: args.Name, Query: args.Query, Module: args.Module, File: args.File}))
 	case "slice":
 		// Same cross-def context reuse as read/outline above: any slice
 		// kind is a strict subset of the full body already served.
@@ -1112,7 +1117,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 					)
 					return textResult(stub), nil, nil
 				}
-				return wrapStale(s.handleExpand(ctx, req, codeParam{Name: args.Name, Include: []string{"outline", "callers", "body"}}))
+				return wrapStale(s.handleExpand(ctx, req, codeParam{Name: args.Name, Include: []string{"outline", "callers", "body"}, Module: args.Module, File: args.File}))
 			}
 		}
 		return wrapStale(s.handleSlice(ctx, req, args))
@@ -1168,7 +1173,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "create":
 		return s.handleCreate(ctx, req, createParam{Body: args.Body, Module: args.Module, File: args.File})
 	case "delete":
-		return s.handleDelete(ctx, req, nameParam{Name: args.Name, Force: args.Force})
+		return s.handleDelete(ctx, req, nameParam{Name: args.Name, Force: args.Force, Module: args.Module, File: args.File})
 	case "rename":
 		return s.handleRename(ctx, req, renameParam{OldName: args.OldName, NewName: args.NewName})
 	case "move":
@@ -1177,9 +1182,9 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if args.Test != "" {
 			return s.handleTestByName(ctx, req, args.Test)
 		}
-		return s.handleTest(ctx, req, nameParam{Name: args.Name})
+		return s.handleTest(ctx, req, nameParam{Name: args.Name, Module: args.Module, File: args.File})
 	case "similar":
-		return wrapStale(s.handleSimilar(ctx, req, nameParam{Name: args.Name}))
+		return wrapStale(s.handleSimilar(ctx, req, nameParam{Name: args.Name, Module: args.Module, File: args.File}))
 	case "apply":
 		return s.handleApply(ctx, req, applyParam{Operations: args.Operations, DryRun: args.DryRun})
 	case "query":
@@ -1235,7 +1240,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 }
 
 func (s *server) handleImpact(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.backend.GetDefinitionByName(args.Name, "")
+	d, err := s.resolveEditTarget(args.Name, "", args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -1629,7 +1634,7 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 	if args.Mode == "" && !args.Full && !justMutated && os.Getenv("DEFN_SUMMARY_READ_DEFAULT") != "0" {
 		args.Mode = "summary"
 	}
-	d, err := s.backend.GetDefinitionByName(args.Name, "")
+	d, err := s.resolveEditTarget(args.Name, "", args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -4074,7 +4079,7 @@ func compositeMatchesType(expr ast.Expr, typeName string) bool {
 }
 
 func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.backend.GetDefinitionByName(args.Name, "")
+	d, err := s.resolveEditTarget(args.Name, "", args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -4325,7 +4330,7 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 }
 
 func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.backend.GetDefinitionByName(args.Name, "")
+	d, err := s.resolveEditTarget(args.Name, "", args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -4579,7 +4584,7 @@ func humanSize(n int64) string {
 }
 
 func (s *server) handleSimilar(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.backend.GetDefinitionByName(args.Name, "")
+	d, err := s.resolveEditTarget(args.Name, "", args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -5311,7 +5316,7 @@ func (s *server) handleExpand(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	resolved := 0
 	var firstErr error
 	for i, name := range names {
-		d, err := s.backend.GetDefinitionByName(name, "")
+		d, err := s.resolveEditTarget(name, "", args.Module, args.File)
 		if err != nil {
 			notFound = append(notFound, name)
 			if firstErr == nil {
@@ -6309,7 +6314,7 @@ func firstDocLine(doc string) string {
 // on >2000-char bodies (87% compression). See
 // [[project_putget_edit_vocab_design]] for the phase context.
 func (s *server) handleOutline(_ context.Context, req *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.backend.GetDefinitionByName(args.Name, "")
+	d, err := s.resolveEditTarget(args.Name, "", args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -6423,7 +6428,7 @@ func (s *server) handleSlice(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		return errResult(fmt.Errorf("slice: kind is required — valid: %s", strings.Join(projection.SliceKindNames(), ", ")))
 	}
 
-	d, err := s.backend.GetDefinitionByName(args.Name, "")
+	d, err := s.resolveEditTarget(args.Name, "", args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}

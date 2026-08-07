@@ -4582,6 +4582,142 @@ func UseC(e *Engine) string { return e.Protocol }
 	}
 }
 
+// TestHandleGetDefinition_ModuleDisambiguatesSameNamedType is issue
+// #15: the read path (handleGetDefinition, reached via op:"read")
+// called GetDefinitionByName(name, "") directly, ignoring nameParam's
+// Module/File even when set -- unlike handleEdit, which #219/gemot
+// already fixed via resolveEditTarget. Same bft/chess Engine fixture:
+// chess's Engine has more references, so the pre-fix blast-radius
+// tiebreak would silently return chess's body for a read scoped to
+// module:"testproj/bft".
+func TestHandleGetDefinition_ModuleDisambiguatesSameNamedType(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	if err := os.MkdirAll(filepath.Join(projDir, "bft"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(projDir, "chess"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "bft", "engine.go"), []byte(`package bft
+
+type Engine struct{ Replica string }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "chess", "engine.go"), []byte(`package chess
+
+type Engine struct{ Protocol string }
+
+func NewEngine() *Engine { return &Engine{} }
+func UseA(e *Engine) string { return e.Protocol }
+func UseB(e *Engine) string { return e.Protocol }
+func UseC(e *Engine) string { return e.Protocol }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	// Prove the fixture actually stresses the bug: a module-blind lookup
+	// (what handleGetDefinition called before the #15 fix) must resolve
+	// to chess's more-referenced Engine, not bft's -- otherwise the
+	// assertions below would pass for the wrong reason.
+	if blind, err := db.GetDefinitionByName("Engine", ""); err != nil || blind == nil || !strings.Contains(blind.Body, "Protocol") {
+		t.Fatalf("fixture sanity check: module-blind GetDefinitionByName(\"Engine\", \"\") should resolve to chess's Engine (Protocol field) via the blast-radius tiebreak, got: %+v, err=%v", blind, err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleGetDefinition(context.Background(), nil, nameParam{
+		Name:   "Engine",
+		Module: "testproj/bft",
+		Full:   true,
+	})
+	if err != nil {
+		t.Fatalf("handleGetDefinition: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Replica string") {
+		t.Errorf("expected bft's Engine (Replica field), got:\n%s", text)
+	}
+	if strings.Contains(text, "Protocol string") {
+		t.Errorf("read scoped to module:\"testproj/bft\" returned chess's Engine instead:\n%s", text)
+	}
+}
+
+// TestHandleExpand_ModuleDisambiguatesSameNamedType is issue #15's
+// expand-path counterpart: handleExpand receives the full codeParam
+// (Module/File already in scope) but called GetDefinitionByName(name,
+// "") directly, discarding them.
+func TestHandleExpand_ModuleDisambiguatesSameNamedType(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	if err := os.MkdirAll(filepath.Join(projDir, "bft"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(projDir, "chess"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "bft", "engine.go"), []byte(`package bft
+
+type Engine struct{ Replica string }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "chess", "engine.go"), []byte(`package chess
+
+type Engine struct{ Protocol string }
+
+func NewEngine() *Engine { return &Engine{} }
+func UseA(e *Engine) string { return e.Protocol }
+func UseB(e *Engine) string { return e.Protocol }
+func UseC(e *Engine) string { return e.Protocol }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleExpand(context.Background(), nil, codeParam{
+		Name:    "Engine",
+		Module:  "testproj/bft",
+		Include: []string{"body"},
+	})
+	if err != nil {
+		t.Fatalf("handleExpand: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Replica string") {
+		t.Errorf("expected bft's Engine (Replica field), got:\n%s", text)
+	}
+	if strings.Contains(text, "Protocol string") {
+		t.Errorf("expand scoped to module:\"testproj/bft\" returned chess's Engine instead:\n%s", text)
+	}
+}
+
 // TestHandleFragmentEdit_ModuleDisambiguatesSameNamedType is
 // TestHandleEdit_ModuleDisambiguatesSameNamedType's fragment-edit
 // counterpart: handleFragmentEdit is a separate handler (the
