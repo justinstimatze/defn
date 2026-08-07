@@ -105,3 +105,19 @@ func TestResolveIngestDBPath(t *testing.T) {
 		}
 	})
 }
+
+func TestCollectStatus_NoDatabaseDoesNotCreateOne(t *testing.T) {
+	dir := t.TempDir()
+
+	r := collectStatus(dir)
+
+	if !r.NoDatabase {
+		t.Fatalf("expected NoDatabase=true for a directory with no defn.db, got %+v", r)
+	}
+	if r.Database != nil {
+		t.Fatalf("expected nil Database, got %+v", r.Database)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "defn.db")); !os.IsNotExist(err) {
+		t.Fatalf("collectStatus must not create defn.db as a side effect of a status check; stat err=%v", err)
+	}
+}

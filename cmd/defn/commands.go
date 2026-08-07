@@ -167,7 +167,7 @@ func defnClaudeMDSection() string {
 
 This project is indexed in defn (` + "`.defn/`" + `). For any ` + "`.go`" + ` file, use the ` + "`code`" + ` MCP tool — **not** Read, Bash, Grep, or Edit. Those built-ins are reserved for non-Go files (yaml, json, md, sh, ` + "`go.mod`" + `, Dockerfile).
 
-**This is enforced, not just requested.** ` + "`hooks/defn-go-guard.sh`" + ` blocks ` + "`Read`" + `/` + "`Write`" + `/` + "`Edit`" + `/` + "`MultiEdit`" + ` on ` + "`.go`" + ` paths and Bash dumps (` + "`cat`" + `/` + "`head`" + `/` + "`tail`" + `/etc.) of ` + "`.go`" + ` files. Escape hatch (rare, e.g. a known defn write-path bug): ` + "`touch ~/.claude-allow-go-edit`" + ` before the one blocked call you need — self-consuming, no manual removal needed.
+**This can be enforced at the harness level, not just requested — but isn't wired up automatically by init/ingest.** Copy ` + "`hooks/defn-go-guard.sh`" + ` from the defn repo into ` + "`hooks/`" + ` here and register it under ` + "`.claude/settings.json`" + `'s ` + "`PreToolUse`" + ` hooks (matcher ` + "`Read|Write|Edit|MultiEdit|Bash`" + `) to make it actually block ` + "`Read`" + `/` + "`Write`" + `/` + "`Edit`" + `/` + "`MultiEdit`" + ` on ` + "`.go`" + ` paths and Bash dumps (` + "`cat`" + `/` + "`head`" + `/` + "`tail`" + `/etc.) of ` + "`.go`" + ` files. Until installed, treat this section as a convention the model must self-enforce, not a guaranteed backstop. Once installed, escape hatch (rare, e.g. a known defn write-path bug): ` + "`touch ~/.claude-allow-go-edit`" + ` before the one blocked call you need — self-consuming, no manual removal needed.
 
 **Do not ` + "`ls`" + ` and ` + "`Read`" + ` files by hand.** Start any Go task with ` + "`code(op:\"overview\")`" + ` to see the project shape, then drill in with ` + "`search`" + ` / ` + "`outline`" + ` / ` + "`impact`" + `.
 
@@ -1893,6 +1893,10 @@ type statusReport struct {
 	RunningServe *runningServeInfo `json:"running_serve,omitempty"`
 	VersionSkew  *versionSkewInfo  `json:"version_skew,omitempty"`
 	Database     *databaseInfo     `json:"database,omitempty"`
+	// NoDatabase is true when no defn database exists yet at the target
+	// path (as opposed to Database being nil because it's locked by a
+	// running serve) — status must not create one just to check.
+	NoDatabase bool `json:"no_database,omitempty"`
 	// Freshness is nil when we couldn't check (e.g. the embedded DB is
 	// locked by the running serve). Scripts should treat a missing
 	// field as "unknown", not "up to date".
@@ -1978,6 +1982,16 @@ func collectStatus(dbPath string) statusReport {
 		return r
 	}
 
+	// A plain status check must not create a database that doesn't exist
+	// yet — OpenBackend would otherwise MkdirAll+create defn.db as a side
+	// effect of what's supposed to be a read-only query.
+	if !strings.Contains(dbPath, "@") {
+		if _, err := os.Stat(filepath.Join(dbPath, "defn.db")); os.IsNotExist(err) {
+			r.NoDatabase = true
+			return r
+		}
+	}
+
 	db, err := store.OpenBackend(dbPath)
 	if err != nil {
 		fatal(err)
@@ -2029,6 +2043,11 @@ func printStatus(r statusReport) {
 					"  restart 'defn serve' to pick up the new binary.\n\n",
 				r.VersionSkew.Running, r.VersionSkew.OnDisk)
 		}
+	}
+
+	if r.NoDatabase {
+		fmt.Fprintln(os.Stderr, "No defn database found (run 'defn ingest .' or 'defn init .' to create one).")
+		return
 	}
 
 	if r.Database == nil {

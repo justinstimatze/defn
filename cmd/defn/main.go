@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	mcpserver "github.com/justinstimatze/defn/internal/mcp"
 )
 
 func main() {
@@ -18,6 +20,10 @@ func main() {
 		if a == "-h" || a == "--help" {
 			usage()
 			os.Exit(1)
+		}
+		if a == "-v" || a == "--version" {
+			fmt.Println(mcpserver.Version)
+			os.Exit(0)
 		}
 	}
 
@@ -156,6 +162,8 @@ func main() {
 		cmdRestart(all)
 	case "analyze-session":
 		cmdAnalyzeSession(os.Args[2:])
+	case "version":
+		fmt.Println(mcpserver.Version)
 	default:
 		usage()
 		os.Exit(1)
@@ -176,6 +184,7 @@ Usage:
   defn untested                Definitions without test coverage
   defn lint                    Lint with diagnostics → definitions
   defn status                  Backend stats
+  defn version                 Print defn version
   defn check                   Consistency diagnostics (defs by kind, orphan literal types)
   defn query <sql>             Read-only SQL query
   defn gc                      Compact storage (VACUUM)
