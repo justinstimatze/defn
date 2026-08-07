@@ -2903,6 +2903,30 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		return errResult(fmt.Errorf("no modules found — run defn init first"))
 	}
 
+	// #12: write and build-gate through a transaction so a build
+	// failure leaves neither the DB nor the file changed. Previously
+	// this wrote straight to s.backend (durable immediately) and
+	// treated a later build failure as informational only.
+	//
+	// #239: Begin() now runs before the "new directory" EnsureModule
+	// call below (moved up from just before UpsertDefinition) and that
+	// call now goes through tx, not s.backend. EnsureModule used to
+	// commit the new module row directly to the backend, outside any
+	// transaction — if the build below then failed and rolled back the
+	// definition, the module row it belonged to was never rolled back
+	// with it. That orphaned, forever-zero-def module row survived every
+	// later emit; emitModule's zero-defs cleanup then guessed a filename
+	// from it and deleted whatever real file already happened to live at
+	// that path, e.g. a `create` attempt against grpc-go's
+	// resolver/passthrough that failed to build left behind an empty
+	// module row for resolver/passthrough, and the next unscoped emit
+	// deleted the real, pre-existing passthrough.go.
+	tx, commit, rollback, txErr := s.backend.Begin()
+	if txErr != nil {
+		return errResult(txErr)
+	}
+	defer rollback()
+
 	// #13: file: named a directory with no existing module -- this is
 	// genuinely new territory, not the same package as whatever module:
 	// fallback we just resolved above. Reusing that fallback module's
@@ -2920,7 +2944,7 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 			if root := emit.DetectModuleRoot(mods); root != "" {
 				newPath = root + "/" + dir
 			}
-			newMod, ensureErr := s.backend.EnsureModule(newPath, filepath.Base(dir), "")
+			newMod, ensureErr := tx.EnsureModule(newPath, filepath.Base(dir), "")
 			if ensureErr != nil {
 				return errResult(fmt.Errorf("create module for new directory %q: %w", dir, ensureErr))
 			}
@@ -2959,16 +2983,6 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		Body:       args.Body,
 		SourceFile: args.File,
 	}
-
-	// #12: write and build-gate through a transaction so a build
-	// failure leaves neither the DB nor the file changed. Previously
-	// this wrote straight to s.backend (durable immediately) and
-	// treated a later build failure as informational only.
-	tx, commit, rollback, txErr := s.backend.Begin()
-	if txErr != nil {
-		return errResult(txErr)
-	}
-	defer rollback()
 
 	id, err := tx.UpsertDefinition(d)
 	if err != nil {

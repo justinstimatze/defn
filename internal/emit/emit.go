@@ -383,17 +383,23 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 		if scoped {
 			return nil, nil, nil, nil
 		}
-		relPath := mod.Path
-		if moduleRoot != "" && strings.HasPrefix(mod.Path, moduleRoot) {
-			relPath = strings.TrimPrefix(mod.Path, moduleRoot)
-			relPath = strings.TrimPrefix(relPath, "/")
+		// Only remove files defn has independent evidence it actually
+		// wrote before (raw source captured in file_sources during some
+		// prior ingest). A module can reach zero defs without ever having
+		// had real content -- see the ingestPackage guard in
+		// internal/ingest/ingest.go for the build-tag-exclusion case that
+		// used to create these phantom rows. Guessing a filename from
+		// mod.Name and deleting it blindly is what turned a phantom
+		// zero-def module row into real file deletion on a real grpc-go
+		// checkout (task #239): resolver/passthrough.go,
+		// security/advancedtls.go and others were removed despite defn
+		// never having ingested a single def from them.
+		rawSources, rerr := db.ListFileSources(mod.ID)
+		if rerr != nil || len(rawSources) == 0 {
+			return nil, nil, nil, nil
 		}
-		if relPath != "" && relPath != "." {
-			pkgDir := filepath.Join(outDir, relPath)
-			mainFile := filepath.Join(pkgDir, strings.ToLower(mod.Name)+".go")
-			testFile := filepath.Join(pkgDir, strings.ToLower(mod.Name)+"_test.go")
-			os.Remove(mainFile)
-			os.Remove(testFile)
+		for sourceFile := range rawSources {
+			os.Remove(filepath.Join(outDir, sourceFile))
 		}
 		return nil, nil, nil, nil
 	}

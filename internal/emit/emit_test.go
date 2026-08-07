@@ -1797,3 +1797,96 @@ func TestEmitExcludesFieldKindFromTopLevelDecls(t *testing.T) {
 		t.Errorf("expected exactly one 'Port int' (inside the struct, not floating), got:\n%s", out)
 	}
 }
+
+func TestEmitZeroDefModuleWithKnownFileSourcesStillCleansUp(t *testing.T) {
+	// The legitimate case the zero-defs cleanup exists for must still
+	// work: a module defn genuinely used to manage (file_sources
+	// populated by a prior ingest/emit) whose last definition was
+	// deleted should still have its emitted file removed.
+	db := testDB(t)
+	mod, err := db.EnsureModule("example.com/test/pkg", "pkg", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetFileSource(mod.ID, "pkg/pkg.go", "package pkg\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	outDir := t.TempDir()
+	pkgDir := filepath.Join(outDir, "pkg")
+	if err := os.MkdirAll(pkgDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	trackedPath := filepath.Join(pkgDir, "pkg.go")
+	if err := os.WriteFile(trackedPath, []byte("package pkg\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := EmitWithOpts(db, outDir, Opts{}); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+
+	if _, err := os.Stat(trackedPath); !os.IsNotExist(err) {
+		t.Fatalf("expected the tracked, now-empty module's file to be removed, stat err = %v", err)
+	}
+}
+
+func TestEmitZeroDefPhantomModuleDoesNotDeleteRealFile(t *testing.T) {
+	// Regression test for task #239: a module row can reach zero defs
+	// without defn ever having written real content for it -- e.g. an
+	// orphaned module row left behind by a failed code(op:"create")
+	// into a new directory (see TestHandleCreateFailedBuildDoesNotOrphanModule
+	// in internal/mcp). Guessing a filename from mod.Name and deleting
+	// it on the next unscoped emit turned that orphan into real data
+	// loss: resolver/passthrough/passthrough.go and four other files
+	// were deleted from a real grpc-go checkout this way, despite defn
+	// never having ingested a single def from any of them.
+	db := testDB(t)
+	// A real, legitimately-managed root module establishes a moduleRoot
+	// shorter than the phantom's path below -- without this, DetectModuleRoot
+	// on a single-module DB collapses moduleRoot to the phantom's own
+	// path, relPath goes empty, and the old code's cleanup guard
+	// (`relPath != "" && relPath != "."`) never fires at all. That shape
+	// doesn't match the real bug: a real project always has other real
+	// modules alongside an orphaned one.
+	rootMod, err := db.EnsureModule("example.com/test", "test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.UpsertDefinition(&store.Definition{
+		ModuleID: rootMod.ID, Name: "Real", Kind: "function", Exported: true,
+		Body: "func Real() {}", SourceFile: "test.go",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// No definitions, no file_sources -- exactly the phantom-module
+	// shape: EnsureModule ran, nothing else ever did.
+	if _, err := db.EnsureModule("example.com/test/pkg", "pkg", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	outDir := t.TempDir()
+	pkgDir := filepath.Join(outDir, "pkg")
+	if err := os.MkdirAll(pkgDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// A real file defn never touched, sitting at the guessed
+	// mod.Name-derived path (pkg.go) the old code would have deleted.
+	realContent := []byte("package pkg\n\nfunc RealFunc() int { return 1 }\n")
+	realPath := filepath.Join(pkgDir, "pkg.go")
+	if err := os.WriteFile(realPath, realContent, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := EmitWithOpts(db, outDir, Opts{}); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+
+	got, err := os.ReadFile(realPath)
+	if err != nil {
+		t.Fatalf("real file was deleted by the phantom module's zero-defs cleanup: %v", err)
+	}
+	if string(got) != string(realContent) {
+		t.Fatalf("real file was modified:\n%s", got)
+	}
+}

@@ -176,6 +176,19 @@ func ingestPackage(db store.Backend, pkg *packages.Package, modulePath string, s
 			break
 		}
 	}
+	if len(pkg.Syntax) == 0 {
+		// go/packages.Load still returns a *packages.Package for
+		// directories whose Go files are all excluded by build
+		// constraints for the host's GOOS/GOARCH or custom tags (the
+		// common //go:build tools idiom, or platform-specific files).
+		// Nothing here was ever actually parsed -- skip creating a
+		// module row entirely. Without this guard, EnsureModule below
+		// created a phantom zero-def module row pointing at a real
+		// directory defn never touched, and emitModule's zero-defs
+		// cleanup mistook it for a module defn used to manage, deleting
+		// real files on an unscoped emit (task #239).
+		return nil
+	}
 	mod, err := db.EnsureModule(pkgPath, pkgName, pkgDoc)
 	if err != nil {
 		return err

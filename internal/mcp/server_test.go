@@ -5024,3 +5024,66 @@ func UseC(e *Engine) string { return e.Protocol }
 		t.Errorf("module-scoped read returned chess's Engine instead of bft's:\n%s", secondText)
 	}
 }
+
+func TestHandleCreateFailedBuildDoesNotOrphanModule(t *testing.T) {
+	// Regression test for task #239: handleCreate's "new directory"
+	// branch used to call EnsureModule on s.backend directly, outside
+	// the transaction guarding the definition write. A build failure
+	// rolled back the definition but left the module row committed -- a
+	// permanent zero-def module pointing at a real directory.
+	// emitModule's zero-defs cleanup then guessed a filename from that
+	// orphan and deleted whatever real file already lived there on the
+	// next unscoped emit. This is exactly how a real bench run lost
+	// grpc-go's resolver/passthrough/passthrough.go and four other
+	// untouched files.
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+
+	// A real, pre-existing file defn never ingested or wrote -- stands
+	// in for e.g. resolver/passthrough/passthrough.go.
+	preexistDir := filepath.Join(projDir, "internal", "willfail")
+	if err := os.MkdirAll(preexistDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	preexistContent := []byte("package willfail\n\n// PreExisting was never touched by defn.\nfunc PreExisting() int { return 1 }\n")
+	preexistPath := filepath.Join(preexistDir, "willfail.go")
+	if err := os.WriteFile(preexistPath, preexistContent, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Body is syntactically valid (passes inference) but references an
+	// undefined symbol, so the build fails and the tx rolls back.
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body:   "func WillFail() int { return undefinedSymbolXYZ }",
+		File:   "internal/willfail/x.go",
+		Module: "testproj",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "undefinedSymbolXYZ") && !strings.Contains(strings.ToLower(text), "build") {
+		t.Fatalf("expected the undefined-symbol build failure to be reported, got: %s", text)
+	}
+
+	if _, err := db.GetDefinitionByName("WillFail", ""); err == nil {
+		t.Fatal("WillFail should not have persisted -- the build failed and the tx should have rolled back")
+	}
+
+	mods, err := db.ListModules()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range mods {
+		if strings.Contains(m.Path, "willfail") {
+			t.Fatalf("orphaned zero-def module survived the rollback: %+v", m)
+		}
+	}
+
+	// The real pre-existing file must be untouched by the failed create.
+	got, err := os.ReadFile(preexistPath)
+	if err != nil {
+		t.Fatalf("pre-existing file vanished: %v", err)
+	}
+	if string(got) != string(preexistContent) {
+		t.Fatalf("pre-existing file was modified:\n%s", got)
+	}
+}
