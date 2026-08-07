@@ -2397,7 +2397,7 @@ func resolveIngestDBPath(origCwd, modulePath string) string {
 	}
 	if origCwd != "" && origCwd != modulePath {
 		dbPath := filepath.Join(origCwd, ".defn")
-		logBackend(fmt.Sprintf("using embedded %s (scoped ingest of %s)", dbPath, modulePath))
+		logBackend(fmt.Sprintf("using embedded %s (invoked from a different dir than %s -- DB anchored at the invocation dir, not the target; cd into %s first if that's not what you want)", dbPath, modulePath, modulePath))
 		return dbPath
 	}
 	logBackend("using embedded .defn/")

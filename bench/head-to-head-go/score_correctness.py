@@ -188,6 +188,18 @@ def arm_touched_files(arm_data, workdir_hint):
                                 sub.get("name"), workdir_hint
                             ):
                                 touched.add(normalize_path(f, workdir_hint))
+            # files-mode arm: Edit/Write/MultiEdit are the actual write
+            # tools, not a `__code` op — no over-reporting risk here (no
+            # emit-reformat side effect), so this is safe to trust directly,
+            # unlike git-status for the defn arm (see comment in main()).
+            # Missing this was a real bug: files-mode scored 0 touched files
+            # on every task before this fix, not because it didn't write
+            # anything (git status showed real, focused edits) but because
+            # nothing was parsing its tool calls at all.
+            if nm in ("Edit", "Write", "MultiEdit"):
+                f = args.get("file_path")
+                if f:
+                    touched.add(normalize_path(f, workdir_hint))
             # Bash-shape writes (rare, but possible): sed -i / echo > / tee
             if nm == "Bash":
                 cmd = args.get("command", "") or ""

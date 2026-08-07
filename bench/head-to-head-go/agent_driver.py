@@ -27,6 +27,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 TASKS = os.path.join(HERE, "tasks.jsonl")
 ARM_DIR = os.path.join(HERE, "arm_defn")
+ARM_DIR_FILES = os.path.join(HERE, "arm_files")
 WORKDIR_ROOT = "/tmp/defn-h2h-go"
 # Cached fresh .defn/ per (instance_id, defn_binary_hash). Contamination
 # fix (6abe8e1) forces a fresh ingest per arm — ~30-90s of pure CPU per
@@ -55,6 +56,7 @@ def _defn_cache_path(inst_id, binhash):
 DEFN_MCP_CONFIG = {
     "mcpServers": {"defn": {"type": "stdio", "command": "defn", "args": ["serve"]}}
 }
+EMPTY_MCP_CONFIG = {"mcpServers": {}}
 
 # SECURITY: with --permission-mode bypassPermissions, any allowed tool runs
 # without user approval. Bash is intentionally NOT in the allowlist — an
@@ -112,6 +114,48 @@ implement your best guess and iterate. Additional reads past that point
 almost never surface new information — you already have what you need.
 """.strip()
 
+# files-mode arm: the live comparison counterpart. No defn MCP tool at all
+# (EMPTY_MCP_CONFIG) -- Read/Grep/Glob to explore, Edit/Write to change,
+# Bash for `go build`/`go test`. Same off-tool escape hatches closed as the
+# defn arm, for parity.
+FILES_ALLOWED_TOOLS = "Read Write Edit MultiEdit Bash Grep Glob TodoWrite"
+FILES_DISALLOWED_TOOLS = (
+    "Agent Task TaskCreate TaskUpdate TaskGet TaskList TaskOutput TaskStop "
+    "mcp__dispatch__dispatch mcp__dispatch__peek mcp__dispatch__ack "
+    "mcp__dispatch__who mcp__dispatch__subscribe mcp__dispatch__unsubscribe "
+    "SendMessage WebFetch WebSearch"
+)
+
+FILES_SYSTEM_APPEND = """
+IMPORTANT — this session is Go-only. Use Read/Grep/Glob to explore the
+codebase, Edit/Write to make changes, Bash for `go build`/`go test`.
+Complete the task and stop.
+
+The issue describes a bug that CURRENTLY EXISTS in this codebase. Assume
+the fix is not already in place until you have PROVEN it — either by
+reading the exact code the issue names and confirming the failing input
+would still fail, OR by running the relevant test and observing the
+failure. If your entire set of writes ends up in `_test.go` files, you
+have NOT implemented the fix — production code must change. Do not
+conclude the task complete without a production-code write unless you
+can cite the exact function and line whose current implementation
+already handles the issue.
+
+If the issue names a failing test (`TestFoo` / `TestBar`), REPRODUCE it
+before writing anything: `go test -run TestFoo ./...` runs one test by
+name. A test that passes today means the bug is not what you think it is
+— re-read before editing. A test that fails is a concrete anchor for
+your fix; iterate against it.
+
+Read-then-give-up is the most common failure mode on this bench. After
+5 Read/Grep/Glob calls WITHOUT a write or a test-run, STOP READING.
+Instead: form a concrete hypothesis (name the function and the exact
+behavior change), then either (a) run the relevant test to observe
+current behavior, or (b) edit your best guess and iterate. Additional
+reads past that point almost never surface new information — you
+already have what you need.
+""".strip()
+
 
 def load_task(instance_id):
     with open(TASKS) as f:
@@ -122,12 +166,21 @@ def load_task(instance_id):
     raise KeyError(instance_id)
 
 
-def setup_workspace(task):
-    """Clone repo at base_commit, run defn init + ingest. Returns workdir."""
+def setup_workspace(task, arm="defn"):
+    """Clone repo at base_commit, run defn init + ingest. Returns workdir.
+
+    Workdir is arm-scoped (inst__arm, not just inst) -- running both arms
+    of the same task concurrently against a shared directory races on the
+    initial `git clone` and corrupts whichever arm loses. Found 2026-08-07
+    when both arms of the same task launched in parallel: one arm's clone
+    failed outright (dir already existed non-empty), and cache/ingest
+    interleaving under concurrent load caused a second, separate failure
+    mode. Arm-scoping the workdir removes the collision entirely.
+    """
     inst = task["instance_id"]
-    workdir = os.path.join(WORKDIR_ROOT, inst)
+    workdir = os.path.join(WORKDIR_ROOT, f"{inst}__{arm}")
     os.makedirs(WORKDIR_ROOT, exist_ok=True)
-    print(f"[setup] instance {inst}", file=sys.stderr)
+    print(f"[setup] instance {inst} (arm={arm})", file=sys.stderr)
 
     if not os.path.isdir(os.path.join(workdir, ".git")):
         print(f"[setup] cloning {task['org']}/{task['repo']}", file=sys.stderr)
@@ -209,13 +262,23 @@ def setup_workspace(task):
     # Use subprocess.run and check that `.defn/` was created rather
     # than trusting exit status; ingest returns non-zero when any
     # package fails but still persists what it could parse.
+    # `defn init <path>`/`defn ingest <path>` don't actually operate on
+    # the path argument -- they write .defn relative to CWD instead,
+    # silently (exit 0, "done. N modules...") and REPORT SUCCESS while
+    # writing to the wrong place. Found 2026-08-07: every concurrent
+    # harness run was racing to write the SAME shared ~/.defn (the
+    # script's own cwd) instead of each process's own workdir. Passing
+    # cwd=workdir works around it; this looks like a real defn CLI bug
+    # independent of this harness, worth filing separately.
     subprocess.run(
-        ["defn", "init", workdir],
+        ["defn", "init", "."],
+        cwd=workdir,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     subprocess.run(
-        ["defn", "ingest", workdir],
+        ["defn", "ingest", "."],
+        cwd=workdir,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -248,11 +311,15 @@ Use defn's code MCP for all source access. When done, stop — do not open a she
 """
 
 
-def run_claude(workdir, prompt, budget_usd, max_turns):
-    """Invoke claude -p with defn-only tools; return list of stream-json event dicts."""
+def run_claude(workdir, prompt, budget_usd, max_turns, arm="defn"):
+    """Invoke claude -p with the given arm's tool set; return list of stream-json event dicts."""
     mcp_config_path = os.path.join(workdir, ".mcp-defn-only.json")
     with open(mcp_config_path, "w") as f:
-        json.dump(DEFN_MCP_CONFIG, f)
+        json.dump(DEFN_MCP_CONFIG if arm == "defn" else EMPTY_MCP_CONFIG, f)
+
+    allowed = ALLOWED_TOOLS if arm == "defn" else FILES_ALLOWED_TOOLS
+    disallowed = DISALLOWED_TOOLS if arm == "defn" else FILES_DISALLOWED_TOOLS
+    system_append = SYSTEM_APPEND if arm == "defn" else FILES_SYSTEM_APPEND
 
     # --add-dir and --allowedTools are variadic in claude's CLI parser, so
     # any positional prompt arg that follows can be swallowed. Feed the
@@ -268,11 +335,11 @@ def run_claude(workdir, prompt, budget_usd, max_turns):
         mcp_config_path,
         "--strict-mcp-config",
         "--allowedTools",
-        ALLOWED_TOOLS,
+        allowed,
         "--disallowedTools",
-        DISALLOWED_TOOLS,
+        disallowed,
         "--append-system-prompt",
-        SYSTEM_APPEND,
+        system_append,
         "--output-format",
         "stream-json",
         "--verbose",
@@ -406,16 +473,21 @@ def apply_edits_via_defn(workdir):
         print(f"[emit] defn emit failed: {e}", file=sys.stderr)
 
 
-def run_one(instance_id, budget_usd, max_turns):
+def run_one(instance_id, budget_usd, max_turns, arm="defn"):
     task = load_task(instance_id)
-    workdir = setup_workspace(task)
+    workdir = setup_workspace(task, arm=arm)
     prompt = build_prompt(task)
-    events, rc, elapsed = run_claude(workdir, prompt, budget_usd, max_turns)
+    events, rc, elapsed = run_claude(workdir, prompt, budget_usd, max_turns, arm=arm)
     traj, cost = events_to_fncall_messages(events)
-    apply_edits_via_defn(workdir)
+    if arm == "defn":
+        # files-mode already writes directly to disk via Edit/Write --
+        # calling `defn emit` here would overwrite those changes with the
+        # DB's (untouched, since files-mode never called defn) stale state.
+        apply_edits_via_defn(workdir)
 
-    os.makedirs(ARM_DIR, exist_ok=True)
-    out_path = os.path.join(ARM_DIR, instance_id + ".json")
+    out_dir = ARM_DIR if arm == "defn" else ARM_DIR_FILES
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, instance_id + ".json")
     with open(out_path, "w") as f:
         json.dump(
             {
@@ -442,6 +514,7 @@ def main():
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--budget-usd", type=float, default=3.0)
     ap.add_argument("--max-turns", type=int, default=50)
+    ap.add_argument("--arm", choices=["defn", "files"], default="defn")
     args = ap.parse_args()
 
     if args.all:
@@ -450,13 +523,13 @@ def main():
         for i, tid in enumerate(tasks, 1):
             print(f"\n===== [{i}/{len(tasks)}] {tid} =====", file=sys.stderr)
             try:
-                run_one(tid, args.budget_usd, args.max_turns)
+                run_one(tid, args.budget_usd, args.max_turns, arm=args.arm)
             except Exception as e:
                 print(f"[fail] {tid}: {type(e).__name__}: {e}", file=sys.stderr)
     else:
         if not args.instance_id:
             ap.error("provide instance_id or --all")
-        run_one(args.instance_id, args.budget_usd, args.max_turns)
+        run_one(args.instance_id, args.budget_usd, args.max_turns, arm=args.arm)
 
 
 if __name__ == "__main__":

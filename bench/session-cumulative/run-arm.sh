@@ -23,6 +23,15 @@ EXTRA_ARGS=("$@")
 TURNS_FILE=${TURNS_FILE:-turns.txt}
 OUT_DIR=${OUT_DIR:-./out/$ARM}
 
+# 2026-08-07: turn-1-gaming persisted even after decoupling turn 1's topic
+# from the task (see 2026-08-07-turn1-gaming-and-crg.md) -- every arm,
+# files-mode included, front-loaded the whole 10-turn task into turn 1
+# regardless of prompt content. This is a blunt countermeasure: tell the
+# model directly not to do that. Applied on every invocation (not just
+# turn 1) since --append-system-prompt's persistence across --resume is
+# unverified -- cheaper to just always pass it than to check.
+TURN_BUDGET_PROMPT='This is one turn in a longer, incremental multi-turn session. Only do what THIS message asks -- nothing more. Do not implement, test, or otherwise act on functionality that later messages might request, even if you can infer what a natural next step would be. Further instructions will follow in later messages; stop when this message'"'"'s request is done.'
+
 mkdir -p "$OUT_DIR"
 
 # #180 / #174 plumbing: capture defn serve's stderr JSONL for this arm.
@@ -98,6 +107,7 @@ while IFS= read -r prompt; do
             --output-format stream-json --verbose \
             --dangerously-skip-permissions \
             --strict-mcp-config \
+            --append-system-prompt "$TURN_BUDGET_PROMPT" \
             "${EXTRA_ARGS[@]}" \
             -- "$prompt") > "$OUT_FILE" 2> "$OUT_FILE.err" || {
             echo "[$ARM] turn $TURN FAILED, stderr:"
@@ -111,6 +121,7 @@ while IFS= read -r prompt; do
             --output-format stream-json --verbose \
             --dangerously-skip-permissions \
             --strict-mcp-config \
+            --append-system-prompt "$TURN_BUDGET_PROMPT" \
             "${EXTRA_ARGS[@]}" \
             -- "$prompt") > "$OUT_FILE" 2> "$OUT_FILE.err" || {
             echo "[$ARM] turn $TURN FAILED, stderr:"
