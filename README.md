@@ -9,17 +9,22 @@
 
 Edit through defn or edit files directly. Either side auto-syncs to the other. Either can recover the other.
 
-**"What breaks if I change this function?"** Tested on [gin-gonic/gin](https://github.com/gin-gonic/gin) (24K lines, 1,580 definitions):
+defn ships as an MCP tool: point Claude Code, Codex, or any MCP-capable agent at a Go repo and it queries the graph instead of grepping files.
 
-> **Without defn:** grep → read 5 files → scroll → guess
-> 9 calls | 144K tokens | 45s | found 19 of 21 callers | no transitives | no test count
+**"What breaks if I change this function?"** In [gin-gonic/gin](https://github.com/gin-gonic/gin), `(*responseWriter).WriteHeader` is called through the `http.ResponseWriter` interface, not directly — the kind of indirection grep can't follow:
 
-> **With defn:** `code(op:"impact", name:"Render")`
-> **2 calls | 51K tokens | 12s | 33 callers | 341 transitive | 238 tests** — including interface dispatch
+| | Tool calls | Wire cost <sup>[1](#fn-cost)</sup> | Wall time | Callers found | Transitive | Tests |
+|---|---|---|---|---|---|---|
+| grep + read | 5 | 2,415 tokens | 1.5s | 3 of 11 | — | — |
+| `code(op:"impact", name:"WriteHeader")` | 1 | 2,014 tokens | 0.02s | **11 of 11** | **306** | **226** |
+
+grep can't tell `WriteHeader` from `WriteHeaderNow`, or a real call site from a same-named method on an unrelated test type (`mockWriter`, `interceptedWriter`) — sorting that out took 4 more reads and still missed the 8 callers that only exist through interface dispatch. Transitive callers and test coverage aren't things grep computes at all; they need a call graph.
+
+<a name="fn-cost"></a><sub>1. This is the cost of one call, not a full session — an agent that uses defn *alongside* file tools rather than in place of them won't see this ratio hold across a whole session. Session-level cost is a separate, harder measurement; see [methodology](#methodology) below.</sub>
 
 ## What makes this different
 
-**Files don't know about each other.** grep finds text matches, not callers. Reading `context.go` doesn't tell you that `responseWriter` satisfies `ResponseWriter`, or that changing `WriteHeader` breaks 238 tests through interface dispatch. That information exists in the type system but dies when you close your editor.
+**Files don't know about each other.** grep finds text matches, not callers. Reading `context.go` doesn't tell you that `responseWriter` satisfies `ResponseWriter`, or that changing `WriteHeader` breaks 226 tests through interface dispatch. That information exists in the type system but dies when you close your editor.
 
 **defn makes it permanent.** It parses your code with `go/types` (the same type checker gopls uses) and stores the result in SQLite (`modernc.org/sqlite`, pure Go, no CGO). The reference graph persists across sessions, includes interface satisfaction, and is queryable:
 
@@ -96,7 +101,7 @@ One MCP tool — `code` — with an `op` field. Your AI agent calls it naturally
 | `untested` | Definitions without test coverage | — |
 | `edit` | Full body replace, OR fragment replace via `old_fragment`+`new_fragment` | `name` |
 | `insert` | Insert code after an anchor string | `name`, `after`, `body` |
-| `create` | Create (infers name/kind from body) | `body`, optional `module` |
+| `create` | Create def(s) from body — infers name/kind; with `file:` set, `body` may hold multiple declarations to author a whole new file in one call | `body`, optional `module`, `file?` |
 | `delete` | Remove + clean up references | `name` |
 | `rename` | Rename + update callers (AST-based, preserves comments) | `old_name`, `new_name` |
 | `move` | Move to another module | `name`, `module` |
@@ -130,11 +135,13 @@ Only one `defn serve` process can own a `.defn/` at a time — enforced via `sys
 
 ## Scale
 
+Measured fresh against defn v0.26.6 (Aug 2026):
+
 | Project | Lines | Defs | Refs | Init time |
 |---------|-------|------|------|-----------|
-| chi | 10K | 370 | 704 | 11s |
-| gin | 24K | 1,580 | 3,829 | 48s |
-| hugo | 218K | 10,221 | 22,209 | 7min |
+| chi | 11,690 | 494 | 965 | 2.6s |
+| gin | 24,099 | 1,877 | 3,815 | 32.4s |
+| hugo | 218K | 10,221 | 22,209 | 7min *(not re-measured this pass)* |
 
 Init is a one-time cost. Incremental resolve after edits is much faster.
 
