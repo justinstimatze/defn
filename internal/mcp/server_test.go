@@ -5225,3 +5225,110 @@ func TestHandleCreate_RolledBackCreateDoesNotClaimSuccess(t *testing.T) {
 		t.Errorf("expected the response to say the create was rolled back, got: %s", text)
 	}
 }
+
+// TestHandleOutline_ReflectsRenameOfCompoundReceiverName mirrors a real
+// bench trajectory (chi rate-limit task, defn-forced arm, 2026-08-07):
+// after renaming a pointer-receiver method via the "(*T).old" compound
+// name string, an immediate outline lookup by "(*T).new" returned the
+// OLD signature and doc, as if the rename hadn't happened. Reproduces
+// the exact call shape from that trajectory to check whether it's live.
+func TestHandleOutline_ReflectsRenameOfCompoundReceiverName(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	if _, _, err := s.handleCreate(context.Background(), nil, createParam{
+		Body: "type tokenBucket struct{ tokens int }",
+		File: "bucket.go",
+	}); err != nil {
+		t.Fatalf("setup: create tokenBucket: %v", err)
+	}
+	createResult, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body: "func (b *tokenBucket) allow() bool { if b.tokens <= 0 { return false }; b.tokens--; return true }",
+		File: "bucket.go",
+	})
+	if !strings.Contains(resultText(t, createResult), "Created") {
+		t.Fatalf("setup: create allow failed: %s", resultText(t, createResult))
+	}
+
+	renameResult, _, err := s.handleRename(context.Background(), nil, renameParam{
+		OldName: "(*tokenBucket).allow",
+		NewName: "acquire",
+	})
+	if err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if renameResult == nil || !strings.Contains(resultText(t, renameResult), "Renamed") {
+		t.Fatalf("rename did not report success: %v", resultText(t, renameResult))
+	}
+
+	outlineResult, _, err := s.handleOutline(context.Background(), nil, nameParam{Name: "(*tokenBucket).acquire"})
+	if err != nil {
+		t.Fatalf("outline after rename: %v", err)
+	}
+	out := resultText(t, outlineResult)
+	if strings.Contains(out, "allow()") {
+		t.Errorf("outline after rename still shows the OLD name/signature:\n%s", out)
+	}
+	if !strings.Contains(out, "acquire()") {
+		t.Errorf("outline after rename does not show the NEW name/signature:\n%s", out)
+	}
+}
+
+// TestHandleRename_CompoundOldNameStillUpdatesCallers is the caller-side
+// counterpart to TestHandleOutline_ReflectsRenameOfCompoundReceiverName:
+// same root cause (astRename needs a bare identifier but got the
+// receiver-qualified "(*T).method" old_name), different symptom -- a
+// real caller referencing the old method name silently kept calling it,
+// because `strings.Contains(caller.Body, args.OldName)` never matched
+// (the caller body has `b.allow()`, not the literal compound string) so
+// the caller wasn't even selected for update, let alone renamed.
+func TestHandleRename_CompoundOldNameStillUpdatesCallers(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	if _, _, err := s.handleCreate(context.Background(), nil, createParam{
+		Body: "type tokenBucket struct{ tokens int }",
+		File: "bucket.go",
+	}); err != nil {
+		t.Fatalf("setup: create tokenBucket: %v", err)
+	}
+	if _, _, err := s.handleCreate(context.Background(), nil, createParam{
+		Body: "func (b *tokenBucket) allow() bool { if b.tokens <= 0 { return false }; b.tokens--; return true }",
+		File: "bucket.go",
+	}); err != nil {
+		t.Fatalf("setup: create allow: %v", err)
+	}
+	if _, _, err := s.handleCreate(context.Background(), nil, createParam{
+		Body: "func tryOnce(b *tokenBucket) bool { return b.allow() }",
+		File: "bucket.go",
+	}); err != nil {
+		t.Fatalf("setup: create tryOnce: %v", err)
+	}
+
+	renameResult, _, err := s.handleRename(context.Background(), nil, renameParam{
+		OldName: "(*tokenBucket).allow",
+		NewName: "acquire",
+	})
+	if err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	out := resultText(t, renameResult)
+	if strings.Contains(out, "Updated 0 callers") {
+		t.Errorf("rename reported 0 callers updated, expected tryOnce to be counted:\n%s", out)
+	}
+
+	caller, err := db.GetDefinitionByName("tryOnce", "")
+	if err != nil {
+		t.Fatalf("lookup tryOnce: %v", err)
+	}
+	if strings.Contains(caller.Body, "b.allow()") {
+		t.Errorf("caller still calls the OLD method name:\n%s", caller.Body)
+	}
+	if !strings.Contains(caller.Body, "b.acquire()") {
+		t.Errorf("caller was not updated to call the NEW method name:\n%s", caller.Body)
+	}
+}

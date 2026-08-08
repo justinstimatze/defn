@@ -4269,11 +4269,18 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// for deletes in b274ccc; the same shape recurs for renames).
 	qualifiedOld := emit.FuncIdentity(d.Name, d.Receiver)
 	originalID := d.ID
+	// astRename matches bare *ast.Ident nodes, but args.OldName may be the
+	// receiver-qualified "(*T).method" form GetDefinitionByName also
+	// accepts (and that method disambiguation naturally produces) -- that
+	// never matches a real identifier, so capture the resolved bare name
+	// once, before d.Name is mutated below, and use it for every AST-level
+	// operation instead of the possibly-qualified args.OldName.
+	oldBareName := d.Name
 
 	// Update the definition name in its own body using AST rename.
 	// Only renames identifiers — preserves comments and string literals.
 	totalSkipped := 0
-	newBody, _ := astRename(d.Body, args.OldName, args.NewName)
+	newBody, _ := astRename(d.Body, oldBareName, args.NewName)
 	newSig := extractSignature(newBody)
 	exported := len(args.NewName) > 0 && args.NewName[0] >= 'A' && args.NewName[0] <= 'Z'
 
@@ -4307,9 +4314,9 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	}
 	updated := 0
 	for _, caller := range callers {
-		if strings.Contains(caller.Body, args.OldName) {
+		if strings.Contains(caller.Body, oldBareName) {
 			var skipped int
-			caller.Body, skipped = astRename(caller.Body, args.OldName, args.NewName)
+			caller.Body, skipped = astRename(caller.Body, oldBareName, args.NewName)
 			totalSkipped += skipped
 			caller.Signature = extractSignature(caller.Body)
 			if _, err := s.backend.UpsertDefinition(&caller); err != nil {
