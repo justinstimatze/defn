@@ -1069,8 +1069,34 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		// file) -- see readShapedOps for why it moved here instead of
 		// counting as a singleton.
 		isBatch := args.Op == "context" || args.Op == "apply" || args.Op == "overview" || (args.Op == "expand" && len(args.Names) >= 2)
+		nameForTracking := args.Name
+		if args.Op == "expand" && len(args.Names) == 1 {
+			nameForTracking = args.Names[0]
+		}
+		s.trackReadShapedName(sc, args.Op, nameForTracking)
 		breakerMsg := s.circuitBreakerCheck(sc, args.Op, isBatch)
+		// A block on a nameable op does not just refuse -- it auto-batches
+		// every name seen since the last reset into one expand call instead.
+		// Measured motivation (2026-08-08 pilot digging): a bare refusal
+		// assumes the model immediately restructures its whole remaining
+		// strategy after one denial. It often doesn't -- one real
+		// trajectory hit 11 CONSECUTIVE blocked calls (26% of that
+		// trajectory's entire tool budget) before switching to batching,
+		// each one a full round-trip returning zero information. This
+		// makes the server robust to that instead of depending on the
+		// model's compliance.
+		var autoNames []string
+		if breakerMsg != "" && nameableReadOps[args.Op] && len(sc.pendingReadNames) > 0 {
+			autoNames = append([]string(nil), sc.pendingReadNames...)
+			sc.pendingReadNames = nil
+			sc.readShapedCount = 0
+		}
 		s.respCache.mu.Unlock()
+		if len(autoNames) > 0 {
+			r, o, e := wrapStale(s.handleExpand(ctx, req, codeParam{Names: autoNames, Include: []string{"outline", "callers"}}))
+			note := fmt.Sprintf("[circuit breaker: auto-batched %d individual lookups this turn (%s) into one expand call instead of refusing -- call code(op:\"context\"/op:\"expand\", names:[...]) yourself next time to skip this extra round-trip.]\n\n", len(autoNames), strings.Join(autoNames, ", "))
+			return prependNote(r, note), o, e
+		}
 		if breakerMsg != "" {
 			return textResult(breakerMsg), nil, nil
 		}
@@ -7815,4 +7841,16 @@ func (s *server) resolveEditTarget(name, receiver, module, file string) (*store.
 		}
 	}
 	return d, err
+}
+
+// prependNote prepends note to a successful text result's content,
+// mirroring handleCode's wrapStale helper. No-op on an error result or
+// unexpected content shape.
+func prependNote(r *sdkmcp.CallToolResult, note string) *sdkmcp.CallToolResult {
+	if r != nil && !r.IsError && len(r.Content) > 0 {
+		if tc, ok := r.Content[0].(*sdkmcp.TextContent); ok {
+			tc.Text = note + tc.Text
+		}
+	}
+	return r
 }

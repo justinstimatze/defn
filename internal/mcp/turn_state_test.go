@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -276,5 +277,60 @@ func TestCheckCompactionEpoch_MissingFileIsNoOp(t *testing.T) {
 	s.checkCompactionEpoch(sc)
 	if sc.compactionEpoch != 5 {
 		t.Fatalf("missing epoch file should be a no-op, got %d", sc.compactionEpoch)
+	}
+}
+
+// TestHandleCode_CircuitBreakerAutoBatchesInsteadOfRefusing is the
+// end-to-end counterpart to the circuitBreakerCheck unit tests above.
+// Measured motivation (2026-08-08 pilot digging): a bare refusal assumes
+// the model immediately restructures its whole remaining strategy after
+// one denial. Real trajectories showed that assumption failing badly --
+// one hit 11 CONSECUTIVE blocked calls (26% of that trajectory's entire
+// tool budget), each a full round-trip returning zero information,
+// before the model adapted. This proves the block now auto-batches the
+// names seen this turn into one expand call and serves real content
+// instead of just nagging.
+func TestHandleCode_CircuitBreakerAutoBatchesInsteadOfRefusing(t *testing.T) {
+	t.Setenv("DEFN_CIRCUIT_BREAKER", "2")
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
+
+	for _, name := range []string{"Greet", "Farewell"} {
+		r, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: name})
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if strings.Contains(resultText(t, r), "circuit breaker") {
+			t.Fatalf("read %s should be within threshold, got: %s", name, resultText(t, r))
+		}
+	}
+
+	// Third read is past threshold=2 -- must auto-batch Greet+Farewell+main
+	// via expand instead of a bare refusal.
+	third, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "main"})
+	if err != nil {
+		t.Fatalf("third read: %v", err)
+	}
+	text := resultText(t, third)
+	if !strings.Contains(text, "auto-batched") {
+		t.Fatalf("expected an auto-batch note, got: %s", text)
+	}
+	for _, name := range []string{"Greet", "Farewell", "main"} {
+		if !strings.Contains(text, name) {
+			t.Errorf("auto-batched result missing %s: %s", name, text)
+		}
+	}
+
+	// The auto-batch redirect must itself count as a reset -- the next
+	// singleton call should NOT be immediately blocked again.
+	fourth, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "Greet"})
+	if err != nil {
+		t.Fatalf("fourth read: %v", err)
+	}
+	if strings.Contains(resultText(t, fourth), "circuit breaker") {
+		t.Fatalf("expected fresh budget after auto-batch reset, got: %s", resultText(t, fourth))
 	}
 }

@@ -45,6 +45,7 @@ func (s *server) checkTurnBoundary(sc *sessionCache) {
 	if token != "" && token != sc.turnToken {
 		sc.turnToken = token
 		sc.readShapedCount = 0
+		sc.pendingReadNames = nil
 	}
 }
 
@@ -54,6 +55,7 @@ func (s *server) circuitBreakerCheck(sc *sessionCache, op string, isBatch bool) 
 	}
 	if isBatch {
 		sc.readShapedCount = 0
+		sc.pendingReadNames = nil
 		return ""
 	}
 	if !readShapedOps[op] {
@@ -166,4 +168,32 @@ func (s *server) checkCompactionEpoch(sc *sessionCache) {
 	if n > sc.compactionEpoch {
 		sc.compactionEpoch = n
 	}
+}
+
+// nameableReadOps is the subset of readShapedOps that resolve a single
+// named definition -- read/outline/impact/methods by name:, or expand
+// with exactly one entry in names:. A circuit-breaker block on one of
+// these can redirect through expand with the names accumulated this
+// turn instead of just refusing, since there's a concrete def to serve.
+// search has no such resolution (pattern-based, no single target) and
+// keeps the plain refusal.
+var nameableReadOps = map[string]bool{
+	"read": true, "outline": true, "impact": true, "methods": true, "expand": true,
+}
+
+// trackReadShapedName records name for a possible circuit-breaker
+// auto-batch redirect. Called for every read-shaped call regardless of
+// whether it ends up blocked, so a later block can reconstruct the
+// whole turn's want-list. Cleared wherever readShapedCount resets
+// (batch call, new turn, or after a redirect consumes it).
+func (s *server) trackReadShapedName(sc *sessionCache, op, name string) {
+	if strings.TrimSpace(name) == "" || !nameableReadOps[op] {
+		return
+	}
+	for _, n := range sc.pendingReadNames {
+		if n == name {
+			return
+		}
+	}
+	sc.pendingReadNames = append(sc.pendingReadNames, name)
 }

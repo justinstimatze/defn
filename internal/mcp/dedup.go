@@ -53,6 +53,11 @@ type sessionCache struct {
 	compactionEpoch int64
 	bodyServed      map[string]int64 // #176/#227: name -> compaction epoch when its full body (read full:true) was served this session
 	justMutated     map[string]bool  // names changed by the most recent write op; consumed once by the next read to force full body instead of the summary-mode default
+	// pendingReadNames accumulates the resolved name of every nameable
+	// read-shaped call (see nameableReadOps) since the last reset, so a
+	// circuit-breaker block can auto-batch them via expand instead of
+	// just refusing. Reset alongside readShapedCount.
+	pendingReadNames []string
 }
 
 type cacheEntry struct {
