@@ -4489,6 +4489,9 @@ func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args n
 	}
 
 	if len(impact.Tests) == 0 {
+		if d.Test {
+			return textResult(fmt.Sprintf("%s is itself a test function, not something other tests cover — run it directly with test:%q (the `test` param runs a test by name; `name` looks up coverage).", args.Name, args.Name)), nil, nil
+		}
 		return textResult(fmt.Sprintf("No tests cover %s. Nothing to run.", args.Name)), nil, nil
 	}
 

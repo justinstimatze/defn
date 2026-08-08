@@ -5397,3 +5397,36 @@ func TestHandleCode_ReadOutlineFileOnlyErrorSuggestsOverview(t *testing.T) {
 		})
 	}
 }
+
+// TestHandleTest_OnTestFunctionSuggestsTestParam covers a gap seen
+// independently in three real head-to-head-go trajectories: an agent
+// calling op:"test", name:"TestFoo" on a test function it just wrote,
+// expecting it to run. handleTest's name param means "what tests cover
+// this def", so for a test function itself (nothing calls a test) it
+// always returned the generic "No tests cover TestFoo. Nothing to run." --
+// indistinguishable from a real dead-code case, forcing a second call with
+// the differently-named test: param to actually run it.
+func TestHandleTest_OnTestFunctionSuggestsTestParam(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	create, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op:   "create",
+		File: "main.go",
+		Body: "func TestSomethingNew(t *testing.T) {}",
+	})
+	if strings.Contains(resultText(t, create), "rolled back") {
+		t.Fatalf("setup create failed: %s", resultText(t, create))
+	}
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "test", Name: "TestSomethingNew"})
+	text := resultText(t, result)
+	if !strings.Contains(text, `test:"TestSomethingNew"`) {
+		t.Errorf("expected a pointer to test:\"TestSomethingNew\", got: %s", text)
+	}
+	if strings.Contains(text, "No tests cover") {
+		t.Errorf("still using the generic dead-code message for a test function: %s", text)
+	}
+}
