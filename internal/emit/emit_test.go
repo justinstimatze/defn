@@ -1798,39 +1798,6 @@ func TestEmitExcludesFieldKindFromTopLevelDecls(t *testing.T) {
 	}
 }
 
-func TestEmitZeroDefModuleWithKnownFileSourcesStillCleansUp(t *testing.T) {
-	// The legitimate case the zero-defs cleanup exists for must still
-	// work: a module defn genuinely used to manage (file_sources
-	// populated by a prior ingest/emit) whose last definition was
-	// deleted should still have its emitted file removed.
-	db := testDB(t)
-	mod, err := db.EnsureModule("example.com/test/pkg", "pkg", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.SetFileSource(mod.ID, "pkg/pkg.go", "package pkg\n"); err != nil {
-		t.Fatal(err)
-	}
-
-	outDir := t.TempDir()
-	pkgDir := filepath.Join(outDir, "pkg")
-	if err := os.MkdirAll(pkgDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	trackedPath := filepath.Join(pkgDir, "pkg.go")
-	if err := os.WriteFile(trackedPath, []byte("package pkg\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := EmitWithOpts(db, outDir, Opts{}); err != nil {
-		t.Fatalf("emit: %v", err)
-	}
-
-	if _, err := os.Stat(trackedPath); !os.IsNotExist(err) {
-		t.Fatalf("expected the tracked, now-empty module's file to be removed, stat err = %v", err)
-	}
-}
-
 func TestEmitZeroDefPhantomModuleDoesNotDeleteRealFile(t *testing.T) {
 	// Regression test for task #239: a module row can reach zero defs
 	// without defn ever having written real content for it -- e.g. an
@@ -1888,5 +1855,48 @@ func TestEmitZeroDefPhantomModuleDoesNotDeleteRealFile(t *testing.T) {
 	}
 	if string(got) != string(realContent) {
 		t.Fatalf("real file was modified:\n%s", got)
+	}
+}
+
+func TestEmitZeroDefModuleNeverDeletesEvenWithFileSources(t *testing.T) {
+	// file_sources being populated used to be treated as proof defn
+	// legitimately managed this file, safe to delete once its defs hit
+	// zero. Task #239's real root cause disproved that: the incremental
+	// ingest fast path can populate file_sources for a file under the
+	// WRONG module path (nested-module directories walkGoFiles now skips
+	// -- see TestWalkGoFilesSkipsNestedModule) and never reliably capture
+	// its definitions. file_sources alone is not proof of anything.
+	// emitModule must never delete on zero defs, full stop -- a user who
+	// wants a file gone after deleting its last definition can rm it.
+	db := testDB(t)
+	mod, err := db.EnsureModule("example.com/test/pkg", "pkg", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetFileSource(mod.ID, "pkg/pkg.go", "package pkg\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	outDir := t.TempDir()
+	pkgDir := filepath.Join(outDir, "pkg")
+	if err := os.MkdirAll(pkgDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	trackedPath := filepath.Join(pkgDir, "pkg.go")
+	content := []byte("package pkg\n")
+	if err := os.WriteFile(trackedPath, content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := EmitWithOpts(db, outDir, Opts{}); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+
+	got, err := os.ReadFile(trackedPath)
+	if err != nil {
+		t.Fatalf("file was deleted despite the never-delete policy: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Fatalf("file was modified:\n%s", got)
 	}
 }

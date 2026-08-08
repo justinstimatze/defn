@@ -377,30 +377,22 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 	}
 	defs = fieldFree
 	if len(defs) == 0 {
-		// No definitions — clean up any previously emitted files for this
-		// module. Scoped emit skips this cleanup: a singleton rename/edit
-		// against an unrelated module shouldn't garbage-collect it.
-		if scoped {
-			return nil, nil, nil, nil
-		}
-		// Only remove files defn has independent evidence it actually
-		// wrote before (raw source captured in file_sources during some
-		// prior ingest). A module can reach zero defs without ever having
-		// had real content -- see the ingestPackage guard in
-		// internal/ingest/ingest.go for the build-tag-exclusion case that
-		// used to create these phantom rows. Guessing a filename from
-		// mod.Name and deleting it blindly is what turned a phantom
-		// zero-def module row into real file deletion on a real grpc-go
-		// checkout (task #239): resolver/passthrough.go,
-		// security/advancedtls.go and others were removed despite defn
-		// never having ingested a single def from them.
-		rawSources, rerr := db.ListFileSources(mod.ID)
-		if rerr != nil || len(rawSources) == 0 {
-			return nil, nil, nil, nil
-		}
-		for sourceFile := range rawSources {
-			os.Remove(filepath.Join(outDir, sourceFile))
-		}
+		// No definitions -- nothing to write. This used to also delete
+		// any previously-emitted file for the module, guessing its name
+		// from mod.Name (later: from file_sources). Both guesses turned
+		// out unsafe (task #239): a module can reach zero defs without
+		// defn ever having correctly captured its content -- e.g. a
+		// nested Go module (its own go.mod, like grpc-go's
+		// security/advancedtls or test/tools) that the incremental
+		// ingest fast path's filesystem walk discovers and ingests
+		// under the WRONG (root) module path, only for the following
+		// resolve pass to unreliably wipe what it just added. Both the
+		// module row and file_sources end up populated regardless of
+		// whether the defs stuck, so neither was ever reliable proof
+		// defn owns the on-disk file. Never delete here; a module
+		// stuck at zero defs is simply not emitted. If a user genuinely
+		// wants a file removed after deleting its last definition,
+		// that's an `rm`, not something defn should guess at.
 		return nil, nil, nil, nil
 	}
 

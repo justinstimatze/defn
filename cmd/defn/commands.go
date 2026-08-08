@@ -1441,6 +1441,25 @@ func walkGoFiles(projectDir string, since int64) (all []string, stale []string) 
 				name == "node_modules" || name == "testdata" {
 				return filepath.SkipDir
 			}
+			// #239 followup: a subdirectory with its own go.mod is a
+			// separate Go module (common for tooling/examples/experimental
+			// subtrees -- e.g. grpc-go's security/advancedtls, test/tools).
+			// goload.LoadAll's packages.Load("./...") correctly never
+			// crosses this boundary, so the full ingest never has defs for
+			// it. Without this guard, this raw walk found it anyway,
+			// ingest.IngestFile ingested it using the WRONG (root) go.mod's
+			// module path, and a subsequent resolve pass against that
+			// mis-scoped package produced unreliable results -- sometimes
+			// the real definitions, sometimes none. A module stuck at zero
+			// defs then looked, to callers, indistinguishable from one
+			// whose last real definition was legitimately deleted. Treat
+			// nested go.mod the same as any other module boundary: don't
+			// walk into it.
+			if path != projectDir {
+				if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
+					return filepath.SkipDir
+				}
+			}
 			return nil
 		}
 		if !strings.HasSuffix(path, ".go") {
