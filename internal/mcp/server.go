@@ -2283,9 +2283,19 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Updated %s%s (id=%d, hash=%s)\n", recv, d.Name, id, store.HashBody(args.NewBody)[:12]))
 	if buildResult != "" {
-		sb.WriteString("\n" + buildResult)
+		// commitOrRollbackOnBuild/commitOrRollbackOnEmit's contract: any
+		// non-empty result means the whole transaction was rolled back --
+		// the id above was never durable. Saying "Updated X (id=N)" here,
+		// even followed by a build-failure dump, reads as "it saved, but
+		// something else is also broken" rather than "nothing was saved."
+		// Same misleading-message bug handleCreate already got fixed for;
+		// a real trajectory hit this exact shape here too (three
+		// sequential edits, each showing "Updated X ... BUILD FAILED",
+		// while chasing a signature change across call sites).
+		sb.WriteString(fmt.Sprintf("edit %s%s rolled back — nothing was saved\n\n%s", recv, d.Name, buildResult))
+	} else {
+		sb.WriteString(fmt.Sprintf("Updated %s%s (id=%d, hash=%s)\n", recv, d.Name, id, store.HashBody(args.NewBody)[:12]))
 	}
 
 	// Impact nudge: show callers if this definition has any. Only on
@@ -2854,13 +2864,17 @@ func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest
 	buildResult := s.commitOrRollbackOnBuild(tx, commit, rollback, opts)
 
 	var sb strings.Builder
-	replaced := "1 occurrence"
-	if args.ReplaceAll {
-		replaced = fmt.Sprintf("%d occurrences", count)
-	}
-	sb.WriteString(fmt.Sprintf("Edited %s%s — replaced %s\n", recv, d.Name, replaced))
 	if buildResult != "" {
-		sb.WriteString("\n" + buildResult)
+		// Same misleading-message fix as handleEdit -- see its comment
+		// for the full rationale. commitOrRollbackOnBuild's contract:
+		// non-empty means the whole transaction was rolled back.
+		sb.WriteString(fmt.Sprintf("edit %s%s rolled back — nothing was saved\n\n%s", recv, d.Name, buildResult))
+	} else {
+		replaced := "1 occurrence"
+		if args.ReplaceAll {
+			replaced = fmt.Sprintf("%d occurrences", count)
+		}
+		sb.WriteString(fmt.Sprintf("Edited %s%s — replaced %s\n", recv, d.Name, replaced))
 	}
 
 	if buildResult == "" {

@@ -5595,3 +5595,53 @@ func TestHandleApply_EditReceiverDisambiguatesSameNamedMethod(t *testing.T) {
 		t.Errorf("A.Handle should be untouched, got: %s", resultText(t, readA))
 	}
 }
+
+// TestHandleEdit_BuildFailureMessageDoesNotClaimSuccess is the message-
+// wording counterpart to TestHandleEdit_SignatureChangedBuildFailureRollsBackBothDBAndFile:
+// that test only checked DB/file state, not the response text. A real
+// trajectory (2026-08-08) hit this exact shape three times in one
+// session -- "Updated X (id=N, hash=H)\n\nBUILD FAILED: ..." reads as
+// "it saved, but something else is also broken" rather than "nothing
+// was saved," the same misleading-message bug handleCreate already got
+// fixed for.
+func TestHandleEdit_BuildFailureMessageDoesNotClaimSuccess(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleEdit(context.Background(), nil, editParam{
+		Name:    "Greet",
+		NewBody: "func Greet(name string, extra int) string { return undefinedHelperFunc(name, extra) }",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "rolled back — nothing was saved") {
+		t.Errorf("expected an explicit rollback message, got: %s", text)
+	}
+	if strings.Contains(text, "Updated Greet (id=") {
+		t.Errorf("still claims success alongside the build failure: %s", text)
+	}
+}
+
+// TestHandleFragmentEdit_BuildFailureMessageDoesNotClaimSuccess is the
+// fragment-edit counterpart to TestHandleEdit_BuildFailureMessageDoesNotClaimSuccess.
+func TestHandleFragmentEdit_BuildFailureMessageDoesNotClaimSuccess(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleFragmentEdit(context.Background(), nil, codeParam{
+		Op:          "edit",
+		Name:        "Greet",
+		OldFragment: `return "Hello, " + name`,
+		NewFragment: `return undefinedHelperFunc(name)`,
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "rolled back — nothing was saved") {
+		t.Errorf("expected an explicit rollback message, got: %s", text)
+	}
+	if strings.Contains(text, "Edited Greet — replaced") {
+		t.Errorf("still claims success alongside the build failure: %s", text)
+	}
+}
