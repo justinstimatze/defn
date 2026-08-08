@@ -55,11 +55,26 @@ def normalize_path(p, prefix_workdir):
 
 
 _SAFE_DEFNAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
+_SAFE_RECEIVER = re.compile(r"^\*?[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def resolve_defname_to_file(name, workdir):
+def resolve_defname_to_file(name, workdir, receiver=None):
     """Ask defn where a named def lives. Returns list of candidate paths
-    (possibly multiple — same def name across packages) or empty list."""
+    (possibly multiple — same def name across packages) or empty list.
+
+    Without a receiver, a bare name query can silently over-match: e.g.
+    grpc-go defines regeneratePicker in both balancer/grpclb/grpclb.go and
+    an unrelated balancer/base/balancer.go, and virtually every
+    balancer.Balancer implementation across the repo defines the same
+    lifecycle method names (HandleSubConnStateChange, etc). An edit call
+    that correctly disambiguated by receiver at the tool layer would still
+    get every matching file counted as "touched" here, inflating the
+    scored file-touch count (and tanking precision) for something the arm
+    never actually wrote to. Found 2026-08-08 via a real grpc-go-2631
+    trajectory: reported touched=12 for an edit that only landed in 2
+    files, traced to this exact query never using the receiver the tool
+    call actually specified.
+    """
     if not name or not workdir or not os.path.isdir(os.path.join(workdir, ".defn")):
         return []
     # `name` comes from agent trajectory tool_call args. Reject anything
@@ -68,13 +83,19 @@ def resolve_defname_to_file(name, workdir):
     # accepts raw SQL so we cannot rely on it to parameterize.
     if not _SAFE_DEFNAME.match(name):
         return []
-    # Method names arrive as "Receiver.Method" (agent syntax) but the DB
-    # stores the bare name in the `name` column and the receiver separately.
-    # Split on the last dot so top-level identifiers with dots (rare) still
-    # match; if the split half hits any def with the receiver-ish column
-    # non-null we prefer that, else fall back to the whole-name query.
-    if "." in name:
+    # defn's actual `code` tool schema passes name and receiver as
+    # separate JSON fields (e.g. {"name": "Pick", "receiver": "*lbPicker"}),
+    # never as a single dotted "Receiver.Method" string -- prefer an
+    # explicit receiver arg when the caller has one.
+    recv = None
+    bare = name
+    if receiver and _SAFE_RECEIVER.match(receiver):
+        recv = receiver
+    elif "." in name:
+        # Fallback for a dotted-name calling convention, in case some
+        # other harness or agent shape uses it.
         recv, bare = name.rsplit(".", 1)
+    if recv:
         sql = (
             "SELECT DISTINCT source_file FROM definitions "
             f"WHERE name = '{bare}' AND (receiver = '{recv}' "
@@ -175,7 +196,7 @@ def arm_touched_files(arm_data, workdir_hint):
                         touched.add(normalize_path(f, workdir_hint))
                     else:
                         for f in resolve_defname_to_file(
-                            args.get("name"), workdir_hint
+                            args.get("name"), workdir_hint, args.get("receiver")
                         ):
                             touched.add(normalize_path(f, workdir_hint))
                 elif op == "apply":
@@ -185,7 +206,7 @@ def arm_touched_files(arm_data, workdir_hint):
                             touched.add(normalize_path(f, workdir_hint))
                         else:
                             for f in resolve_defname_to_file(
-                                sub.get("name"), workdir_hint
+                                sub.get("name"), workdir_hint, sub.get("receiver")
                             ):
                                 touched.add(normalize_path(f, workdir_hint))
             # files-mode arm: Edit/Write/MultiEdit are the actual write
