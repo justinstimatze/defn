@@ -278,3 +278,57 @@ var Sample = Provenance{
 		t.Errorf("Quote stored as %q; want %q (BinaryExpr collapse regression)", rows[0].FieldValue, want)
 	}
 }
+
+func TestResolveFileRefreshesCallRefsFromTestFile(t *testing.T) {
+	// Regression probe for a friction point found in a real head-to-head-go
+	// trajectory: after a projection-op edit (replace-hunk) rewrote a
+	// _test.go function's call target, code(op:"delete") on the OLD
+	// target still refused with "callers still reference this def" --
+	// even after an explicit code(op:"sync", file:<the test file>). Both
+	// paths funnel through ResolveFile, which hardcodes Tests: false.
+	// This reproduces that in isolation: does ResolveFile actually pick
+	// up a call-ref change made inside a _test.go file?
+	src := `package refsbug
+
+func A() int { return 1 }
+func B() int { return 2 }
+`
+	testSrc := `package refsbug
+
+func UseA() int { return A() }
+`
+	dir := writeModule(t, map[string]string{"main.go": src, "main_test.go": testSrc})
+
+	db := testDB(t)
+	if err := ingest.Ingest(db, dir); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if err := Resolve(db, dir); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	rs, _ := db.QueryRefs("UseA", "A", "call", 0)
+	if len(rs) == 0 {
+		t.Fatalf("setup: expected initial UseA -> A call ref")
+	}
+
+	// Edit: UseA now calls B instead of A -- the same shape as the
+	// real trajectory's replace-hunk rewriting a test's call target.
+	testSrc2 := `package refsbug
+
+func UseA() int { return B() }
+`
+	writeFile(t, dir, "main_test.go", testSrc2)
+
+	if _, err := ingest.IngestFile(db, dir, filepath.Join(dir, "main_test.go")); err != nil {
+		t.Fatalf("ingest file: %v", err)
+	}
+	if err := ResolveFile(db, dir, filepath.Join(dir, "main_test.go")); err != nil {
+		t.Fatalf("resolve file: %v", err)
+	}
+
+	rs, _ = db.QueryRefs("UseA", "A", "call", 0)
+	if len(rs) != 0 {
+		t.Errorf("ResolveFile left a stale UseA -> A call ref after the test file's call target changed: %+v -- this is exactly what makes code(op:\"delete\") on A wrongly refuse, and what an explicit code(op:\"sync\", file:<test file>) fails to fix, since handleSync's single-file path calls this same ResolveFile", rs)
+	}
+}

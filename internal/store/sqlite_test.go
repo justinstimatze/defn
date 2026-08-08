@@ -583,3 +583,53 @@ func TestQueryLiteralFields_DefIDsFilter(t *testing.T) {
 		t.Errorf("expected 0 fields for a nonexistent def ID, got %d", len(none))
 	}
 }
+
+func TestGetDefinitionByNameAndReceiver_ExactModuleMatchOnly(t *testing.T) {
+	// Regression test for a real bug found in a head-to-head-go
+	// trajectory: creating a package-level var alias in "zrpc" was
+	// rejected as "already exists" because a same-named function
+	// already existed in the UNRELATED module "zrpc/internal" -- the
+	// SQL used `m.path LIKE '%' || modulePath || '%'`, so "zrpc" as a
+	// substring of "zrpc/internal" false-collided. Every real caller
+	// (handleCreate's existence check, resolveEditTarget, the resolve
+	// package's def-ID lookups) passes an already-resolved, exact
+	// module path -- none of them want or expect fuzzy substring
+	// matching, unlike GetDefinitionByName's modulePath param (which
+	// can be raw user-typed shorthand and deliberately falls back to a
+	// fuzzy match after trying exact first).
+	db, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	inner, err := db.EnsureModule("example.com/pkg/inner", "inner", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.UpsertDefinition(&Definition{
+		ModuleID: inner.ID, Name: "Widget", Kind: "function", Exported: true,
+		Body: "func Widget() {}", SourceFile: "inner.go",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	outer, err := db.EnsureModule("example.com/pkg", "pkg", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// "example.com/pkg" is a prefix of "example.com/pkg/inner" -- the
+	// bug's exact shape. A lookup scoped to the outer module must NOT
+	// see the inner module's Widget.
+	if _, err := db.GetDefinitionByNameAndReceiver("Widget", outer.Path, ""); err == nil {
+		t.Fatalf("GetDefinitionByNameAndReceiver found %q in module %q via prefix collision with %q -- exact match should have found nothing", "Widget", outer.Path, inner.Path)
+	}
+
+	// Sanity: it's still found when scoped to the module it's actually in.
+	if d, err := db.GetDefinitionByNameAndReceiver("Widget", inner.Path, ""); err != nil {
+		t.Fatalf("expected to find Widget in its real module %q: %v", inner.Path, err)
+	} else if d.ModuleID != inner.ID {
+		t.Fatalf("found Widget in module_id=%d, want %d", d.ModuleID, inner.ID)
+	}
+}

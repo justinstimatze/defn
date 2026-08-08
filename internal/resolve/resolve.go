@@ -72,14 +72,24 @@ func ResolveFile(db store.Backend, projectDir, filePath string) error {
 		Dir: projectDir,
 		// Tests: false — #101 diagnosis. Tests:true forces go/packages to
 		// load both the package AND its external test variant, which
-		// nearly doubles the load cost (26s vs 1s on cli/cli). The
-		// per-file incremental path is only expected to refresh refs
-		// for defs in `filePath`'s own package; test→def refs from
-		// _test.go files get re-resolved when the test file itself is
-		// synced or during a full Resolve. If filePath IS a _test.go,
-		// the containing test package still loads (packages.Load "file="
-		// picks up the file's own package regardless of Tests).
-		Tests: false,
+		// nearly doubles the load cost (26s vs 1s on cli/cli). That cost
+		// is only worth avoiding when filePath is a production file --
+		// its own refs don't depend on the test variant loading at all.
+		//
+		// When filePath IS a _test.go file, the opposite used to be true
+		// silently: with Tests:false, go/packages excludes _test.go
+		// syntax from the package it returns, so the very file this call
+		// exists to re-resolve never got its own outgoing refs rebuilt.
+		// Confirmed via TestResolveFileDoesNotRefreshCallRefsFromTestFile
+		// -- a replace-hunk-edited test function's call ref stayed
+		// pointed at the old target through both the post-edit
+		// autoResolveFile call AND an explicit code(op:"sync",
+		// file:<test file>), since handleSync's single-file path also
+		// calls ResolveFile. Only a full, unscoped resolve ever picked
+		// it up. Loading the test variant here is the same one-package
+		// scoped cost either way -- Tests:true when filePath itself is
+		// the thing whose refs need refreshing.
+		Tests: strings.HasSuffix(filePath, "_test.go"),
 	}
 	tPL := time.Now()
 	pkgs, err := packages.Load(cfg, "file="+filePath)

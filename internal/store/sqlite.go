@@ -474,12 +474,23 @@ func (s *SQLiteDB) GetDefinitionByNameAndReceiver(name, modulePath, receiver str
 	var query string
 	var args []any
 	if modulePath != "" {
+		// Exact match only -- unlike GetDefinitionByName's modulePath
+		// param (which can be raw user-typed shorthand and deliberately
+		// falls back to a fuzzy LIKE match), every current caller here
+		// passes an already-resolved, fully-qualified module path
+		// (mod.Path from findModule/findModuleByFile, or pkgPath from
+		// go/types). A LIKE '%...%' match on that is never useful and
+		// is actively harmful: any module path that's a prefix of
+		// another (e.g. "zrpc" vs "zrpc/internal") false-collides,
+		// which is exactly what made handleCreate's existence check
+		// reject a legitimate create as "already exists" in the wrong
+		// module.
 		query = sqliteFullDefSelect + `
 		 FROM definitions d
 		 LEFT JOIN bodies b ON b.def_id = d.id
 		 JOIN modules m ON d.module_id = m.id
-		 WHERE d.name = ? AND m.path LIKE ? AND COALESCE(d.receiver,'') = ?`
-		args = []any{name, "%" + modulePath + "%", receiver}
+		 WHERE d.name = ? AND m.path = ? AND COALESCE(d.receiver,'') = ?`
+		args = []any{name, modulePath, receiver}
 	} else {
 		query = sqliteFullDefSelect + `
 		 FROM definitions d
