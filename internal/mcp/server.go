@@ -2167,6 +2167,20 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 		return errResult(fmt.Errorf("new_body has syntax error: %v", parseErr))
 	}
 
+	// A multi-decl new_body silently stores every extra declaration as
+	// literal text inside this ONE definition's Body -- it parses fine
+	// (Go allows several func decls in one string) and passes the
+	// identity check below (which only looks at the first decl), so
+	// nothing catches it here. The real trajectory this guards against:
+	// an edit's new_body concatenated 3 functions together, got stored
+	// verbatim under the first one's name, and a later sync/re-ingest of
+	// the emitted file split the extra two into duplicate definitions --
+	// producing a "redeclared in this block" build failure neither the
+	// edit nor the sync surfaced clearly.
+	if n := countTopLevelDecls(args.NewBody); n > 1 {
+		return errResult(fmt.Errorf("edit %s%s: new_body has %d top-level declarations — op:\"edit\" changes ONE definition's body; batch multiple changes with op:\"apply\", or use op:\"create\" with file: to add new declarations", formatReceiver(d.Receiver), d.Name, n))
+	}
+
 	// #222: edit must preserve identity. A new_body that declares a
 	// different name/receiver than d leaves d.Name/d.Receiver stale
 	// while the body says otherwise -- mergeDeclsIntoSource matches the
@@ -2797,6 +2811,13 @@ func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest
 	src := "package x\n" + newBody
 	if _, parseErr := parser.ParseFile(token.NewFileSet(), "", src, parser.ParseComments); parseErr != nil {
 		return errResult(fmt.Errorf("fragment edit produces invalid Go: %v", parseErr))
+	}
+
+	// Same multi-decl guard as handleEdit -- see its comment for the full
+	// story (a real trajectory hit this via new_body; a fragment
+	// replacement that inserts a whole extra declaration can hit it too).
+	if n := countTopLevelDecls(newBody); n > 1 {
+		return errResult(fmt.Errorf("edit %s%s: the fragment replacement produces %d top-level declarations — op:\"edit\" changes ONE definition's body; batch multiple changes with op:\"apply\"", formatReceiver(d.Receiver), d.Name, n))
 	}
 
 	if args.DryRun {
@@ -3713,6 +3734,12 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			validSrc := "package x\n" + d.Body
 			if _, parseErr := parser.ParseFile(token.NewFileSet(), "", validSrc, parser.ParseComments); parseErr != nil {
 				errors = append(errors, fmt.Sprintf("edit %s: produces invalid Go: %v", op.Name, parseErr))
+				continue
+			}
+			// Same multi-decl guard as handleEdit's standalone path -- see its
+			// comment for the full story.
+			if n := countTopLevelDecls(d.Body); n > 1 {
+				errors = append(errors, fmt.Sprintf("edit %s: new_body has %d top-level declarations — op:\"edit\" changes ONE definition's body; add separate edit/create ops to this same apply batch instead", op.Name, n))
 				continue
 			}
 			// #222: edit must preserve identity -- see handleEdit's identical

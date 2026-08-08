@@ -5430,3 +5430,97 @@ func TestHandleTest_OnTestFunctionSuggestsTestParam(t *testing.T) {
 		t.Errorf("still using the generic dead-code message for a test function: %s", text)
 	}
 }
+
+// TestHandleEdit_RejectsMultiDeclNewBody replicates a real head-to-head-go
+// trajectory bug (2026-08-08 pilot digging): new_body concatenated 3
+// function declarations as one string. edit had no multi-decl check
+// (unlike create's countTopLevelDecls guard) -- it parsed fine (Go allows
+// several func decls in one string) and passed the identity check (which
+// only looks at the first decl), so the whole blob got stored verbatim as
+// the target definition's Body. A later sync/re-ingest of the emitted
+// file then split the extra two decls into duplicate definitions,
+// producing a "redeclared in this block" build failure that took the
+// real agent over a dozen confused follow-up calls (a failed apply, four
+// failing replace-hunk attempts, a pointless rename-and-rename-back) to
+// work around.
+func TestHandleEdit_RejectsMultiDeclNewBody(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op:   "edit",
+		Name: "Greet",
+		NewBody: "func Greet(name string) string { return helper(name) }\n\n" +
+			"func helper(name string) string { return name }",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "top-level declarations") {
+		t.Fatalf("expected a multi-decl rejection, got: %s", text)
+	}
+
+	// Must not have been silently stored as a mangled body.
+	read, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "read", Name: "Greet"})
+	if strings.Contains(resultText(t, read), "func helper") {
+		t.Errorf("rejected edit still landed the extra decl into Greet's body: %s", resultText(t, read))
+	}
+}
+
+// TestHandleApply_EditRejectsMultiDeclNewBody is the apply-batched
+// counterpart to TestHandleEdit_RejectsMultiDeclNewBody -- same gap,
+// reached via handleApply's own "edit" case instead of the standalone
+// handleEdit path (both are exercised by real trajectories).
+func TestHandleApply_EditRejectsMultiDeclNewBody(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{
+				Op:   "edit",
+				Name: "Greet",
+				NewBody: "func Greet(name string) string { return helper(name) }\n\n" +
+					"func helper(name string) string { return name }",
+			},
+		},
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "top-level declarations") {
+		t.Fatalf("expected a multi-decl rejection, got: %s", text)
+	}
+
+	read, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "read", Name: "Greet"})
+	if strings.Contains(resultText(t, read), "func helper") {
+		t.Errorf("rejected batched edit still landed the extra decl into Greet's body: %s", resultText(t, read))
+	}
+}
+
+// TestHandleFragmentEdit_RejectsMultiDeclResult is the old_fragment/
+// new_fragment counterpart to TestHandleEdit_RejectsMultiDeclNewBody --
+// same gap, since a fragment replacement that inserts a whole extra
+// declaration produces the identical silently-mangled-body outcome.
+func TestHandleFragmentEdit_RejectsMultiDeclResult(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op:          "edit",
+		Name:        "Greet",
+		OldFragment: `return "Hello, " + name`,
+		NewFragment: "return helper(name)\n}\n\nfunc helper(name string) string {\n\treturn name",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "top-level declarations") {
+		t.Fatalf("expected a multi-decl rejection, got: %s", text)
+	}
+
+	read, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "read", Name: "Greet"})
+	if strings.Contains(resultText(t, read), "func helper") {
+		t.Errorf("rejected fragment edit still landed the extra decl into Greet's body: %s", resultText(t, read))
+	}
+}
