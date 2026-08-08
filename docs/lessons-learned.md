@@ -10,15 +10,17 @@ in a session re-pays that cost at the cache-write rate, not the cache-read
 rate — so trimming it is a direct multiplier on the single biggest cost
 driver found in this project's own 2026-08 caching investigation.
 
-## 2026-08-07/08: six real bugs from real trajectories, one self-healing design fix
+## 2026-08-07/08: twelve real bugs from real trajectories, two design fixes
 
 A two-day digging session working strictly from real `head-to-head-go`
-defn-arm trajectories (grpc-go, go-zero tasks on defn-bench) instead of
-theorizing about cost drivers — the standing practice this project
-follows because synthetic sweeps had previously missed exactly this
-class of bug. Every fix below traces to a specific, read line-by-line
-tool-call sequence, not a guess. Commits: `773eeed`, `008e271` (both
-released as `v0.26.14`), `9506b09`, `1004ba9`, `60fb503`, `b272b6e`.
+defn-arm trajectories (grpc-go, go-zero, cli/cli tasks on defn-bench)
+instead of theorizing about cost drivers — the standing practice this
+project follows because synthetic sweeps had previously missed exactly
+this class of bug. Every fix below traces to a specific, read
+line-by-line tool-call sequence, not a guess. Commits: `773eeed`,
+`008e271` (both released as `v0.26.14`), `9506b09`, `1004ba9`,
+`60fb503`, `b272b6e` (`v0.26.15`), `38b5dc8`, `2ef68af`, `d19ba62`,
+`dd51c81`, `77ba9a8` (`v0.26.16`+), `6b231ac`.
 
 - **`edit` silently corrupted a definition instead of rejecting a
   multi-decl body** (`b272b6e`) — the most serious of the six. A real
@@ -101,6 +103,56 @@ released as `v0.26.14`), `9506b09`, `1004ba9`, `60fb503`, `b272b6e`.
   needed no changes. Pilot-verified on the exact worst-case trajectory
   (the 11-consecutive-block one): re-run with the fix, that same task
   hit 0 plain blocks and 3 productive auto-batches instead.
+
+- **`similar` had two structurally different algorithms silently
+  swapped based on data shape** (`38b5dc8`, then collapsed further in
+  `2ef68af`). Per the `Project-reverted-similar-cardinality-comod`
+  postmortem, the reverted 2026-07-06 calque port was flagged for
+  blocking candidate discovery on a signature `LIKE` prefilter. The
+  live implementation (MinHash-of-body-shingles) moved past that for
+  bodied defs, but kept the exact same flawed `LIKE` fallback for any
+  def whose body was too short to shingle (interfaces, consts, vars) —
+  and `ComputeMinHash` returns a fixed all-max sentinel for short
+  input, so every such def would score 100% similar to every other one
+  if the primary path were used naively. Fix collapsed to one
+  unconditional formula: `ComputeMinHash(signature + "\n" + body)` for
+  every definition, no branching, no threshold. Not trajectory-proven
+  (no real run ever called `similar`) — proven directly via a
+  sentinel-collision unit test instead.
+- **`apply`'s name-based ops had no `receiver:` field at all**
+  (`d19ba62`). Every batched `edit`/`delete`/`rename`/projection op
+  resolved by bare name only, unlike every standalone handler (#219).
+  A real trajectory needed to edit a same-named method disambiguated
+  only by receiver, got a schema rejection passing `receiver:` into an
+  apply op, then burned ~10 more retries on stale fragments and
+  identity-check failures. Added `resolveApplyTarget`, a tx-aware
+  mirror of `resolveEditTarget`'s exact precedence. Live re-verification
+  on the same task: apply calls 10→3, writes 9→4, cost -31%, wall -30%.
+- **`edit`/`handleFragmentEdit` claimed success on a rolled-back
+  build** (`dd51c81`) — the identical anti-pattern `handleCreate`
+  already got fixed for (see its own code comment), never applied to
+  its two siblings. "Updated X (id=N)... BUILD FAILED" reads as
+  partial success, not total rollback. Hit twice independently
+  (cli-1069, grpc-2631).
+- **`replace-hunk`'s `old`/`new` didn't accept `edit`'s
+  `old_fragment`/`new_fragment` names** (`77ba9a8`) for the identical
+  before/after-text concept — hit independently in cli-1069
+  (standalone) and grpc-2631 (inside `apply`, mixing `edit` and
+  `replace-hunk`). Now aliased at both entry points instead of erroring.
+- **The bench harness itself was undercounting precision**
+  (`6b231ac`, `bench/head-to-head-go/score_correctness.py`) —
+  `resolve_defname_to_file`'s receiver-parsing branch assumed a
+  `"Receiver.Method"` dotted-name convention defn's tool schema never
+  actually uses (name and receiver are separate JSON fields). Every
+  name-only write matched every same-named def in the whole repo, not
+  just the one the tool call actually targeted. Confirmed via a real
+  grpc-go-2631 trajectory: `regeneratePicker` matched 2 files
+  (`balancer/grpclb/grpclb.go` + an unrelated `balancer/base/balancer.go`)
+  when the agent had correctly disambiguated by receiver at the tool
+  layer. This means some of this session's own "over-touching"
+  precision numbers were partly measurement artifacts, not real
+  agent misbehavior — a reminder that the measurement tool itself
+  needs the same trajectory-driven scrutiny as the thing it measures.
 
 Process note: mid-session the standing practice shifted from "ship a
 release per individual fix" (7 releases in one sitting the day before)
