@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -5782,5 +5783,87 @@ func TestHandleApply_RenamePointerReceiverMethodThenEditSameBatch(t *testing.T) 
 	}
 	if after.Body != "func (b *tokenBucket) acquire() bool { return b.tokens > 0 }" {
 		t.Errorf("DB's acquire body doesn't match the edit applied in the same batch: %q", after.Body)
+	}
+}
+
+// TestAlreadyFreshlyIngested guards the #241 fix: newMCPServer's startup
+// goroutine must skip its redundant full packages.Load+ingest+resolve
+// when the DB already covers every .go file on disk (e.g. right after
+// `defn init`/`defn ingest .`), and must NOT skip it otherwise -- a
+// false positive here would leave a genuinely stale or never-ingested
+// DB silently marked ready, which is worse than the "may be stale"
+// warning it replaces. Root-cause trajectory: a real grpc-go-2630 run
+// where the first `search` call raced the always-on reingest and
+// returned unrelated defs, leading the agent to edit the wrong function.
+func TestAlreadyFreshlyIngested(t *testing.T) {
+	t.Run("fresh right after ingest", func(t *testing.T) {
+		db, projDir := setupTestDB(t)
+		defer db.Close()
+		if !alreadyFreshlyIngested(db, projDir) {
+			t.Error("expected fresh DB right after ingest to be reported as already fresh")
+		}
+	})
+
+	t.Run("stale after a file is touched", func(t *testing.T) {
+		db, projDir := setupTestDB(t)
+		defer db.Close()
+
+		lastIngestStr, err := db.GetMeta("last_ingest")
+		if err != nil || lastIngestStr == "" {
+			t.Fatalf("expected last_ingest meta to be set after ingest, got %q, err=%v", lastIngestStr, err)
+		}
+		lastIngest, err := strconv.ParseInt(lastIngestStr, 10, 64)
+		if err != nil {
+			t.Fatalf("parse last_ingest: %v", err)
+		}
+
+		mainGo := filepath.Join(projDir, "main.go")
+		future := time.Unix(lastIngest+10, 0)
+		if err := os.Chtimes(mainGo, future, future); err != nil {
+			t.Fatalf("chtimes: %v", err)
+		}
+
+		if alreadyFreshlyIngested(db, projDir) {
+			t.Error("expected a file modified after last_ingest to be reported as NOT fresh")
+		}
+	})
+
+	t.Run("never ingested", func(t *testing.T) {
+		dir := t.TempDir()
+		db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		projDir := filepath.Join(dir, "testproj")
+		os.MkdirAll(projDir, 0755)
+		os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+
+		if alreadyFreshlyIngested(db, projDir) {
+			t.Error("expected a DB with no last_ingest meta to never be reported as fresh")
+		}
+	})
+}
+
+// TestHandleCode_TestOpWithTestFieldDoesNotRequireName guards the #241
+// fix: op:"test" with test:"TestX" (named-test reproduction, documented
+// as the way to replicate a bug report before touching any code) was
+// rejected with "test: name is required" because the pre-dispatch
+// validation switch grouped "test" with name-required ops (read/
+// outline/impact/delete/history/similar) without checking whether
+// test: had already been supplied.
+func TestHandleCode_TestOpWithTestFieldDoesNotRequireName(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{Op: "test", Test: "TestGreet"})
+	if err != nil {
+		t.Fatalf("handleCode: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "name is required") {
+		t.Errorf("op:test with test:\"TestGreet\" should not require name, got: %s", text)
 	}
 }

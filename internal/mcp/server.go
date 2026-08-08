@@ -16,6 +16,7 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
@@ -60,11 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-// Version is the running defn build's semver string. Kept as a package
-// constant so the CLI can compare its own version against what a
-// running serve reports via the /version HTTP endpoint, surfacing
-// binary/serve skew in `defn status`.
-const Version = "0.26.18"
+const Version = "0.26.19"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -334,6 +331,16 @@ func newMCPServer(ctx context.Context, database store.Backend, projDir string) (
 		// the client's connection timeout. Queries before completion serve
 		// from whatever's in the DB; results include a staleness notice.
 		go func() {
+			// #241: skip the redundant reload+ingest+resolve when the
+			// DB already covers every .go file on disk -- see
+			// alreadyFreshlyIngested's doc comment for the full story
+			// (a real grpc-go-2630 trajectory where this exact race
+			// corrupted search results and caused a wrong-function edit).
+			if alreadyFreshlyIngested(s.backend, projDir) {
+				s.ready.Store(true)
+				s.backfillNarratives(ctx)
+				return
+			}
 			if err := s.ingestAndResolve(); err != nil {
 				// "connection is already closed" means the DB was torn
 				// down mid-ingest (stdin EOF → db.Close()). Not a real
@@ -851,12 +858,24 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	}
 
 	switch args.Op {
-	case "read", "outline", "impact", "delete", "test", "history", "similar":
+	case "read", "outline", "impact", "delete", "history", "similar":
 		if strings.TrimSpace(args.Name) == "" {
 			if strings.TrimSpace(args.File) != "" {
 				return errResult(fmt.Errorf("%s: name is required — pass name:\"<def>\" for one definition, or use op:\"overview\", file:%q to see every def in that file", args.Op, args.File))
 			}
 			return errResult(fmt.Errorf("%s: name is required", args.Op))
+		}
+	case "test":
+		// #241: test:"TestX" (named-test reproduction -- e.g. replicate a
+		// bug report before touching any code) doesn't need name; only
+		// the def-scoped path (name:"F", run tests covering F) does. The
+		// grouped case above required name unconditionally for "test"
+		// too, which broke this tool's own documented named-test path.
+		if strings.TrimSpace(args.Test) == "" && strings.TrimSpace(args.Name) == "" {
+			if strings.TrimSpace(args.File) != "" {
+				return errResult(fmt.Errorf("test: name is required — pass name:\"<def>\" for one definition, test:\"TestX\" to run a named test directly, or use op:\"overview\", file:%q to see every def in that file", args.File))
+			}
+			return errResult(fmt.Errorf("test: name is required (or test:\"TestX\" to run a named test directly)"))
 		}
 	case "explain":
 		// #186: accept name OR names[]; the Q+A co-processor path
@@ -7935,4 +7954,73 @@ func (s *server) resolveApplyTarget(backend store.Backend, name, receiver, modul
 		}
 	}
 	return d, err
+}
+
+// alreadyFreshlyIngested reports whether the DB's last_ingest already
+// covers every .go file under projectDir, so newMCPServer's startup
+// goroutine can skip a redundant full packages.Load+ingest+resolve.
+//
+// Without this check, every MCP session start pays that reload even
+// when a CLI `defn ingest .` (e.g. `defn init`, or a bench harness's
+// setup step) ran moments earlier and produced an identical DB --
+// and worse, the in-flight reingest tears down and rebuilds the defs
+// table, so a read-shaped op racing s.ready during that window can
+// return actively wrong results (not just stale ones), with only a
+// soft "may be stale" text warning a model can easily miss.
+// Root-caused via a real grpc-go-2630 head-to-head-go trajectory: the
+// first `search` call landed mid-reingest, returned unrelated defs
+// (Server/rpcStats/errDropped instead of regeneratePicker), and the
+// agent confidently edited the wrong function -- scored F1=0.00 while
+// files-mode got partial credit on the same task.
+//
+// Returns false (must reingest) whenever last_ingest is missing or
+// unparseable -- a never-ingested DB must never be treated as fresh.
+// Mirrors the walk in cmd/defn's countStaleFiles/walkGoFiles and
+// db.DB.StaleFiles; kept as its own small copy since internal/mcp
+// can't import cmd/defn (package main), and this check is narrower
+// than the full nested-module-aware walk ingest itself needs -- it
+// only needs to know whether ANY covered file changed.
+func alreadyFreshlyIngested(db store.Backend, projectDir string) bool {
+	lastIngestStr, err := db.GetMeta("last_ingest")
+	if err != nil || lastIngestStr == "" {
+		return false
+	}
+	lastIngest, err := strconv.ParseInt(lastIngestStr, 10, 64)
+	if err != nil {
+		return false
+	}
+	fresh := true
+	_ = filepath.WalkDir(projectDir, func(path string, d fs.DirEntry, werr error) error {
+		if !fresh {
+			return filepath.SkipAll
+		}
+		if werr != nil {
+			return nil
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if name == ".defn" || name == ".git" || name == "vendor" ||
+				name == "node_modules" || name == "testdata" {
+				return filepath.SkipDir
+			}
+			if path != projectDir {
+				if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if info.ModTime().Unix() > lastIngest {
+			fresh = false
+		}
+		return nil
+	})
+	return fresh
 }
