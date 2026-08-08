@@ -4801,9 +4801,11 @@ func (s *server) handleSimilar(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 	// defn's scale — LSH later if needed).
 	//
 	// Every def -- bodied or not -- gets a real MinHash computed from
-	// the best available text (see store.ComputeMinHashForDef): body
-	// when there's enough of it to shingle meaningfully, else
-	// signature. That happens synchronously at write time
+	// signature+body together, unconditionally (see
+	// store.ComputeMinHashForDef): one formula for every kind, so
+	// bodyless/short-body defs (interfaces, consts, vars) get real
+	// comparable content instead of ComputeMinHash's all-max sentinel
+	// for empty input. That happens synchronously at write time
 	// (UpsertDefinition/UpsertDefinitionsBulk) and via a one-shot
 	// backfill on DB open, so an empty/errored summaries table here
 	// means something genuinely wrong (a fresh-open race or a real DB

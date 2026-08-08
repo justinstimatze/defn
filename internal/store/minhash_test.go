@@ -90,14 +90,20 @@ func TestComputeMinHashForDef_BodylessDefsDontCollide(t *testing.T) {
 	}
 }
 
-// TestComputeMinHashForDef_PrefersBodyWhenPresent confirms the normal,
-// bodied case is unchanged: a def with a real body still hashes on the
-// body, not the signature.
-func TestComputeMinHashForDef_PrefersBodyWhenPresent(t *testing.T) {
+// TestComputeMinHashForDef_HashesSignatureAndBodyTogether confirms the
+// single, unconditional formula: two defs with the same body but
+// different signatures should score high similarity (dominated by the
+// shared body content) without being byte-identical to a plain
+// ComputeMinHash(body) call, since the signature is always folded in
+// too.
+func TestComputeMinHashForDef_HashesSignatureAndBodyTogether(t *testing.T) {
 	body := "func Sum(a, b int) int {\n\treturn a + b\n}\n"
 	got := ComputeMinHashForDef(body, "func Sum(a, b int) int")
-	want := ComputeMinHash(body)
-	if string(got) != string(want) {
-		t.Error("ComputeMinHashForDef should hash the body verbatim when it's long enough to shingle")
+	bodyOnly := ComputeMinHash(body)
+	if string(got) == string(bodyOnly) {
+		t.Error("expected the signature to be folded into the hash, not ignored")
+	}
+	if j := MinHashJaccard(got, bodyOnly); j < 0.5 {
+		t.Errorf("expected body-dominated content to still score similar to a body-only hash, got Jaccard=%v", j)
 	}
 }
