@@ -3031,9 +3031,23 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	if args.File != "" {
 		loc = args.File + " (" + mod.Path + ")"
 	}
-	sb.WriteString(fmt.Sprintf("Created %s (id=%d, kind=%s) in %s\n", name, id, kind, loc))
 	if buildResult != "" {
-		sb.WriteString("\n" + buildResult)
+		// commitOrRollbackOnBuild's contract: any non-empty result means
+		// the whole transaction (including this UpsertDefinition) was
+		// rolled back -- the id above was never durable. Saying
+		// "Created X (id=N)" here, even followed by a build-failure
+		// dump, reads as "it saved, but something else is also broken"
+		// rather than "nothing was saved." That misled a real
+		// trajectory: three sequential creates for three different
+		// receivers all build-failed and rolled back except the last,
+		// but each response said "Created ... (id=N)" -- the agent
+		// concluded defn had a graph bug reusing the same id across
+		// unrelated defs, and burned ~10 calls on a fix for a collision
+		// that was never real.
+		recv := formatReceiver(receiver)
+		fmt.Fprintf(&sb, "create %s%s rolled back — nothing was saved\n\n%s", recv, name, buildResult)
+	} else {
+		sb.WriteString(fmt.Sprintf("Created %s (id=%d, kind=%s) in %s\n", name, id, kind, loc))
 	}
 	return textResult(sb.String()), nil, nil
 }
@@ -3857,6 +3871,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	// DB write durable first (pre-existing #233 asymmetry, not addressed
 	// here — see #12's issue body for why).
 	var buildResult string
+	rolledBack := false
 	switch {
 	case len(pendingImports) == 0 && (len(touchedFiles) > 0 || len(allowedRemovals) > 0 || len(allowedAdds) > 0):
 		goimportsFiles := make([]string, 0, len(touchedFiles))
@@ -3873,6 +3888,16 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			for fp := range resolveSet {
 				s.autoResolveFile(fp.file, fp.module)
 			}
+		} else {
+			// commitOrRollbackOnBuild's contract: any non-empty result
+			// here means the WHOLE batch's transaction was rolled back,
+			// including every "+ created"/"~ edited"/"- deleted" line
+			// already written to sb during the per-op loop above. Same
+			// misleading-message bug as handleCreate's single-op path
+			// (see its fix), at batch scale: those lines read as
+			// confirmed successes with no indication the whole thing
+			// never landed.
+			rolledBack = true
 		}
 
 	case len(pendingImports) == 0:
@@ -3922,6 +3947,17 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		}
 	}
 	if buildResult != "" {
+		if rolledBack {
+			// Deliberately not including sb's per-op "+ created"/"~ edited"/
+			// "- deleted" lines here: those record what was ATTEMPTED, but
+			// this whole transaction was rolled back, so none of it landed.
+			// Showing them alongside a "rolled back" banner still misled a
+			// real trajectory that misread "+ created X (id=N)" as X
+			// actually existing (see the sibling handleCreate fix for the
+			// full story) -- the banner alone wasn't enough of a signal
+			// against an explicit, itemized "+ created" line right below it.
+			return textResult(fmt.Sprintf("apply rolled back — build failed, nothing was saved:\n\n%s", buildResult)), nil, nil
+		}
 		sb.WriteString("\n" + buildResult)
 	}
 

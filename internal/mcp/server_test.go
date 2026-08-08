@@ -5165,3 +5165,63 @@ func TestHandleCode_DeleteReceiverDisambiguatesThroughDispatch(t *testing.T) {
 		t.Fatalf("(*Decoy).Equal should NOT have been touched (0 refs vs its 3), but it's gone: %v", err)
 	}
 }
+
+func TestHandleApply_RolledBackBatchDoesNotClaimSuccess(t *testing.T) {
+	// Same bug as TestHandleCreate_RolledBackCreateDoesNotClaimSuccess,
+	// at apply's batch scale: each successful per-op upsert wrote a
+	// "+ created"/"~ edited" line to the response DURING the loop, before
+	// the batch-wide build gate ran at the tail. If that gate then rolled
+	// the whole transaction back, those lines stayed in the response with
+	// no indication any of it was undone.
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "create", File: "main.go", Body: "func BrokenNewFunc() string { return undefinedHelperFunc() }"},
+		},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "+ created BrokenNewFunc") {
+		t.Fatalf("response claims BrokenNewFunc was created despite the rolled-back batch: %s", text)
+	}
+	if !strings.Contains(text, "rolled back") {
+		t.Errorf("expected the response to say the batch was rolled back, got: %s", text)
+	}
+
+	if _, err := db.GetDefinitionByName("BrokenNewFunc", ""); err == nil {
+		t.Error("BrokenNewFunc exists in the DB despite the build failing -- apply was not rolled back")
+	}
+}
+
+func TestHandleCreate_RolledBackCreateDoesNotClaimSuccess(t *testing.T) {
+	// Regression test for a real bug found by reading a head-to-head-go
+	// trajectory: handleCreate always wrote "Created X (id=N) in Y" even
+	// when the build failed afterward and the whole transaction --
+	// including that insert -- got rolled back. The id was never
+	// durable, but the message read as "created, and also something
+	// else is broken" rather than "nothing was saved". A real agent
+	// created three same-named-but-different-receiver methods in a row,
+	// each build-failing except the last, and concluded from three
+	// identical-looking "Created ... (id=N)" responses that defn had a
+	// def-id collision bug -- when in fact only the last one had ever
+	// actually landed. Burned ~10 calls "fixing" a bug that didn't exist.
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body: "func BrokenNewFunc() string { return undefinedHelperFunc() }",
+		File: "main.go",
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "Created BrokenNewFunc") {
+		t.Fatalf("response claims BrokenNewFunc was created despite the rolled-back build failure: %s", text)
+	}
+	if !strings.Contains(text, "rolled back") {
+		t.Errorf("expected the response to say the create was rolled back, got: %s", text)
+	}
+}
