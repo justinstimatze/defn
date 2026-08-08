@@ -194,6 +194,57 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 	// BEFORE extracting references, so collectRefs can resolve interface calls.
 	// Build a map from interface method objects → concrete method definition IDs.
 	// This is used by collectRefs to resolve interface dispatch calls.
+	//
+	// Interfaces are routinely declared in a DIFFERENT package than
+	// their implementers -- define-where-consumed, implement-elsewhere is
+	// the standard Go idiom (io.Writer, sort.Interface, and real-world
+	// cases like grpc-go's balancer.Picker interface satisfied by
+	// grpclb.lbPicker in a different package). The original pass only
+	// paired concrete types and interfaces declared in the SAME package's
+	// own scope, so every cross-package case was silently missed:
+	// ifaceMethodToImpls never got an entry for Picker.Pick ->
+	// (*lbPicker).Pick, so calls dispatched through the interface got zero
+	// caller edges, and op:"test"/GetImpact reported "no tests cover this"
+	// for a method real tests exercised at runtime through the interface
+	// -- confirmed via a real bench trajectory where an agent shipped a
+	// deadlocking regression because of exactly this false negative.
+	//
+	// Fix: collect interfaces per package once, then for each package's
+	// concrete types check against its OWN interfaces plus every DIRECTLY
+	// IMPORTED package's interfaces -- not a full N×M cross product over
+	// every package pair, and not transitive imports. Bounded by the
+	// package's own import list, which covers the overwhelmingly common
+	// case: a type only satisfies an interface on purpose if it imports
+	// that interface's package to see its method signatures in the first
+	// place. Purely structural satisfaction with no import at all is
+	// possible in Go but rare enough to accept as a documented gap rather
+	// than pay for a global cross product.
+	ifacesByPkg := map[string][]*types.Named{}
+	for _, pkg := range filtered {
+		pkgPath := pkg.PkgPath
+		if strings.HasSuffix(pkg.Name, "_test") {
+			pkgPath = strings.TrimSuffix(pkgPath, "_test")
+		}
+		scope := pkg.Types.Scope()
+		if scope == nil {
+			continue
+		}
+		for _, name := range scope.Names() {
+			obj := scope.Lookup(name)
+			tn, ok := obj.(*types.TypeName)
+			if !ok {
+				continue
+			}
+			named, ok := tn.Type().(*types.Named)
+			if !ok {
+				continue
+			}
+			if types.IsInterface(named) {
+				ifacesByPkg[pkgPath] = append(ifacesByPkg[pkgPath], named)
+			}
+		}
+	}
+
 	ifaceMethodToImpls := map[types.Object][]int64{}
 
 	for _, pkg := range filtered {
@@ -210,9 +261,8 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 			continue
 		}
 
-		// Collect all named types and interfaces in this package.
+		// Collect all named (non-interface) types in this package.
 		var namedTypes []*types.Named
-		var ifaces []*types.Named
 		for _, name := range scope.Names() {
 			obj := scope.Lookup(name)
 			tn, ok := obj.(*types.TypeName)
@@ -223,16 +273,30 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 			if !ok {
 				continue
 			}
-			if types.IsInterface(named) {
-				ifaces = append(ifaces, named)
-			} else {
+			if !types.IsInterface(named) {
 				namedTypes = append(namedTypes, named)
 			}
+		}
+		if len(namedTypes) == 0 {
+			continue
+		}
+
+		// Candidate interfaces: this package's own, plus every directly
+		// imported package's (map keys in pkg.Imports already dedup by
+		// path). Interfaces from packages outside `filtered` (e.g. stdlib)
+		// never resolve to a defn ID below anyway, so it's harmless that
+		// they're absent from ifacesByPkg.
+		candidateIfaces := append([]*types.Named{}, ifacesByPkg[pkgPath]...)
+		for importPath := range pkg.Imports {
+			candidateIfaces = append(candidateIfaces, ifacesByPkg[importPath]...)
+		}
+		if len(candidateIfaces) == 0 {
+			continue
 		}
 
 		// Check each (concrete, interface) pair.
 		for _, concrete := range namedTypes {
-			for _, iface := range ifaces {
+			for _, iface := range candidateIfaces {
 				ifaceType, ok := iface.Underlying().(*types.Interface)
 				if !ok || ifaceType.NumMethods() == 0 {
 					continue
@@ -245,9 +309,17 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 					continue
 				}
 
+				// The interface may live in a different package than the
+				// concrete type now -- look its def ID up under its OWN
+				// package path, not the concrete type's.
+				ifacePkgPath := pkgPath
+				if p := iface.Obj().Pkg(); p != nil {
+					ifacePkgPath = p.Path()
+				}
+
 				// Find defn IDs for the concrete type and interface.
 				concreteID := lookupTypeDefID(db, pkgPath, concrete.Obj().Name(), cache)
-				ifaceID := lookupTypeDefID(db, pkgPath, iface.Obj().Name(), cache)
+				ifaceID := lookupTypeDefID(db, ifacePkgPath, iface.Obj().Name(), cache)
 
 				// Stage "implements" edge: concrete type → interface. Apply
 				// at the end with all the other refs for concreteID so a
@@ -752,7 +824,19 @@ func isPackageLevelOrMethod(obj types.Object, pkgScope *types.Scope) bool {
 	if fn, ok := obj.(*types.Func); ok {
 		sig := fn.Signature()
 		if sig != nil && sig.Recv() != nil {
-			return true
+			// Interface methods also report a non-nil Recv() (the
+			// interface type itself, per go/types) -- distinct from a
+			// concrete method's receiver. Without this check they slip
+			// past this filter, then lookupDefID's fallback chain (a
+			// bare GetDefinitionByName with its blast-radius tiebreak)
+			// silently binds the interface method's object to whatever
+			// unrelated same-named def happens to exist elsewhere in the
+			// whole DB, polluting objToDef and making every call site
+			// dispatched through that interface resolve to the wrong
+			// definition -- with the real implementer(s), correctly
+			// found via ifaceMethodToImpls, never getting a chance
+			// because collectRefs checks objToDef first.
+			return !types.IsInterface(sig.Recv().Type())
 		}
 	}
 	return obj.Parent() == pkgScope

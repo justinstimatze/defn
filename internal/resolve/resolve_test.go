@@ -332,3 +332,162 @@ func UseA() int { return B() }
 		t.Errorf("ResolveFile left a stale UseA -> A call ref after the test file's call target changed: %+v -- this is exactly what makes code(op:\"delete\") on A wrongly refuse, and what an explicit code(op:\"sync\", file:<test file>) fails to fix, since handleSync's single-file path calls this same ResolveFile", rs)
 	}
 }
+
+// TestResolveCrossPackageInterfaceSatisfaction is the regression for a
+// real bench trajectory: an agent's fix to grpc-go's (*lbPicker).Pick
+// (package grpclb) deadlocked a real test, but defn's own op:"test"
+// said "No tests cover Pick. Nothing to run." Root cause: pass 2 of
+// resolve() only paired concrete types and interfaces declared in the
+// SAME package's own scope, so it never noticed grpclb.lbPicker
+// implements balancer.Picker -- a different package, the completely
+// standard Go idiom of declaring an interface where it's consumed and
+// implementing it elsewhere. Calls dispatched through the interface got
+// zero caller edges. This test mirrors that shape with three packages:
+// the interface, the implementer (a different package), and a caller
+// that only ever touches the interface type, never the concrete one.
+func TestResolveCrossPackageInterfaceSatisfaction(t *testing.T) {
+	dir := writeModule(t, map[string]string{
+		"iface/iface.go": `package iface
+
+type Picker interface{ Pick() int }
+`,
+		"impl/impl.go": `package impl
+
+import "example.com/refsbug/iface"
+
+type LBPicker struct{ n int }
+
+func (p *LBPicker) Pick() int { return p.n }
+
+func New() iface.Picker { return &LBPicker{} }
+`,
+		"main.go": `package refsbug
+
+import (
+	"example.com/refsbug/iface"
+	"example.com/refsbug/impl"
+)
+
+func dispatch(p iface.Picker) int {
+	return p.Pick()
+}
+
+func run() int {
+	var p iface.Picker = &impl.LBPicker{}
+	return dispatch(p)
+}
+`,
+	})
+
+	db := testDB(t)
+	if err := ingest.Ingest(db, dir); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if err := Resolve(db, dir); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	pick, err := db.GetDefinitionByNameAndReceiver("Pick", "", "*LBPicker")
+	if err != nil {
+		t.Fatalf("lookup (*LBPicker).Pick: %v", err)
+	}
+
+	refs, err := db.QueryRefs("dispatch", "", "interface_dispatch", 0)
+	if err != nil {
+		t.Fatalf("query interface_dispatch refs: %v", err)
+	}
+	found := false
+	for _, r := range refs {
+		if r.ToDef == pick.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected dispatch -> (*LBPicker).Pick interface_dispatch ref (cross-package), got %d refs: %+v", len(refs), refs)
+	}
+}
+
+// TestResolveCrossPackageInterfaceDispatchCountsAsTestCoverage is the
+// end-to-end version of the bug: a test that only ever reaches a
+// concrete method through a cross-package interface must show up in
+// GetImpact(method).Tests, matching what op:"test" actually consults.
+// Before the fix, this method's Tests list was empty -- "no tests
+// cover this" -- for a method a real test did exercise.
+func TestResolveCrossPackageInterfaceDispatchCountsAsTestCoverage(t *testing.T) {
+	dir := writeModule(t, map[string]string{
+		"iface/iface.go": `package iface
+
+type Picker interface{ Pick() int }
+`,
+		"impl/impl.go": `package impl
+
+import "example.com/refsbug/iface"
+
+type LBPicker struct{ n int }
+
+func (p *LBPicker) Pick() int { return p.n }
+
+func New() iface.Picker { return &LBPicker{} }
+`,
+		// Decoy: an unrelated type with a same-named "Pick" method and
+		// several direct callers, so it wins any name-only, module-fuzzy
+		// "most references" tiebreak. Without the fix, the interface
+		// method's declaration-site object incorrectly binds to whichever
+		// same-named def wins that tiebreak -- this decoy makes that
+		// failure mode deterministic instead of accidentally passing
+		// because the fixture only had one "Pick" to find.
+		"decoy/decoy.go": `package decoy
+
+type Widget struct{}
+
+func (w *Widget) Pick() int { return -1 }
+
+func A() int { return (&Widget{}).Pick() }
+func B() int { return (&Widget{}).Pick() }
+func C() int { return (&Widget{}).Pick() }
+`,
+		"main.go": `package refsbug
+
+import "example.com/refsbug/iface"
+
+func dispatch(p iface.Picker) int {
+	return p.Pick()
+}
+`,
+		"main_test.go": `package refsbug
+
+import (
+	"testing"
+
+	"example.com/refsbug/impl"
+)
+
+func TestDispatch(t *testing.T) {
+	if dispatch(impl.New()) != 0 {
+		t.Fail()
+	}
+}
+`,
+	})
+
+	db := testDB(t)
+	if err := ingest.Ingest(db, dir); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if err := Resolve(db, dir); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	pick, err := db.GetDefinitionByNameAndReceiver("Pick", "", "*LBPicker")
+	if err != nil {
+		t.Fatalf("lookup (*LBPicker).Pick: %v", err)
+	}
+
+	impact, err := db.GetImpact(pick.ID)
+	if err != nil {
+		t.Fatalf("GetImpact: %v", err)
+	}
+	if len(impact.Tests) == 0 {
+		t.Fatalf("expected TestDispatch to cover (*LBPicker).Pick via interface dispatch, got zero tests in impact: %+v", impact)
+	}
+}
