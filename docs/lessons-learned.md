@@ -10,6 +10,107 @@ in a session re-pays that cost at the cache-write rate, not the cache-read
 rate — so trimming it is a direct multiplier on the single biggest cost
 driver found in this project's own 2026-08 caching investigation.
 
+## 2026-08-07/08: six real bugs from real trajectories, one self-healing design fix
+
+A two-day digging session working strictly from real `head-to-head-go`
+defn-arm trajectories (grpc-go, go-zero tasks on defn-bench) instead of
+theorizing about cost drivers — the standing practice this project
+follows because synthetic sweeps had previously missed exactly this
+class of bug. Every fix below traces to a specific, read line-by-line
+tool-call sequence, not a guess. Commits: `773eeed`, `008e271` (both
+released as `v0.26.14`), `9506b09`, `1004ba9`, `60fb503`, `b272b6e`.
+
+- **`edit` silently corrupted a definition instead of rejecting a
+  multi-decl body** (`b272b6e`) — the most serious of the six. A real
+  `new_body` concatenated 3 function declarations into one string.
+  Unlike `create` (`countTopLevelDecls` + `handleCreateMultiDecl`), none
+  of edit's three entry points — `handleEdit`, `handleFragmentEdit`,
+  `handleApply`'s own "edit" case — ever checked decl count. The blob
+  parsed fine (Go allows several func decls in one string) and passed
+  the identity check (which only looks at the first decl), so it landed
+  verbatim as the ONE target definition's `Body`. A later sync/re-ingest
+  of the emitted file then split the extra two decls into duplicate
+  definitions, producing a "redeclared in this block" build failure —
+  and the edit itself had reported plain success, with nothing pointing
+  back at the real cause. The real trajectory burned over a dozen
+  confused follow-up calls recovering: a failed `apply`, four different
+  `replace-hunk` attempts each failing on a *different*
+  missing-required-arg error, and a pointless rename-to-`Xnew`-then-
+  rename-back that fixed nothing. All three entry points now reject a
+  multi-decl result up front, mirroring `create`'s own guard.
+- **Cross-package interface dispatch never reached the ref graph**
+  (`773eeed`). Two compounding bugs in `internal/resolve/resolve.go`'s
+  pass 2: (1) interface-satisfaction pairing only checked a concrete
+  type against interfaces in its OWN package, but Go's normal idiom is
+  define-where-consumed/implement-elsewhere — grpc-go's `lbPicker.Pick`
+  implements `balancer.Picker`, declared in a different package; (2)
+  `go/types` reports a non-nil `Recv()` for interface method
+  *declarations* too, identical in shape to a concrete method's
+  receiver — without filtering `types.IsInterface(sig.Recv().Type())`,
+  interface method decls leaked into `objToDef` via the same
+  bare-`GetDefinitionByName` blast-radius-tiebreak fallback documented
+  in the #219/#220 bug class, silently rebinding every call site
+  dispatched through that interface to an unrelated same-named def
+  elsewhere in the whole DB. Real-corpus confirmation: `defn impact
+  '(*lbPicker).Pick'` went from 0 covering tests to 41 on grpc-go.
+- **`apply`'s `create` case didn't support multi-decl bodies with
+  `file:`** (`008e271`), unlike the standalone `create` op
+  (`handleCreateMultiDecl`, motivated by 2026-07-11's finding). A real
+  trajectory batched `edit` + a 2-decl `create` (file: set — the exact
+  pattern this file and `CLAUDE.md` recommend) into one `apply` call and
+  got rejected with "split into 2 create ops," burning a whole extra
+  round-trip on retry. Pilot-verified on the same two tasks before/after
+  the fix: writes down ~90% (9→1, 20→2), cost down ~84% ($2.28→$0.36
+  combined), correctness *up* (F1 matched or beat the files-mode
+  baseline instead of trailing it).
+- **`read`/`outline` with `file:` and no `name:` gave unhelpful or
+  crashing errors** (`9506b09`), seen independently in 4 trajectories —
+  agents naturally reach for "show me this whole file" via `file:`
+  alone. `read` said "name is required" (fine but unhelpful); `outline`
+  had no upfront validation at all, fell through to
+  `resolveEditTarget → findModuleByFile`, and either returned
+  `definition "" not found` or — with a nil backend, the same
+  construction `TestHandleCodeValidation` itself already relies on
+  being safe for every other op — panicked. Both now point straight at
+  `op:"overview", file:...`, which already serves this correctly.
+- **`test` on a test function itself gave the dead-code message**
+  (`1004ba9`), seen independently in 3 trajectories: an agent writes
+  `TestFoo`, calls `op:"test", name:"TestFoo"` expecting it to run.
+  `name` means "what covers this def" — nothing calls a test, so it
+  always said "No tests cover TestFoo. Nothing to run.", indistinguishable
+  from real dead code, forcing a second call with the differently-named
+  `test:` param. Now checks the resolved def's own `Test` flag and
+  points at `test:"TestFoo"` directly.
+- **Circuit breaker (`#209`, below) self-heals instead of refusing**
+  (`60fb503`). Quantified from the same trajectory sample: 18 of 175
+  total tool calls (10%) were pure-waste breaker blocks — zero
+  information returned, just the nag repeated. Worst case: 11
+  CONSECUTIVE blocked calls, 26% of that one trajectory's entire tool
+  budget, before the model switched to batching. The original design
+  assumed one refusal would make the model immediately restructure its
+  whole remaining strategy; that assumption doesn't hold reliably.
+  `sessionCache` now tracks `pendingReadNames` — every nameable
+  read-shaped call (read/outline/impact/methods/single-name expand)
+  records its name whether or not it ends up blocked. A block on one of
+  those ops now redirects through `expand` with every name accumulated
+  since the last reset, instead of a bare refusal, and the redirect
+  itself resets the counter. `search` (no single resolvable name) keeps
+  the plain refusal. `circuitBreakerCheck`'s own signature and behavior
+  are untouched — tracking is a separate, additive step at the
+  `handleCode` call site — so all 8 pre-existing breaker unit tests
+  needed no changes. Pilot-verified on the exact worst-case trajectory
+  (the 11-consecutive-block one): re-run with the fix, that same task
+  hit 0 plain blocks and 3 productive auto-batches instead.
+
+Process note: mid-session the standing practice shifted from "ship a
+release per individual fix" (7 releases in one sitting the day before)
+to "batch fixes, verify with a real head-to-head-go pilot arm before
+shipping something meant to matter" — the unit-test-only gate satisfied
+the letter of "verify before push" but missed whether a fix changed real
+agent behavior. The `apply` multi-decl fix above is the first one shipped
+under the new rule, and the pilot numbers are why it was worth the extra
+step: unit tests alone would never have surfaced the 90%/84% deltas.
+
 ## #209: enforcement alone made things worse, not better
 
 A chi-explore bench with the go-guard hook live cost +154% vs. native
