@@ -60,11 +60,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-// Version is the running defn build's semver string. Kept as a package
-// constant so the CLI can compare its own version against what a
-// running serve reports via the /version HTTP endpoint, surfacing
-// binary/serve skew in `defn status`.
-const Version = "0.26.12"
+const Version = "0.26.13"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
