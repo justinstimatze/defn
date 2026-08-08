@@ -5548,3 +5548,50 @@ func TestHandleSimilar_NoLongerUsesRetiredSignatureFallback(t *testing.T) {
 		t.Errorf("still surfacing the retired signature-LIKE fallback's output shape: %s", text)
 	}
 }
+
+// TestHandleApply_EditReceiverDisambiguatesSameNamedMethod replicates a
+// real head-to-head-go trajectory (2026-08-08): applyOp had no receiver
+// field at all, so a same-named method on a different type couldn't be
+// disambiguated inside a batch -- unlike every standalone handler
+// (handleEdit, handleDelete, etc via nameParam/editParam's Receiver).
+// The real agent tried passing receiver: anyway and got a schema
+// rejection ("unexpected additional properties [\"receiver\"]"), then
+// burned ~10 more apply retries working around it with stale
+// old_fragments and confused identity-check failures. Two types here
+// both declare a Handle method with different bodies -- editing one via
+// apply must not silently hit (or fail to find) the other.
+func TestHandleApply_EditReceiverDisambiguatesSameNamedMethod(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	create, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op:   "create",
+		File: "handlers.go",
+		Body: "type A struct{}\n\nfunc (a A) Handle() string { return \"a\" }\n\n" +
+			"type B struct{}\n\nfunc (b B) Handle() string { return \"b\" }",
+	})
+	if strings.Contains(resultText(t, create), "rolled back") {
+		t.Fatalf("setup create failed: %s", resultText(t, create))
+	}
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "edit", Name: "Handle", Receiver: "B", NewBody: "func (b B) Handle() string { return \"b-edited\" }"},
+		},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "not found") || strings.Contains(text, "rolled back") {
+		t.Fatalf("expected the receiver-qualified edit to resolve B.Handle, got: %s", text)
+	}
+
+	readB, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "read", Name: "Handle", Receiver: "B"})
+	if !strings.Contains(resultText(t, readB), "b-edited") {
+		t.Errorf("B.Handle was not updated: %s", resultText(t, readB))
+	}
+	readA, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "read", Name: "Handle", Receiver: "A"})
+	if !strings.Contains(resultText(t, readA), `"a"`) {
+		t.Errorf("A.Handle should be untouched, got: %s", resultText(t, readA))
+	}
+}

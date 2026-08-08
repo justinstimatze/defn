@@ -471,6 +471,7 @@ type codeParam struct {
 type applyOp struct {
 	Op          string `json:"op"`
 	Name        string `json:"name,omitempty"`
+	Receiver    string `json:"receiver,omitempty"` // disambiguates same-named methods across types (#219), mirrors nameParam/editParam's Receiver
 	NewName     string `json:"new_name,omitempty"`
 	Body        string `json:"body,omitempty"`
 	NewBody     string `json:"new_body,omitempty"`
@@ -3452,13 +3453,13 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 					sb.WriteString(fmt.Sprintf("+ would create %s (%s)\n", name, kind))
 				}
 			case "edit":
-				if _, err := s.backend.GetDefinitionByName(op.Name, ""); err != nil {
+				if _, err := s.resolveApplyTarget(s.backend, op.Name, op.Receiver, op.Module, op.File); err != nil {
 					errors = append(errors, fmt.Sprintf("edit %s: not found", op.Name))
 				} else {
 					sb.WriteString(fmt.Sprintf("~ would edit %s\n", op.Name))
 				}
 			case "delete":
-				if _, err := s.backend.GetDefinitionByName(op.Name, ""); err != nil {
+				if _, err := s.resolveApplyTarget(s.backend, op.Name, op.Receiver, op.Module, op.File); err != nil {
 					errors = append(errors, fmt.Sprintf("delete %s: not found", op.Name))
 				} else {
 					sb.WriteString(fmt.Sprintf("- would delete %s\n", op.Name))
@@ -3466,7 +3467,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			case "rename":
 				if op.Name == "" || op.NewName == "" {
 					errors = append(errors, "rename: both name and new_name are required")
-				} else if _, err := s.backend.GetDefinitionByName(op.Name, ""); err != nil {
+				} else if _, err := s.resolveApplyTarget(s.backend, op.Name, op.Receiver, op.Module, op.File); err != nil {
 					errors = append(errors, fmt.Sprintf("rename %s: not found", op.Name))
 				} else {
 					sb.WriteString(fmt.Sprintf("→ would rename %s → %s\n", op.Name, op.NewName))
@@ -3481,7 +3482,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 						name = inferred
 					}
 				}
-				if _, err := s.backend.GetDefinitionByName(name, ""); err != nil {
+				if _, err := s.resolveApplyTarget(s.backend, name, op.Receiver, op.Module, op.File); err != nil {
 					errors = append(errors, fmt.Sprintf("%s %s: not found", op.Op, name))
 				} else {
 					sb.WriteString(fmt.Sprintf("~ would %s on %s\n", op.Op, name))
@@ -3565,7 +3566,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			}
 			name = inferred
 		}
-		d, err := tx.GetDefinitionByName(name, "")
+		d, err := s.resolveApplyTarget(tx, name, op.Receiver, op.Module, op.File)
 		if err != nil {
 			return "", fmt.Sprintf("%s %s: not found", op.Op, name)
 		}
@@ -3704,7 +3705,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			}
 
 		case "edit":
-			d, err := tx.GetDefinitionByName(op.Name, "")
+			d, err := s.resolveApplyTarget(tx, op.Name, op.Receiver, op.Module, op.File)
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("edit %s: not found", op.Name))
 				continue
@@ -3764,7 +3765,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			}
 
 		case "delete":
-			d, err := tx.GetDefinitionByName(op.Name, "")
+			d, err := s.resolveApplyTarget(tx, op.Name, op.Receiver, op.Module, op.File)
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("delete %s: not found", op.Name))
 				continue
@@ -3785,7 +3786,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				errors = append(errors, "rename: both name and new_name are required")
 				continue
 			}
-			d, err := tx.GetDefinitionByName(op.Name, "")
+			d, err := s.resolveApplyTarget(tx, op.Name, op.Receiver, op.Module, op.File)
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("rename %s: not found", op.Name))
 				continue
@@ -7849,4 +7850,40 @@ func prependNote(r *sdkmcp.CallToolResult, note string) *sdkmcp.CallToolResult {
 		}
 	}
 	return r
+}
+
+// resolveApplyTarget mirrors resolveEditTarget's disambiguation
+// precedence (receiver for same-named methods; module/file for
+// same-named non-methods, file winning when both are set), but takes
+// its backend explicitly so it works for both apply's tx (mid-batch,
+// must see this batch's own uncommitted writes) and s.backend
+// (dry-run preview, no transaction open yet). Motivated by a real
+// trajectory that burned ~10 apply retries trying to disambiguate a
+// same-named method with no receiver field on applyOp to put it in --
+// resolveEditTarget itself is hardwired to s.backend and can't see a
+// batch's own uncommitted writes, so it can't be reused as-is here.
+func (s *server) resolveApplyTarget(backend store.Backend, name, receiver, module, file string) (*store.Definition, error) {
+	var modulePath string
+	if file != "" {
+		if mod := s.findModuleByFile(file); mod != nil {
+			modulePath = mod.Path
+		}
+	}
+	if modulePath == "" && module != "" {
+		if mod := s.findModule(module); mod != nil {
+			modulePath = mod.Path
+		}
+	}
+	if receiver == "" {
+		return backend.GetDefinitionByName(name, modulePath)
+	}
+	d, err := backend.GetDefinitionByNameAndReceiver(name, modulePath, receiver)
+	if err != nil {
+		if alt := strings.TrimPrefix(receiver, "*"); alt != receiver {
+			d, err = backend.GetDefinitionByNameAndReceiver(name, modulePath, alt)
+		} else {
+			d, err = backend.GetDefinitionByNameAndReceiver(name, modulePath, "*"+receiver)
+		}
+	}
+	return d, err
 }
