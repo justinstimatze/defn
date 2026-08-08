@@ -519,6 +519,17 @@ type nameParam struct {
 	// one-line intent summary if one exists, else falls back to the
 	// full body with a header noting the summary is unavailable.
 	Mode string `json:"mode,omitempty"`
+	// Receiver disambiguates between multiple methods sharing Name
+	// across different types (e.g. two "Equal" methods). Same #219 gap
+	// editParam already closed for handleEdit, found again the hard
+	// way: handleDelete accepted this field in its JSON schema but
+	// never read it, always calling resolveEditTarget with receiver="",
+	// which falls back to GetDefinitionByName's blast-radius tiebreak
+	// -- it deletes whichever same-named def has the most references,
+	// not the one actually requested. In a real trajectory this deleted
+	// an unrelated, well-referenced pre-existing method instead of the
+	// freshly-created, zero-reference one the agent asked for.
+	Receiver string `json:"receiver,omitempty"`
 	// Module/File disambiguate same-named defs across packages (#15),
 	// same precedent as editParam's fields for the mutation path. File
 	// wins when both are set, mirroring resolveEditTarget's precedence.
@@ -578,6 +589,17 @@ type findParam struct {
 type moveParam struct {
 	Name     string `json:"name"`
 	ToModule string `json:"to_module"`
+	// Receiver/File disambiguate the SOURCE definition when multiple
+	// defs share Name -- same #219-class gap as nameParam/editParam.
+	// Before this, handleMove called GetDefinitionByName(args.Name, "")
+	// directly (not resolveEditTarget), so it always took the
+	// blast-radius tiebreak among same-named defs regardless of which
+	// one was actually meant. For move specifically that's worse than
+	// a misread: it deletes the winning def from its module and
+	// recreates it in ToModule, silently relocating and (via the
+	// delete+insert new-ID path) orphaning the real target.
+	Receiver string `json:"receiver,omitempty"`
+	File     string `json:"file,omitempty"`
 }
 
 func textResult(text string) *sdkmcp.CallToolResult {
@@ -1077,7 +1099,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 				return wrapStale(s.handleExpand(ctx, req, codeParam{Name: args.Name, Include: []string{"outline", "callers", "body"}, Module: args.Module, File: args.File}))
 			}
 		}
-		return wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name, Full: args.Full, Query: args.Query, Mode: args.Mode, Module: args.Module, File: args.File}))
+		return wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name, Full: args.Full, Query: args.Query, Mode: args.Mode, Receiver: args.Receiver, Module: args.Module, File: args.File}))
 	case "resummarize":
 		return s.handleResummarize(ctx, req, args)
 	case "read-and-verify":
@@ -1104,7 +1126,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 				return wrapStale(s.handleExpand(ctx, req, codeParam{Name: args.Name, Include: []string{"outline", "callers", "body"}, Module: args.Module, File: args.File}))
 			}
 		}
-		return wrapStale(s.handleOutline(ctx, req, nameParam{Name: args.Name, Query: args.Query, Module: args.Module, File: args.File}))
+		return wrapStale(s.handleOutline(ctx, req, nameParam{Name: args.Name, Query: args.Query, Receiver: args.Receiver, Module: args.Module, File: args.File}))
 	case "slice":
 		// Same cross-def context reuse as read/outline above: any slice
 		// kind is a strict subset of the full body already served.
@@ -1149,7 +1171,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if strings.TrimSpace(args.Question) != "" {
 			return wrapStale(s.handleExplainWithQuestion(ctx, req, args))
 		}
-		return wrapStale(s.handleExplain(ctx, req, nameParam{Name: args.Name}))
+		return wrapStale(s.handleExplain(ctx, req, nameParam{Name: args.Name, Receiver: args.Receiver, Module: args.Module, File: args.File}))
 	case "context":
 		// #195: server-side bundle to collapse turn-1 exploration.
 		// Question drives the search; server picks top-N relevant
@@ -1173,18 +1195,18 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "create":
 		return s.handleCreate(ctx, req, createParam{Body: args.Body, Module: args.Module, File: args.File})
 	case "delete":
-		return s.handleDelete(ctx, req, nameParam{Name: args.Name, Force: args.Force, Module: args.Module, File: args.File})
+		return s.handleDelete(ctx, req, nameParam{Name: args.Name, Force: args.Force, Receiver: args.Receiver, Module: args.Module, File: args.File})
 	case "rename":
 		return s.handleRename(ctx, req, renameParam{OldName: args.OldName, NewName: args.NewName})
 	case "move":
-		return s.handleMove(ctx, req, moveParam{Name: args.Name, ToModule: args.Module})
+		return s.handleMove(ctx, req, moveParam{Name: args.Name, ToModule: args.Module, Receiver: args.Receiver, File: args.File})
 	case "test":
 		if args.Test != "" {
 			return s.handleTestByName(ctx, req, args.Test)
 		}
-		return s.handleTest(ctx, req, nameParam{Name: args.Name, Module: args.Module, File: args.File})
+		return s.handleTest(ctx, req, nameParam{Name: args.Name, Receiver: args.Receiver, Module: args.Module, File: args.File})
 	case "similar":
-		return wrapStale(s.handleSimilar(ctx, req, nameParam{Name: args.Name, Module: args.Module, File: args.File}))
+		return wrapStale(s.handleSimilar(ctx, req, nameParam{Name: args.Name, Receiver: args.Receiver, Module: args.Module, File: args.File}))
 	case "apply":
 		return s.handleApply(ctx, req, applyParam{Operations: args.Operations, DryRun: args.DryRun})
 	case "query":
@@ -1240,7 +1262,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 }
 
 func (s *server) handleImpact(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.resolveEditTarget(args.Name, "", args.Module, args.File)
+	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -1634,7 +1656,7 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 	if args.Mode == "" && !args.Full && !justMutated && os.Getenv("DEFN_SUMMARY_READ_DEFAULT") != "0" {
 		args.Mode = "summary"
 	}
-	d, err := s.resolveEditTarget(args.Name, "", args.Module, args.File)
+	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -2806,7 +2828,7 @@ func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest
 }
 
 func (s *server) handleInsert(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.backend.GetDefinitionByName(args.Name, "")
+	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -4093,7 +4115,7 @@ func compositeMatchesType(expr ast.Expr, typeName string) bool {
 }
 
 func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.resolveEditTarget(args.Name, "", args.Module, args.File)
+	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -4344,7 +4366,7 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 }
 
 func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.resolveEditTarget(args.Name, "", args.Module, args.File)
+	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -4598,7 +4620,7 @@ func humanSize(n int64) string {
 }
 
 func (s *server) handleSimilar(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.resolveEditTarget(args.Name, "", args.Module, args.File)
+	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -4995,7 +5017,7 @@ func (s *server) handlePatch(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		return errResult(fmt.Errorf("patch: old_name and new_name are required (the old and new text)"))
 	}
 
-	d, err := s.backend.GetDefinitionByName(args.Name, "")
+	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -5528,7 +5550,7 @@ func (s *server) handleSimulate(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 }
 
 func (s *server) handleTraverse(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.backend.GetDefinitionByName(args.Name, "")
+	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found: %w", args.Name, err))
 	}
@@ -5816,7 +5838,7 @@ func (s *server) handleTestCoverage(_ context.Context, _ *sdkmcp.CallToolRequest
 	if strings.TrimSpace(args.Name) == "" {
 		return errResult(fmt.Errorf("test-coverage: name is required"))
 	}
-	d, err := s.backend.GetDefinitionByName(args.Name, "")
+	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -6328,7 +6350,7 @@ func firstDocLine(doc string) string {
 // on >2000-char bodies (87% compression). See
 // [[project_putget_edit_vocab_design]] for the phase context.
 func (s *server) handleOutline(_ context.Context, req *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.resolveEditTarget(args.Name, "", args.Module, args.File)
+	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -6442,7 +6464,7 @@ func (s *server) handleSlice(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		return errResult(fmt.Errorf("slice: kind is required — valid: %s", strings.Join(projection.SliceKindNames(), ", ")))
 	}
 
-	d, err := s.resolveEditTarget(args.Name, "", args.Module, args.File)
+	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}

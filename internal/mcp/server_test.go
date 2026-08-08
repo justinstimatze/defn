@@ -5087,3 +5087,81 @@ func TestHandleCreateFailedBuildDoesNotOrphanModule(t *testing.T) {
 		t.Fatalf("pre-existing file was modified:\n%s", got)
 	}
 }
+
+func TestHandleCode_DeleteReceiverDisambiguatesThroughDispatch(t *testing.T) {
+	// Regression test for a real, severe bug found in a head-to-head-go
+	// trajectory: code(op:"delete", name:"Equal", receiver:"matcher")
+	// silently deleted an unrelated, well-referenced (*lbConfig).Equal
+	// instead, because receiver was dropped somewhere between the raw
+	// JSON args and the actual delete. Two separate gaps combined to
+	// cause this:
+	//  1. nameParam had no Receiver field at all, so handleDelete always
+	//     called resolveEditTarget with receiver="", which falls back to
+	//     GetDefinitionByName's blast-radius tiebreak -- it picks
+	//     whichever same-named def has the most references, not the one
+	//     actually requested.
+	//  2. Even after adding Receiver to nameParam and wiring handleDelete
+	//     to read it, handleCode's dispatch switch constructed
+	//     nameParam{Name: args.Name, Force: args.Force, Module: ...,
+	//     File: ...} WITHOUT copying args.Receiver -- so a handler-level
+	//     test calling s.handleDelete directly with a hand-built
+	//     nameParam{Receiver: "x"} would have passed while the real
+	//     entry point (a raw code(op:"delete", receiver:"x") call, which
+	//     always goes through handleCode first) still silently dropped
+	//     it. This test goes through handleCode, not handleDelete
+	//     directly, specifically to catch that class of gap.
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	mod, err := db.GetModuleByPath("testproj")
+	if err != nil {
+		t.Fatalf("find testproj module: %v", err)
+	}
+
+	// The decoy: well-referenced, must survive.
+	decoyID, err := db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Equal", Kind: "method", Receiver: "*Decoy",
+		Body: "func (d *Decoy) Equal(o *Decoy) bool { return true }", SourceFile: "main.go",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		callerID, err := db.UpsertDefinition(&store.Definition{
+			ModuleID: mod.ID, Name: fmt.Sprintf("CallsDecoy%d", i), Kind: "function",
+			Body: "func CallsDecoy() bool { return true }", SourceFile: "main.go",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.SetReferences(callerID, []store.Reference{{FromDef: callerID, ToDef: decoyID, Kind: "call"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The real target: zero references, the one actually meant.
+	targetID, err := db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Equal", Kind: "method", Receiver: "*Target",
+		Body: "func (tg *Target) Equal(o *Target) bool { return true }", SourceFile: "main.go",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op: "delete", Name: "Equal", Receiver: "*Target", Force: true,
+	})
+	text := resultText(t, result)
+	if result.IsError {
+		t.Fatalf("expected delete to succeed, got error: %s", text)
+	}
+
+	if _, err := db.GetDefinition(targetID); err == nil {
+		t.Fatalf("(*Target).Equal should have been deleted, still present")
+	}
+	if _, err := db.GetDefinition(decoyID); err != nil {
+		t.Fatalf("(*Decoy).Equal should NOT have been touched (0 refs vs its 3), but it's gone: %v", err)
+	}
+}
