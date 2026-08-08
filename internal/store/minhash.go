@@ -86,3 +86,24 @@ func MinHashJaccard(a, b []byte) float64 {
 	}
 	return float64(matches) / float64(minHashN)
 }
+
+// ComputeMinHashForDef is the def-aware entry point for `similar`'s
+// index: every definition, bodied or not, gets a real MinHash computed
+// from the best available text, so callers never need a structurally
+// different fallback algorithm for bodyless defs.
+func ComputeMinHashForDef(body, signature string) []byte {
+	return ComputeMinHash(similarityText(body, signature))
+}
+
+// similarityText picks the text ComputeMinHash should hash for def
+// similarity: the body when it's long enough to shingle meaningfully,
+// else the signature. Without this, every bodyless def (interface,
+// type, const, var — anything under minHashK chars of body) hits
+// ComputeMinHash's all-max sentinel path and appears 100% similar to
+// every OTHER bodyless def, a degenerate false-positive collision.
+func similarityText(body, signature string) string {
+	if len(body) >= minHashK {
+		return body
+	}
+	return signature
+}

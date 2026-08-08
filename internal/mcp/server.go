@@ -4800,18 +4800,25 @@ func (s *server) handleSimilar(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 	// body shingles; sub-linear-friendly (though we scan naively at
 	// defn's scale — LSH later if needed).
 	//
-	// Falls back to the old sig-token search when the target def has
-	// no body (kind=type/interface/const with no source text to hash)
-	// or the summaries table is empty (upgrade race).
+	// Every def -- bodied or not -- gets a real MinHash computed from
+	// the best available text (see store.ComputeMinHashForDef): body
+	// when there's enough of it to shingle meaningfully, else
+	// signature. That happens synchronously at write time
+	// (UpsertDefinition/UpsertDefinitionsBulk) and via a one-shot
+	// backfill on DB open, so an empty/errored summaries table here
+	// means something genuinely wrong (a fresh-open race or a real DB
+	// error), not "this def has no body" -- there's no structurally
+	// different fallback algorithm to reach for; report it honestly
+	// instead of silently degrading to a worse one.
 	summaries, err := s.backend.AllDefSummaryMinHashes()
-	if err != nil || len(summaries) == 0 || len(d.Body) < 8 {
-		return s.handleSimilarBySignature(d)
+	if err != nil || len(summaries) == 0 {
+		return textResult(fmt.Sprintf("Similarity index isn't available for %s right now (empty or errored def_summaries) — try again in a moment.", args.Name)), nil, nil
 	}
 	target, ok := summaries[d.ID]
 	if !ok {
 		// Not yet computed for this def; compute on the fly and
 		// backfill for future queries.
-		target = store.ComputeMinHash(d.Body)
+		target = store.ComputeMinHashForDef(d.Body, d.Signature)
 		_ = s.backend.SetDefSummaryMinHash(d.ID, target)
 	}
 
@@ -4856,46 +4863,6 @@ func (s *server) handleSimilar(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 	}
 	text, _ := toJSON(matches)
 	return textResult(fmt.Sprintf("Definitions with similar bodies to %s (MinHash Jaccard, 5-char shingles):\n\n%s", args.Name, text)), nil, nil
-}
-
-// handleSimilarBySignature is the pre-#151 signature-token search,
-// kept as a fallback for defs without body text (interface/type/const
-// declarations) or when the summaries table is empty.
-func (s *server) handleSimilarBySignature(d *store.Definition) (*sdkmcp.CallToolResult, any, error) {
-	if d.Signature == "" {
-		return errResult(fmt.Errorf("definition %q has no signature or body to compare on", d.Name))
-	}
-	sig := d.Signature
-	if idx := strings.Index(sig, "("); idx >= 0 {
-		sig = sig[idx:]
-	}
-	sigDefs, _ := s.backend.FindDefinitions("%" + sig + "%")
-	seen := map[string]bool{d.Name: true}
-	type match struct {
-		Name      string `json:"name"`
-		Kind      string `json:"kind"`
-		Receiver  string `json:"receiver,omitempty"`
-		Signature string `json:"signature"`
-	}
-	var matches []match
-	for _, c := range sigDefs {
-		key := c.Name + c.Receiver
-		if seen[key] || c.Signature == "" {
-			continue
-		}
-		seen[key] = true
-		matches = append(matches, match{
-			Name: c.Name, Kind: c.Kind, Receiver: c.Receiver, Signature: c.Signature,
-		})
-		if len(matches) >= 20 {
-			break
-		}
-	}
-	if len(matches) == 0 {
-		return textResult(fmt.Sprintf("No definitions with similar signatures to %s", d.Name)), nil, nil
-	}
-	text, _ := toJSON(matches)
-	return textResult(fmt.Sprintf("Definitions with similar signatures to %s (body-less fallback):\n\n%s", d.Name, text)), nil, nil
 }
 
 // projectOverview returns a compact module-level summary: package path,

@@ -160,7 +160,8 @@ func (s *SQLiteDB) backfillDefSummaries() error {
 		return nil
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT b.def_id, b.body FROM bodies b
+		SELECT b.def_id, b.body, COALESCE(d.signature, '') FROM bodies b
+		JOIN definitions d ON d.id = b.def_id
 		LEFT JOIN def_summaries ds ON ds.def_id = b.def_id
 		WHERE ds.def_id IS NULL`)
 	if err != nil {
@@ -179,12 +180,12 @@ func (s *SQLiteDB) backfillDefSummaries() error {
 	defer stmt.Close()
 	for rows.Next() {
 		var id int64
-		var body string
-		if err := rows.Scan(&id, &body); err != nil {
+		var body, signature string
+		if err := rows.Scan(&id, &body, &signature); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
-		if _, err := stmt.ExecContext(ctx, id, ComputeMinHash(body)); err != nil {
+		if _, err := stmt.ExecContext(ctx, id, ComputeMinHashForDef(body, signature)); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
@@ -851,7 +852,7 @@ func (s *SQLiteDB) UpsertDefinition(d *Definition) (int64, error) {
 		}
 		// #151: precompute minhash. Best-effort — error here shouldn't
 		// fail the ingest.
-		_ = s.SetDefSummaryMinHash(id, ComputeMinHash(d.Body))
+		_ = s.SetDefSummaryMinHash(id, ComputeMinHashForDef(d.Body, d.Signature))
 		return id, nil
 	}
 	if err != nil {
@@ -885,7 +886,7 @@ func (s *SQLiteDB) UpsertDefinition(d *Definition) (int64, error) {
 		return 0, fmt.Errorf("sqlite: update body: %w", err)
 	}
 	// #151: body changed → recompute minhash. Best-effort.
-	_ = s.SetDefSummaryMinHash(existingID, ComputeMinHash(d.Body))
+	_ = s.SetDefSummaryMinHash(existingID, ComputeMinHashForDef(d.Body, d.Signature))
 	return existingID, nil
 }
 
@@ -1050,7 +1051,7 @@ func (s *SQLiteDB) UpsertDefinitionsBulk(defs []*Definition) ([]int64, error) {
 		mhArgs := make([]any, 0, 2*len(chunk))
 		for i, d := range chunk {
 			mhPlaceholders[i] = "(?, ?)"
-			mhArgs = append(mhArgs, firstID+int64(i), ComputeMinHash(d.Body))
+			mhArgs = append(mhArgs, firstID+int64(i), ComputeMinHashForDef(d.Body, d.Signature))
 		}
 		mhq := "INSERT OR REPLACE INTO def_summaries(def_id, minhash) VALUES " + strings.Join(mhPlaceholders, ",")
 		_, _ = s.db.ExecContext(ctx, mhq, mhArgs...)

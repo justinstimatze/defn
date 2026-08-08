@@ -69,3 +69,35 @@ func TestMinHash_SelfSimilarityGoCode(t *testing.T) {
 		t.Errorf("unrelated body should score lower; a↔c=%f a↔b=%f", jFar, jNear)
 	}
 }
+
+// TestComputeMinHashForDef_BodylessDefsDontCollide is the regression
+// motivating similarityText/ComputeMinHashForDef: ComputeMinHash on a
+// short/empty body returns the same all-max sentinel for every such
+// def, so two UNRELATED bodyless defs (e.g. two different interfaces)
+// would score 100% similar to each other -- a degenerate false
+// positive. Falling back to the def's signature text instead gives
+// each one a real, comparable signal.
+func TestComputeMinHashForDef_BodylessDefsDontCollide(t *testing.T) {
+	a := ComputeMinHashForDef("", "type Reader interface { Read(p []byte) (n int, err error) }")
+	b := ComputeMinHashForDef("", "type Writer interface { Write(p []byte) (n int, err error) }")
+	sentinel := ComputeMinHash("")
+
+	if MinHashJaccard(a, sentinel) == 1.0 {
+		t.Fatal("bodyless def collapsed to the raw ComputeMinHash sentinel instead of hashing its signature")
+	}
+	if j := MinHashJaccard(a, b); j >= 1.0 {
+		t.Errorf("two unrelated bodyless defs scored identical (Jaccard=%v) -- expected the sentinel collision to be gone", j)
+	}
+}
+
+// TestComputeMinHashForDef_PrefersBodyWhenPresent confirms the normal,
+// bodied case is unchanged: a def with a real body still hashes on the
+// body, not the signature.
+func TestComputeMinHashForDef_PrefersBodyWhenPresent(t *testing.T) {
+	body := "func Sum(a, b int) int {\n\treturn a + b\n}\n"
+	got := ComputeMinHashForDef(body, "func Sum(a, b int) int")
+	want := ComputeMinHash(body)
+	if string(got) != string(want) {
+		t.Error("ComputeMinHashForDef should hash the body verbatim when it's long enough to shingle")
+	}
+}

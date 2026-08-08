@@ -5524,3 +5524,27 @@ func TestHandleFragmentEdit_RejectsMultiDeclResult(t *testing.T) {
 		t.Errorf("rejected fragment edit still landed the extra decl into Greet's body: %s", resultText(t, read))
 	}
 }
+
+// TestHandleSimilar_NoLongerUsesRetiredSignatureFallback covers the
+// handleSimilarBySignature retirement: that fallback used a signature
+// LIKE prefilter -- the exact anti-pattern flagged in the calque revert
+// postmortem ("blocking on signature LIKE guarantees the misses") -- and
+// silently served structurally different, lower-quality results for any
+// def whose body was too short to shingle. Every def now gets a real
+// MinHash from store.ComputeMinHashForDef (body when long enough, else
+// signature), so there's one consistent scoring path.
+func TestHandleSimilar_NoLongerUsesRetiredSignatureFallback(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{Op: "similar", Name: "Greet"})
+	if err != nil {
+		t.Fatalf("similar: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "body-less fallback") || strings.Contains(text, "similar signatures to") {
+		t.Errorf("still surfacing the retired signature-LIKE fallback's output shape: %s", text)
+	}
+}
