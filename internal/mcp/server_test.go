@@ -5698,3 +5698,89 @@ func TestHandleCode_ReplaceHunkAcceptsFragmentFieldNames(t *testing.T) {
 		t.Errorf("expected a successful hunk replacement, got: %s", text)
 	}
 }
+
+// TestHandleApply_RenamePointerReceiverMethodThenEditSameBatch reproduces
+// the exact shape from the 2026-08-07 defn-forced pilot trajectory
+// (bench/session-cumulative/2026-08-07-raw/out/defn-forced/turn-01.json):
+// one apply batch renames a pointer-receiver method AND edits that same
+// renamed method's body AND creates new defs in the same file, all in one
+// transaction. On that trajectory this produced "WARNING: ... could not
+// be matched to an on-disk declaration" (old name left on disk, DB moved
+// on to the new name) followed by a sync that reverted the DB's rename,
+// forcing the agent into a create+delete cleanup dance (~12 extra tool
+// calls). If commitOrRollbackOnBuild's #218 contract (a WARNING is
+// failure-equivalent, so the whole batch rolls back) is honored here, this
+// exact combination must either land cleanly (old name gone, new name and
+// new body present) or fail atomically -- never partially diverge.
+func TestHandleApply_RenamePointerReceiverMethodThenEditSameBatch(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	if _, _, err := s.handleCreate(context.Background(), nil, createParam{
+		Body: "type tokenBucket struct{ tokens int }",
+		File: "main.go",
+	}); err != nil {
+		t.Fatalf("setup: create tokenBucket type: %v", err)
+	}
+	createResult, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body: "func (b *tokenBucket) allow() bool { return b.tokens > 0 }",
+		File: "main.go",
+	})
+	if !strings.Contains(resultText(t, createResult), "Created") {
+		t.Fatalf("setup: create allow failed: %s", resultText(t, createResult))
+	}
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "edit", Name: "tokenBucket", NewBody: "// holds tokens\ntype tokenBucket struct{ tokens int }"},
+			{Op: "rename", Name: "(*tokenBucket).allow", NewName: "acquire"},
+			{Op: "edit", Name: "(*tokenBucket).acquire", NewBody: "func (b *tokenBucket) acquire() bool { return b.tokens > 0 }"},
+			{Op: "create", File: "main.go", Name: "release", Body: "func (b *tokenBucket) release() { b.tokens++ }"},
+		},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "WARNING") && !strings.Contains(text, "apply rolled back") {
+		t.Fatalf("apply reported a WARNING but did not roll back the whole batch -- #218 contract violated, DB and disk are now allowed to diverge:\n%s", text)
+	}
+
+	final, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	src := string(final)
+
+	if strings.Contains(text, "apply rolled back") {
+		// Atomic failure is an acceptable outcome per #218 -- just make
+		// sure disk truly reflects the pre-batch state (old method only).
+		if !strings.Contains(src, "func (b *tokenBucket) allow()") {
+			t.Errorf("apply rolled back but disk lost the original allow() method:\n%s", src)
+		}
+		if strings.Contains(src, "func (b *tokenBucket) acquire()") {
+			t.Errorf("apply rolled back but disk has the new acquire() method anyway:\n%s", src)
+		}
+		return
+	}
+
+	// No rollback reported -- the batch must have landed COMPLETELY and
+	// consistently: old name gone, new name present with its edited body,
+	// new method present. Any partial state here is the divergence bug.
+	if strings.Contains(src, "func (b *tokenBucket) allow()") {
+		t.Errorf("apply reported success but old allow() method is still on disk (should have been renamed away):\n%s", src)
+	}
+	if !strings.Contains(src, "func (b *tokenBucket) acquire()") {
+		t.Errorf("apply reported success but new acquire() method is missing from disk:\n%s", src)
+	}
+	if !strings.Contains(src, "func (b *tokenBucket) release()") {
+		t.Errorf("apply reported success but new release() method is missing from disk:\n%s", src)
+	}
+
+	after, err := db.GetDefinitionByName("acquire", "")
+	if err != nil {
+		t.Fatalf("acquire not found in DB after apply reported success: %v", err)
+	}
+	if after.Body != "func (b *tokenBucket) acquire() bool { return b.tokens > 0 }" {
+		t.Errorf("DB's acquire body doesn't match the edit applied in the same batch: %q", after.Body)
+	}
+}

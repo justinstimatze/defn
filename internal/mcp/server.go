@@ -3823,18 +3823,32 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			qualifiedOld := emit.FuncIdentity(d.Name, d.Receiver)
 			allowedRemovals = append(allowedRemovals, qualifiedOld)
 			addTouched(d.SourceFile)
-			d.Body, _ = astRename(d.Body, op.Name, op.NewName)
-			d.Name = op.NewName
-			d.Signature = extractSignature(d.Body)
-			d.Exported = len(op.NewName) > 0 && op.NewName[0] >= 'A' && op.NewName[0] <= 'Z'
-			if _, err := tx.UpsertDefinition(d); err != nil {
+			newBody, _ := astRename(d.Body, op.Name, op.NewName)
+			newSig := extractSignature(newBody)
+			exported := len(op.NewName) > 0 && op.NewName[0] >= 'A' && op.NewName[0] <= 'Z'
+			// RenameDefinition updates BY ID, preserving row identity --
+			// mirrors handleRename's own fix (see its comment for the full
+			// story). Mutating d.Name and calling UpsertDefinition here
+			// instead looks up by (module,name,kind,receiver,test), which no
+			// longer matches once the name changes: it INSERTS a new row
+			// under the new name and leaves the old-named row orphaned in
+			// the DB, so both the old and new names exist simultaneously.
+			// mergeDeclsIntoSource then wants to write the orphaned old-name
+			// row too (already spliced out via allowedRemovals, so it can't
+			// match anything on disk), surfacing as a false "database and
+			// disk have diverged" warning that trips #218's whole-batch
+			// rollback on an otherwise perfectly valid rename+edit combo.
+			if err := tx.RenameDefinition(d.ID, op.NewName, newBody, newSig, exported); err != nil {
 				errors = append(errors, fmt.Sprintf("rename %s: %v", op.Name, err))
 				continue
 			}
+			d.Name = op.NewName
+			d.Body = newBody
+			d.Signature = newSig
+			d.Exported = exported
 			s.enqueueSummary(d)
 			// #163: rename creates a new-named def from the emit path's POV.
 			allowedAdds = append(allowedAdds, emit.FuncIdentity(op.NewName, d.Receiver))
-			s.enqueueSummary(d)
 			callers, _ := tx.GetCallers(d.ID)
 			callerCount := 0
 			for _, caller := range callers {
