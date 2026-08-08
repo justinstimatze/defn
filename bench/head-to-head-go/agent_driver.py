@@ -356,6 +356,17 @@ def run_claude(workdir, prompt, budget_usd, max_turns, arm="defn"):
         # uses the invoking user's OAuth session. Downside: parent hooks +
         # CLAUDE.md may still fire; use --strict-mcp-config + tool filters
         # to isolate. Set CLAUDE_CODE_SIMPLE=1 in env for lighter runs.
+        #
+        # --model sonnet: this bench had been running on the CLI's default
+        # (Opus 5, confirmed via the raw stream-json "model" field) with
+        # no explicit pin. Every bug found so far -- test op parameter
+        # confusion, receiver disambiguation, cross-module name collisions
+        # -- is basic tool-API friction, not something that needs
+        # frontier-tier reasoning to surface. Pinning Sonnet keeps the
+        # bug-finding signal while making reruns (this bench has needed
+        # several in one session) much cheaper.
+        "--model",
+        "sonnet",
         "--mcp-config",
         mcp_config_path,
         "--strict-mcp-config",
