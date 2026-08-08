@@ -5867,3 +5867,65 @@ func TestHandleCode_TestOpWithTestFieldDoesNotRequireName(t *testing.T) {
 		t.Errorf("op:test with test:\"TestGreet\" should not require name, got: %s", text)
 	}
 }
+
+// TestHandleSearch_FileScopesResults guards the #241 fix: search's
+// file: param was accepted but silently ignored, so every search ran
+// repo-wide regardless of the hint -- root-caused via a real
+// grpc-go-2630 trajectory where search(pattern:"drop", file:"grpclb")
+// returned unrelated repo-wide results instead of scoping to the
+// grpclb package, contributing to a wrong-function edit.
+func TestHandleSearch_FileScopesResults(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "alpha"), 0755)
+	os.MkdirAll(filepath.Join(projDir, "beta"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "alpha.go"), []byte(`package alpha
+
+// Widget handles the banana queue.
+func Widget() {}
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "beta", "beta.go"), []byte(`package beta
+
+// Gadget handles the banana crate.
+func Gadget() {}
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+
+	// Unscoped: both Widget and Gadget match "banana".
+	result, _, err := s.handleSearch(context.Background(), nil, codeParam{Pattern: "banana"})
+	if err != nil {
+		t.Fatalf("handleSearch: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Widget") || !strings.Contains(text, "Gadget") {
+		t.Fatalf("expected both Widget and Gadget unscoped, got: %s", text)
+	}
+
+	// Scoped to alpha/: only Widget should survive.
+	result, _, err = s.handleSearch(context.Background(), nil, codeParam{Pattern: "banana", File: "alpha"})
+	if err != nil {
+		t.Fatalf("handleSearch with file: %v", err)
+	}
+	text = resultText(t, result)
+	if !strings.Contains(text, "Widget") {
+		t.Errorf("file:\"alpha\" should still include Widget (in alpha/), got: %s", text)
+	}
+	if strings.Contains(text, "Gadget") {
+		t.Errorf("file:\"alpha\" should have excluded Gadget (in beta/), got: %s", text)
+	}
+}

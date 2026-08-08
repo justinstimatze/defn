@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.19"
+const Version = "0.26.20"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -1953,6 +1953,26 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	}
 	if err != nil {
 		return errResult(err)
+	}
+
+	// #241: file: was accepted as a param but silently ignored -- every
+	// search ran repo-wide regardless. Root-caused via a real
+	// grpc-go-2630 trajectory: the agent called
+	// search(pattern:"drop", file:"grpclb") expecting scoping, got
+	// unfiltered repo-wide results ranked by IDF, and the top hits were
+	// unrelated defs from elsewhere in the module -- contributing to a
+	// wrong-function edit. Substring match on source_file (not
+	// findModuleByFile's directory-suffix match used by read/outline/
+	// edit) because callers pass bare package-ish hints like "grpclb",
+	// not full paths with a directory component.
+	if args.File != "" {
+		filtered := defs[:0]
+		for _, d := range defs {
+			if strings.Contains(d.SourceFile, args.File) {
+				filtered = append(filtered, d)
+			}
+		}
+		defs = filtered
 	}
 
 	limit := maxSearchResults
