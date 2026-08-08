@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -100,5 +101,135 @@ func TestMaybeWriteIngestConfig_ReindexSkipsWrites(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "CLAUDE.md")); err != nil {
 		t.Errorf("reindex=false: expected CLAUDE.md to be written: %v", err)
+	}
+}
+
+// TestWriteClaudeHooks_WritesScriptAndSettings guards the #241 fix:
+// defn init previously never installed the UserPromptSubmit hook that
+// grounds the #203 starter bundle in the real question -- every
+// consuming project silently got the weaker per-op-arg fallback.
+func TestWriteClaudeHooks_WritesScriptAndSettings(t *testing.T) {
+	dir := t.TempDir()
+	writeClaudeHooks(dir)
+
+	hookPath := filepath.Join(dir, ".defn", "hooks", "defn-capture-question.sh")
+	data, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read hook script: %v", err)
+	}
+	if !strings.Contains(string(data), "UserPromptSubmit") {
+		t.Errorf("expected the installed script to be the capture-question hook, got: %s", data)
+	}
+
+	settingsData, err := os.ReadFile(filepath.Join(dir, ".claude", "settings.json"))
+	if err != nil {
+		t.Fatalf("read settings.json: %v", err)
+	}
+	var settings map[string]any
+	if err := json.Unmarshal(settingsData, &settings); err != nil {
+		t.Fatalf("unmarshal settings.json: %v", err)
+	}
+	groups := settings["hooks"].(map[string]any)["UserPromptSubmit"].([]any)
+	if len(groups) != 1 {
+		t.Fatalf("expected exactly 1 UserPromptSubmit group, got %d: %+v", len(groups), groups)
+	}
+	entries := groups[0].(map[string]any)["hooks"].([]any)
+	cmd := entries[0].(map[string]any)["command"].(string)
+	if !strings.Contains(cmd, hookPath) {
+		t.Errorf("expected command to reference %s, got %q", hookPath, cmd)
+	}
+}
+
+// TestWriteClaudeHooks_IdempotentNoDuplicateEntry confirms repeat
+// calls (defn init followed by defn ingest, or ingest run twice)
+// don't pile up duplicate UserPromptSubmit hook entries.
+func TestWriteClaudeHooks_IdempotentNoDuplicateEntry(t *testing.T) {
+	dir := t.TempDir()
+	writeClaudeHooks(dir)
+	writeClaudeHooks(dir)
+	writeClaudeHooks(dir)
+
+	data, err := os.ReadFile(filepath.Join(dir, ".claude", "settings.json"))
+	if err != nil {
+		t.Fatalf("read settings.json: %v", err)
+	}
+	var settings map[string]any
+	if err := json.Unmarshal(data, &settings); err != nil {
+		t.Fatalf("unmarshal settings.json: %v", err)
+	}
+	groups := settings["hooks"].(map[string]any)["UserPromptSubmit"].([]any)
+	if len(groups) != 1 {
+		t.Errorf("expected 1 UserPromptSubmit group after 3 calls, got %d: %+v", len(groups), groups)
+	}
+}
+
+// TestWriteClaudeHooks_PreservesExistingHooksAndSettings confirms an
+// existing .claude/settings.json (the user's own hooks, or another
+// tool's) survives untouched -- writeClaudeHooks must merge, not
+// overwrite.
+func TestWriteClaudeHooks_PreservesExistingHooksAndSettings(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".claude"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	existing := `{
+		"permissions": {"allow": ["Bash(go test *)"]},
+		"hooks": {
+			"UserPromptSubmit": [
+				{"hooks": [{"type": "command", "command": "echo other-tool-hook"}]}
+			],
+			"PreToolUse": [
+				{"matcher": "Write|Edit", "hooks": [{"type": "command", "command": "echo guard"}]}
+			]
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(dir, ".claude", "settings.json"), []byte(existing), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	writeClaudeHooks(dir)
+
+	data, err := os.ReadFile(filepath.Join(dir, ".claude", "settings.json"))
+	if err != nil {
+		t.Fatalf("read settings.json: %v", err)
+	}
+	var settings map[string]any
+	if err := json.Unmarshal(data, &settings); err != nil {
+		t.Fatalf("unmarshal settings.json: %v", err)
+	}
+
+	perms := settings["permissions"].(map[string]any)
+	if perms == nil {
+		t.Error("expected existing permissions block to survive")
+	}
+
+	preTool := settings["hooks"].(map[string]any)["PreToolUse"]
+	if preTool == nil {
+		t.Error("expected existing PreToolUse hooks to survive untouched")
+	}
+
+	groups := settings["hooks"].(map[string]any)["UserPromptSubmit"].([]any)
+	if len(groups) != 2 {
+		t.Fatalf("expected the other tool's hook PLUS defn's own (2 groups), got %d: %+v", len(groups), groups)
+	}
+	foundOther := false
+	foundDefn := false
+	for _, g := range groups {
+		entries := g.(map[string]any)["hooks"].([]any)
+		for _, e := range entries {
+			cmd := e.(map[string]any)["command"].(string)
+			if cmd == "echo other-tool-hook" {
+				foundOther = true
+			}
+			if strings.Contains(cmd, "defn-capture-question.sh") {
+				foundDefn = true
+			}
+		}
+	}
+	if !foundOther {
+		t.Error("expected the other tool's UserPromptSubmit hook to survive")
+	}
+	if !foundDefn {
+		t.Error("expected defn's own UserPromptSubmit hook to be added")
 	}
 }

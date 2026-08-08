@@ -1,6 +1,7 @@
 package main
 
 import (
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,23 +10,12 @@ import (
 	"strings"
 )
 
-// writeProjectConfig writes/updates project-level configuration
-// files that make defn discoverable to AI coding tools running in
-// this directory. Idempotent — safe to call on every ingest/init.
-// See #168 receipt: chi-explore session bench measured a −18% cost
-// win from having CLAUDE.md steer the model toward mcp__defn__code,
-// vs zero defn calls when CLAUDE.md was absent.
-//
-// modulePath must be an absolute path; caller is responsible for
-// the chdir into it. absBin is the path to the defn executable
-// (used in the emitted .mcp.json / .codex config). absDB is the
-// absolute path to .defn/defn.db. noSummaries threads through to
-// writeMCPConfigForProject (#201 init --no-summaries).
 func writeProjectConfig(modulePath, absBin, absDB string, noSummaries bool) {
 	writeMCPConfigForProject(modulePath, absBin, absDB, noSummaries)
 	writeCodexConfig(modulePath, absBin, absDB)
 	writeGitignore(modulePath)
 	writeCLAUDEMDSection(modulePath)
+	writeClaudeHooks(modulePath)
 }
 
 func writeCodexConfig(modulePath, absBin, absDB string) {
@@ -172,3 +162,88 @@ func defnBinaryPath() string {
 	}
 	return absBin
 }
+
+// writeClaudeHooks installs the UserPromptSubmit hook that grounds the
+// #203 starter bundle in the real user question instead of a weak
+// per-op fallback (a bare search pattern, an op name) -- see
+// lastUserQuestion's doc comment in internal/mcp for the full
+// mechanism. #241: this was previously dev-only tooling
+// (hooks/defn-capture-question.sh, wired only in this repo's own
+// .claude/settings.local.json), never installed for consuming
+// projects -- every real defn init user got the weaker fallback
+// silently. Root-caused via a real grpc-go-2630 head-to-head-go
+// trajectory where the starter bundle grounded on the literal search
+// term "drop" instead of the actual problem statement, surfaced an
+// unrelated same-named "drop" feature elsewhere in the package, and
+// contributed to a wrong-function edit.
+//
+// Idempotent -- preserves any other hooks already declared in
+// settings.json (own or third-party), and does not add a second
+// UserPromptSubmit entry for defn's hook on repeat init/ingest calls.
+// Writes the script to .defn/hooks/ (gitignored, like the rest of
+// .defn/) rather than the project's own hooks/ directory, so it never
+// collides with a user-authored script of the same name.
+func writeClaudeHooks(modulePath string) {
+	hookDir := filepath.Join(modulePath, ".defn", "hooks")
+	if err := os.MkdirAll(hookDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not create %s: %v\n", hookDir, err)
+		return
+	}
+	hookPath := filepath.Join(hookDir, "defn-capture-question.sh")
+	if err := os.WriteFile(hookPath, []byte(captureQuestionHookScript), 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not write %s: %v\n", hookPath, err)
+		return
+	}
+
+	settingsPath := filepath.Join(modulePath, ".claude", "settings.json")
+	settings := map[string]any{}
+	if data, err := os.ReadFile(settingsPath); err == nil {
+		json.Unmarshal(data, &settings)
+	}
+	hooksSection, _ := settings["hooks"].(map[string]any)
+	if hooksSection == nil {
+		hooksSection = map[string]any{}
+	}
+	submitGroups, _ := hooksSection["UserPromptSubmit"].([]any)
+
+	command := "bash " + hookPath
+	for _, g := range submitGroups {
+		group, ok := g.(map[string]any)
+		if !ok {
+			continue
+		}
+		entries, _ := group["hooks"].([]any)
+		for _, e := range entries {
+			entry, ok := e.(map[string]any)
+			if !ok {
+				continue
+			}
+			if cmd, _ := entry["command"].(string); cmd == command {
+				return // already installed
+			}
+		}
+	}
+
+	submitGroups = append(submitGroups, map[string]any{
+		"hooks": []any{
+			map[string]any{"type": "command", "command": command},
+		},
+	})
+	hooksSection["UserPromptSubmit"] = submitGroups
+	settings["hooks"] = hooksSection
+
+	claudeDir := filepath.Join(modulePath, ".claude")
+	if err := os.MkdirAll(claudeDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not create %s: %v\n", claudeDir, err)
+		return
+	}
+	settingsJSON, _ := json.MarshalIndent(settings, "", "  ")
+	if err := os.WriteFile(settingsPath, settingsJSON, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not write %s: %v\n", settingsPath, err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "wrote Claude Code hook config to %s\n", settingsPath)
+}
+
+//go:embed assets/defn-capture-question.sh
+var captureQuestionHookScript string
