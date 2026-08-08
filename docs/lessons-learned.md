@@ -10,7 +10,7 @@ in a session re-pays that cost at the cache-write rate, not the cache-read
 rate — so trimming it is a direct multiplier on the single biggest cost
 driver found in this project's own 2026-08 caching investigation.
 
-## 2026-08-07/08: twelve real bugs from real trajectories, two design fixes
+## 2026-08-07/08: thirteen real bugs from real trajectories, two design fixes
 
 A two-day digging session working strictly from real `head-to-head-go`
 defn-arm trajectories (grpc-go, go-zero, cli/cli tasks on defn-bench)
@@ -20,7 +20,7 @@ this class of bug. Every fix below traces to a specific, read
 line-by-line tool-call sequence, not a guess. Commits: `773eeed`,
 `008e271` (both released as `v0.26.14`), `9506b09`, `1004ba9`,
 `60fb503`, `b272b6e` (`v0.26.15`), `38b5dc8`, `2ef68af`, `d19ba62`,
-`dd51c81`, `77ba9a8` (`v0.26.16`+), `6b231ac`.
+`dd51c81`, `77ba9a8` (`v0.26.16`+), `6b231ac`, `c7738b9` (`v0.26.18`).
 
 - **`edit` silently corrupted a definition instead of rejecting a
   multi-decl body** (`b272b6e`) — the most serious of the six. A real
@@ -153,6 +153,43 @@ line-by-line tool-call sequence, not a guess. Commits: `773eeed`,
   precision numbers were partly measurement artifacts, not real
   agent misbehavior — a reminder that the measurement tool itself
   needs the same trajectory-driven scrutiny as the thing it measures.
+
+- **`apply`'s `rename` op duplicated the definition instead of renaming
+  it in place** (`c7738b9`, `v0.26.18`) — the same "sibling handler
+  didn't get the fix" shape as the `receiver:` bug above, one layer
+  deeper. `handleRename`'s own code comment already documents the trap:
+  `UpsertDefinition` looks up rows by `(module,name,kind,receiver,test)`,
+  so mutating `d.Name` in place before calling it inserts a fresh row
+  under the new name instead of updating the old one — `handleRename`
+  correctly uses the by-ID `RenameDefinition` instead, but `apply`'s
+  own "rename" case never got the same treatment. A real trajectory
+  batched `edit` + `rename` (pointer-receiver method) + `edit` of the
+  just-renamed method + `create` in one `apply` call; the resulting DB
+  had both the old and new names as separate rows, which
+  `mergeDeclsIntoSource` then tried to write both — the old one
+  already spliced out via `allowedRemovals`, so it matched nothing on
+  disk, surfacing as a false "database and disk have diverged" warning.
+  On the pre-#218 defn build that ran the original trajectory this
+  landed as *silent* on-disk corruption (old method left behind,
+  requiring a manual create+delete cleanup dance, ~12 extra tool
+  calls); on current HEAD #218's contract correctly converts it into a
+  clean whole-batch rollback instead — contained, but still a spurious
+  failure on an otherwise valid batch. Root cause confirmed by directly
+  instrumenting `mergeDeclsIntoSource` mid-test: both `allow` and
+  `acquire` existed as separate rows simultaneously. Regression test
+  reproduces the exact batch shape. Live pilot re-run of the exact
+  originating task (chi rate-limit-middleware, `defn-forced`, same
+  turns.txt) after the fix: 64→32 tool calls (-50%), $5.31→$3.00
+  (-43%), all turns clean with zero retries — though that specific run
+  happened to solve the task without ever needing a rename (the agent
+  designed the ctx-aware method correctly from the start), so the
+  pilot confirms overall trajectory health rather than replaying the
+  exact rename+edit code path; the regression test is what proves the
+  fix itself. Two follow-up digs (the `defn-natural` arm from the same
+  original session, and turns 2-10 of this fresh pilot) turned up
+  nothing new — worth recording as a negative result, not just
+  positive ones: it means this investigation had genuinely run its
+  course rather than stopping short.
 
 Process note: mid-session the standing practice shifted from "ship a
 release per individual fix" (7 releases in one sitting the day before)
