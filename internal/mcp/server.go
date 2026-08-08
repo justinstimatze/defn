@@ -850,9 +850,12 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	}
 
 	switch args.Op {
-	case "read", "impact", "delete", "test", "history", "similar":
-		if r, o, e := need(args.Name, "name"); r != nil {
-			return r, o, e
+	case "read", "outline", "impact", "delete", "test", "history", "similar":
+		if strings.TrimSpace(args.Name) == "" {
+			if strings.TrimSpace(args.File) != "" {
+				return errResult(fmt.Errorf("%s: name is required — pass name:\"<def>\" for one definition, or use op:\"overview\", file:%q to see every def in that file", args.Op, args.File))
+			}
+			return errResult(fmt.Errorf("%s: name is required", args.Op))
 		}
 	case "explain":
 		// #186: accept name OR names[]; the Q+A co-processor path

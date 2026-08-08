@@ -5372,3 +5372,28 @@ func TestHandleApply_CreateMultiDeclWithFile(t *testing.T) {
 		t.Errorf("emitted main.go missing one or both new funcs:\n%s", src)
 	}
 }
+
+// TestHandleCode_ReadOutlineFileOnlyErrorSuggestsOverview covers a gap seen
+// independently in two real head-to-head-go trajectories (2026-08-07/08):
+// an agent tried op:"read"/op:"outline" with file: set and no name:,
+// intending "show me this whole file". read gave a bare "name is required"
+// and outline (which had no upfront name validation at all -- it isn't in
+// handleCode's name-required op group) fell through to a downstream lookup
+// and returned the far more confusing "definition \"\" not found". Both
+// wasted a round-trip on a request op:"overview" already serves correctly.
+func TestHandleCode_ReadOutlineFileOnlyErrorSuggestsOverview(t *testing.T) {
+	s := &server{backend: nil}
+
+	for _, op := range []string{"read", "outline"} {
+		t.Run(op, func(t *testing.T) {
+			result, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: op, File: "pkg/x.go"})
+			text := resultText(t, result)
+			if !strings.Contains(text, "name is required") {
+				t.Errorf("%s: expected \"name is required\", got: %s", op, text)
+			}
+			if !strings.Contains(text, `op:"overview"`) || !strings.Contains(text, "pkg/x.go") {
+				t.Errorf("%s: expected a pointer to op:\"overview\" with the file, got: %s", op, text)
+			}
+		})
+	}
+}
