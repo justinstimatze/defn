@@ -5645,3 +5645,56 @@ func TestHandleFragmentEdit_BuildFailureMessageDoesNotClaimSuccess(t *testing.T)
 		t.Errorf("still claims success alongside the build failure: %s", text)
 	}
 }
+
+// TestHandleApply_ReplaceHunkAcceptsFragmentFieldNames is the apply-
+// batched counterpart to TestHandleCode_ReplaceHunkAcceptsFragmentFieldNames
+// -- same gap, hit in a real trajectory (grpc-2631) inside an apply batch
+// that mixed an edit (fragment mode) and replace-hunk ops together.
+func TestHandleApply_ReplaceHunkAcceptsFragmentFieldNames(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "replace-hunk", Name: "Greet", OldFragment: `return "Hello, " + name`, NewFragment: `return "Hi, " + name`},
+		},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "old is required") || strings.Contains(text, "not found") || strings.Contains(text, "rolled back") {
+		t.Fatalf("old_fragment/new_fragment should be accepted as old/new aliases, got: %s", text)
+	}
+
+	read, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "read", Name: "Greet"})
+	if !strings.Contains(resultText(t, read), `"Hi, "`) {
+		t.Errorf("Greet was not updated: %s", resultText(t, read))
+	}
+}
+
+// TestHandleCode_ReplaceHunkAcceptsFragmentFieldNames replicates a real
+// trajectory (2026-08-08, cli-1069): an agent called op:"replace-hunk"
+// with old_fragment/new_fragment -- edit's fragment-mode field names for
+// the identical "before/after text" concept -- and got rejected with
+// "replace-hunk: old is required", wasting a round-trip before retrying
+// with the correct old/new names. Now accepted as aliases.
+func TestHandleCode_ReplaceHunkAcceptsFragmentFieldNames(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op:          "replace-hunk",
+		Name:        "Greet",
+		OldFragment: `return "Hello, " + name`,
+		NewFragment: `return "Hi, " + name`,
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "old is required") || strings.Contains(text, "new is required") {
+		t.Fatalf("old_fragment/new_fragment should be accepted as old/new aliases, got: %s", text)
+	}
+	if !strings.Contains(text, "replaced hunk") {
+		t.Errorf("expected a successful hunk replacement, got: %s", text)
+	}
+}

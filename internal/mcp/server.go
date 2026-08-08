@@ -895,6 +895,18 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if r, o, e := need(args.Name, "name"); r != nil {
 			return r, o, e
 		}
+		// old_fragment/new_fragment are edit's fragment-mode field names for
+		// this exact same "before/after text" concept -- accept them here
+		// too instead of erroring, since a model batching edit and
+		// replace-hunk together naturally reaches for the name it just used
+		// on the sibling op. Confirmed hitting two independent real
+		// trajectories (one standalone, one inside apply).
+		if args.Old == "" && args.OldFragment != "" {
+			args.Old = args.OldFragment
+		}
+		if args.New == "" && args.NewFragment != "" {
+			args.New = args.NewFragment
+		}
 		if r, o, e := need(args.Old, "old"); r != nil {
 			return r, o, e
 		}
@@ -3869,8 +3881,17 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			}
 
 		case "replace-hunk":
+			// Same old_fragment/new_fragment alias as handleCode's
+			// validation -- see its comment for the full rationale.
+			oldText, newText := op.Old, op.New
+			if oldText == "" && op.OldFragment != "" {
+				oldText = op.OldFragment
+			}
+			if newText == "" && op.NewFragment != "" {
+				newText = op.NewFragment
+			}
 			line, errStr := projEdit(op, func(body string) (string, error) {
-				return projection.ReplaceHunk(body, op.Old, op.New, op.Index)
+				return projection.ReplaceHunk(body, oldText, newText, op.Index)
 			})
 			if errStr != "" {
 				errors = append(errors, errStr)
