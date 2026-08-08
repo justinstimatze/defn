@@ -5332,3 +5332,43 @@ func TestHandleRename_CompoundOldNameStillUpdatesCallers(t *testing.T) {
 		t.Errorf("caller was not updated to call the NEW method name:\n%s", caller.Body)
 	}
 }
+
+// TestHandleApply_CreateMultiDeclWithFile is the code(op:"apply") counterpart
+// to TestHandleCreateMultiDeclWithFile -- handleApply's own "create" case had
+// a separate, stricter countTopLevelDecls check that unconditionally
+// rejected bodies with >1 decl, never delegating to the same file:-aware
+// multi-decl path handleCreate uses. Caught via a real head-to-head-go
+// pilot trajectory (2026-08-07/08): an agent batched one edit + one
+// multi-decl create (file: set) into a single apply call -- the exact
+// pattern this project's own CLAUDE.md recommends -- and got rejected with
+// "split into 2 create ops", burning an extra round-trip to retry as two
+// separate create ops.
+func TestHandleApply_CreateMultiDeclWithFile(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{
+				Op:   "create",
+				File: "main.go",
+				Body: "func alpha() int { return 1 }\n\nfunc beta() int { return 2 }",
+			},
+		},
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "created alpha") || !strings.Contains(text, "created beta") {
+		t.Fatalf("expected both decls created, got: %s", text)
+	}
+
+	final, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	src := string(final)
+	if !strings.Contains(src, "func alpha()") || !strings.Contains(src, "func beta()") {
+		t.Errorf("emitted main.go missing one or both new funcs:\n%s", src)
+	}
+}

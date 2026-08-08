@@ -3381,7 +3381,18 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			switch op.Op {
 			case "create":
 				if n := countTopLevelDecls(op.Body); n > 1 {
-					errors = append(errors, fmt.Sprintf("create: body has %d top-level decls — split into %d create ops", n, n))
+					if op.File == "" {
+						errors = append(errors, fmt.Sprintf("create: body has %d top-level decls — set file: to author a whole file in one call, or split into %d create ops", n, n))
+						continue
+					}
+					decls, declErr := sliceDecls(op.Body)
+					if declErr != nil {
+						errors = append(errors, fmt.Sprintf("create: multi-decl parse: %v", declErr))
+						continue
+					}
+					for _, d := range decls {
+						sb.WriteString(fmt.Sprintf("+ would create %s (%s) in %s\n", d.Name, d.Kind, op.File))
+					}
 					continue
 				}
 				name, kind, _, _ := s.inferFromBody(op.Body)
@@ -3536,7 +3547,62 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		switch op.Op {
 		case "create":
 			if n := countTopLevelDecls(op.Body); n > 1 {
-				errors = append(errors, fmt.Sprintf("create: body has %d top-level decls — split into %d create ops", n, n))
+				if op.File == "" {
+					errors = append(errors, fmt.Sprintf("create: body has %d top-level decls — set file: to author a whole file in one call, or split into %d create ops", n, n))
+					continue
+				}
+				decls, declErr := sliceDecls(op.Body)
+				if declErr != nil {
+					errors = append(errors, fmt.Sprintf("create: multi-decl parse: %v", declErr))
+					continue
+				}
+				mod := s.findModuleByFile(op.File)
+				if mod == nil && op.Module != "" {
+					mod = s.findModule(op.Module)
+				}
+				if mod == nil {
+					mods, _ := s.backend.ListModules()
+					for i := range mods {
+						if mod == nil || len(mods[i].Path) < len(mod.Path) {
+							mod = &mods[i]
+						}
+					}
+				}
+				if mod == nil {
+					errors = append(errors, "create: no modules found")
+					continue
+				}
+				collided := false
+				for _, d := range decls {
+					if existing, err := tx.GetDefinitionByName(d.Name, mod.Path); err == nil {
+						recv := formatReceiver(existing.Receiver)
+						errors = append(errors, fmt.Sprintf("create %s%s: already exists in %s (id=%d)", recv, d.Name, mod.Path, existing.ID))
+						collided = true
+						break
+					}
+				}
+				if collided {
+					continue
+				}
+				for _, d := range decls {
+					exported := len(d.Name) > 0 && d.Name[0] >= 'A' && d.Name[0] <= 'Z'
+					def := &store.Definition{
+						ModuleID: mod.ID, Name: d.Name, Kind: d.Kind, Exported: exported,
+						Test: d.IsTest, Receiver: d.Receiver, Signature: extractSignature(d.Body), Body: d.Body,
+						SourceFile: op.File,
+					}
+					id, err := tx.UpsertDefinition(def)
+					if err != nil {
+						errors = append(errors, fmt.Sprintf("create %s: %v", d.Name, err))
+						continue
+					}
+					def.ID = id
+					s.enqueueSummary(def)
+					addTouched(op.File)
+					addResolve(op.File, mod.ID)
+					allowedAdds = append(allowedAdds, emit.FuncIdentity(d.Name, d.Receiver))
+					sb.WriteString(fmt.Sprintf("+ created %s (id=%d)\n", d.Name, id))
+				}
 				continue
 			}
 			name, kind, receiver, isTest := s.inferFromBody(op.Body)
