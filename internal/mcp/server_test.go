@@ -7489,3 +7489,379 @@ func TestHandlePragmas_LimitOverridesDefaultCap(t *testing.T) {
 		t.Errorf("expected at most 2 pragma lines with limit:2, got %d:\n%s", got, text)
 	}
 }
+
+// TestBodyScanResult_PipePatternHintsNotRegex guards the pilot8b fix:
+// search(pattern:"A|B|C") reads like regex alternation but search has
+// no regex support anywhere in its path (LIKE + FTS + substring, all
+// literal) -- a real go-zero-2283 trajectory got a generic "no
+// matches" for exactly this shape even though one of the terms
+// existed, found trivially by a follow-up single-term search.
+func TestBodyScanResult_PipePatternHintsNotRegex(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.bodyScanResult("NoSuchThing|AlsoNotThere", 100, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "not regex") {
+		t.Errorf("expected a hint that '|' is literal, not regex alternation, got:\n%s", text)
+	}
+}
+
+// TestHandleCode_AmbiguityNoteOnOtherReadShapedOps extends the #248
+// disclosure fix to every other read-shaped op that resolves a bare
+// name via resolveEditTarget's identical best-effort tiebreak but
+// (unlike read/outline/expand) never surfaced it: impact, explain,
+// similar, slice, test (name-based coverage lookup), test-coverage,
+// and traverse. Found via a systematic sweep of resolveEditTarget's
+// 11 production callers after the pilot8b digging pass turned up the
+// same gap on handleTestByName specifically.
+func TestHandleCode_AmbiguityNoteOnOtherReadShapedOps(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "bft"), 0755)
+	os.MkdirAll(filepath.Join(projDir, "chess"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "bft", "engine.go"), []byte("package bft\n\nfunc Engine() bool { return true }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "chess", "engine.go"), []byte(`package chess
+
+func Engine() bool { return false }
+
+func UseEngine() bool { return Engine() }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	cases := []struct {
+		op    string
+		extra codeParam
+	}{
+		{op: "impact"},
+		{op: "explain"},
+		{op: "similar"},
+		{op: "slice", extra: codeParam{Slice: "signature"}},
+		{op: "test"},
+		{op: "test-coverage"},
+		{op: "traverse", extra: codeParam{Direction: "callers"}},
+	}
+	for _, c := range cases {
+		t.Run(c.op, func(t *testing.T) {
+			args := c.extra
+			args.Op = c.op
+			args.Name = "Engine"
+			result, _, err := s.handleCode(context.Background(), nil, args)
+			if err != nil {
+				t.Fatalf("handleCode %s: %v", c.op, err)
+			}
+			text := resultText(t, result)
+			if !strings.Contains(text, "2 definitions share the name") {
+				t.Errorf("%s: expected an ambiguity note, got:\n%s", c.op, text)
+			}
+		})
+	}
+}
+
+// TestHandleExpand_BodyNotReservedWhenAlreadyServedThisSession guards
+// the pilot8b fix: renderExpandSection never checked bodyServedEpochsAgo
+// before honoring include:["body"], so a name whose full body was
+// already read via read(full:true) got it dumped in full again the
+// next time it was swept into an expand call (including the circuit
+// breaker's own auto-batch redirect) -- pure wasted tokens, confirmed
+// via a real grpc-go-3119 trajectory.
+func TestHandleExpand_BodyNotReservedWhenAlreadyServedThisSession(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
+
+	if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "Greet", Full: true}); err != nil {
+		t.Fatalf("read full: %v", err)
+	}
+
+	result, _, err := s.handleExpand(context.Background(), req, codeParam{Name: "Greet", Include: []string{"outline", "body", "callers"}})
+	if err != nil {
+		t.Fatalf("handleExpand: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, `"Hello, "`) {
+		t.Errorf("expected Greet's body (already served via read(full:true)) to be omitted from expand, got:\n%s", text)
+	}
+	if !strings.Contains(text, "already read in this session") {
+		t.Errorf("expected a note explaining why the body was omitted, got:\n%s", text)
+	}
+}
+
+// TestHandleTestByName_AmbiguousPatternDisclosesTiebreak guards the
+// pilot8b fix: test:"TestX" with no module:/file: hint used to
+// silently scope to whichever same-named test's package won
+// GetDefinitionByName's best-effort caller-count tiebreak, with zero
+// indication another package had a same-named test too -- a real
+// cli-5503 trajectory got a false "PASS" from an unrelated sibling
+// package's TestNewCmdList/TestListRun and only caught it by noticing
+// the printed subtest names looked wrong.
+func TestHandleTestByName_AmbiguousPatternDisclosesTiebreak(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "alpha"), 0755)
+	os.MkdirAll(filepath.Join(projDir, "beta"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "alpha.go"), []byte("package alpha\n\nfunc Widget() bool { return true }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "alpha_test.go"), []byte(`package alpha
+
+import "testing"
+
+func TestDup(t *testing.T) {
+	if !Widget() {
+		t.Fatal("false")
+	}
+}
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "beta", "beta.go"), []byte("package beta\n\nfunc Gadget() bool { return true }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "beta", "beta_test.go"), []byte(`package beta
+
+import "testing"
+
+func TestDup(t *testing.T) {
+	if !Gadget() {
+		t.Fatal("false")
+	}
+}
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+
+	result, _, err := s.handleTestByName(context.Background(), nil, "TestDup", "", "")
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "2 definitions share the name") {
+		t.Errorf("expected an ambiguity note disclosing the tiebreak, got:\n%s", text)
+	}
+	if strings.Contains(text, "./...") {
+		t.Errorf("expected scoping to one specific package's own test, not a whole-repo ./... run, got:\n%s", text)
+	}
+}
+
+// TestHandleTestByName_PanicReportedAsBinaryPanicNotTestFailure is the
+// end-to-end version of TestTestPanicked: a real test-binary crash
+// (not a normal assertion failure) must be labeled distinctly from
+// "SOME TESTS FAILED", the same way a build failure already is.
+func TestHandleTestByName_PanicReportedAsBinaryPanicNotTestFailure(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "crash_test.go"), []byte(`package main
+
+import "testing"
+
+func TestCrashes(t *testing.T) {
+	panic("boom")
+}
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+
+	result, _, err := s.handleTestByName(context.Background(), nil, "TestCrashes", "", "")
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "TEST BINARY PANICKED") {
+		t.Errorf("expected a distinct panic label, got:\n%s", text)
+	}
+	if strings.Contains(text, "SOME TESTS FAILED") {
+		t.Errorf("a binary panic must not also be labeled as a generic test failure:\n%s", text)
+	}
+}
+
+// TestTestPanicked guards the pilot8b fix: a test binary crash (e.g. a
+// duplicate flag/command registration panic shared across an entire
+// package's tests) used to get the same generic "SOME TESTS FAILED"
+// label as a genuine assertion failure -- confirmed via a real cli-405
+// trajectory (panic: create flag redefined: draft) that invited
+// suspicion of an unrelated, correct edit.
+func TestTestPanicked(t *testing.T) {
+	cases := []struct {
+		name string
+		out  string
+		want bool
+	}{
+		{"real panic with trace", "panic: create flag redefined: draft\n\ngoroutine 1 [running]:\nmain.main()\n", true},
+		{"build failed", "# pkg\nfile.go:1:1: undefined: Foo\nFAIL\tpkg [build failed]\n", false},
+		{"real test failure", "--- FAIL: TestX (0.00s)\nFAIL\n", false},
+		{"pass", "PASS\nok  \tpkg\t0.010s\n", false},
+		{"mentions panic without a trace", "--- FAIL: TestX\n    x_test.go:10: expected panic recovery, got nil\nFAIL\n", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := testPanicked(c.out); got != c.want {
+				t.Errorf("testPanicked(%q) = %v, want %v", c.out, got, c.want)
+			}
+		})
+	}
+}
+
+// TestHandleCode_MethodsFileParamThreadedThroughDispatch guards the
+// dispatch-layer half of the same fix: handleCode's "methods" case used
+// to silently drop file:/module: before ever calling handleMethods --
+// passing them had zero effect. Confirmed end-to-end through
+// handleCode, not just the handler directly.
+func TestHandleCode_MethodsFileParamThreadedThroughDispatch(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := &server{backend: db}
+	s.ready.Store(true)
+
+	modA, err := db.EnsureModule("example.com/a", "a", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	modB, err := db.EnsureModule("example.com/b", "b", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := func(mod *store.Module, file, methodName string) {
+		typeDef := &store.Definition{ModuleID: mod.ID, Name: "Engine", Kind: "type", SourceFile: file, Body: "type Engine struct{}"}
+		typeDef.Hash = store.HashBody(typeDef.Body)
+		if _, err := db.UpsertDefinition(typeDef); err != nil {
+			t.Fatal(err)
+		}
+		m := &store.Definition{ModuleID: mod.ID, Name: methodName, Kind: "method", Receiver: "*Engine",
+			SourceFile: file, Body: "func (e *Engine) " + methodName + "() {}", Signature: "func (e *Engine) " + methodName + "()"}
+		m.Hash = store.HashBody(m.Body)
+		if _, err := db.UpsertDefinition(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed(modA, "a/engine.go", "Drive")
+	seed(modB, "b/engine.go", "Fly")
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{Op: "methods", Name: "Engine", File: "b/engine.go"})
+	if err != nil {
+		t.Fatalf("handleCode: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Fly") || strings.Contains(text, "Drive") {
+		t.Errorf("expected file: to actually scope through handleCode's dispatch, got:\n%s", text)
+	}
+}
+
+// TestHandleMethods_SameNamedTypesAcrossFilesGetMergeWarning guards the
+// pilot8b sweep fix: methods were collected by receiver-type-NAME alone
+// with no module/file scoping, so two completely unrelated types
+// sharing a name in different packages had their method sets silently
+// merged into one list -- indistinguishable from a genuine single
+// type's method set. An unscoped call now warns; file: now actually
+// scopes to one.
+func TestHandleMethods_SameNamedTypesAcrossFilesGetMergeWarning(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := &server{backend: db}
+
+	modA, err := db.EnsureModule("example.com/a", "a", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	modB, err := db.EnsureModule("example.com/b", "b", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	seed := func(mod *store.Module, file, methodName string) {
+		typeDef := &store.Definition{ModuleID: mod.ID, Name: "Engine", Kind: "type", SourceFile: file, Body: "type Engine struct{}"}
+		typeDef.Hash = store.HashBody(typeDef.Body)
+		if _, err := db.UpsertDefinition(typeDef); err != nil {
+			t.Fatal(err)
+		}
+		m := &store.Definition{ModuleID: mod.ID, Name: methodName, Kind: "method", Receiver: "*Engine",
+			SourceFile: file, Body: "func (e *Engine) " + methodName + "() {}", Signature: "func (e *Engine) " + methodName + "()"}
+		m.Hash = store.HashBody(m.Body)
+		if _, err := db.UpsertDefinition(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed(modA, "a/engine.go", "Drive")
+	seed(modB, "b/engine.go", "Fly")
+
+	// Unscoped: both methods merged, with a warning disclosing it.
+	result, _, err := s.handleMethods(context.Background(), nil, nameParam{Name: "Engine"})
+	if err != nil {
+		t.Fatalf("handleMethods: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Drive") || !strings.Contains(text, "Fly") {
+		t.Fatalf("expected both unrelated types' methods merged (documenting the pre-fix behavior), got:\n%s", text)
+	}
+	if !strings.Contains(text, "UNRELATED same-named types") {
+		t.Errorf("expected a merge warning when methods came from >1 file with no scoping, got:\n%s", text)
+	}
+
+	// Scoped via file: -- only that file's method, no warning.
+	scoped, _, err := s.handleMethods(context.Background(), nil, nameParam{Name: "Engine", File: "a/engine.go"})
+	if err != nil {
+		t.Fatalf("handleMethods scoped: %v", err)
+	}
+	scopedText := resultText(t, scoped)
+	if !strings.Contains(scopedText, "Drive") || strings.Contains(scopedText, "Fly") {
+		t.Errorf("file: should scope to just that file's methods, got:\n%s", scopedText)
+	}
+	if strings.Contains(scopedText, "UNRELATED same-named types") {
+		t.Errorf("a file:-scoped call should not warn about merging, got:\n%s", scopedText)
+	}
+}

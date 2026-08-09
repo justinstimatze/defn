@@ -1251,7 +1251,11 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 				return wrapStale(s.handleExpand(ctx, req, codeParam{Name: args.Name, Include: []string{"outline", "callers", "body"}, Module: args.Module, File: args.File}))
 			}
 		}
-		return wrapStale(s.handleSlice(ctx, req, args))
+		r, o, e := wrapStale(s.handleSlice(ctx, req, args))
+		if note := s.ambiguityNote(args.Name, args.Receiver, args.Module, args.File); note != "" {
+			r = prependNote(r, note)
+		}
+		return r, o, e
 	case "insert-precondition":
 		return s.handleInsertPrecondition(ctx, req, args)
 	case "replace-slice":
@@ -1281,7 +1285,11 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		r, o, e := wrapStale(s.handleSearch(ctx, req, args))
 		return s.appendStarter(r, o, e, req, args.Pattern)
 	case "impact":
-		return wrapStale(s.handleImpact(ctx, req, args))
+		r, o, e := wrapStale(s.handleImpact(ctx, req, args))
+		if note := s.ambiguityNote(args.Name, args.Receiver, args.Module, args.File); note != "" {
+			r = prependNote(r, note)
+		}
+		return r, o, e
 	case "explain":
 		// #186: when a `question` is passed, route to the Sonnet
 		// co-processor path (assembles bodies, calls Sonnet, returns
@@ -1290,7 +1298,11 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if strings.TrimSpace(args.Question) != "" {
 			return wrapStale(s.handleExplainWithQuestion(ctx, req, args))
 		}
-		return wrapStale(s.handleExplain(ctx, req, nameParam{Name: args.Name, Receiver: args.Receiver, Module: args.Module, File: args.File}))
+		r, o, e := wrapStale(s.handleExplain(ctx, req, nameParam{Name: args.Name, Receiver: args.Receiver, Module: args.Module, File: args.File}))
+		if note := s.ambiguityNote(args.Name, args.Receiver, args.Module, args.File); note != "" {
+			r = prependNote(r, note)
+		}
+		return r, o, e
 	case "context":
 		// #195: server-side bundle to collapse turn-1 exploration.
 		// Question drives the search; server picks top-N relevant
@@ -1323,9 +1335,17 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if args.Test != "" {
 			return s.handleTestByName(ctx, req, args.Test, args.Module, args.File)
 		}
-		return s.handleTest(ctx, req, nameParam{Name: args.Name, Receiver: args.Receiver, Module: args.Module, File: args.File})
+		r, o, e := s.handleTest(ctx, req, nameParam{Name: args.Name, Receiver: args.Receiver, Module: args.Module, File: args.File})
+		if note := s.ambiguityNote(args.Name, args.Receiver, args.Module, args.File); note != "" {
+			r = prependNote(r, note)
+		}
+		return r, o, e
 	case "similar":
-		return wrapStale(s.handleSimilar(ctx, req, nameParam{Name: args.Name, Receiver: args.Receiver, Module: args.Module, File: args.File}))
+		r, o, e := wrapStale(s.handleSimilar(ctx, req, nameParam{Name: args.Name, Receiver: args.Receiver, Module: args.Module, File: args.File}))
+		if note := s.ambiguityNote(args.Name, args.Receiver, args.Module, args.File); note != "" {
+			r = prependNote(r, note)
+		}
+		return r, o, e
 	case "apply":
 		return s.handleApply(ctx, req, applyParam{Operations: args.Operations, DryRun: args.DryRun})
 	case "query":
@@ -1340,13 +1360,17 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		}
 		return s.appendStarter(r, o, e, req, q)
 	case "methods":
-		return wrapStale(s.handleMethods(ctx, req, nameParam{Name: args.Name, Query: args.Query}))
+		return wrapStale(s.handleMethods(ctx, req, nameParam{Name: args.Name, Query: args.Query, Module: args.Module, File: args.File}))
 	case "patch":
 		return s.handlePatch(ctx, req, args)
 	case "sync":
 		return s.handleSync(ctx, req, args)
 	case "test-coverage":
-		return wrapStale(s.handleTestCoverage(ctx, req, args))
+		r, o, e := wrapStale(s.handleTestCoverage(ctx, req, args))
+		if note := s.ambiguityNote(args.Name, args.Receiver, args.Module, args.File); note != "" {
+			r = prependNote(r, note)
+		}
+		return r, o, e
 	case "batch-impact":
 		return wrapStale(s.handleBatchImpact(ctx, req, args))
 	case "simulate":
@@ -1370,7 +1394,11 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "literals":
 		return wrapStale(s.handleLiterals(ctx, req, args))
 	case "traverse":
-		return wrapStale(s.handleTraverse(ctx, req, args))
+		r, o, e := wrapStale(s.handleTraverse(ctx, req, args))
+		if note := s.ambiguityNote(args.Name, args.Receiver, args.Module, args.File); note != "" {
+			r = prependNote(r, note)
+		}
+		return r, o, e
 	case "emit":
 		return s.handleEmit(ctx, req, args)
 	case "gc":
@@ -2188,9 +2216,20 @@ func (s *server) bodyScanResult(pattern string, limit int, file string) (*sdkmcp
 		if file != "" {
 			scope = fmt.Sprintf(" scoped to file:%q", file)
 		}
+		// A pattern like "A|B|C" reads as regex alternation but search has
+		// no regex support anywhere in its path (LIKE + FTS + substring
+		// scan, all literal) -- confirmed via a real go-zero-2283
+		// trajectory where search(pattern:"SetCors|WithCors|...") came back
+		// "no matches" even though WithCors existed, found trivially by a
+		// follow-up single-term search. "|" is a reasonable multi-term
+		// guess an agent will keep making without this hint.
+		regexHint := ""
+		if strings.Contains(pattern, "|") {
+			regexHint = " Note: pattern is a plain substring/LIKE match, not regex — \"|\" is searched for as a literal character, not alternation. Call search once per term instead."
+		}
 		msg := fmt.Sprintf(
-			"[no matches for %q%s — tried name-LIKE, FTS on doc+body, and substring body-scan. If you're grepping for a comment or string literal, this substring wasn't found in any indexed body. Try `overview` for project shape or a broader pattern.]",
-			pattern, scope,
+			"[no matches for %q%s — tried name-LIKE, FTS on doc+body, and substring body-scan.%s If you're grepping for a comment or string literal, this substring wasn't found in any indexed body. Try `overview` for project shape or a broader pattern.]",
+			pattern, scope, regexHint,
 		)
 		return textResult(msg), nil, nil
 	}
@@ -4833,6 +4872,7 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 	if hint == "" {
 		hint = module
 	}
+	ambiguityMsg := ""
 	if hint == "" && testNamePattern.MatchString(pattern) {
 		// No explicit scope, but pattern is very often the literal test
 		// name being targeted (the documented, common case: reproduce an
@@ -4842,11 +4882,17 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 		// `go test ./...` fail regardless of whether the agent's actual
 		// edit -- in a completely different package -- was correct.
 		// Scoping to the named test's own package sidesteps any sibling
-		// package that isn't even imported by it. Best-effort: silently
-		// falls through to ./... if the name doesn't resolve or is
-		// ambiguous across packages.
+		// package that isn't even imported by it. Best-effort tiebreak
+		// (most production callers) when the name is ambiguous across
+		// packages -- real trajectory (cli-5503): test:"TestNewCmdList"
+		// silently ran against an unrelated same-named test in a sibling
+		// package and reported PASS, with nothing verified in the package
+		// actually edited. ambiguityNote discloses the tiebreak below
+		// instead of staying silent about it, same precedent as #248's
+		// read/outline fix.
 		if d, err := s.backend.GetDefinitionByName(pattern, ""); err == nil && d != nil {
 			hint = d.SourceFile
+			ambiguityMsg = s.ambiguityNote(pattern, "", "", "")
 		}
 	}
 	target := s.testScopeTarget(hint)
@@ -4864,16 +4910,18 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 	switch {
 	case err != nil && testBuildFailed(outStr):
 		sb.WriteString("\nBUILD FAILED -- the package did not compile; zero tests ran. This is NOT a test-failure signal, fix the compile error shown above first")
-	case err != nil:
-		sb.WriteString("\nSOME TESTS FAILED")
+	case err != nil && testPanicked(outStr):
+		sb.WriteString("\nTEST BINARY PANICKED -- not a normal assertion failure; likely caused by state unrelated to your edit (e.g. duplicate flag/command registration shared across tests in one binary). Investigate the panic trace above before assuming your edit is wrong")
 	case ctx.Err() == context.DeadlineExceeded:
 		sb.WriteString(fmt.Sprintf("\nTIMED OUT after %s -- this is NOT a pass; the run was killed before finishing, likely a hang introduced by a recent edit", testTimeout))
+	case err != nil:
+		sb.WriteString("\nSOME TESTS FAILED")
 	case testMatchedNothing(outStr):
 		sb.WriteString(fmt.Sprintf("\nNO TESTS MATCHED — pattern %q matched zero tests in %s; nothing was verified. Check the name/pattern and scope (module:/file:) before trusting this as a pass", pattern, target))
 	default:
 		sb.WriteString("\nALL TESTS PASSED")
 	}
-	return textResult(sb.String()), nil, nil
+	return prependNote(textResult(sb.String()), ambiguityMsg), nil, nil
 }
 
 func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
@@ -4932,10 +4980,12 @@ func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args n
 	switch {
 	case err != nil && testBuildFailed(outStr):
 		sb.WriteString("\nBUILD FAILED -- the package did not compile; zero tests ran. This is NOT a test-failure signal, fix the compile error shown above first")
-	case err != nil:
-		sb.WriteString("\nSOME TESTS FAILED")
+	case err != nil && testPanicked(outStr):
+		sb.WriteString("\nTEST BINARY PANICKED -- not a normal assertion failure; likely caused by state unrelated to your edit (e.g. duplicate flag/command registration shared across tests in one binary). Investigate the panic trace above before assuming your edit is wrong")
 	case ctx.Err() == context.DeadlineExceeded:
 		sb.WriteString(fmt.Sprintf("\nTIMED OUT after %s -- this is NOT a pass; the run was killed before finishing, likely a hang introduced by a recent edit", testTimeout))
+	case err != nil:
+		sb.WriteString("\nSOME TESTS FAILED")
 	case testMatchedNothing(outStr):
 		sb.WriteString(fmt.Sprintf("\nNO TESTS MATCHED — the %d covering test(s) didn't run in %s (likely scoped to the wrong package, e.g. coverage via interface dispatch in a sibling package); nothing was verified", len(testNames), target))
 	default:
@@ -5847,30 +5897,7 @@ func compactReadFile(file, modulePath string, defs []store.Definition, fullSize 
 	return sb.String()
 }
 
-// handleExpand returns a definition plus caller-chosen graph neighborhoods
-// in one tool_result. Attacks the N² cache-read cost problem: every kind
-// under `include:` is a hop that would otherwise cost a separate turn.
-//
-// Supported include kinds: "outline" (sig+doc+body-size+callees+flow —
-// the compact projection, 5-10× smaller than body), "body" (full source),
-// "callers" (direct callers with source locations).
-//
-// Default when include is omitted: ["outline","callers"] — the pair that
-// answers most exploratory questions ("what does X do / who calls it")
-// without paying for the body. Explicitly request "body" when you're
-// about to edit or need to see branching. See #172.
-//
-// #210: accepts names:["A","B",...] (plural) to expand several defs in
-// ONE call instead of one expand per target -- the #206/#209 chi-explore
-// bench found the model making 11 separate expand calls in a single turn
-// for exactly this shape (routeHTTP, Handle, Middlewares, Chain, Route,
-// Mount, ...), each paying a full round-trip's cache-read cost on top of
-// the growing conversation prefix. name (singular) still works and is
-// equivalent to names:[name] -- fully backward compatible. Unresolvable
-// names are skipped with a note rather than failing the whole call.
-//
-// Design notes in scratchpad/expand-op-design.md.
-func (s *server) handleExpand(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) handleExpand(_ context.Context, req *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	names := args.Names
 	if len(names) == 0 {
 		if strings.TrimSpace(args.Name) == "" {
@@ -5919,7 +5946,31 @@ func (s *server) handleExpand(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		if note := s.ambiguityNote(name, "", args.Module, args.File); note != "" {
 			sb.WriteString(note)
 		}
-		if err := s.renderExpandSection(&sb, d, modulePathByID[d.ModuleID], want); err != nil {
+		// This name's own want-map: a per-name copy only when body needs to
+		// be suppressed below, so other names in the same batch still get
+		// whatever the caller asked for.
+		sectionWant := want
+		if want["body"] && req != nil && s.respCache != nil {
+			// The direct read/outline/slice dispatch cases in handleCode all
+			// check bodyServedEpochsAgo before re-serving a body, but this
+			// batched path -- including the circuit breaker's own auto-batch
+			// redirect through here -- never did, so a name whose full body
+			// was already read verbatim this session got it re-dumped in
+			// full again on the very next expand/auto-batch that swept it
+			// in. Confirmed via a real grpc-go-3119 trajectory: a function
+			// read explicitly via read(full:true) got its body re-served 10
+			// calls later purely because it was caught in an unrelated
+			// circuit-breaker batch.
+			if epochsAgo, ok := s.respCache.bodyServedEpochsAgo(req.Session, name); ok && epochsAgo <= staleEpochThreshold {
+				sectionWant = map[string]bool{}
+				for k, v := range want {
+					sectionWant[k] = v
+				}
+				sectionWant["body"] = false
+				sb.WriteString(fmt.Sprintf("_(%s's full body was already read in this session via read(full:true) -- omitted here, nothing new. If it may have changed since, call code(op:\"sync\") first.)_\n", name))
+			}
+		}
+		if err := s.renderExpandSection(&sb, d, modulePathByID[d.ModuleID], sectionWant); err != nil {
 			return errResult(fmt.Errorf("expand: gather callers for %s: %w", name, err))
 		}
 		resolved++
@@ -6699,54 +6750,65 @@ func truncateFlow(flow []string, cap int) string {
 	return strings.Join(flow[:cap], " → ") + fmt.Sprintf(" → … (%d more)", len(flow)-cap)
 }
 
-// handleMethods returns a compact projection of every method whose
-// receiver is (or points to) the given type. Task #79: browsing a
-// type's method set is one of the most common exploration patterns
-// (agents ask "what can I do with this thing?") and the alternatives
-// today are all bad: `read` on every method (N×full-body tokens),
-// `overview` on the file (mixes methods with unrelated defs and
-// includes bodies), or grep (misses interface dispatch, no signatures).
-//
-// Response shape: header line ("TypeName — N methods"), exported
-// methods grouped first (alphabetical), then unexported, each on one
-// line as `Method(args) return  // first-line doc`. Ends with a
-// pointer at `code(op:"read")` for full body access.
-//
-// Also handles interfaces by parsing the interface body's inline
-// method declarations — those live in the type body, not as separate
-// method rows.
 func (s *server) handleMethods(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
 	name := strings.TrimSpace(args.Name)
 	if name == "" {
 		return errResult(fmt.Errorf("methods: name is required (a type or interface name)"))
 	}
-	// Strip leading '*' — callers often paste "*Mux" from a receiver.
+	// Strip leading '*' -- callers often paste "*Mux" from a receiver.
 	name = strings.TrimPrefix(name, "*")
+
+	// #250 sweep: module:/file: were accepted codeParam fields but never
+	// threaded into this op's nameParam at the handleCode dispatch site --
+	// a caller trying to disambiguate two same-named types got silent
+	// non-scoping. Resolve the same way resolveEditTarget does.
+	var modulePath string
+	if args.File != "" {
+		if mod := s.findModuleByFile(args.File); mod != nil {
+			modulePath = mod.Path
+		}
+	}
+	if modulePath == "" && args.Module != "" {
+		if mod := s.findModule(args.Module); mod != nil {
+			modulePath = mod.Path
+		}
+	}
 
 	// Interface path: methods live inline in the interface body, not
 	// as separate method rows. If we find a type/interface def by
 	// this name and its kind is 'interface', parse its body.
-	if typeDef, err := s.backend.GetDefinitionByName(name, ""); err == nil && typeDef != nil && typeDef.Kind == "interface" {
+	if typeDef, err := s.backend.GetDefinitionByName(name, modulePath); err == nil && typeDef != nil && typeDef.Kind == "interface" {
 		return s.methodsFromInterfaceBody(typeDef)
 	}
 
 	// Type path: scan all methods, keep those whose receiver matches.
 	// Handles pointer receivers (*T), value receivers (T), and
-	// generic receivers (T[X], *T[X]) — we compare against T after
+	// generic receivers (T[X], *T[X]) -- we compare against T after
 	// stripping the pointer prefix and generic bracket suffix.
 	allMethods, err := s.backend.FilterDefinitions("", "method", "", 0)
 	if err != nil {
 		return errResult(fmt.Errorf("methods: list: %w", err))
 	}
 	var mine []store.Definition
+	// distinctFiles tracks every source file contributing a match so an
+	// unscoped lookup can warn when it silently merged methods from more
+	// than one file -- two unrelated same-named types in different
+	// packages would otherwise have their method sets combined into one
+	// list with no indication they aren't the same type.
+	distinctFiles := map[string]bool{}
 	for _, m := range allMethods {
 		recv := strings.TrimPrefix(m.Receiver, "*")
 		if idx := strings.Index(recv, "["); idx > 0 {
 			recv = recv[:idx]
 		}
-		if recv == name {
-			mine = append(mine, m)
+		if recv != name {
+			continue
 		}
+		if args.File != "" && !strings.Contains(m.SourceFile, args.File) {
+			continue
+		}
+		mine = append(mine, m)
+		distinctFiles[m.SourceFile] = true
 	}
 	if len(mine) == 0 {
 		return errResult(fmt.Errorf("methods: no methods found for type %q (check spelling, or try code(op:\"search\", pattern:%q))", name, name))
@@ -6762,7 +6824,17 @@ func (s *server) handleMethods(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 		}
 	}
 
-	return s.formatMethodList(name, "type", mine, args.Query)
+	r, o, e := s.formatMethodList(name, "type", mine, args.Query)
+	if args.File == "" && len(distinctFiles) > 1 {
+		files := make([]string, 0, len(distinctFiles))
+		for f := range distinctFiles {
+			files = append(files, f)
+		}
+		sort.Strings(files)
+		note := fmt.Sprintf("[note: methods came from %d different files (%s) sharing receiver type %q -- these may be UNRELATED same-named types merged into one list. Pass file: to scope to a single one.]\n\n", len(distinctFiles), strings.Join(files, ", "), name)
+		r = prependNote(r, note)
+	}
+	return r, o, e
 }
 
 // filterMethodsByQuery keeps only methods whose name or doc contains
@@ -8635,4 +8707,17 @@ func testMatchedNothing(out string) bool {
 // this indistinguishable message, even though zero tests ran.
 func testBuildFailed(out string) bool {
 	return strings.Contains(out, "[build failed]") || strings.Contains(out, "[setup failed]")
+}
+
+// testPanicked reports whether a `go test` invocation's output shows the
+// test binary crashed (e.g. a global-registration panic unrelated to the
+// edited def), not that any test made a failing assertion. Confirmed via
+// a real cli-405 trajectory: a duplicate-flag-registration panic in an
+// unrelated shared Cobra command tree got the same generic "SOME TESTS
+// FAILED" label as a genuine assertion failure, inviting a wrong-edit
+// suspicion instead of pointing at the actual crash. Requires both
+// markers (not just "panic: ") to avoid a false positive on a test that
+// merely prints or asserts on the word "panic".
+func testPanicked(out string) bool {
+	return strings.Contains(out, "panic: ") && strings.Contains(out, "goroutine ")
 }
