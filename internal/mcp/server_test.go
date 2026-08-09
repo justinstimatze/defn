@@ -6186,3 +6186,49 @@ func Widget() string { return "beta" }
 		t.Errorf("resolved to the wrong package's Widget, got: %s", text)
 	}
 }
+
+func TestHandleCode_DeleteDryRunDoesNotDelete(t *testing.T) {
+	// Regression test for a real bug found in a head-to-head-go
+	// trajectory: code(op:"delete", name:"X", dry_run:true) silently
+	// executed a real delete instead of previewing it. Root cause:
+	// handleCode's dispatch built nameParam{Name, Force, Receiver,
+	// Module, File} for the delete case without copying args.DryRun,
+	// and nameParam had no DryRun field for handleDelete to read even
+	// if it had been copied. apply's dry_run already previews deletes
+	// correctly ("- would delete X"); delete's standalone dry_run was a
+	// complete no-op. Goes through handleCode, not handleDelete
+	// directly, to catch the dispatch-level gap (same shape as
+	// TestHandleCode_DeleteReceiverDisambiguatesThroughDispatch).
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	mod, err := db.GetModuleByPath("testproj")
+	if err != nil {
+		t.Fatalf("find testproj module: %v", err)
+	}
+
+	targetID, err := db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Standalone", Kind: "function",
+		Body: "func Standalone() bool { return true }", SourceFile: "main.go",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op: "delete", Name: "Standalone", DryRun: true,
+	})
+	text := resultText(t, result)
+	if result.IsError {
+		t.Fatalf("expected dry-run delete to succeed, got error: %s", text)
+	}
+	if !strings.Contains(text, "would delete") || !strings.Contains(text, "dry run") {
+		t.Fatalf("expected dry-run preview text, got: %s", text)
+	}
+
+	if _, err := db.GetDefinition(targetID); err != nil {
+		t.Fatalf("Standalone should NOT have been deleted by a dry run, but it's gone: %v", err)
+	}
+}

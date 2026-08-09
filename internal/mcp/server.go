@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.25"
+const Version = "0.26.27"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -517,6 +517,10 @@ type nameParam struct {
 	// caller-count refusal). Ignored by ops that don't have a safety
 	// gate. Default false — safe delete refuses on any references.
 	Force bool `json:"force,omitempty"`
+	// DryRun previews the delete (mirrors apply's dry_run) without
+	// touching the DB or disk. Only handleDelete reads this today; other
+	// nameParam-shaped ops ignore it.
+	DryRun bool `json:"dry_run,omitempty"`
 	// Query, when non-empty, activates #153 query-adaptive read:
 	// return only body statements whose source contains any token
 	// from the query. Elided runs collapse to a single comment stub.
@@ -1256,7 +1260,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "create":
 		return s.handleCreate(ctx, req, createParam{Body: args.Body, Module: args.Module, File: args.File})
 	case "delete":
-		return s.handleDelete(ctx, req, nameParam{Name: args.Name, Force: args.Force, Receiver: args.Receiver, Module: args.Module, File: args.File})
+		return s.handleDelete(ctx, req, nameParam{Name: args.Name, Force: args.Force, DryRun: args.DryRun, Receiver: args.Receiver, Module: args.Module, File: args.File})
 	case "rename":
 		return s.handleRename(ctx, req, renameParam{OldName: args.OldName, NewName: args.NewName})
 	case "move":
@@ -4407,6 +4411,10 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 
 	// Show what we're about to delete.
 	recv := formatReceiver(d.Receiver)
+
+	if args.DryRun {
+		return textResult(fmt.Sprintf("- would delete %s%s (id=%d)\n\n(dry run — no changes made)", recv, d.Name, d.ID)), nil, nil
+	}
 
 	// #12: delete + build-gate through a transaction so a build failure
 	// leaves neither the DB nor the file changed. Previously
