@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.30"
+const Version = "0.26.31"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -569,6 +569,11 @@ type editParam struct {
 	// both are set (most specific), mirroring createParam's precedent.
 	Module string `json:"module,omitempty"`
 	File   string `json:"file,omitempty"`
+	// DryRun previews the edit (mirrors delete's dry_run) without
+	// touching the DB or disk. #246: was accepted by the top-level
+	// codeParam schema but silently dropped before reaching handleEdit
+	// -- a caller asking for a preview got a real edit instead.
+	DryRun bool `json:"dry_run,omitempty"`
 }
 
 type createParam struct {
@@ -583,8 +588,11 @@ type applyParam struct {
 }
 
 type renameParam struct {
-	OldName string `json:"old_name"`
-	NewName string `json:"new_name"`
+	OldName  string `json:"old_name"`
+	NewName  string `json:"new_name"`
+	Receiver string `json:"receiver,omitempty"`
+	Module   string `json:"module,omitempty"`
+	File     string `json:"file,omitempty"`
 }
 
 type sqlParam struct {
@@ -803,23 +811,22 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	// write ops invalidate the session cache so the next read is a clean
 	// miss. See internal/mcp/dedup.go.
 	defer func() {
-		if err != nil || result == nil || result.IsError || req == nil {
+		if req == nil {
 			return
 		}
-		// #176: record before dedup potentially replaces result with a
-		// stub -- marking is driven by args (what was asked for), not
-		// by the final response bytes. Only an explicit full:true with
-		// no query is an unambiguous full-body serve: a plain read()
-		// can be silently downgraded to summary or auto-outline mode
-		// (#174/#184), and a query-filtered read elides statements, so
-		// neither is a reliable "the caller has everything" signal.
-		if args.Op == "read" && args.Full && strings.TrimSpace(args.Query) == "" && args.Module == "" && args.File == "" {
-			s.respCache.markBodyServed(req.Session, args.Name)
-		}
-		if op, argKey, ok := dedupOpKey(args); ok {
-			result = s.respCache.dedup(req.Session, op, argKey, result)
-			return
-		}
+		// #245: write ops can partially mutate the DB even when they
+		// return an error -- e.g. a module-spanning sync/apply that
+		// fails partway through has already durably committed the
+		// packages/ops processed before the failure (SQLite writes
+		// commit as they happen; see autoCommit's doc comment -- there's
+		// no staged/uncommitted working set to fall back on here). The
+		// old code gated ALL invalidation on !result.IsError, so a
+		// failed sync/apply left stale cache entries served with false
+		// "nothing has changed since" confidence for exactly the defs
+		// that DID change. Invalidate for write ops regardless of
+		// success/failure; only the dedup/markBodyServed bookkeeping
+		// below (which needs a genuine successful response) stays
+		// gated on error.
 		if isWriteOp(args.Op) {
 			// Scope invalidation to what this write actually touched when
 			// we can determine it, instead of wiping every other def's
@@ -844,12 +851,29 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 			if s.reach != nil {
 				s.reach.invalidate()
 			}
-			if args.Name != "" {
+			if err == nil && result != nil && !result.IsError && args.Name != "" {
 				// A read right after a mutation is almost always "show me
 				// what I just did" -- mark it so the next read of this
-				// name skips the summary-mode default.
+				// name skips the summary-mode default. Only meaningful
+				// on a genuine success.
 				s.respCache.markMutated(req.Session, args.Name)
 			}
+		}
+		if err != nil || result == nil || result.IsError {
+			return
+		}
+		// #176: record before dedup potentially replaces result with a
+		// stub -- marking is driven by args (what was asked for), not
+		// by the final response bytes. Only an explicit full:true with
+		// no query is an unambiguous full-body serve: a plain read()
+		// can be silently downgraded to summary or auto-outline mode
+		// (#174/#184), and a query-filtered read elides statements, so
+		// neither is a reliable "the caller has everything" signal.
+		if args.Op == "read" && args.Full && strings.TrimSpace(args.Query) == "" && args.Module == "" && args.File == "" {
+			s.respCache.markBodyServed(req.Session, args.Name)
+		}
+		if op, argKey, ok := dedupOpKey(args); ok {
+			result = s.respCache.dedup(req.Session, op, argKey, result)
 		}
 	}()
 
@@ -1164,7 +1188,11 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 				return wrapStale(s.handleExpand(ctx, req, codeParam{Name: args.Name, Include: []string{"outline", "callers", "body"}, Module: args.Module, File: args.File}))
 			}
 		}
-		return wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name, Full: args.Full, Query: args.Query, Mode: args.Mode, Receiver: args.Receiver, Module: args.Module, File: args.File}))
+		r, o, e := wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name, Full: args.Full, Query: args.Query, Mode: args.Mode, Receiver: args.Receiver, Module: args.Module, File: args.File}))
+		if note := s.ambiguityNote(args.Name, args.Receiver, args.Module, args.File); note != "" {
+			r = prependNote(r, note)
+		}
+		return r, o, e
 	case "resummarize":
 		return s.handleResummarize(ctx, req, args)
 	case "read-and-verify":
@@ -1191,7 +1219,11 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 				return wrapStale(s.handleExpand(ctx, req, codeParam{Name: args.Name, Include: []string{"outline", "callers", "body"}, Module: args.Module, File: args.File}))
 			}
 		}
-		return wrapStale(s.handleOutline(ctx, req, nameParam{Name: args.Name, Query: args.Query, Receiver: args.Receiver, Module: args.Module, File: args.File}))
+		r, o, e := wrapStale(s.handleOutline(ctx, req, nameParam{Name: args.Name, Query: args.Query, Receiver: args.Receiver, Module: args.Module, File: args.File}))
+		if note := s.ambiguityNote(args.Name, args.Receiver, args.Module, args.File); note != "" {
+			r = prependNote(r, note)
+		}
+		return r, o, e
 	case "slice":
 		// Same cross-def context reuse as read/outline above: any slice
 		// kind is a strict subset of the full body already served.
@@ -1224,6 +1256,16 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if args.Pattern == "" {
 			args.Pattern = args.Name
 		}
+		// #248: query: is a real codeParam field, but only op:"read" wires
+		// it up (query-adaptive body filtering). A caller reaching for
+		// search(query:"X") instead of search(pattern:"X") got pattern=="",
+		// which silently matched nearly everything and returned a
+		// caller-count-ranked list dressed up with a plausible "score" --
+		// indistinguishable from a real, relevant result. Accept query: as
+		// a pattern alias here, same precedent as the name: fallback above.
+		if args.Pattern == "" {
+			args.Pattern = args.Query
+		}
 		r, o, e := wrapStale(s.handleSearch(ctx, req, args))
 		return s.appendStarter(r, o, e, req, args.Pattern)
 	case "impact":
@@ -1254,7 +1296,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if body == "" {
 			body = args.Body
 		}
-		return s.handleEdit(ctx, req, editParam{Name: args.Name, NewBody: body, Receiver: args.Receiver, Module: args.Module, File: args.File})
+		return s.handleEdit(ctx, req, editParam{Name: args.Name, NewBody: body, Receiver: args.Receiver, Module: args.Module, File: args.File, DryRun: args.DryRun})
 	case "insert":
 		return s.handleInsert(ctx, req, args)
 	case "create":
@@ -1262,7 +1304,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "delete":
 		return s.handleDelete(ctx, req, nameParam{Name: args.Name, Force: args.Force, DryRun: args.DryRun, Receiver: args.Receiver, Module: args.Module, File: args.File})
 	case "rename":
-		return s.handleRename(ctx, req, renameParam{OldName: args.OldName, NewName: args.NewName})
+		return s.handleRename(ctx, req, renameParam{OldName: args.OldName, NewName: args.NewName, Receiver: args.Receiver, Module: args.Module, File: args.File})
 	case "move":
 		return s.handleMove(ctx, req, moveParam{Name: args.Name, ToModule: args.Module, Receiver: args.Receiver, File: args.File})
 	case "test":
@@ -1743,10 +1785,15 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 	if args.Mode == "summary" {
 		if sum, sErr := s.backend.GetDefSummary(d.ID); sErr == nil && sum != nil {
 			currentHash := store.HashBodyStructural(d.Body)
-			if sum.BodyHash == currentHash {
+			// #248: a Stub-backend placeholder ("TODO: <Name>") is not a
+			// real summary -- enqueueSummary's own doc comment promises the
+			// read path treats it as a miss and falls back to full body,
+			// but this check was missing, so summary-mode-by-default served
+			// the literal stub text as if it were a genuine intent line.
+			if sum.BodyHash == currentHash && sum.Model != summary.StubModelName {
 				return renderSummaryOnly(d, sum), nil, nil
 			}
-			// Stale — fall through to body but signal it.
+			// Stale or stub — fall through to body but signal it.
 		}
 		// Falls through to full-body rendering; the reader can see
 		// no summary appeared in the response header.
@@ -2001,7 +2048,7 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	if len(defs) == 0 && args.Pattern != "" {
 		scanPattern := strings.Trim(args.Pattern, "%")
 		if scanPattern != "" && !strings.Contains(scanPattern, "%") {
-			return s.bodyScanResult(scanPattern, limit)
+			return s.bodyScanResult(scanPattern, limit, args.File)
 		}
 	}
 
@@ -2069,15 +2116,42 @@ func topLinesOfBody(body string, n int) string {
 // re-locate the match without a follow-up read. Empty result set returns
 // a message that names the fallback tried, distinguishing "no def named
 // X + no body containing X" from "search op failed silently."
-func (s *server) bodyScanResult(pattern string, limit int) (*sdkmcp.CallToolResult, any, error) {
-	hits, err := s.backend.SearchBodiesLike(pattern, limit)
+func (s *server) bodyScanResult(pattern string, limit int, file string) (*sdkmcp.CallToolResult, any, error) {
+	// #241 covered stages 1-2's file: scoping but missed this stage-3
+	// fallback -- SearchBodiesLike itself has no file parameter, so a
+	// wider fetch is over-fetched here and filtered by SourceFile before
+	// truncating to limit, rather than trusting the store layer to scope it.
+	fetchLimit := limit
+	if file != "" {
+		fetchLimit = limit * 20
+		if fetchLimit > 500 {
+			fetchLimit = 500
+		}
+	}
+	hits, err := s.backend.SearchBodiesLike(pattern, fetchLimit)
 	if err != nil {
 		return errResult(fmt.Errorf("search body-scan: %w", err))
 	}
+	if file != "" {
+		filtered := hits[:0]
+		for _, h := range hits {
+			if strings.Contains(h.SourceFile, file) {
+				filtered = append(filtered, h)
+			}
+		}
+		hits = filtered
+	}
+	if len(hits) > limit {
+		hits = hits[:limit]
+	}
 	if len(hits) == 0 {
+		scope := ""
+		if file != "" {
+			scope = fmt.Sprintf(" scoped to file:%q", file)
+		}
 		msg := fmt.Sprintf(
-			"[no matches for %q — tried name-LIKE, FTS on doc+body, and substring body-scan. If you're grepping for a comment or string literal, this substring wasn't found in any indexed body. Try `overview` for project shape or a broader pattern.]",
-			pattern,
+			"[no matches for %q%s — tried name-LIKE, FTS on doc+body, and substring body-scan. If you're grepping for a comment or string literal, this substring wasn't found in any indexed body. Try `overview` for project shape or a broader pattern.]",
+			pattern, scope,
 		)
 		return textResult(msg), nil, nil
 	}
@@ -2218,7 +2292,7 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 	// across different types; module:/file: disambiguate same-named
 	// non-method defs across different packages -- same gap, no
 	// receiver to key off of. See resolveEditTarget.
-	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
+	d, err := s.resolveWriteTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		if args.Receiver != "" {
 			return s.notFoundOrErr(fmt.Sprintf("%s.%s", args.Receiver, args.Name), err)
@@ -2258,6 +2332,17 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 	// changes identity.
 	if newName, _, newReceiver, _ := s.inferFromBody(args.NewBody); newName != "" && (newName != d.Name || newReceiver != d.Receiver) {
 		return errResult(fmt.Errorf("edit %s%s: new_body declares %s%s, which changes its name/receiver — use code(op:\"rename\") to rename a definition; op:\"edit\" only changes body content", formatReceiver(d.Receiver), d.Name, formatReceiver(newReceiver), newName))
+	}
+
+	// #246: dry_run was accepted by the top-level codeParam schema and
+	// silently dropped before reaching editParam -- the same
+	// accepted-but-not-wired gap already fixed for delete's dry_run,
+	// except here the effect is worse: the caller asked for a preview
+	// and got a REAL edit instead, with no error to signal the mistake.
+	// All validation above (parse, multi-decl, identity) has already
+	// run, so a dry-run report here is a genuine preview, not a guess.
+	if args.DryRun {
+		return textResult(fmt.Sprintf("- would update %s%s (id=%d)\n\n(dry run — no changes made)", formatReceiver(d.Receiver), d.Name, d.ID)), nil, nil
 	}
 
 	// Capture the pre-edit signature so we can decide whether the build
@@ -2853,7 +2938,7 @@ func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest
 	// receiver/module/file were available on this handler's own
 	// codeParam but never consulted, so GetDefinitionByName's blast-
 	// radius tiebreak could silently target the wrong same-named def.
-	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
+	d, err := s.resolveWriteTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		if args.Receiver != "" {
 			return s.notFoundOrErr(fmt.Sprintf("%s.%s", args.Receiver, args.Name), err)
@@ -2957,7 +3042,7 @@ func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest
 }
 
 func (s *server) handleInsert(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
+	d, err := s.resolveWriteTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -4433,7 +4518,7 @@ func compositeMatchesType(expr ast.Expr, typeName string) bool {
 }
 
 func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
+	d, err := s.resolveWriteTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -4542,7 +4627,11 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// state gets corrupted. Waiting for ready serializes them.
 	s.waitReady()
 
-	d, err := s.backend.GetDefinitionByName(args.OldName, "")
+	// #248: was a raw bare-name lookup hardcoded to modulePath="" with no
+	// receiver/module/file params on renameParam at all -- rename couldn't
+	// be disambiguated even if the caller wanted to, the worst case of the
+	// same silent-wrong-target bug fixed elsewhere via resolveWriteTarget.
+	d, err := s.resolveWriteTarget(args.OldName, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.OldName, err)
 	}
@@ -4661,21 +4750,6 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	return textResult(sb.String()), nil, nil
 }
 
-// handleTestByName runs `go test -run <pattern>` so the model can
-// reproduce a bug from an issue that names the failing test directly.
-// L11: agents that read the right code but never confirm the failure loop
-// through the read graph without committing to a fix. Naming a test lets
-// the model turn a hypothesis into an observation before writing.
-//
-// #241: module/file scope the run to one package (go test -run P
-// ./<dir>/...) instead of always running the ENTIRE repo (./...) just
-// to filter by name -- on a large repo this is both a real wire-cost
-// tax (every unrelated package's build+test output ships back, most
-// of it "no tests to run") and confusing enough that a real trajectory
-// retried the same named test 5+ times with different -run variations,
-// unable to tell its own result apart from the flood of irrelevant
-// package output. module/file are best-effort: an unresolvable scope
-// falls back to today's ./... behavior, never an error.
 func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, pattern, module, file string) (*sdkmcp.CallToolResult, any, error) {
 	if s.projectDir == "" {
 		return errResult(fmt.Errorf("no project directory configured"))
@@ -4696,7 +4770,6 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 	// is meant to replace. Match directly against source_file paths
 	// instead (same approach as search's file: fix), which actually
 	// distinguishes "core/logx" from every other package in the repo.
-	target := "./..."
 	hint := file
 	if hint == "" {
 		hint = module
@@ -4717,19 +4790,7 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 			hint = d.SourceFile
 		}
 	}
-	if hint != "" {
-		if files, err := s.backend.DistinctSourceFiles(); err == nil {
-			for _, f := range files {
-				if !strings.Contains(f, hint) {
-					continue
-				}
-				if dir := filepath.ToSlash(filepath.Dir(f)); dir != "" && dir != "." {
-					target = "./" + dir + "/..."
-				}
-				break
-			}
-		}
-	}
+	target := s.testScopeTarget(hint)
 
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
@@ -4782,15 +4843,22 @@ func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args n
 	}
 	runPattern := "^(" + strings.Join(testNames, "|") + ")$"
 
+	// #248: this used to always run `./...` regardless of where the
+	// target definition and its tests actually live -- the same
+	// whole-repo flood #241 fixed for handleTestByName, just on the
+	// sibling name-based entry point. Scope to the target definition's
+	// own package the same way.
+	target := s.testScopeTarget(d.SourceFile)
+
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "test", "-run", runPattern, "-count=1", "-v", "./...")
+	cmd := exec.CommandContext(ctx, "go", "test", "-run", runPattern, "-count=1", "-v", target)
 	cmd.Dir = s.projectDir
 	out, err := cmd.CombinedOutput()
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Running %d of %d tests (affected by %s):\n\n",
-		len(testNames), len(testNames), args.Name))
+	sb.WriteString(fmt.Sprintf("Running %d of %d tests (affected by %s) across %s:\n\n",
+		len(testNames), len(testNames), args.Name, target))
 	sb.WriteString(truncateTestOutput(string(out)))
 
 	if err != nil {
@@ -4935,6 +5003,44 @@ func (s *server) handleSync(_ context.Context, _ *sdkmcp.CallToolRequest, args c
 			return errResult(fmt.Errorf("commit after sync: %w", err))
 		}
 		return textResult(fmt.Sprintf("Synced %s: updated %d definitions.", args.File, n)), nil, nil
+	}
+
+	// Fast path: sync every file belonging to one module without a
+	// full-repo packages.Load. Without this, module: was accepted by
+	// the schema but silently ignored, falling through to a whole-repo
+	// resync -- one unrelated, unbuildable package elsewhere in a large
+	// repo then failed the ENTIRE sync (verified via a real grpc-go
+	// trajectory: google.golang.org/grpc/balancer/rls/internal/keys
+	// couldn't be resynced because an unrelated xds/experimental
+	// package failed to load).
+	if args.Module != "" {
+		mod := s.findModule(args.Module)
+		if mod == nil {
+			return errResult(fmt.Errorf("sync: no module matching %q", args.Module))
+		}
+		sources, err := s.backend.ListFileSources(mod.ID)
+		if err != nil {
+			return errResult(fmt.Errorf("list module files: %w", err))
+		}
+		n := 0
+		for sourceFile := range sources {
+			filePath := sourceFile
+			if !filepath.IsAbs(filePath) {
+				filePath = filepath.Join(s.projectDir, filePath)
+			}
+			defs, err := ingest.IngestFile(s.backend, s.projectDir, filePath)
+			if err != nil {
+				return errResult(fmt.Errorf("ingest file %s: %w", sourceFile, err))
+			}
+			if err := resolve.ResolveFile(s.backend, s.projectDir, filePath); err != nil {
+				return errResult(fmt.Errorf("resolve file %s: %w", sourceFile, err))
+			}
+			n += defs
+		}
+		if err := s.autoCommit(); err != nil {
+			return errResult(fmt.Errorf("commit after sync: %w", err))
+		}
+		return textResult(fmt.Sprintf("Synced module %s: updated %d definitions across %d files.", mod.Path, n, len(sources))), nil, nil
 	}
 
 	// Full sync: re-ingest all packages and rebuild references.
@@ -5099,7 +5205,7 @@ func (s *server) projectOverview(ctx context.Context) (*sdkmcp.CallToolResult, a
 		return errResult(fmt.Errorf("list modules: %w", err))
 	}
 	if len(mods) == 0 {
-		return textResult("[project overview: no modules ingested — run defn ingest .]"), nil, nil
+		return textResult("[project overview: no modules ingested — call code(op:\"sync\") to ingest the project, or run `defn ingest .` from a shell.]"), nil, nil
 	}
 	sort.Slice(mods, func(i, j int) bool { return mods[i].Path < mods[j].Path })
 
@@ -5272,11 +5378,22 @@ func (s *server) handleOverview(ctx context.Context, _ *sdkmcp.CallToolRequest, 
 		}
 	}
 
+	// #248: cap AFTER query filtering so a narrowing query still returns
+	// its own matches in full when they fit.
+	var cappedFrom int
+	if len(defs) > overviewDefsCap {
+		cappedFrom = len(defs)
+		defs = defs[:overviewDefsCap]
+	}
+
 	// Get full definitions with bodies to check relationships.
 	var sb strings.Builder
-	if hiddenDefs > 0 {
+	switch {
+	case hiddenDefs > 0:
 		sb.WriteString(fmt.Sprintf("## %s (%d of %d definitions, filtered by query=%q)\n\n", file, len(defs), totalDefs, args.Query))
-	} else {
+	case cappedFrom > 0:
+		sb.WriteString(fmt.Sprintf("## %s (showing %d of %d definitions — pass a narrower file/query for the rest)\n\n", file, len(defs), cappedFrom))
+	default:
 		sb.WriteString(fmt.Sprintf("## %s (%d definitions)\n\n", file, len(defs)))
 	}
 
@@ -5372,7 +5489,7 @@ func (s *server) handlePatch(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		return errResult(fmt.Errorf("patch: old_name and new_name are required (the old and new text)"))
 	}
 
-	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
+	d, err := s.resolveWriteTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
 	}
@@ -6893,7 +7010,7 @@ func (s *server) handleInsertPrecondition(_ context.Context, req *sdkmcp.CallToo
 		}
 		name = inferred
 	}
-	d, err := s.resolveEditTarget(name, args.Receiver, args.Module, args.File)
+	d, err := s.resolveWriteTarget(name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", name))
 	}
@@ -7028,7 +7145,7 @@ func (s *server) handleRenameParam(_ context.Context, req *sdkmcp.CallToolReques
 		}
 		name = inferred
 	}
-	d, err := s.resolveEditTarget(name, args.Receiver, args.Module, args.File)
+	d, err := s.resolveWriteTarget(name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", name))
 	}
@@ -7062,7 +7179,7 @@ func (s *server) handleWrapInDefer(_ context.Context, req *sdkmcp.CallToolReques
 		}
 		name = inferred
 	}
-	d, err := s.resolveEditTarget(name, args.Receiver, args.Module, args.File)
+	d, err := s.resolveWriteTarget(name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", name))
 	}
@@ -7111,7 +7228,7 @@ func (s *server) handleReplaceSlice(_ context.Context, req *sdkmcp.CallToolReque
 		}
 		name = inferred
 	}
-	d, err := s.resolveEditTarget(name, args.Receiver, args.Module, args.File)
+	d, err := s.resolveWriteTarget(name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", name))
 	}
@@ -7154,7 +7271,7 @@ func (s *server) handleReplaceHunk(_ context.Context, req *sdkmcp.CallToolReques
 		}
 		name = inferred
 	}
-	d, err := s.resolveEditTarget(name, args.Receiver, args.Module, args.File)
+	d, err := s.resolveWriteTarget(name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", name))
 	}
@@ -7265,12 +7382,14 @@ func (s *server) applyEditTerse(session *sdkmcp.ServerSession, d *store.Definiti
 		}
 	}
 	if buildResult != "" {
-		firstLine := buildResult
-		if idx := strings.Index(buildResult, "\n"); idx > 0 {
-			firstLine = buildResult[:idx]
-		}
+		// #244: previously kept only the first line of buildResult,
+		// discarding the actual compiler diagnostics (file/line, the
+		// undefined symbol, etc.) that handleEdit's failure path shows
+		// in full -- forcing an agent to blind-guess or fall back to
+		// the verbose edit op whenever a projection-op edit failed to
+		// build. Write the full result, matching handleEdit.
 		sb.WriteString("build: ")
-		sb.WriteString(strings.ToLower(firstLine))
+		sb.WriteString(buildResult)
 		sb.WriteString("\n")
 	}
 	// #158: nudge apply-batching after N serial mutations to one file.
@@ -8112,7 +8231,23 @@ func (s *server) resolveApplyTarget(backend store.Backend, name, receiver, modul
 		}
 	}
 	if receiver == "" {
-		return backend.GetDefinitionByName(name, modulePath)
+		d, err := backend.GetDefinitionByName(name, modulePath)
+		if err != nil {
+			return d, err
+		}
+		// #248: same refusal as resolveWriteTarget -- apply's edit/delete/
+		// rename/projection sub-ops all funnel through this one function,
+		// so this is the single place to close the ambiguous-bare-name
+		// write gap for the whole apply surface, not just standalone ops.
+		if module == "" && file == "" {
+			if n, cErr := backend.CountDefinitionsByName(name); cErr == nil && n > 1 {
+				return nil, fmt.Errorf(
+					"%q is ambiguous: %d definitions share this name across different packages -- refusing to guess which one to write. Pass receiver:, module:, or file: to disambiguate, or use search(pattern:%q) to see every candidate",
+					name, n, name,
+				)
+			}
+		}
+		return d, nil
 	}
 	d, err := backend.GetDefinitionByNameAndReceiver(name, modulePath, receiver)
 	if err != nil {
@@ -8273,4 +8408,85 @@ func (s *server) resolveDottedQualifiedName(name string) (*store.Definition, err
 		return &matches[0], nil
 	}
 	return nil, nil
+}
+
+// testScopeTarget resolves a source-file hint (substring match against
+// DistinctSourceFiles) to a `go test` target, scoping the run to one
+// package instead of the whole repo. A hint resolving to the module
+// root package returns ".", not "./..." -- the naive dir!="." check
+// used to silently skip scoping for root-package tests, falling through
+// to the full-repo default it exists to avoid (#248). Best-effort: an
+// empty or unresolvable hint returns "./...", never an error.
+func (s *server) testScopeTarget(hint string) string {
+	if hint == "" {
+		return "./..."
+	}
+	files, err := s.backend.DistinctSourceFiles()
+	if err != nil {
+		return "./..."
+	}
+	for _, f := range files {
+		if !strings.Contains(f, hint) {
+			continue
+		}
+		dir := filepath.ToSlash(filepath.Dir(f))
+		if dir == "" || dir == "." {
+			return "."
+		}
+		return "./" + dir + "/..."
+	}
+	return "./..."
+}
+
+// overviewDefsCap bounds code(op:"overview") at directory/module scope --
+// previously uncapped, so a large package's overview could exceed the MCP
+// response token limit outright (a real trajectory hit a hard "268,223
+// characters... exceeds maximum allowed tokens" failure on one call).
+// Matches fileDefsCap's cap value for the sibling file-scoped op.
+const overviewDefsCap = fileDefsCap
+
+// resolveWriteTarget wraps resolveEditTarget for MUTATING ops. #248:
+// a bare (no receiver/module/file) name lookup uses
+// GetDefinitionByName's best-effort blast-radius tiebreak, which is
+// fine for a read (worst case: stale info) but not for a write --
+// live-reproduced this session when code(op:"edit", name:"Backend")
+// with no module qualifier silently targeted the wrong one of two
+// same-named "Backend" interfaces across different packages and
+// overwrote it with the other's body, corrupting a file that was
+// never meant to be touched. Refuse instead of guessing whenever the
+// name is ambiguous and the caller gave no disambiguating qualifier.
+func (s *server) resolveWriteTarget(name, receiver, module, file string) (*store.Definition, error) {
+	d, err := s.resolveEditTarget(name, receiver, module, file)
+	if err != nil {
+		return d, err
+	}
+	if receiver == "" && module == "" && file == "" {
+		if n, cErr := s.backend.CountDefinitionsByName(name); cErr == nil && n > 1 {
+			return nil, fmt.Errorf(
+				"%q is ambiguous: %d definitions share this name across different packages -- refusing to guess which one to write. Pass receiver:, module:, or file: to disambiguate, or use search(pattern:%q) to see every candidate",
+				name, n, name,
+			)
+		}
+	}
+	return d, nil
+}
+
+// ambiguityNote warns when a bare-name lookup (no receiver/module/file
+// qualifier) resolved via GetDefinitionByName's best-effort tiebreak
+// while other same-named definitions exist -- #248: outline/read gave
+// no indication another candidate existed, unlike search which lists
+// every match. Empty qualifiers only: an explicit receiver/module/file
+// is a deliberate disambiguation, not something to second-guess.
+func (s *server) ambiguityNote(name, receiver, module, file string) string {
+	if receiver != "" || module != "" || file != "" || strings.TrimSpace(name) == "" {
+		return ""
+	}
+	n, err := s.backend.CountDefinitionsByName(name)
+	if err != nil || n <= 1 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"[note: %d definitions share the name %q; this resolved to one via a best-effort tiebreak (most production callers). Pass receiver:/module:/file: to target a specific one, or search(pattern:%q) to see every candidate.]\n\n",
+		n, name, name,
+	)
 }

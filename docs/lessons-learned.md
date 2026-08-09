@@ -22,25 +22,38 @@ bench's own scorer); full bug-by-bug detail lives in
 `git log --oneline v0.26.13..v0.26.27` and each commit's message, not
 repeated here. The durable, reusable lessons:
 
-- **A module spanning multiple packages can silently corrupt files
-  that share a basename.** The most severe find: `emitModule` grouped
-  a module's definitions by `filepath.Base(SourceFile)` instead of the
-  full path. Since `store.Module` is per `go.mod` (see below), any
-  repo with two files sharing a basename in different packages — e.g.
-  `pkg/cmd/gist/create/create.go` and `pkg/cmd/repo/create/create.go`,
-  both reducing to `"create.go"` — had their definitions merged into
-  one write target on emit. One file got the other's content merged
-  in; its sibling was silently never re-emitted. A real trajectory
-  editing `repo/create`'s `createRun` corrupted `gist/create`'s
-  `createRun` with the wrong body and imports, a file the agent never
-  touched or referenced. Likely a significant, previously invisible
-  contributor to defn's measured "over-touching" on every real
-  multi-package repo tested (common basenames like `create.go`,
-  `delete.go`, `config.go` repeat across packages constantly) — the
-  corruption looked like the agent wrote extra files, when emit did.
-  Any time a per-file operation is keyed by something derived from a
-  path, ask whether two different real paths could produce the same
-  key before trusting it as a file identity.
+- **Two different packages' files sharing a basename could collide on
+  emit's write path.** The most severe find: `emitModule` grouped a
+  package's definitions by `filepath.Base(SourceFile)` instead of the
+  full relative path. The original write-up (and the fix commit's own
+  message) explained this as "`store.Module` is per `go.mod`, spanning
+  every package" — that explanation was itself wrong and was corrected
+  2026-08-09 (see below): `store.Module` is one row per Go package,
+  confirmed by re-reading `ingestPackage`'s `db.EnsureModule(pkgPath,
+  ...)` call (keyed on `pkg.PkgPath`, one per package) and by querying
+  defn's own single-go.mod DB, which has 30 `Module` rows, not 1. The
+  real corruption path was in output-path derivation, not Module
+  scope: two different packages' `emitModule` calls could still land
+  on the same on-disk directory (`pkgDir`) when the module-root-
+  relative path collapsed, and bare-basename keys then silently
+  collided at write time — e.g. `pkg/cmd/gist/create/create.go` and
+  `pkg/cmd/repo/create/create.go` both reducing to `"create.go"`. One
+  file got the other's content merged in; its sibling was silently
+  never re-emitted. A real trajectory editing `repo/create`'s
+  `createRun` corrupted `gist/create`'s `createRun` with the wrong
+  body and imports, a file the agent never touched or referenced.
+  Likely a significant, previously invisible contributor to defn's
+  measured "over-touching" on every real multi-package repo tested
+  (common basenames like `create.go`, `delete.go`, `config.go` repeat
+  across packages constantly) — the corruption looked like the agent
+  wrote extra files, when emit did. Fixed by keying on the full
+  cleaned relative path instead of the bare basename, which is a
+  strictly safer invariant regardless of Module granularity. Any time
+  a per-file operation is keyed by something derived from a path, ask
+  whether two different real paths could produce the same key before
+  trusting it as a file identity — and verify the "why" against the
+  actual code, not just the reasonable-sounding story that fits the
+  symptom, which is exactly what went wrong here.
 - **A synthetic disambiguating name must be stable across every
   context it can be assigned in, or it isn't an identity at all.**
   Second-most-severe find. Go allows unlimited `func init()` per
@@ -91,19 +104,29 @@ repeated here. The durable, reusable lessons:
   mistake. When adding a flag to a shared param shape, grep every
   dispatch site that constructs that struct, not just the handler that
   reads it.
-- **`store.Module` is per `go.mod`, not per package.** A single-module
-  repo (the common case: go-zero, grpc-go, cli/cli) has exactly one
-  `Module` row covering every package. Any fix that resolves a
-  "scope to package X" argument through `findModule`/`findModuleByFile`
-  without checking this silently scopes to "the whole repo" instead.
-  Match against `source_file` substrings directly when the intent is
-  package-level, not repo-level, scoping. Same root cause behind
-  `test:"TestX"` defaulting to a whole-repo `go test ./...`: an
-  unrelated, unbuildable sibling package elsewhere in a large repo
-  poisoned every named-test run regardless of whether the actual
-  target package was fine. Fixed by resolving the pattern itself
+- **`store.Module` is per Go package, not per `go.mod`** — and a
+  belief to the contrary shipped into this very file, a fix commit
+  message, and a regression test's doc comment for a full day before
+  being caught and corrected (2026-08-09). `ingestPackage` calls
+  `db.EnsureModule(pkg.PkgPath, ...)` once per `*packages.Package`, and
+  the SQL upsert is keyed on that path (`ON CONFLICT(path)`) — so a
+  single-module repo (go-zero, grpc-go, cli/cli) gets one `Module` row
+  *per package*, not one for the whole repo. Confirmed by querying
+  defn's own DB (`SELECT COUNT(*) FROM modules`) — 30 rows for one
+  `go.mod`. `findModule`/`findModuleByFile` scoping to "package X"
+  therefore does resolve to that one package's Module row correctly;
+  that part of the original worry was unfounded. The `test:"TestX"`
+  defaulting to a whole-repo `go test ./...` when no scope is given is
+  a real, separately-verified finding — an unrelated, unbuildable
+  sibling package elsewhere in a large repo poisoned every named-test
+  run regardless of whether the actual target package was fine — but
+  its cause is that unscoped `test` shells out to `./...` outright, not
+  a Module-granularity mixup. Fixed by resolving the pattern itself
   against the DB when no explicit scope is given, since it's usually
-  the literal test name.
+  the literal test name. Lesson generalized: a plausible-sounding
+  causal story that matches the symptom is not the same as reading the
+  code that actually produces it — this file is not exempt from that
+  check just because it's the place bugs get written up.
 - **A feature exercised only in this repo's own dev loop is a feature
   that doesn't ship.** `hooks/defn-capture-question.sh` (grounds the
   `#203` starter bundle in the real user question) was wired only into

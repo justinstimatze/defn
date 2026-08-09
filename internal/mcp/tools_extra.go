@@ -74,7 +74,7 @@ func (s *server) handleExplain(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 }
 
 func (s *server) handleMove(_ context.Context, _ *sdkmcp.CallToolRequest, args moveParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.resolveEditTarget(args.Name, args.Receiver, "", args.File)
+	d, err := s.resolveWriteTarget(args.Name, args.Receiver, "", args.File)
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", args.Name))
 	}

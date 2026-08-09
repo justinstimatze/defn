@@ -35,6 +35,11 @@ type Backend interface {
 	// Definitions — reads
 	GetDefinition(id int64) (*Definition, error)
 	GetDefinitionByName(name, modulePath string) (*Definition, error)
+	// CountDefinitionsByName returns how many definitions share name,
+	// regardless of module/package -- used to detect when a bare-name
+	// lookup's best-effort tiebreak (GetDefinitionByName's blast-radius
+	// ORDER BY) silently picked one of several candidates.
+	CountDefinitionsByName(name string) (int, error)
 	GetDefinitionByNameAndReceiver(name, modulePath, receiver string) (*Definition, error)
 	FilterDefinitions(name, kind, file string, limit int) ([]Definition, error)
 	FindDefinitions(namePattern string) ([]Definition, error)

@@ -2650,3 +2650,14 @@ func (s *SQLiteDB) SetExplainCache(cacheKey, question, scope, answer, model stri
 	}
 	return nil
 }
+
+// CountDefinitionsByName returns how many definitions share name,
+// regardless of module/package.
+func (s *SQLiteDB) CountDefinitionsByName(name string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(s.Ctx(), "SELECT COUNT(*) FROM definitions WHERE name = ?", name).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}

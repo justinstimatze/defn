@@ -41,16 +41,6 @@ type Result struct {
 	Err      error
 }
 
-// Backend produces one-line intent summaries. Implementations:
-//   - Stub: returns a synthetic "TODO: <Name>" line. Used for stage 1
-//     wiring tests and as the null-object when no real backend is
-//     configured.
-//   - Haiku (stage 2, not yet implemented): calls Anthropic API.
-//
-// Generate returns one Result per Request in the same order. Failure
-// modes: partial (some Results have Err set), complete (all Err), or
-// success (all Err nil). Never returns a slice of different length
-// than the input.
 type Backend interface {
 	Generate(ctx context.Context, reqs []Request) []Result
 	// Name is the model identifier written into
@@ -70,7 +60,7 @@ type Persister interface {
 // + read path) before a real model is wired up.
 type Stub struct{}
 
-func (Stub) Name() string { return "stub" }
+func (Stub) Name() string { return StubModelName }
 
 func (Stub) Generate(_ context.Context, reqs []Request) []Result {
 	out := make([]Result, len(reqs))
@@ -79,7 +69,7 @@ func (Stub) Generate(_ context.Context, reqs []Request) []Result {
 			DefID:    r.DefID,
 			OneLine:  fmt.Sprintf("TODO: %s", r.Name),
 			BodyHash: r.BodyHash,
-			Model:    "stub",
+			Model:    StubModelName,
 		}
 	}
 	return out
@@ -94,3 +84,9 @@ func toStoreSummary(r Result) *store.DefSummary {
 		Model:    r.Model,
 	}
 }
+
+// StubModelName is the sentinel Result.Model/DefSummary.Model value
+// written by Stub. Callers use it to tell a real (if low-quality)
+// summary apart from a placeholder that hasn't been backfilled yet --
+// see internal/mcp's handleGetDefinition and renderReadNeighborhood.
+const StubModelName = "stub"

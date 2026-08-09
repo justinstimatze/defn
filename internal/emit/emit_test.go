@@ -1904,17 +1904,23 @@ func TestEmitZeroDefModuleNeverDeletesEvenWithFileSources(t *testing.T) {
 // TestEmitModule_SameBasenameDifferentPackagesDontCollide guards a
 // severe data-corruption bug found via a real cli/cli head-to-head-go
 // trajectory (cli-2671, 2026-08-09): pkg/cmd/gist/create/create.go and
-// pkg/cmd/repo/create/create.go share the basename "create.go" and
-// live under the SAME store.Module (one go.mod = one Module row,
-// spanning every package in the repo -- store.Module is per go.mod,
-// not per package). emitModule grouped definitions by
-// filepath.Base(SourceFile) instead of the full project-relative
-// path, so both files' definitions landed in ONE map bucket keyed
-// "create.go". Only one of the two real files ended up written (with
-// the OTHER package's definitions merged into it); the sibling file
-// was silently skipped. Live symptom: editing repo/create's createRun
-// overwrote gist/create's createRun with repo's body and imports,
-// corrupting a file the agent never touched or referenced.
+// pkg/cmd/repo/create/create.go share the basename "create.go". The
+// fixture below simulates the corruption with one store.Module and
+// two SourceFile subdirectories for simplicity; real ingest never
+// actually puts two packages under one Module row (store.Module is
+// one row per Go package, keyed on pkg.PkgPath -- corrected
+// 2026-08-09, docs/lessons-learned.md, after the opposite claim
+// shipped in this comment and the fix commit for a full day). The
+// real collision path is emitModule's per-package output directory
+// (pkgDir) landing on the same path for two different packages, then
+// grouping definitions by filepath.Base(SourceFile) instead of the
+// full project-relative path -- so both files' definitions landed in
+// ONE map bucket keyed "create.go" regardless of which package(s)
+// contributed them. Only one of the two real files ended up written
+// (with the OTHER package's definitions merged into it); the sibling
+// file was silently skipped. Live symptom: editing repo/create's
+// createRun overwrote gist/create's createRun with repo's body and
+// imports, corrupting a file the agent never touched or referenced.
 func TestEmitModule_SameBasenameDifferentPackagesDontCollide(t *testing.T) {
 	db := testDB(t)
 	mod, _ := db.EnsureModule("github.com/x/y", "y", "")
