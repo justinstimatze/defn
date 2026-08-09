@@ -418,11 +418,22 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 		return nil, nil, nil, err
 	}
 
-	// Group definitions by source file. Use the basename because
-	// source_file is stored as a project-relative path (e.g.
-	// "internal/mcp/tools_extra.go"); joining that with pkgDir doubles
-	// the directory prefix and writes land in a non-existent path.
-	// If source_file is empty (old data), fall back to one file per package.
+	// Group definitions by source file, keyed on the full cleaned
+	// project-relative path -- NOT the bare basename. A store.Module is
+	// per go.mod, not per package (#241), so a single module routinely
+	// spans many package directories; keying on basename alone collapses
+	// every same-named file across the whole module into one bucket
+	// (e.g. cli/cli's pkg/cmd/gist/create/create.go and
+	// pkg/cmd/repo/create/create.go both reduce to "create.go"). Only
+	// one of the colliding files would then get written -- with the
+	// OTHER package's definitions merged into it -- silently corrupting
+	// one file and dropping the other. Confirmed via a real cli-2671
+	// head-to-head-go trajectory: editing repo/create's createRun
+	// overwrote gist/create's createRun with repo's body and imports.
+	// The full path collapses to a bare basename naturally whenever
+	// SourceFile itself has no directory component (root-level files,
+	// or the empty-SourceFile synthetic-name fallback below), so this
+	// doesn't change behavior for genuinely single-directory modules.
 	byFile := map[string][]store.Definition{}
 	for _, d := range defs {
 		file := d.SourceFile
@@ -433,7 +444,7 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 				file = strings.ToLower(mod.Name) + ".go"
 			}
 		} else {
-			file = filepath.Base(file)
+			file = filepath.ToSlash(filepath.Clean(file))
 		}
 		byFile[file] = append(byFile[file], d)
 	}

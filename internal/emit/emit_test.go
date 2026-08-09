@@ -1900,3 +1900,57 @@ func TestEmitZeroDefModuleNeverDeletesEvenWithFileSources(t *testing.T) {
 		t.Fatalf("file was modified:\n%s", got)
 	}
 }
+
+// TestEmitModule_SameBasenameDifferentPackagesDontCollide guards a
+// severe data-corruption bug found via a real cli/cli head-to-head-go
+// trajectory (cli-2671, 2026-08-09): pkg/cmd/gist/create/create.go and
+// pkg/cmd/repo/create/create.go share the basename "create.go" and
+// live under the SAME store.Module (one go.mod = one Module row,
+// spanning every package in the repo -- store.Module is per go.mod,
+// not per package). emitModule grouped definitions by
+// filepath.Base(SourceFile) instead of the full project-relative
+// path, so both files' definitions landed in ONE map bucket keyed
+// "create.go". Only one of the two real files ended up written (with
+// the OTHER package's definitions merged into it); the sibling file
+// was silently skipped. Live symptom: editing repo/create's createRun
+// overwrote gist/create's createRun with repo's body and imports,
+// corrupting a file the agent never touched or referenced.
+func TestEmitModule_SameBasenameDifferentPackagesDontCollide(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("github.com/x/y", "y", "")
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "AlphaCreate", Kind: "function", Exported: true,
+		Body: "func AlphaCreate() string {\n\treturn \"alpha\"\n}", SourceFile: "alpha/create.go",
+	})
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "BetaCreate", Kind: "function", Exported: true,
+		Body: "func BetaCreate() string {\n\treturn \"beta\"\n}", SourceFile: "beta/create.go",
+	})
+
+	outDir := t.TempDir()
+	if err := Emit(db, outDir); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+
+	alphaSrc, err := os.ReadFile(filepath.Join(outDir, "alpha", "create.go"))
+	if err != nil {
+		t.Fatalf("alpha/create.go was never written: %v", err)
+	}
+	betaSrc, err := os.ReadFile(filepath.Join(outDir, "beta", "create.go"))
+	if err != nil {
+		t.Fatalf("beta/create.go was never written: %v", err)
+	}
+
+	if !strings.Contains(string(alphaSrc), "AlphaCreate") {
+		t.Errorf("alpha/create.go missing its own AlphaCreate:\n%s", alphaSrc)
+	}
+	if strings.Contains(string(alphaSrc), "BetaCreate") {
+		t.Errorf("alpha/create.go was corrupted with beta's BetaCreate:\n%s", alphaSrc)
+	}
+	if !strings.Contains(string(betaSrc), "BetaCreate") {
+		t.Errorf("beta/create.go missing its own BetaCreate:\n%s", betaSrc)
+	}
+	if strings.Contains(string(betaSrc), "AlphaCreate") {
+		t.Errorf("beta/create.go was corrupted with alpha's AlphaCreate:\n%s", betaSrc)
+	}
+}
