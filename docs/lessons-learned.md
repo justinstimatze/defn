@@ -10,361 +10,103 @@ in a session re-pays that cost at the cache-write rate, not the cache-read
 rate — so trimming it is a direct multiplier on the single biggest cost
 driver found in this project's own 2026-08 caching investigation.
 
-## 2026-08-07/08: sixteen real bugs from real trajectories, two design fixes
+## Lessons from trajectory-driven bug hunting
 
-A two-day digging session working strictly from real `head-to-head-go`
-defn-arm trajectories (grpc-go, go-zero, cli/cli tasks on defn-bench)
-instead of theorizing about cost drivers — the standing practice this
-project follows because synthetic sweeps had previously missed exactly
-this class of bug. Every fix below traces to a specific, read
-line-by-line tool-call sequence, not a guess. Commits: `773eeed`,
-`008e271` (both released as `v0.26.14`), `9506b09`, `1004ba9`,
-`60fb503`, `b272b6e` (`v0.26.15`), `38b5dc8`, `2ef68af`, `d19ba62`,
-`dd51c81`, `77ba9a8` (`v0.26.16`+), `6b231ac`, `c7738b9` (`v0.26.18`),
-`a23f2c5`, `51aeb99`, `8f65ee4` (`v0.26.19`-`v0.26.21`).
+Three days (2026-08-07 to 2026-08-09) digging real `head-to-head-go`
+defn-arm trajectories (grpc-go, go-zero, cli/cli tasks) instead of
+theorizing about cost drivers — the standing practice this project
+follows because synthetic sweeps had previously missed exactly this
+class of bug. Nineteen real bugs came out of it (in defn's MCP tool,
+`internal/resolve`, and the bench's own scorer); full bug-by-bug
+detail lives in `git log --oneline v0.26.13..v0.26.22` and each
+commit's message, not repeated here. The durable, reusable lessons:
 
-- **`edit` silently corrupted a definition instead of rejecting a
-  multi-decl body** (`b272b6e`) — the most serious of the six. A real
-  `new_body` concatenated 3 function declarations into one string.
-  Unlike `create` (`countTopLevelDecls` + `handleCreateMultiDecl`), none
-  of edit's three entry points — `handleEdit`, `handleFragmentEdit`,
-  `handleApply`'s own "edit" case — ever checked decl count. The blob
-  parsed fine (Go allows several func decls in one string) and passed
-  the identity check (which only looks at the first decl), so it landed
-  verbatim as the ONE target definition's `Body`. A later sync/re-ingest
-  of the emitted file then split the extra two decls into duplicate
-  definitions, producing a "redeclared in this block" build failure —
-  and the edit itself had reported plain success, with nothing pointing
-  back at the real cause. The real trajectory burned over a dozen
-  confused follow-up calls recovering: a failed `apply`, four different
-  `replace-hunk` attempts each failing on a *different*
-  missing-required-arg error, and a pointless rename-to-`Xnew`-then-
-  rename-back that fixed nothing. All three entry points now reject a
-  multi-decl result up front, mirroring `create`'s own guard.
-- **Cross-package interface dispatch never reached the ref graph**
-  (`773eeed`). Two compounding bugs in `internal/resolve/resolve.go`'s
-  pass 2: (1) interface-satisfaction pairing only checked a concrete
-  type against interfaces in its OWN package, but Go's normal idiom is
-  define-where-consumed/implement-elsewhere — grpc-go's `lbPicker.Pick`
-  implements `balancer.Picker`, declared in a different package; (2)
-  `go/types` reports a non-nil `Recv()` for interface method
-  *declarations* too, identical in shape to a concrete method's
-  receiver — without filtering `types.IsInterface(sig.Recv().Type())`,
-  interface method decls leaked into `objToDef` via the same
-  bare-`GetDefinitionByName` blast-radius-tiebreak fallback documented
-  in the #219/#220 bug class, silently rebinding every call site
-  dispatched through that interface to an unrelated same-named def
-  elsewhere in the whole DB. Real-corpus confirmation: `defn impact
-  '(*lbPicker).Pick'` went from 0 covering tests to 41 on grpc-go.
-- **`apply`'s `create` case didn't support multi-decl bodies with
-  `file:`** (`008e271`), unlike the standalone `create` op
-  (`handleCreateMultiDecl`, motivated by 2026-07-11's finding). A real
-  trajectory batched `edit` + a 2-decl `create` (file: set — the exact
-  pattern this file and `CLAUDE.md` recommend) into one `apply` call and
-  got rejected with "split into 2 create ops," burning a whole extra
-  round-trip on retry. Pilot-verified on the same two tasks before/after
-  the fix: writes down ~90% (9→1, 20→2), cost down ~84% ($2.28→$0.36
-  combined), correctness *up* (F1 matched or beat the files-mode
-  baseline instead of trailing it).
-- **`read`/`outline` with `file:` and no `name:` gave unhelpful or
-  crashing errors** (`9506b09`), seen independently in 4 trajectories —
-  agents naturally reach for "show me this whole file" via `file:`
-  alone. `read` said "name is required" (fine but unhelpful); `outline`
-  had no upfront validation at all, fell through to
-  `resolveEditTarget → findModuleByFile`, and either returned
-  `definition "" not found` or — with a nil backend, the same
-  construction `TestHandleCodeValidation` itself already relies on
-  being safe for every other op — panicked. Both now point straight at
-  `op:"overview", file:...`, which already serves this correctly.
-- **`test` on a test function itself gave the dead-code message**
-  (`1004ba9`), seen independently in 3 trajectories: an agent writes
-  `TestFoo`, calls `op:"test", name:"TestFoo"` expecting it to run.
-  `name` means "what covers this def" — nothing calls a test, so it
-  always said "No tests cover TestFoo. Nothing to run.", indistinguishable
-  from real dead code, forcing a second call with the differently-named
-  `test:` param. Now checks the resolved def's own `Test` flag and
-  points at `test:"TestFoo"` directly.
-- **Circuit breaker (`#209`, below) self-heals instead of refusing**
-  (`60fb503`). Quantified from the same trajectory sample: 18 of 175
-  total tool calls (10%) were pure-waste breaker blocks — zero
-  information returned, just the nag repeated. Worst case: 11
-  CONSECUTIVE blocked calls, 26% of that one trajectory's entire tool
-  budget, before the model switched to batching. The original design
-  assumed one refusal would make the model immediately restructure its
-  whole remaining strategy; that assumption doesn't hold reliably.
-  `sessionCache` now tracks `pendingReadNames` — every nameable
-  read-shaped call (read/outline/impact/methods/single-name expand)
-  records its name whether or not it ends up blocked. A block on one of
-  those ops now redirects through `expand` with every name accumulated
-  since the last reset, instead of a bare refusal, and the redirect
-  itself resets the counter. `search` (no single resolvable name) keeps
-  the plain refusal. `circuitBreakerCheck`'s own signature and behavior
-  are untouched — tracking is a separate, additive step at the
-  `handleCode` call site — so all 8 pre-existing breaker unit tests
-  needed no changes. Pilot-verified on the exact worst-case trajectory
-  (the 11-consecutive-block one): re-run with the fix, that same task
-  hit 0 plain blocks and 3 productive auto-batches instead.
+- **Sibling handlers drift.** When one operation has multiple entry
+  points — `edit` vs `handleFragmentEdit` vs `apply`'s "edit" case;
+  `create` vs `apply`'s "create" case — a correctness fix to one does
+  *not* propagate to the others. Hit five separate times: multi-decl-
+  body rejection, receiver-based disambiguation, rollback-vs-success
+  reporting, multi-decl `create` support, and rename-by-ID vs
+  rename-by-upsert (this last one a trap `handleRename` already
+  documented in its own code comment — the sibling still didn't get
+  it). When fixing one op's handler, grep for every other entry point
+  implementing the same concept and check each one explicitly.
+- **An accepted parameter isn't necessarily a wired-through one.**
+  Schema acceptance and actual effect are separate claims. `search`'s
+  `file:` param was silently ignored; `test:"TestX"`'s `module:`/
+  `file:` were never threaded to the handler at all. Both looked like
+  real scoping options to a caller and both silently ran unscoped —
+  worse than an error, because nothing signals the mistake.
+- **`store.Module` is per `go.mod`, not per package.** A single-module
+  repo (the common case: go-zero, grpc-go, cli/cli) has exactly one
+  `Module` row covering every package. Any fix that resolves a
+  "scope to package X" argument through `findModule`/`findModuleByFile`
+  without checking this silently scopes to "the whole repo" instead.
+  Match against `source_file` substrings directly when the intent is
+  package-level, not repo-level, scoping.
+- **A feature exercised only in this repo's own dev loop is a feature
+  that doesn't ship.** `hooks/defn-capture-question.sh` (grounds the
+  `#203` starter bundle in the real user question) was wired only into
+  this repo's own `.claude/settings.local.json` — `defn init` never
+  installed it for consuming projects, so every real user got a
+  silently weaker fallback with no way to know the stronger path
+  existed. Before assuming a capability benefits users, check whether
+  `defn init`'s actual output makes it reachable.
+- **The measurement tool needs the same scrutiny as the thing it
+  measures.** Found twice in the bench's own `score_correctness.py`:
+  once assuming a name/receiver convention defn's schema never uses,
+  once rejecting a parenthesized-pointer-receiver form the schema
+  sometimes does produce. Both understated defn's real correctness. A
+  surprising bench delta is at least as likely to be a scorer bug as a
+  product regression — read the actual trajectory before trusting an
+  aggregate number.
+- **Ephemeral storage must outlive whatever depends on it, not just
+  the process that created it.** `head-to-head-go`'s scoring pass
+  reads `.defn/` workdirs an earlier agent run left under `/tmp`; an
+  EC2 stop/start clears `/tmp` and silently destroyed 9 of 10 tasks'
+  scoring data, which then looked exactly like a correctness
+  regression (same cost, F1 dropped to 0) until traced to the wiped
+  directory. Moved to `~/.cache`. General form: if step B depends on
+  state step A left behind, that state needs to survive B's
+  environment, not just A's own lifetime.
+- **A pilot's job is to generate fresh trajectories, not just confirm
+  the fix that motivated running it.** After one fix landed and two
+  digs into *already-collected* data came up clean, the instinct was
+  to stop. Correction: parity with files-mode is the floor, not the
+  goal, and "nothing new in data already examined" isn't the same as
+  "nothing left to find" — the next step is a fresh run, not a re-read
+  of old data.
+- **Not every remaining gap is a tool bug.** One example task
+  (`grpc-go-2630`) survived four straight fixes, each independently
+  live-verified doing exactly what it claimed, because the task itself
+  is a genuinely hard lexical-disambiguation case — a doc comment
+  elsewhere in the same package authentically discusses the same
+  keyword the issue uses, giving a keyword-driven search real textual
+  grounds for the wrong answer. Recognize when a gap has shifted from
+  "defn tooling defect" to "model reasoning limit" and stop chasing
+  the same example past that point — see the standing warning against
+  benchmark-validity rabbit holes.
+- **Circuit breakers should self-heal, not just refuse.** A block that
+  only refuses assumes the caller immediately restructures its whole
+  strategy after one denial. Measured: one real trajectory hit 11
+  consecutive refused calls (26% of its entire tool budget) before
+  adapting. Fixed by having a block auto-batch every name seen since
+  the last reset into one `expand` call instead of just saying no.
 
-- **`similar` had two structurally different algorithms silently
-  swapped based on data shape** (`38b5dc8`, then collapsed further in
-  `2ef68af`). Per the `Project-reverted-similar-cardinality-comod`
-  postmortem, the reverted 2026-07-06 calque port was flagged for
-  blocking candidate discovery on a signature `LIKE` prefilter. The
-  live implementation (MinHash-of-body-shingles) moved past that for
-  bodied defs, but kept the exact same flawed `LIKE` fallback for any
-  def whose body was too short to shingle (interfaces, consts, vars) —
-  and `ComputeMinHash` returns a fixed all-max sentinel for short
-  input, so every such def would score 100% similar to every other one
-  if the primary path were used naively. Fix collapsed to one
-  unconditional formula: `ComputeMinHash(signature + "\n" + body)` for
-  every definition, no branching, no threshold. Not trajectory-proven
-  (no real run ever called `similar`) — proven directly via a
-  sentinel-collision unit test instead.
-- **`apply`'s name-based ops had no `receiver:` field at all**
-  (`d19ba62`). Every batched `edit`/`delete`/`rename`/projection op
-  resolved by bare name only, unlike every standalone handler (#219).
-  A real trajectory needed to edit a same-named method disambiguated
-  only by receiver, got a schema rejection passing `receiver:` into an
-  apply op, then burned ~10 more retries on stale fragments and
-  identity-check failures. Added `resolveApplyTarget`, a tx-aware
-  mirror of `resolveEditTarget`'s exact precedence. Live re-verification
-  on the same task: apply calls 10→3, writes 9→4, cost -31%, wall -30%.
-- **`edit`/`handleFragmentEdit` claimed success on a rolled-back
-  build** (`dd51c81`) — the identical anti-pattern `handleCreate`
-  already got fixed for (see its own code comment), never applied to
-  its two siblings. "Updated X (id=N)... BUILD FAILED" reads as
-  partial success, not total rollback. Hit twice independently
-  (cli-1069, grpc-2631).
-- **`replace-hunk`'s `old`/`new` didn't accept `edit`'s
-  `old_fragment`/`new_fragment` names** (`77ba9a8`) for the identical
-  before/after-text concept — hit independently in cli-1069
-  (standalone) and grpc-2631 (inside `apply`, mixing `edit` and
-  `replace-hunk`). Now aliased at both entry points instead of erroring.
-- **The bench harness itself was undercounting precision**
-  (`6b231ac`, `bench/head-to-head-go/score_correctness.py`) —
-  `resolve_defname_to_file`'s receiver-parsing branch assumed a
-  `"Receiver.Method"` dotted-name convention defn's tool schema never
-  actually uses (name and receiver are separate JSON fields). Every
-  name-only write matched every same-named def in the whole repo, not
-  just the one the tool call actually targeted. Confirmed via a real
-  grpc-go-2631 trajectory: `regeneratePicker` matched 2 files
-  (`balancer/grpclb/grpclb.go` + an unrelated `balancer/base/balancer.go`)
-  when the agent had correctly disambiguated by receiver at the tool
-  layer. This means some of this session's own "over-touching"
-  precision numbers were partly measurement artifacts, not real
-  agent misbehavior — a reminder that the measurement tool itself
-  needs the same trajectory-driven scrutiny as the thing it measures.
-
-- **`apply`'s `rename` op duplicated the definition instead of renaming
-  it in place** (`c7738b9`, `v0.26.18`) — the same "sibling handler
-  didn't get the fix" shape as the `receiver:` bug above, one layer
-  deeper. `handleRename`'s own code comment already documents the trap:
-  `UpsertDefinition` looks up rows by `(module,name,kind,receiver,test)`,
-  so mutating `d.Name` in place before calling it inserts a fresh row
-  under the new name instead of updating the old one — `handleRename`
-  correctly uses the by-ID `RenameDefinition` instead, but `apply`'s
-  own "rename" case never got the same treatment. A real trajectory
-  batched `edit` + `rename` (pointer-receiver method) + `edit` of the
-  just-renamed method + `create` in one `apply` call; the resulting DB
-  had both the old and new names as separate rows, which
-  `mergeDeclsIntoSource` then tried to write both — the old one
-  already spliced out via `allowedRemovals`, so it matched nothing on
-  disk, surfacing as a false "database and disk have diverged" warning.
-  On the pre-#218 defn build that ran the original trajectory this
-  landed as *silent* on-disk corruption (old method left behind,
-  requiring a manual create+delete cleanup dance, ~12 extra tool
-  calls); on current HEAD #218's contract correctly converts it into a
-  clean whole-batch rollback instead — contained, but still a spurious
-  failure on an otherwise valid batch. Root cause confirmed by directly
-  instrumenting `mergeDeclsIntoSource` mid-test: both `allow` and
-  `acquire` existed as separate rows simultaneously. Regression test
-  reproduces the exact batch shape. Live pilot re-run of the exact
-  originating task (chi rate-limit-middleware, `defn-forced`, same
-  turns.txt) after the fix: 64→32 tool calls (-50%), $5.31→$3.00
-  (-43%), all turns clean with zero retries — though that specific run
-  happened to solve the task without ever needing a rename (the agent
-  designed the ctx-aware method correctly from the start), so the
-  pilot confirms overall trajectory health rather than replaying the
-  exact rename+edit code path; the regression test is what proves the
-  fix itself. Two follow-up digs (the `defn-natural` arm from the same
-  original session, and turns 2-10 of this fresh pilot) turned up
-  nothing new — worth recording as a negative result, not just
-  positive ones: it means this investigation had genuinely run its
-  course rather than stopping short.
-
-Process note: mid-session the standing practice shifted from "ship a
-release per individual fix" (7 releases in one sitting the day before)
-to "batch fixes, verify with a real head-to-head-go pilot arm before
-shipping something meant to matter" — the unit-test-only gate satisfied
-the letter of "verify before push" but missed whether a fix changed real
-agent behavior. The `apply` multi-decl fix above is the first one shipped
-under the new rule, and the pilot numbers are why it was worth the extra
-step: unit tests alone would never have surfaced the 90%/84% deltas.
-
-### 2026-08-08 continued: pilot = fresh trajectories, not just fix confirmation
-
-After the `apply`-rename fix (`c7738b9`) landed and two follow-up digs on
-*existing* trajectory data came up clean, the standing instruction was
-corrected: a pilot's job is to generate a fresh trajectory to dig into
-for the *next* bug, not just confirm the fix that motivated running it
-— and parity with files-mode is the floor, not the finish line ("we
-don't stop until defn is much better than files"). A fresh EC2 pilot
-turned up three more real bugs, all traced through one stubborn
-example task (`grpc-go-2630`, "grpclb should drop only when at least
-one connection is ready") that kept failing for a *different* reason
-each time:
-
-- **MCP startup always re-ran a full ingest, even when the DB was
-  already fresh** (`a23f2c5`, `v0.26.19`) — `newMCPServer`'s startup
-  goroutine unconditionally fired a full `packages.Load` + ingest +
-  resolve, even right after a CLI `defn ingest .` (exactly what `defn
-  init` and every bench harness setup step does) had just produced an
-  identical DB. Until `s.ready` flipped, read-shaped ops raced the
-  in-flight reingest — which *tears down and rebuilds* the defs table,
-  not just leaves it stale — and returned actively wrong results
-  tagged with only a soft "may be stale" text warning. Root-caused via
-  a live grpc-go-2630 trajectory: the first `search` call landed
-  mid-reingest and returned `Server`/`rpcStats`/`errDropped` instead of
-  `regeneratePicker`, and the agent confidently edited the wrong
-  function from that garbage. `alreadyFreshlyIngested` skips the
-  reload when `last_ingest` already covers every `.go` file on disk.
-  Live-verified: rerunning the same task on the fixed binary confirmed
-  the stale-ingest warning is gone.
-
-- **`search`'s `file:` param was accepted but silently ignored**
-  (`51aeb99`, `v0.26.20`) — every search ran repo-wide regardless of
-  the hint. Same trajectory: the agent called
-  `search(pattern:"drop", file:"grpclb")` expecting scoping and got
-  unfiltered results ranked by IDF instead. Fixed with a substring
-  match on `source_file` (not `findModuleByFile`'s directory-suffix
-  match used by read/outline/edit, which silently picks the wrong
-  module for a bare hint like `"grpclb"` with no path separator).
-  Regression-tested directly; did not by itself fix grpc-go-2630 (see
-  below).
-
-- **The `#203` starter bundle's "ground in the real question" path was
-  never wired up for real users** (`8f65ee4`, `v0.26.21`) — the
-  biggest find of the three. `lastUserQuestion()` reads
-  `.defn/.last-question`, written by a Claude Code
-  `UserPromptSubmit` hook (`hooks/defn-capture-question.sh`) — but that
-  hook was *only* ever wired into this repo's own local dev settings
-  (`.claude/settings.local.json`, gitignored). `defn init` never
-  installed it for consuming projects. Every real `defn init` user was
-  silently getting the weaker fallback (grounded on a bare search
-  pattern or op name) with no way to know the stronger path existed.
-  Confirmed on the same grpc-go-2630 trajectory: the starter bundle
-  fired as designed but grounded on the literal term `"drop"` instead
-  of the real problem statement, surfacing `Server.Drop`/`rpcStats.drop`
-  — a real, legitimate, *unrelated* "drop" feature elsewhere in the
-  same package. `writeClaudeHooks` embeds the script
-  (`cmd/defn/assets/`, kept in sync with the repo's own copy by
-  comment pointer since `go:embed` can't cross the `cmd/defn`
-  directory boundary) and merges a `UserPromptSubmit` entry into
-  `.claude/settings.json` — idempotent, provably preserves any
-  existing hooks. Live-verified the hook now actually fires under
-  headless `claude -p` (not just interactive sessions): `.last-question`
-  held the real problem statement on the next rerun.
-
-**Honest outcome on grpc-go-2630 itself**: four straight attempts
-across all three fixes still landed on the same wrong function
-(`(*lbPicker).Pick`) — not because the fixes didn't work (each was
-independently live-verified doing exactly what it claimed), but
-because the task is a genuinely hard lexical-disambiguation case:
-`lbPicker`'s own doc comment authentically discusses "drop" handling
-as part of normal per-request pick logic, so a keyword-driven approach
-has real textual grounds for the wrong answer, not just noise. This is
-a reasoning/disambiguation gap, not a defn tooling gap — flagged as
-its own harder thread rather than chased further, per the standing
-warning against benchmark-validity rabbit holes over fixing what's
-actually fixable. (A 5th, unrelated rerun as part of the full n=9 batch
-below did happen to land correctly — plausible model non-determinism,
-not attributed to any specific fix.)
-
-**A fourth bug, in the measurement tool, not the product**
-(`3ac708b`, bench-only, no version bump): rescoring the full n=9
-`head-to-head-go` set after the three fixes above showed
-`grpc-go-2631`'s F1 apparently regress from 0.67 to 0.00 across two
-otherwise-identical runs. Reading the actual trajectory showed a
-*correct* edit matching the gold patch exactly
-(`regeneratePicker`/`HandleSubConnStateChange`/`processServerList`) —
-the agent had called `edit` with a combined
-`name:"(*lbBalancer).regeneratePicker"` form instead of separate
-`name`+`receiver` fields, which defn itself resolves fine, but
-`score_correctness.py`'s injection-safety identifier gate rejected the
-parens/asterisk outright and scored it as a total miss. Fixed with a
-narrow, still-anchored regex for exactly this shape. A reminder,
-again, that the scorer needs the same trajectory-driven scrutiny as
-the thing it measures (see the receiver-resolve fix earlier in this
-doc for the first instance of this exact lesson).
-
-**Net result, full n=9 `head-to-head-go` set, same model, same tasks,
-before vs after this whole arc** (`v0.26.18` → `v0.26.21`, honestly
-rescored with the fixed scorer on both):
+**Net result on `head-to-head-go`** (real GitHub issues, n=10, live
+2-arm, same model, `v0.26.13` → `v0.26.22`):
 
 | | defn | files-mode |
 |---|---:|---:|
-| mean F1 | 0.783 | 0.711 |
-| F1≥0.5 hit-rate | 7/9 | 8/9 |
-| total cost | $3.55 | $3.79 |
+| mean F1 | 0.790 | 0.680 |
+| F1≥0.5 hit-rate | 9/10 | 8/10 |
+| total cost | $2.97 | $4.24 |
 
-For the first time on this benchmark, defn beats files-mode on *both*
-correctness and cost, not just approaches parity on one while trailing
-on the other. n=9 on one model is still not enough to call this
-stable — the next pilot should keep pushing for a larger, repeated
-sample before treating this ranking as settled.
-
-### 2026-08-09: n=10, one more real bug, and an EC2-hygiene lesson
-
-Continuing the same session: completed the 10th task (`cli-3461`,
-already in `tasks.jsonl` but never run against `v0.26.21`) and found
-one more real bug digging `zeromicro/go-zero-1456` (a bigger task —
-add a plain-text log encoding — whose cost had roughly tripled between
-runs with no correctness gain, $0.625 → $1.54, same F1 0.44):
-
-- **`test:"TestX"` always ran `go test ./...` across the WHOLE repo**,
-  ignoring any `module:`/`file:` hint — the dispatch site never even
-  threaded those fields through to `handleTestByName`. On a large repo
-  this ships back every unrelated package's build+test output (mostly
-  "no tests to run") on every call, and the real trajectory retried
-  the same named test 5+ times with different `-run` patterns, unable
-  to spot its own result in the flood. First fix attempt resolved the
-  scope through `findModule`/`findModuleByFile` (the helpers
-  read/outline/edit already use) — wrong granularity: `store.Module`
-  is per `go.mod`, not per package, so a single-module repo (go-zero,
-  grpc-go, cli — the common case) has exactly one `Module` row
-  covering every package, no better than `./...`. Fixed by matching
-  directly against `source_file` paths instead, mirroring the
-  `search` `file:` fix. (`v0.26.22`.)
-
-**A second, real infra bug, not a defn bug**: rescoring the full n=10
-set after adding `cli-3461` showed 4 of 9 previously-correct tasks
-apparently regress to F1=0.00 — but costs were byte-identical to the
-prior scoring, meaning nothing had actually re-run. The EC2 box had
-been stopped and restarted between the two scoring passes, and
-`head-to-head-go`'s `WORKDIR_ROOT`/`DEFN_CACHE_ROOT` lived under
-`/tmp`, which a stop/start cycle clears (systemd-tmpfiles on boot) —
-the scorer's `resolve_defname_to_file` had nothing left to query.
-Moved both roots to `~/.cache` (persistent root volume); a `/tmp`
-symlink to the new location kept already-recorded trajectory JSONs
-(which embed the literal workdir path at run time) resolvable too.
-Lesson generalized: don't stop the EC2 box between iterations of the
-same digging arc, and anything a later scoring/analysis pass depends
-on must survive a restart, not just the run that produced it.
-
-**Net result, full n=10, `v0.26.18` → `v0.26.22`:**
-
-| | defn | files-mode |
-|---|---:|---:|
-| mean F1 | **0.790** | 0.680 |
-| F1≥0.5 hit-rate | **9/10** | 8/10 |
-| total cost | **$2.97** | $4.24 |
-
-defn now leads on correctness, hit-rate, *and* cost (30% cheaper) on
-the full set. The one remaining failure (`go-zero-2283`) is a shared
-miss — both arms score 0.00 — not a defn-specific gap. Still n=10 on
-one model; the next session should keep growing the sample (more
-tasks and/or repeat runs) before treating this as a stable, permanent
-ranking rather than the first strong result.
+First time defn has led files-mode on correctness, hit-rate, and cost
+simultaneously on this benchmark, not just approached parity on one
+axis while trailing on another. n=10 on one model is not yet enough to
+call the ranking stable — growing the sample (more tasks, repeat runs)
+is the natural next step before treating this as settled.
 
 ## #209: enforcement alone made things worse, not better
 
