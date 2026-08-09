@@ -7969,6 +7969,19 @@ func snapshotFiles(projectDir string, files []string) []fileSnapshot {
 // Both GetDefinitionByName and GetDefinitionByNameAndReceiver already
 // accept a modulePath to scope by -- this was purely a dispatch-layer
 // wiring gap, not a store-layer one.
+//
+// #241: a bare lookup can fail when the caller used Go's own
+// "pkg.Symbol"/"pkg/path.Symbol" qualified-name convention -- a
+// completely natural thing to reach for, especially once a bare name
+// has already come back ambiguous or ill-fitting. Real trajectory
+// (go-zero-2283): read(name:"rest/internal/cors.Middleware") came
+// back "not found" even though Middleware exists right there, forcing
+// an extra outline+file: round trip to recover. resolveDottedQualifiedName
+// retries by splitting on the last "." and matching the prefix against
+// source_file directly, not through findModuleByFile/findModule:
+// store.Module is too coarse for this (per go.mod, not per package),
+// so a package-shaped hint can't resolve through it on a single-module
+// repo.
 func (s *server) resolveEditTarget(name, receiver, module, file string) (*store.Definition, error) {
 	var modulePath string
 	if file != "" {
@@ -7987,36 +8000,8 @@ func (s *server) resolveEditTarget(name, receiver, module, file string) (*store.
 		if err == nil && d != nil {
 			return d, nil
 		}
-		// #241: a bare lookup can fail when the caller used Go's own
-		// "pkg.Symbol" (or "pkg/path.Symbol") qualified-name convention
-		// -- a completely natural thing to reach for, especially once a
-		// bare name has already come back ambiguous or ill-fitting.
-		// Real trajectory (go-zero-2283): read(name:"rest/internal/cors.Middleware")
-		// came back "not found" even though Middleware exists right
-		// there, forcing an extra outline+file: round trip to recover.
-		// Retry by splitting on the last "." and matching the prefix
-		// against source_file directly -- store.Module is too coarse
-		// for this (per go.mod, not per package), so findModuleByFile/
-		// findModule can't resolve a package-shaped hint like this on a
-		// single-module repo.
-		if idx := strings.LastIndex(name, "."); idx > 0 {
-			hint, bare := name[:idx], name[idx+1:]
-			if files, ferr := s.backend.DistinctSourceFiles(); ferr == nil {
-				for _, f := range files {
-					if !strings.Contains(f, hint) {
-						continue
-					}
-					// FilterDefinitions is metadata-only (its query hardcodes
-					// an empty body column) -- fetch the full definition by
-					// ID once it's located the right one.
-					if matches, merr := s.backend.FilterDefinitions(bare, "", f, 1); merr == nil && len(matches) > 0 {
-						if full, gerr := s.backend.GetDefinition(matches[0].ID); gerr == nil && full != nil {
-							return full, nil
-						}
-						return &matches[0], nil
-					}
-				}
-			}
+		if dotted, derr := s.resolveDottedQualifiedName(name); derr == nil && dotted != nil {
+			return dotted, nil
 		}
 		return d, err
 	}
@@ -8193,4 +8178,39 @@ func pluralizeCallers(n int) string {
 		return "a direct caller"
 	}
 	return "direct callers"
+}
+
+// resolveDottedQualifiedName handles Go's own "pkg.Symbol"/
+// "pkg/path.Symbol" qualified-name convention as a fallback when a
+// bare name lookup fails -- see resolveEditTarget's doc comment for
+// the full rationale and the real trajectory that motivated it.
+// Returns (nil, nil) when name has no dot or nothing matches, letting
+// the caller fall through to its own not-found error.
+func (s *server) resolveDottedQualifiedName(name string) (*store.Definition, error) {
+	idx := strings.LastIndex(name, ".")
+	if idx <= 0 {
+		return nil, nil
+	}
+	hint, bare := name[:idx], name[idx+1:]
+	files, err := s.backend.DistinctSourceFiles()
+	if err != nil {
+		return nil, nil
+	}
+	for _, f := range files {
+		if !strings.Contains(f, hint) {
+			continue
+		}
+		// FilterDefinitions is metadata-only (its query hardcodes an
+		// empty body column) -- fetch the full definition by ID once it
+		// has located the right one.
+		matches, merr := s.backend.FilterDefinitions(bare, "", f, 1)
+		if merr != nil || len(matches) == 0 {
+			continue
+		}
+		if full, gerr := s.backend.GetDefinition(matches[0].ID); gerr == nil && full != nil {
+			return full, nil
+		}
+		return &matches[0], nil
+	}
+	return nil, nil
 }
