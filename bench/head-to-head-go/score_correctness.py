@@ -56,6 +56,9 @@ def normalize_path(p, prefix_workdir):
 
 _SAFE_DEFNAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
 _SAFE_RECEIVER = re.compile(r"^\*?[A-Za-z_][A-Za-z0-9_]*$")
+_SAFE_PAREN_RECV = re.compile(
+    r"^\(\*([A-Za-z_][A-Za-z0-9_]*)\)\.([A-Za-z_][A-Za-z0-9_]*)$"
+)
 
 
 def resolve_defname_to_file(name, workdir, receiver=None):
@@ -77,24 +80,38 @@ def resolve_defname_to_file(name, workdir, receiver=None):
     """
     if not name or not workdir or not os.path.isdir(os.path.join(workdir, ".defn")):
         return []
-    # `name` comes from agent trajectory tool_call args. Reject anything
-    # that isn't a plain Go identifier (or dotted receiver form) to avoid
-    # SQL injection via the f-string interpolation below. `defn query`
-    # accepts raw SQL so we cannot rely on it to parameterize.
-    if not _SAFE_DEFNAME.match(name):
-        return []
-    # defn's actual `code` tool schema passes name and receiver as
-    # separate JSON fields (e.g. {"name": "Pick", "receiver": "*lbPicker"}),
-    # never as a single dotted "Receiver.Method" string -- prefer an
-    # explicit receiver arg when the caller has one.
-    recv = None
-    bare = name
-    if receiver and _SAFE_RECEIVER.match(receiver):
-        recv = receiver
-    elif "." in name:
-        # Fallback for a dotted-name calling convention, in case some
-        # other harness or agent shape uses it.
-        recv, bare = name.rsplit(".", 1)
+    # (*Type).Method: defn itself resolves this combined pointer-receiver
+    # form in `name` just fine (some real trajectories call edit/apply
+    # this way instead of separate name+receiver fields -- confirmed
+    # 2026-08-08, grpc-go-2631), but the parens/asterisk fail the plain-
+    # identifier gate below, so a correct edit was scored as a total miss
+    # (0 touched files) despite defn having applied it correctly. Handle
+    # this exact shape before the general identifier check, extracting
+    # receiver/bare name straight from the regex groups (still injection-
+    # safe -- fully anchored to identifier characters only).
+    paren_match = _SAFE_PAREN_RECV.match(name)
+    if paren_match:
+        recv_type, bare = paren_match.groups()
+        recv = "*" + recv_type
+    else:
+        # `name` comes from agent trajectory tool_call args. Reject anything
+        # that isn't a plain Go identifier (or dotted receiver form) to avoid
+        # SQL injection via the f-string interpolation below. `defn query`
+        # accepts raw SQL so we cannot rely on it to parameterize.
+        if not _SAFE_DEFNAME.match(name):
+            return []
+        # defn's actual `code` tool schema passes name and receiver as
+        # separate JSON fields (e.g. {"name": "Pick", "receiver": "*lbPicker"}),
+        # never as a single dotted "Receiver.Method" string -- prefer an
+        # explicit receiver arg when the caller has one.
+        recv = None
+        bare = name
+        if receiver and _SAFE_RECEIVER.match(receiver):
+            recv = receiver
+        elif "." in name:
+            # Fallback for a dotted-name calling convention, in case some
+            # other harness or agent shape uses it.
+            recv, bare = name.rsplit(".", 1)
     if recv:
         sql = (
             "SELECT DISTINCT source_file FROM definitions "
