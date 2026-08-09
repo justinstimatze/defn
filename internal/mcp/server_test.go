@@ -6077,3 +6077,59 @@ func Broken() {
 		t.Errorf("expected TestWidget to pass without beta's broken package poisoning the build, got: %s", text)
 	}
 }
+
+// TestHandleEdit_RollbackNamesTheBrokenCallerForApplyBatching guards the
+// #241 fix: a build-failure rollback now names which definition owns
+// the broken call site instead of leaving the agent to reverse-engineer
+// a bare file:line back into a def name. Real trajectory (cli-1069):
+// the agent had already seen "1 direct caller" via a prior impact call,
+// edited a return-arity-changing signature alone anyway, hit exactly
+// this shape of build failure, and spent one extra call figuring out
+// it needed to batch the edit with its caller via apply.
+func TestHandleEdit_RollbackNamesTheBrokenCallerForApplyBatching(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	// setupTestDB's fixture: Farewell calls Greet(name) with one arg.
+	// Changing Greet to require a second param breaks that call site
+	// without touching Farewell at all -- the exact coupled-change shape.
+	result, _, _ := s.handleEdit(context.Background(), nil, editParam{
+		Name:    "Greet",
+		NewBody: "func Greet(name string, extra int) string { return name }",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "rolled back — nothing was saved") {
+		t.Fatalf("expected an explicit rollback message, got: %s", text)
+	}
+	if !strings.Contains(text, "Farewell") {
+		t.Errorf("expected the rollback to name Farewell (the broken caller), got: %s", text)
+	}
+	if !strings.Contains(text, "apply") {
+		t.Errorf("expected a suggestion to batch via apply, got: %s", text)
+	}
+}
+
+// TestHandleImpact_TipsCoupledChangeWhenProdCallersExist guards the
+// #241 fix: impact already reported caller counts, but only ever
+// framed them as a test-coverage risk ("no test coverage — a change
+// here may break code no test will catch"). A real trajectory called
+// impact, saw "1 direct caller: titleBodySurvey," and still edited a
+// return-arity-changing signature alone -- the caller-count fact was
+// there, but nothing connected it to "you're about to break this call
+// site." Now impact says that explicitly whenever production callers
+// exist, regardless of test coverage.
+func TestHandleImpact_TipsCoupledChangeWhenProdCallersExist(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	// Farewell is a production caller of Greet in setupTestDB's fixture.
+	result, _, _ := s.handleImpact(context.Background(), nil, codeParam{Name: "Greet"})
+	text := resultText(t, result)
+	if !strings.Contains(text, "batch it with its production caller") {
+		t.Errorf("expected a coupled-change tip when production callers exist, got: %s", text)
+	}
+}

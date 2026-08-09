@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.23"
+const Version = "0.26.24"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -1381,6 +1381,15 @@ func (s *server) handleImpact(_ context.Context, _ *sdkmcp.CallToolRequest, args
 			len(prodCallers)))
 	}
 	sb.WriteString(fmt.Sprintf("Direct callers: %d (%d production, %d test)\n", len(impact.DirectCallers), len(prodCallers)+queryHiddenProd, len(testCallers)+queryHiddenTest))
+	if len(prodCallers) > 0 {
+		// #241: a caller-count fact was already visible here in a real
+		// trajectory that still edited a signature-changing def alone --
+		// the existing WARNING above is framed around test-coverage risk,
+		// not "this caller's call site may need a corresponding change."
+		// Same fact, different risk; make the coupled-change one explicit
+		// too instead of relying on the reader to infer it.
+		sb.WriteString("  tip: if you're changing this def's signature (params/returns), batch it with its production caller(s) via op:\"apply\" to avoid an edit-then-rollback round trip.\n")
+	}
 	if queryHiddenProd+queryHiddenTest > 0 {
 		sb.WriteString(fmt.Sprintf("  filtered by query=%q: %d callers hidden (%d production, %d test)\n",
 			args.Query, queryHiddenProd+queryHiddenTest, queryHiddenProd, queryHiddenTest))
@@ -2344,7 +2353,7 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 		// a real trajectory hit this exact shape here too (three
 		// sequential edits, each showing "Updated X ... BUILD FAILED",
 		// while chasing a signature change across call sites).
-		sb.WriteString(fmt.Sprintf("edit %s%s rolled back — nothing was saved\n\n%s", recv, d.Name, buildResult))
+		sb.WriteString(fmt.Sprintf("edit %s%s rolled back — nothing was saved\n\n%s%s", recv, d.Name, buildResult, s.coupledChangeHint(d.ID)))
 	} else {
 		sb.WriteString(fmt.Sprintf("Updated %s%s (id=%d, hash=%s)\n", recv, d.Name, id, store.HashBody(args.NewBody)[:12]))
 	}
@@ -2919,7 +2928,7 @@ func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest
 		// Same misleading-message fix as handleEdit -- see its comment
 		// for the full rationale. commitOrRollbackOnBuild's contract:
 		// non-empty means the whole transaction was rolled back.
-		sb.WriteString(fmt.Sprintf("edit %s%s rolled back — nothing was saved\n\n%s", recv, d.Name, buildResult))
+		sb.WriteString(fmt.Sprintf("edit %s%s rolled back — nothing was saved\n\n%s%s", recv, d.Name, buildResult, s.coupledChangeHint(d.ID)))
 	} else {
 		replaced := "1 occurrence"
 		if args.ReplaceAll {
@@ -3594,6 +3603,11 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	resolveSet := map[filePkg]bool{}
 	var allowedRemovals []string
 	var allowedAdds []string
+	// #241: IDs of defs edited in this batch, so a rolled-back build can
+	// point at their callers via coupledChangeHint -- same rationale as
+	// handleEdit's singleton path, just collected across the batch since
+	// there's no single "the def just edited" here.
+	var editedIDs []int64
 	// #233: add-import's disk write can't go through mergeDeclsIntoSource
 	// (it never touches import blocks) -- queued here, applied via
 	// patchImportOnDisk after commit succeeds, mirroring how every other
@@ -3826,6 +3840,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			} else {
 				addTouched(d.SourceFile)
 				addResolve(d.SourceFile, d.ModuleID)
+				editedIDs = append(editedIDs, d.ID)
 				sb.WriteString(fmt.Sprintf("~ edited %s\n", op.Name))
 			}
 
@@ -4167,7 +4182,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			// actually existing (see the sibling handleCreate fix for the
 			// full story) -- the banner alone wasn't enough of a signal
 			// against an explicit, itemized "+ created" line right below it.
-			return textResult(fmt.Sprintf("apply rolled back — build failed, nothing was saved:\n\n%s", buildResult)), nil, nil
+			return textResult(fmt.Sprintf("apply rolled back — build failed, nothing was saved:\n\n%s%s", buildResult, s.coupledChangeHint(editedIDs...))), nil, nil
 		}
 		sb.WriteString("\n" + buildResult)
 	}
@@ -8105,3 +8120,42 @@ func alreadyFreshlyIngested(db store.Backend, projectDir string) bool {
 // deliberately (e.g. "TestFoo|TestBar", "TestFoo$"), which must not be
 // treated as a literal name lookup.
 var testNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+func (s *server) coupledChangeHint(defIDs ...int64) string {
+	seen := map[string]bool{}
+	var names []string
+	for _, id := range defIDs {
+		impact, err := s.backend.GetImpact(id)
+		if err != nil {
+			continue
+		}
+		for _, c := range impact.DirectCallers {
+			if c.Test || seen[c.Name] {
+				continue
+			}
+			seen[c.Name] = true
+			names = append(names, c.Name)
+			if len(names) >= 3 {
+				break
+			}
+		}
+		if len(names) >= 3 {
+			break
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("\nTip: %s has a direct caller (%s) -- if this build failure is from a coupled signature change, batch this edit together with a fix to it via op:\"apply\".\n",
+		pluralizeCallers(len(names)), strings.Join(names, ", "))
+}
+
+// pluralizeCallers renders "a direct caller"/"direct callers" to match
+// coupledChangeHint's single sentence for either count without a
+// separate branch at each call site.
+func pluralizeCallers(n int) string {
+	if n == 1 {
+		return "a direct caller"
+	}
+	return "direct callers"
+}
