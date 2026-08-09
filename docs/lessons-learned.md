@@ -313,6 +313,59 @@ on the other. n=9 on one model is still not enough to call this
 stable — the next pilot should keep pushing for a larger, repeated
 sample before treating this ranking as settled.
 
+### 2026-08-09: n=10, one more real bug, and an EC2-hygiene lesson
+
+Continuing the same session: completed the 10th task (`cli-3461`,
+already in `tasks.jsonl` but never run against `v0.26.21`) and found
+one more real bug digging `zeromicro/go-zero-1456` (a bigger task —
+add a plain-text log encoding — whose cost had roughly tripled between
+runs with no correctness gain, $0.625 → $1.54, same F1 0.44):
+
+- **`test:"TestX"` always ran `go test ./...` across the WHOLE repo**,
+  ignoring any `module:`/`file:` hint — the dispatch site never even
+  threaded those fields through to `handleTestByName`. On a large repo
+  this ships back every unrelated package's build+test output (mostly
+  "no tests to run") on every call, and the real trajectory retried
+  the same named test 5+ times with different `-run` patterns, unable
+  to spot its own result in the flood. First fix attempt resolved the
+  scope through `findModule`/`findModuleByFile` (the helpers
+  read/outline/edit already use) — wrong granularity: `store.Module`
+  is per `go.mod`, not per package, so a single-module repo (go-zero,
+  grpc-go, cli — the common case) has exactly one `Module` row
+  covering every package, no better than `./...`. Fixed by matching
+  directly against `source_file` paths instead, mirroring the
+  `search` `file:` fix. (`v0.26.22`.)
+
+**A second, real infra bug, not a defn bug**: rescoring the full n=10
+set after adding `cli-3461` showed 4 of 9 previously-correct tasks
+apparently regress to F1=0.00 — but costs were byte-identical to the
+prior scoring, meaning nothing had actually re-run. The EC2 box had
+been stopped and restarted between the two scoring passes, and
+`head-to-head-go`'s `WORKDIR_ROOT`/`DEFN_CACHE_ROOT` lived under
+`/tmp`, which a stop/start cycle clears (systemd-tmpfiles on boot) —
+the scorer's `resolve_defname_to_file` had nothing left to query.
+Moved both roots to `~/.cache` (persistent root volume); a `/tmp`
+symlink to the new location kept already-recorded trajectory JSONs
+(which embed the literal workdir path at run time) resolvable too.
+Lesson generalized: don't stop the EC2 box between iterations of the
+same digging arc, and anything a later scoring/analysis pass depends
+on must survive a restart, not just the run that produced it.
+
+**Net result, full n=10, `v0.26.18` → `v0.26.22`:**
+
+| | defn | files-mode |
+|---|---:|---:|
+| mean F1 | **0.790** | 0.680 |
+| F1≥0.5 hit-rate | **9/10** | 8/10 |
+| total cost | **$2.97** | $4.24 |
+
+defn now leads on correctness, hit-rate, *and* cost (30% cheaper) on
+the full set. The one remaining failure (`go-zero-2283`) is a shared
+miss — both arms score 0.00 — not a defn-specific gap. Still n=10 on
+one model; the next session should keep growing the sample (more
+tasks and/or repeat runs) before treating this as a stable, permanent
+ranking rather than the first strong result.
+
 ## #209: enforcement alone made things worse, not better
 
 A chi-explore bench with the go-guard hook live cost +154% vs. native
