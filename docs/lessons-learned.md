@@ -16,11 +16,11 @@ Three days (2026-08-07 to 2026-08-09) digging real `head-to-head-go`
 defn-arm trajectories (grpc-go, go-zero, cli/cli tasks) instead of
 theorizing about cost drivers — the standing practice this project
 follows because synthetic sweeps had previously missed exactly this
-class of bug. Twenty-four real bugs came out of it (in defn's MCP tool,
-`internal/emit`, `internal/resolve`, and the bench's own scorer); full
-bug-by-bug detail lives in `git log --oneline v0.26.13..v0.26.25` and
-each commit's message, not repeated here. The durable, reusable
-lessons:
+class of bug. Twenty-seven real bugs came out of it (in defn's MCP
+tool, `internal/emit`, `internal/ingest`, `internal/resolve`, and the
+bench's own scorer); full bug-by-bug detail lives in
+`git log --oneline v0.26.13..v0.26.26` and each commit's message, not
+repeated here. The durable, reusable lessons:
 
 - **A module spanning multiple packages can silently corrupt files
   that share a basename.** The most severe find: `emitModule` grouped
@@ -41,6 +41,30 @@ lessons:
   Any time a per-file operation is keyed by something derived from a
   path, ask whether two different real paths could produce the same
   key before trusting it as a file identity.
+- **A synthetic disambiguating name must be stable across every
+  context it can be assigned in, or it isn't an identity at all.**
+  Second-most-severe find. Go allows unlimited `func init()` per
+  module (common: one per file, each registering that file's own
+  subcommands), so ingest assigns each a synthetic name (`init`,
+  `init_1`, `init_2`...) to avoid natural-key collisions. The counter
+  was keyed by module alone, accumulating across every file in
+  whatever order one specific ingest run happened to process them —
+  so a full-module ingest and a single-file `sync` (which always
+  starts its counter fresh) assigned *different* names to the exact
+  same physical function. Since name is part of the upsert natural
+  key, each mode switch forked a new row instead of updating the
+  existing one, and the fast single-file path does no stale-row
+  pruning at all. A real trajectory that mixed file-level and
+  module-level `sync` calls while working on one `init()` ended up
+  with six byte-identical copies of it in the emitted file — likely
+  duplicate command/flag registration at runtime, not just DB noise.
+  Fixed by keying the counter on (module, file) instead of module
+  alone, so the Nth occurrence in a given file is always named the
+  same regardless of which mode or which other files process
+  alongside it. General form: before trusting any synthesized
+  identifier as stable, check whether it can be computed two
+  different ways (two ingest modes, two call orders) that would
+  reasonably disagree.
 - **Sibling handlers drift.** When one operation has multiple entry
   points — `edit` vs `handleFragmentEdit` vs `apply`'s "edit" case;
   `create` vs `apply`'s "create" case — a correctness fix to one does
@@ -79,10 +103,14 @@ lessons:
   existed. Before assuming a capability benefits users, check whether
   `defn init`'s actual output makes it reachable.
 - **The measurement tool needs the same scrutiny as the thing it
-  measures.** Found twice in the bench's own `score_correctness.py`:
-  once assuming a name/receiver convention defn's schema never uses,
-  once rejecting a parenthesized-pointer-receiver form the schema
-  sometimes does produce. Both understated defn's real correctness. A
+  measures.** Found three times now in the bench's own
+  `score_correctness.py`: assuming a name/receiver convention defn's
+  schema never uses, rejecting a parenthesized-pointer-receiver form
+  the schema sometimes does produce, and — the op with the widest
+  gap — never handling `rename`'s `old_name`/`new_name` fields at all
+  (it only ever checked `args.get("name")`, which is always empty for
+  a rename, so every pure-rename fix silently scored as touching
+  nothing). All three understated defn's real correctness. A
   surprising bench delta is at least as likely to be a scorer bug as a
   product regression — read the actual trajectory before trusting an
   aggregate number.
