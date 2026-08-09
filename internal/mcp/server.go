@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.21"
+const Version = "0.26.22"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -1263,7 +1263,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return s.handleMove(ctx, req, moveParam{Name: args.Name, ToModule: args.Module, Receiver: args.Receiver, File: args.File})
 	case "test":
 		if args.Test != "" {
-			return s.handleTestByName(ctx, req, args.Test)
+			return s.handleTestByName(ctx, req, args.Test, args.Module, args.File)
 		}
 		return s.handleTest(ctx, req, nameParam{Name: args.Name, Receiver: args.Receiver, Module: args.Module, File: args.File})
 	case "similar":
@@ -4586,12 +4586,22 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	return textResult(sb.String()), nil, nil
 }
 
-// handleTestByName runs `go test -run <pattern>` verbatim so the model
-// can reproduce a bug from an issue that names the failing test directly.
+// handleTestByName runs `go test -run <pattern>` so the model can
+// reproduce a bug from an issue that names the failing test directly.
 // L11: agents that read the right code but never confirm the failure loop
 // through the read graph without committing to a fix. Naming a test lets
 // the model turn a hypothesis into an observation before writing.
-func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, pattern string) (*sdkmcp.CallToolResult, any, error) {
+//
+// #241: module/file scope the run to one package (go test -run P
+// ./<dir>/...) instead of always running the ENTIRE repo (./...) just
+// to filter by name -- on a large repo this is both a real wire-cost
+// tax (every unrelated package's build+test output ships back, most
+// of it "no tests to run") and confusing enough that a real trajectory
+// retried the same named test 5+ times with different -run variations,
+// unable to tell its own result apart from the flood of irrelevant
+// package output. module/file are best-effort: an unresolvable scope
+// falls back to today's ./... behavior, never an error.
+func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, pattern, module, file string) (*sdkmcp.CallToolResult, any, error) {
 	if s.projectDir == "" {
 		return errResult(fmt.Errorf("no project directory configured"))
 	}
@@ -4602,14 +4612,42 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 	if err := emit.Emit(s.backend, s.projectDir); err != nil {
 		return errResult(fmt.Errorf("emit: %w", err))
 	}
+
+	// store.Module is per go.mod, not per package -- a single-module repo
+	// (the common case: go-zero, grpc-go, cli all have exactly one go.mod
+	// at the root) has exactly one Module row covering every package, so
+	// resolving module:/file: through findModule/findModuleByFile would
+	// scope to the WHOLE repo regardless -- no better than the ./... this
+	// is meant to replace. Match directly against source_file paths
+	// instead (same approach as search's file: fix), which actually
+	// distinguishes "core/logx" from every other package in the repo.
+	target := "./..."
+	hint := file
+	if hint == "" {
+		hint = module
+	}
+	if hint != "" {
+		if files, err := s.backend.DistinctSourceFiles(); err == nil {
+			for _, f := range files {
+				if !strings.Contains(f, hint) {
+					continue
+				}
+				if dir := filepath.ToSlash(filepath.Dir(f)); dir != "" && dir != "." {
+					target = "./" + dir + "/..."
+				}
+				break
+			}
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "test", "-run", pattern, "-count=1", "-v", "./...")
+	cmd := exec.CommandContext(ctx, "go", "test", "-run", pattern, "-count=1", "-v", target)
 	cmd.Dir = s.projectDir
 	out, err := cmd.CombinedOutput()
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Running -run %q across ./...:\n\n", pattern))
+	sb.WriteString(fmt.Sprintf("Running -run %q across %s:\n\n", pattern, target))
 	sb.WriteString(truncateTestOutput(string(out)))
 	if err != nil {
 		sb.WriteString("\nSOME TESTS FAILED")

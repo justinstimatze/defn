@@ -442,7 +442,7 @@ func TestHandleTestByName_RunsNamedTest(t *testing.T) {
 	s := &server{backend: db, projectDir: projDir}
 
 	// Setup DB seeds TestGreet + TestFarewell as passing tests. Run just one.
-	result, _, _ := s.handleTestByName(context.Background(), nil, "TestGreet")
+	result, _, _ := s.handleTestByName(context.Background(), nil, "TestGreet", "", "")
 	text := resultText(t, result)
 	if !strings.Contains(text, "TestGreet") {
 		t.Errorf("expected TestGreet in output, got %q", text)
@@ -460,7 +460,7 @@ func TestHandleTestByName_EmptyPatternRejected(t *testing.T) {
 	defer db.Close()
 	s := &server{backend: db, projectDir: projDir}
 
-	result, _, _ := s.handleTestByName(context.Background(), nil, "")
+	result, _, _ := s.handleTestByName(context.Background(), nil, "", "", "")
 	text := resultText(t, result)
 	if !strings.Contains(text, "empty") {
 		t.Errorf("expected empty-pattern rejection, got %q", text)
@@ -5927,5 +5927,80 @@ func Gadget() {}
 	}
 	if strings.Contains(text, "Gadget") {
 		t.Errorf("file:\"alpha\" should have excluded Gadget (in beta/), got: %s", text)
+	}
+}
+
+// TestHandleTestByName_ModuleScopesGoTestTarget guards the #241 fix:
+// test:"TestX" with module:/file: previously ran `go test ./...`
+// across the WHOLE repo regardless, silently ignoring the scope hint.
+// On a large repo (real trajectory: go-zero) this is both a real
+// wire-cost tax -- every unrelated package's build+test output ships
+// back, most of it "no tests to run" -- and confusing enough that the
+// agent retried the same named test 5+ times with different -run
+// variations, unable to spot its own result in the flood. module:/
+// file: now scope the go test invocation to that package's directory.
+func TestHandleTestByName_ModuleScopesGoTestTarget(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "alpha"), 0755)
+	os.MkdirAll(filepath.Join(projDir, "beta"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "alpha.go"), []byte(`package alpha
+
+func Widget() bool { return true }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "alpha_test.go"), []byte(`package alpha
+
+import "testing"
+
+func TestWidget(t *testing.T) {
+	if !Widget() {
+		t.Fatal("false")
+	}
+}
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "beta", "beta.go"), []byte(`package beta
+
+func Gadget() bool { return true }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "beta", "beta_test.go"), []byte(`package beta
+
+import "testing"
+
+func TestGadget(t *testing.T) {
+	if !Gadget() {
+		t.Fatal("false")
+	}
+}
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+
+	result, _, err := s.handleTestByName(context.Background(), nil, "TestWidget", "", "alpha")
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "./alpha/...") {
+		t.Errorf("expected the go test target to be scoped to ./alpha/..., got: %s", text)
+	}
+	if strings.Contains(text, "beta") {
+		t.Errorf("scoped run should never touch the beta package at all, got: %s", text)
+	}
+	if !strings.Contains(text, "ALL TESTS PASSED") {
+		t.Errorf("expected TestWidget to pass, got: %s", text)
 	}
 }
