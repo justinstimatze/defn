@@ -7130,3 +7130,140 @@ func TestProjectOverview_NoModulesMessageMentionsSync(t *testing.T) {
 		t.Errorf("expected the no-modules message to point at code(op:\"sync\"), got: %s", text)
 	}
 }
+
+// TestHandleTestByName_ReportsNoTestsMatchedInsteadOfFalsePass guards
+// against a false-positive "ALL TESTS PASSED" when a -run pattern
+// matches zero tests. go test exits 0 in that case (just warns "no
+// tests to run"), which used to be indistinguishable from a real pass
+// -- a real trajectory targeted a grpctest-suite method by its bare
+// name (addressed by go test as a subtest, Test/TestFoo, not TestFoo),
+// silently matched nothing, and the agent moved on with false
+// confidence that nothing needed further investigation.
+func TestHandleTestByName_ReportsNoTestsMatchedInsteadOfFalsePass(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "alpha"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "alpha.go"), []byte(`package alpha
+
+func Widget() bool { return true }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "alpha_test.go"), []byte(`package alpha
+
+import "testing"
+
+func TestWidget(t *testing.T) {
+	if !Widget() {
+		t.Fatal("false")
+	}
+}
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+
+	result, _, err := s.handleTestByName(context.Background(), nil, "TestDoesNotExist", "", "alpha/alpha.go")
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "ALL TESTS PASSED") {
+		t.Errorf("a pattern matching zero tests must NOT report ALL TESTS PASSED (that's a false positive -- nothing was verified), got: %s", text)
+	}
+	if !strings.Contains(text, "NO TESTS MATCHED") {
+		t.Errorf("expected an explicit NO TESTS MATCHED signal, got: %s", text)
+	}
+}
+
+// TestHandleApply_CreateSingleDeclRefusesNameCollision guards handleApply's
+// single-declaration "create" branch (the common case -- most create ops
+// in a batch are single declarations), which used to skip the same
+// same-module name+receiver collision check handleCreate and the
+// multi-decl branch both have. Without it, a collision only surfaced as
+// a raw Go compiler error ("X redeclared in this block") at the build
+// stage, rolling back the whole batch instead of defn's own clear
+// "already exists" message.
+func TestHandleApply_CreateSingleDeclRefusesNameCollision(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "create", Body: "func Greet(name string) string { return \"Hi \" + name }", File: "other.go"},
+		},
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "already exists") {
+		t.Fatalf("expected an 'already exists' collision message instead of a raw build-stage failure, got: %s", text)
+	}
+
+	if _, err := os.Stat(filepath.Join(projDir, "other.go")); !os.IsNotExist(err) {
+		t.Errorf("expected other.go to never be written since the collision should be caught before the build stage, got err=%v", err)
+	}
+}
+
+// TestHandleExpand_AmbiguityNoteOnBareName is the expand-path sibling of
+// TestHandleCode_AmbiguityNoteOnBareNameReadAndOutline. The circuit
+// breaker (turn_state.go) silently redirects blocked bare-name
+// read/outline calls through handleExpand, which resolves via the same
+// best-effort tiebreak as handleCode's direct "read"/"outline" cases --
+// but until this fix, expand never disclosed it, so an ambiguous name
+// auto-batched through expand resolved silently with no indication
+// another same-named candidate existed.
+func TestHandleExpand_AmbiguityNoteOnBareName(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "bft"), 0755)
+	os.MkdirAll(filepath.Join(projDir, "chess"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "bft", "engine.go"), []byte("package bft\n\ntype Engine struct{ Replica string }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "chess", "engine.go"), []byte(`package chess
+
+type Engine struct{ Protocol string }
+
+func NewEngine() *Engine { return &Engine{} }
+func UseA(e *Engine) string { return e.Protocol }
+func UseB(e *Engine) string { return e.Protocol }
+func UseC(e *Engine) string { return e.Protocol }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleExpand(context.Background(), nil, codeParam{Name: "Engine"})
+	if err != nil {
+		t.Fatalf("handleExpand: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "2 definitions share the name") {
+		t.Errorf("expected an ambiguity note from expand, got:\n%s", text)
+	}
+}

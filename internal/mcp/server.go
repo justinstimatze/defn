@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.31"
+const Version = "0.26.32"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -3906,6 +3906,26 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				errors = append(errors, "create: no modules found")
 				continue
 			}
+			// Same same-module name+receiver collision check as
+			// handleCreate and this same handler's multi-decl branch a
+			// few lines above -- without it, a collision here (the
+			// common case: most create ops in a batch are single
+			// declarations) only failed at the Go-build stage with a
+			// raw compiler error ("X redeclared in this block"), rolling
+			// back the whole batch, instead of defn's own clear message.
+			existing, existErr := tx.GetDefinitionByNameAndReceiver(name, mod.Path, receiver)
+			if existErr != nil && receiver != "" {
+				if alt := strings.TrimPrefix(receiver, "*"); alt != receiver {
+					existing, existErr = tx.GetDefinitionByNameAndReceiver(name, mod.Path, alt)
+				} else {
+					existing, existErr = tx.GetDefinitionByNameAndReceiver(name, mod.Path, "*"+receiver)
+				}
+			}
+			if existErr == nil {
+				recv := formatReceiver(existing.Receiver)
+				errors = append(errors, fmt.Sprintf("create %s%s: already exists in %s (id=%d)", recv, name, mod.Path, existing.ID))
+				continue
+			}
 			exported := len(name) > 0 && name[0] >= 'A' && name[0] <= 'Z'
 			d := &store.Definition{
 				ModuleID: mod.ID, Name: name, Kind: kind, Exported: exported,
@@ -4798,12 +4818,18 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 	cmd.Dir = s.projectDir
 	out, err := cmd.CombinedOutput()
 
+	outStr := string(out)
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Running -run %q across %s:\n\n", pattern, target))
-	sb.WriteString(truncateTestOutput(string(out)))
-	if err != nil {
+	sb.WriteString(truncateTestOutput(outStr))
+	switch {
+	case err != nil:
 		sb.WriteString("\nSOME TESTS FAILED")
-	} else {
+	case ctx.Err() == context.DeadlineExceeded:
+		sb.WriteString(fmt.Sprintf("\nTIMED OUT after %s -- this is NOT a pass; the run was killed before finishing, likely a hang introduced by a recent edit", testTimeout))
+	case testMatchedNothing(outStr):
+		sb.WriteString(fmt.Sprintf("\nNO TESTS MATCHED — pattern %q matched zero tests in %s; nothing was verified. Check the name/pattern and scope (module:/file:) before trusting this as a pass", pattern, target))
+	default:
 		sb.WriteString("\nALL TESTS PASSED")
 	}
 	return textResult(sb.String()), nil, nil
@@ -4856,14 +4882,20 @@ func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args n
 	cmd.Dir = s.projectDir
 	out, err := cmd.CombinedOutput()
 
+	outStr := string(out)
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Running %d of %d tests (affected by %s) across %s:\n\n",
 		len(testNames), len(testNames), args.Name, target))
-	sb.WriteString(truncateTestOutput(string(out)))
+	sb.WriteString(truncateTestOutput(outStr))
 
-	if err != nil {
+	switch {
+	case err != nil:
 		sb.WriteString("\nSOME TESTS FAILED")
-	} else {
+	case ctx.Err() == context.DeadlineExceeded:
+		sb.WriteString(fmt.Sprintf("\nTIMED OUT after %s -- this is NOT a pass; the run was killed before finishing, likely a hang introduced by a recent edit", testTimeout))
+	case testMatchedNothing(outStr):
+		sb.WriteString(fmt.Sprintf("\nNO TESTS MATCHED — the %d covering test(s) didn't run in %s (likely scoped to the wrong package, e.g. coverage via interface dispatch in a sibling package); nothing was verified", len(testNames), target))
+	default:
 		sb.WriteString("\nALL TESTS PASSED")
 	}
 
@@ -5834,6 +5866,15 @@ func (s *server) handleExpand(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		}
 		if resolved > 0 {
 			sb.WriteString("\n---\n\n")
+		}
+		// #248 gap: the circuit breaker (turn_state.go) silently redirects
+		// blocked bare-name read/outline calls through this same expand
+		// path, which resolves via the identical best-effort tiebreak as
+		// handleCode's direct "read"/"outline" cases but -- unlike those --
+		// never disclosed it. An ambiguous name auto-batched through expand
+		// resolved silently, with no way to tell it wasn't the only match.
+		if note := s.ambiguityNote(name, "", args.Module, args.File); note != "" {
+			sb.WriteString(note)
 		}
 		if err := s.renderExpandSection(&sb, d, modulePathByID[d.ModuleID], want); err != nil {
 			return errResult(fmt.Errorf("expand: gather callers for %s: %w", name, err))
@@ -8489,4 +8530,17 @@ func (s *server) ambiguityNote(name, receiver, module, file string) string {
 		"[note: %d definitions share the name %q; this resolved to one via a best-effort tiebreak (most production callers). Pass receiver:/module:/file: to target a specific one, or search(pattern:%q) to see every candidate.]\n\n",
 		n, name, name,
 	)
+}
+
+// testMatchedNothing reports whether a `go test -run <pattern>` invocation
+// that exited 0 actually ran zero tests -- Go's own behavior when a -run
+// pattern matches nothing: exit code 0, output just warns "no tests to
+// run". Without this check, handleTest/handleTestByName reported "ALL
+// TESTS PASSED" for a run that verified nothing at all -- confirmed via a
+// real trajectory where a grpctest-suite method (addressed by go test as
+// a subtest, Test/TestFoo, not TestFoo) was targeted by its bare method
+// name, silently matched zero tests, and gave the agent false confidence
+// nothing needed further investigation.
+func testMatchedNothing(out string) bool {
+	return strings.Contains(out, "no tests to run")
 }

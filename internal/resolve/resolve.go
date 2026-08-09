@@ -364,7 +364,7 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 					if fromID <= 0 {
 						continue
 					}
-					refs, litFields := collectRefs(d.Body, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls)
+					refs, litFields := collectRefs(d.Body, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls, db, cache)
 					if len(refs) > 0 {
 						defRefs[fromID] = append(defRefs[fromID], refs...)
 					}
@@ -398,7 +398,7 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 									nodes = append(nodes, s.Type)
 								}
 								for _, node := range nodes {
-									refs, litFields := collectRefs(node, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls)
+									refs, litFields := collectRefs(node, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls, db, cache)
 									if len(refs) > 0 {
 										defRefs[fromID] = append(defRefs[fromID], refs...)
 									}
@@ -414,7 +414,7 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 							if fromID <= 0 {
 								continue
 							}
-							refs, litFields := collectRefs(s.Type, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls)
+							refs, litFields := collectRefs(s.Type, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls, db, cache)
 							if len(refs) > 0 {
 								defRefs[fromID] = append(defRefs[fromID], refs...)
 							}
@@ -617,7 +617,29 @@ func lookupVarDefID(db store.Backend, pkgPath, name string, cache pkgIndexCache)
 	return d.ID
 }
 
-func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef map[types.Object]int64, ifaceMethodToImpls map[types.Object][]int64) ([]store.Reference, []store.LiteralField) {
+// collectRefs walks node's AST and returns every reference it makes to a
+// definition in objToDef/ifaceMethodToImpls, plus struct-literal field data.
+//
+// db/cache: fallback for when the "to" side of a reference belongs to a
+// package that wasn't part of THIS resolve call's own package set (e.g.
+// ResolveFile loads only the touched file's own package, so objToDef only
+// has entries for defs declared in that one package -- a call to a func in
+// any other package always misses objToDef here). Without this fallback,
+// ResolveFile doesn't just fail to ADD cross-package outgoing refs, it
+// actively ERASES previously-correct ones: resolve()'s caller flushes via
+// SetManyReferences, which deletes-then-reinserts the touched def's whole
+// ref set, so a miss here is indistinguishable from "this def no longer
+// calls that". db may be nil (unit tests exercising collectRefs directly
+// without a backend) -- the fallback is skipped in that case, same as a
+// permanent miss.
+//
+// Guarded by isPackageLevelOrMethod (the same filter pass1 uses to decide
+// what goes into objToDef in the first place) so this can't bind a local
+// var/param to an unrelated same-named top-level def elsewhere in the DB --
+// it only fires for objects that are themselves plausibly a top-level def
+// or a concrete (non-interface) method, using each object's OWN home
+// package scope rather than the caller's.
+func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef map[types.Object]int64, ifaceMethodToImpls map[types.Object][]int64, db store.Backend, cache pkgIndexCache) ([]store.Reference, []store.LiteralField) {
 	seen := make(map[int64]string)
 	var refs []store.Reference
 	var litFields []store.LiteralField
@@ -627,6 +649,17 @@ func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef 
 			seen[toID] = kind
 			refs = append(refs, store.Reference{ToDef: toID, Kind: kind})
 		}
+	}
+
+	// crossPkgTypeFallback resolves a *types.TypeName that missed objToDef
+	// via the DB-backed cache, scoped to the type's own package. Shared by
+	// the CompositeLit and new(Type) constructor cases below.
+	crossPkgTypeFallback := func(tn *types.TypeName) int64 {
+		pkg := tn.Pkg()
+		if pkg == nil || db == nil || tn.Parent() != pkg.Scope() {
+			return 0
+		}
+		return lookupTypeDefID(db, pkg.Path(), tn.Name(), cache)
 	}
 
 	// Pre-scan: collect idents of embedded struct fields so we can
@@ -659,6 +692,8 @@ func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef 
 					}
 					if named, ok := typ.(*types.Named); ok {
 						if toID, ok := objToDef[named.Obj()]; ok {
+							addRef(toID, "constructor")
+						} else if toID := crossPkgTypeFallback(named.Obj()); toID > 0 {
 							addRef(toID, "constructor")
 						}
 						// Extract field-level data from keyed composite literals.
@@ -702,6 +737,8 @@ func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef 
 						if named, ok := tv.Type.(*types.Named); ok {
 							if toID, ok := objToDef[named.Obj()]; ok {
 								addRef(toID, "constructor")
+							} else if toID := crossPkgTypeFallback(named.Obj()); toID > 0 {
+								addRef(toID, "constructor")
 							}
 						}
 					}
@@ -735,6 +772,18 @@ func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef 
 		if implIDs, ok := ifaceMethodToImpls[obj]; ok {
 			for _, implID := range implIDs {
 				addRef(implID, "interface_dispatch")
+			}
+			return true
+		}
+
+		// Cross-package fallback -- see the doc comment above.
+		if pkg := obj.Pkg(); pkg != nil && db != nil && isPackageLevelOrMethod(obj, pkg.Scope()) {
+			if toID := lookupDefID(db, pkg.Path(), ident, obj, cache); toID > 0 {
+				kind := classifyRef(obj)
+				if kind == "type_ref" && embeddedIdents[ident] {
+					kind = "embed"
+				}
+				addRef(toID, kind)
 			}
 		}
 		return true

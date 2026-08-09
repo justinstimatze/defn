@@ -491,3 +491,57 @@ func TestDispatch(t *testing.T) {
 		t.Fatalf("expected TestDispatch to cover (*LBPicker).Pick via interface dispatch, got zero tests in impact: %+v", impact)
 	}
 }
+
+func TestResolveFileCapturesCrossPackageCallRef(t *testing.T) {
+	// Regression for a bug found via real head-to-head-go trajectories:
+	// impact(name:"Emit") reported 0 production callers even though
+	// cmdEmit and handleTest call emit.Emit directly. Root cause:
+	// ResolveFile loads ONLY the touched file's own package (NeedDeps
+	// intentionally omitted for speed), so pass1's objToDef only has
+	// entries for defs declared in that one package. A call from the
+	// touched file to a func in ANY other package always missed
+	// objToDef and collectRefs silently dropped the ref -- and since
+	// SetManyReferences deletes-then-reinserts the touched def's whole
+	// ref set, this didn't just fail to ADD cross-package refs, it
+	// ERASED previously-correct ones on every edit through this path
+	// (used by code(op:"sync", file:) and after nearly every write op
+	// via autoResolveFile). Fixed by collectRefs falling back to a
+	// DB-backed lookup (lookupDefID/lookupTypeDefID, same as pass1's
+	// "from" side) when an Ident's object isn't in objToDef.
+	dir := writeModule(t, map[string]string{
+		"sub/sub.go": "package sub\n\nfunc Target() int { return 1 }\nfunc Other() int { return 2 }\n",
+		"main.go":    "package refsbug\n\nimport \"example.com/refsbug/sub\"\n\nfunc Caller() int { return sub.Target() }\n",
+	})
+
+	db := testDB(t)
+	if err := ingest.Ingest(db, dir); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if err := Resolve(db, dir); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	rs, _ := db.QueryRefs("Caller", "Target", "call", 0)
+	if len(rs) == 0 {
+		t.Fatalf("setup: expected initial Caller -> Target cross-package call ref")
+	}
+
+	// Edit main.go (the caller's OWN file) to call a different
+	// cross-package function -- same shape as a real code(op:"edit").
+	writeFile(t, dir, "main.go", "package refsbug\n\nimport \"example.com/refsbug/sub\"\n\nfunc Caller() int { return sub.Other() }\n")
+	if _, err := ingest.IngestFile(db, dir, filepath.Join(dir, "main.go")); err != nil {
+		t.Fatalf("ingest file: %v", err)
+	}
+	if err := ResolveFile(db, dir, filepath.Join(dir, "main.go")); err != nil {
+		t.Fatalf("resolve file: %v", err)
+	}
+
+	rs, _ = db.QueryRefs("Caller", "Other", "call", 0)
+	if len(rs) == 0 {
+		t.Errorf("ResolveFile (the scoped single-package path used after every code(op:\"edit\")) failed to capture the new cross-package Caller -> Other call ref")
+	}
+	rs, _ = db.QueryRefs("Caller", "Target", "call", 0)
+	if len(rs) != 0 {
+		t.Errorf("ResolveFile left a stale Caller -> Target ref after the call target changed: %+v", rs)
+	}
+}
