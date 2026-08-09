@@ -7267,3 +7267,225 @@ func UseC(e *Engine) string { return e.Protocol }
 		t.Errorf("expected an ambiguity note from expand, got:\n%s", text)
 	}
 }
+
+// TestHandleCode_CircuitBreakerAutoBatchIncludesBodyWhenReadWasBlocked
+// guards the #250 fix: a blocked op:"read" auto-batched through expand
+// used to hardcode Include:["outline","callers"], silently dropping the
+// body a "read" call is for -- a real grpc-go-3351 trajectory burned 2
+// extra round-trips re-requesting the body this should have returned
+// the first time.
+func TestHandleCode_CircuitBreakerAutoBatchIncludesBodyWhenReadWasBlocked(t *testing.T) {
+	t.Setenv("DEFN_CIRCUIT_BREAKER", "2")
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
+
+	for _, name := range []string{"Greet", "Farewell"} {
+		if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: name}); err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+	}
+
+	third, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "main"})
+	if err != nil {
+		t.Fatalf("third read: %v", err)
+	}
+	text := resultText(t, third)
+	if !strings.Contains(text, "auto-batched") {
+		t.Fatalf("expected an auto-batch note, got: %s", text)
+	}
+	if !strings.Contains(text, `"Hello, "`) {
+		t.Errorf("auto-batched result from a blocked op:\"read\" must include the actual source body (Greet's \"Hello, \" literal), not just outline+callers: %s", text)
+	}
+}
+
+// TestHandleSearch_IncludeParamNotedAsIgnored guards the #250 fix:
+// search accepted include: (a real codeParam field, but only wired up
+// for expand's graph-hop selection) with zero effect and zero signal --
+// a real go-zero-1964 trajectory tried include:["rest"] expecting
+// package scoping (by analogy with expand), got unfiltered repo-wide
+// results twice, and gave up on search entirely.
+func TestHandleSearch_IncludeParamNotedAsIgnored(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+
+	result, _, err := s.handleSearch(context.Background(), nil, codeParam{Pattern: "Greet", Include: []string{"rest"}})
+	if err != nil {
+		t.Fatalf("handleSearch: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "include") || !strings.Contains(text, "ignored") {
+		t.Errorf("expected a note that include: has no effect on search, got: %s", text)
+	}
+}
+
+// TestTestBuildFailed guards the #250 fix: handleTest/handleTestByName
+// used to report the same generic "SOME TESTS FAILED" for a genuine
+// test failure and for a compile/vet error that ran zero tests -- a
+// real cli-3997 trajectory hit exactly this with a pre-existing vet
+// error, indistinguishable from the agent's own edit breaking a test.
+func TestTestBuildFailed(t *testing.T) {
+	cases := []struct {
+		name string
+		out  string
+		want bool
+	}{
+		{"build failed", "# pkg\nfile.go:1:1: undefined: Foo\nFAIL\tpkg [build failed]\n", true},
+		{"setup failed", "FAIL\tpkg [setup failed]\n", true},
+		{"real test failure", "--- FAIL: TestX (0.00s)\nFAIL\n", false},
+		{"pass", "PASS\nok  \tpkg\t0.010s\n", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := testBuildFailed(c.out); got != c.want {
+				t.Errorf("testBuildFailed(%q) = %v, want %v", c.out, got, c.want)
+			}
+		})
+	}
+}
+
+// TestHandleFileDefs_LimitOverridesDefaultCap guards the #250 fix:
+// file-defs accepted a limit: param but silently ignored it, always
+// truncating to the fixed fileDefsCap with no way to ask for more.
+func TestHandleFileDefs_LimitOverridesDefaultCap(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	var sb strings.Builder
+	sb.WriteString("package main\n\n")
+	const n = 10
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&sb, "func Small%d() {}\n", i)
+	}
+	smallPath := filepath.Join(projDir, "small.go")
+	if err := os.WriteFile(smallPath, []byte(sb.String()), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ingest.IngestFile(db, projDir, smallPath); err != nil {
+		t.Fatal("ingest small.go:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	result, _, err := s.handleFileDefs(context.Background(), nil, codeParam{File: "small.go", Limit: 3})
+	if err != nil {
+		t.Fatalf("file-defs: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, fmt.Sprintf("3 of %d definitions", n)) {
+		t.Errorf("expected limit:3 to cap the result to 3 of %d, got:\n%s", n, text)
+	}
+	if strings.Count(text, "\"name\":") > 3 {
+		t.Errorf("expected at most 3 entries with limit:3, got more:\n%s", text)
+	}
+}
+
+// TestHandleLiterals_LimitAndFileScopeResults guards the #250 fix:
+// literals accepted limit:/file: params but silently ignored both --
+// results were always capped at a fixed 200 and never scoped to a
+// file, same silent-drop class as #241 (search's file:).
+func TestHandleLiterals_LimitAndFileScopeResults(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "alpha"), 0755)
+	os.MkdirAll(filepath.Join(projDir, "beta"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "alpha.go"), []byte(`package alpha
+
+type Config struct{ Name string }
+
+func New() Config { return Config{Name: "alpha"} }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "beta", "beta.go"), []byte(`package beta
+
+type Config struct{ Name string }
+
+func New() Config { return Config{Name: "beta"} }
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+
+	// Unscoped: both alpha's and beta's Config literal should appear.
+	result, _, err := s.handleLiterals(context.Background(), nil, codeParam{Pattern: "Config"})
+	if err != nil {
+		t.Fatalf("handleLiterals: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "`alpha`") || !strings.Contains(text, "`beta`") {
+		t.Fatalf("expected both alpha and beta literal values unscoped, got: %s", text)
+	}
+
+	// Scoped to alpha/: only the alpha literal should survive.
+	result, _, err = s.handleLiterals(context.Background(), nil, codeParam{Pattern: "Config", File: "alpha"})
+	if err != nil {
+		t.Fatalf("handleLiterals with file: %v", err)
+	}
+	text = resultText(t, result)
+	if !strings.Contains(text, "`alpha`") {
+		t.Errorf("file:\"alpha\" should still include the alpha literal, got: %s", text)
+	}
+	if strings.Contains(text, "`beta`") {
+		t.Errorf("file:\"alpha\" should have excluded the beta literal, got: %s", text)
+	}
+
+	// limit:1 must cap the unscoped result to a single row.
+	result, _, err = s.handleLiterals(context.Background(), nil, codeParam{Pattern: "Config", Limit: 1})
+	if err != nil {
+		t.Fatalf("handleLiterals with limit: %v", err)
+	}
+	text = resultText(t, result)
+	if strings.Contains(text, "`alpha`") && strings.Contains(text, "`beta`") {
+		t.Errorf("limit:1 should have capped to a single result, got both: %s", text)
+	}
+}
+
+// TestHandlePragmas_LimitOverridesDefaultCap guards the #250 fix:
+// pragmas accepted a limit: param but silently ignored it, always
+// truncating to the fixed pragmasCap with no way to ask for fewer or
+// more.
+func TestHandlePragmas_LimitOverridesDefaultCap(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	var sb strings.Builder
+	sb.WriteString("package main\n\n")
+	const n = 10
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&sb, "//test:pragma\nfunc PragmaTarget%d() {}\n\n", i)
+	}
+	pragmaPath := filepath.Join(projDir, "pragmas.go")
+	if err := os.WriteFile(pragmaPath, []byte(sb.String()), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	result, _, err := s.handlePragmas(context.Background(), nil, codeParam{Pattern: "test:pragma", Limit: 2})
+	if err != nil {
+		t.Fatalf("pragmas: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, fmt.Sprintf("showing 2 of %d", n)) {
+		t.Errorf("expected limit:2 to cap the result to 2, got:\n%s", text)
+	}
+	if got := strings.Count(text, "`test:pragma`"); got > 2 {
+		t.Errorf("expected at most 2 pragma lines with limit:2, got %d:\n%s", got, text)
+	}
+}

@@ -58,6 +58,12 @@ type sessionCache struct {
 	// circuit-breaker block can auto-batch them via expand instead of
 	// just refusing. Reset alongside readShapedCount.
 	pendingReadNames []string
+	// pendingWantsBody is true when any call folded into pendingReadNames
+	// this turn was op:"read" (the one nameable op whose whole point is
+	// the source body) -- so an auto-batch redirect through expand can
+	// include "body" instead of silently downgrading a read into an
+	// outline+callers-only response. See #250.
+	pendingWantsBody bool
 }
 
 type cacheEntry struct {

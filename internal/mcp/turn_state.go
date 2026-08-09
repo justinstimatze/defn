@@ -190,6 +190,9 @@ func (s *server) trackReadShapedName(sc *sessionCache, op, name string) {
 	if strings.TrimSpace(name) == "" || !nameableReadOps[op] {
 		return
 	}
+	if op == "read" {
+		sc.pendingWantsBody = true
+	}
 	for _, n := range sc.pendingReadNames {
 		if n == name {
 			return

@@ -1146,14 +1146,26 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		// makes the server robust to that instead of depending on the
 		// model's compliance.
 		var autoNames []string
+		var autoWantsBody bool
 		if breakerMsg != "" && nameableReadOps[args.Op] && len(sc.pendingReadNames) > 0 {
 			autoNames = append([]string(nil), sc.pendingReadNames...)
+			autoWantsBody = sc.pendingWantsBody
 			sc.pendingReadNames = nil
+			sc.pendingWantsBody = false
 			sc.readShapedCount = 0
 		}
 		s.respCache.mu.Unlock()
 		if len(autoNames) > 0 {
-			r, o, e := wrapStale(s.handleExpand(ctx, req, codeParam{Names: autoNames, Include: []string{"outline", "callers"}}))
+			include := []string{"outline", "callers"}
+			if autoWantsBody {
+				// #250: a blocked op:"read" mid-batch wants source, not just
+				// outline+callers -- dropping the body silently downgraded the
+				// response below what was actually asked for (a real
+				// grpc-go-3351 trajectory burned 2 extra round-trips
+				// re-requesting the body this should have returned).
+				include = append(include, "body")
+			}
+			r, o, e := wrapStale(s.handleExpand(ctx, req, codeParam{Names: autoNames, Include: include}))
 			note := fmt.Sprintf("[circuit breaker: auto-batched %d individual lookups this turn (%s) into one expand call instead of refusing -- call code(op:\"context\"/op:\"expand\", names:[...]) yourself next time to skip this extra round-trip.]\n\n", len(autoNames), strings.Join(autoNames, ", "))
 			return prependNote(r, note), o, e
 		}
@@ -2015,6 +2027,22 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		return errResult(err)
 	}
 
+	// #250: include: is a real codeParam field, but only op:"expand" wires
+	// it up (graph-hop selection). A caller reaching for
+	// search(pattern:"X", include:["pkg"]) by analogy with expand's
+	// scoping-flavored include got total silence -- no error, no note,
+	// just an unfiltered repo-wide result set indistinguishable from a
+	// genuinely scoped-and-empty query. Confirmed via a real
+	// go-zero-1964 trajectory: search(pattern:"logx.Info", include:["rest"])
+	// returned 12 unrelated repo-wide defs, twice, before the agent gave
+	// up on search entirely. Same precedent as #241's file: fix and
+	// expand's own "unsupported include kinds ignored" note -- surface it
+	// instead of silently dropping it.
+	includeNote := ""
+	if len(args.Include) > 0 {
+		includeNote = fmt.Sprintf("_note: \"include\" has no effect on search (that's expand's graph-hop selector) -- ignored: %s. Use file:\"<hint>\" to scope search results by source path instead._\n\n", strings.Join(args.Include, ", "))
+	}
+
 	// #241: file: was accepted as a param but silently ignored -- every
 	// search ran repo-wide regardless. Root-caused via a real
 	// grpc-go-2630 trajectory: the agent called
@@ -2048,7 +2076,11 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	if len(defs) == 0 && args.Pattern != "" {
 		scanPattern := strings.Trim(args.Pattern, "%")
 		if scanPattern != "" && !strings.Contains(scanPattern, "%") {
-			return s.bodyScanResult(scanPattern, limit, args.File)
+			r, o, e := s.bodyScanResult(scanPattern, limit, args.File)
+			if includeNote != "" {
+				r = prependNote(r, includeNote)
+			}
+			return r, o, e
 		}
 	}
 
@@ -2057,7 +2089,11 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// so trigger the caller-count/text-overlap ranker so the head of
 	// the list is actually informative. Explicit rank:true still works.
 	if args.Rank || len(defs) > limit {
-		return s.rankedSearchResult(args.Pattern, defs, limit)
+		r, o, e := s.rankedSearchResult(args.Pattern, defs, limit)
+		if includeNote != "" {
+			r = prependNote(r, includeNote)
+		}
+		return r, o, e
 	}
 
 	type summary struct {
@@ -2092,6 +2128,9 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	}
 	if truncated != "" {
 		text += truncated
+	}
+	if includeNote != "" {
+		text = includeNote + text
 	}
 	return textResult(text), nil, nil
 }
@@ -4823,6 +4862,8 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 	sb.WriteString(fmt.Sprintf("Running -run %q across %s:\n\n", pattern, target))
 	sb.WriteString(truncateTestOutput(outStr))
 	switch {
+	case err != nil && testBuildFailed(outStr):
+		sb.WriteString("\nBUILD FAILED -- the package did not compile; zero tests ran. This is NOT a test-failure signal, fix the compile error shown above first")
 	case err != nil:
 		sb.WriteString("\nSOME TESTS FAILED")
 	case ctx.Err() == context.DeadlineExceeded:
@@ -4889,6 +4930,8 @@ func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args n
 	sb.WriteString(truncateTestOutput(outStr))
 
 	switch {
+	case err != nil && testBuildFailed(outStr):
+		sb.WriteString("\nBUILD FAILED -- the package did not compile; zero tests ran. This is NOT a test-failure signal, fix the compile error shown above first")
 	case err != nil:
 		sb.WriteString("\nSOME TESTS FAILED")
 	case ctx.Err() == context.DeadlineExceeded:
@@ -6026,9 +6069,15 @@ func (s *server) handleFileDefs(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 		StartLine int    `json:"start_line"`
 		EndLine   int    `json:"end_line"`
 	}
+	// #250: Limit was accepted but silently ignored -- output was always
+	// capped at the fixed fileDefsCap with no way to ask for more.
+	limit := fileDefsCap
+	if args.Limit > 0 {
+		limit = args.Limit
+	}
 	total := len(defs)
-	if total > fileDefsCap {
-		defs = defs[:fileDefsCap]
+	if total > limit {
+		defs = defs[:limit]
 	}
 	var results []defSummary
 	for _, d := range defs {
@@ -6041,8 +6090,8 @@ func (s *server) handleFileDefs(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 	if err != nil {
 		return errResult(err)
 	}
-	if total > fileDefsCap {
-		return textResult(fmt.Sprintf("%d of %d definitions in %s (showing first %d — pass a narrower file/query for the rest):\n\n%s", len(results), total, file, fileDefsCap, text)), nil, nil
+	if total > limit {
+		return textResult(fmt.Sprintf("%d of %d definitions in %s (showing first %d — pass limit: for more):\n\n%s", len(results), total, file, limit, text)), nil, nil
 	}
 	return textResult(fmt.Sprintf("%d definitions in %s:\n\n%s", len(results), file, text)), nil, nil
 }
@@ -6169,7 +6218,32 @@ func (s *server) handleLiterals(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 	} else if !strings.Contains(typeName, "%") {
 		typeName = "%" + typeName + "%" // convenience: partial match
 	}
-	fields, err := s.backend.QueryLiteralFields(typeName, args.Name, args.Body, nil, nil, 200, false, false)
+	limit := 200
+	if args.Limit > 0 {
+		limit = args.Limit
+	}
+
+	// #250: File was accepted but silently ignored -- every literals query
+	// ran repo-wide regardless, same silent-drop class as #241 (search's
+	// file:). Scope via defIDs, the pre-filter QueryLiteralFields already
+	// supports for exactly this purpose.
+	var defIDs []int64
+	if args.File != "" {
+		allDefs, ferr := s.backend.FindDefinitions("%")
+		if ferr != nil {
+			return errResult(fmt.Errorf("query literals: %w", ferr))
+		}
+		for _, d := range allDefs {
+			if strings.Contains(d.SourceFile, args.File) {
+				defIDs = append(defIDs, d.ID)
+			}
+		}
+		if len(defIDs) == 0 {
+			return textResult("No literal fields found"), nil, nil
+		}
+	}
+
+	fields, err := s.backend.QueryLiteralFields(typeName, args.Name, args.Body, nil, defIDs, limit, false, false)
 	if err != nil {
 		return errResult(fmt.Errorf("query literals: %w", err))
 	}
@@ -6224,14 +6298,20 @@ func (s *server) handlePragmas(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 		comments = filtered
 	}
 
+	// #250: Limit was accepted but silently ignored -- output was always
+	// capped at the fixed pragmasCap with no way to ask for more.
+	limit := pragmasCap
+	if args.Limit > 0 {
+		limit = args.Limit
+	}
 	total := len(comments)
-	if total > pragmasCap {
-		comments = comments[:pragmasCap]
+	if total > limit {
+		comments = comments[:limit]
 	}
 
 	var sb strings.Builder
-	if total > pragmasCap {
-		fmt.Fprintf(&sb, "## Pragmas matching %q (showing %d of %d results — pass file: or a narrower pattern for the rest)\n\n", pragmaKey, len(comments), total)
+	if total > limit {
+		fmt.Fprintf(&sb, "## Pragmas matching %q (showing %d of %d results — pass limit: or file: or a narrower pattern for the rest)\n\n", pragmaKey, len(comments), total)
 	} else {
 		fmt.Fprintf(&sb, "## Pragmas matching %q (%d results)\n\n", pragmaKey, len(comments))
 	}
@@ -8543,4 +8623,16 @@ func (s *server) ambiguityNote(name, receiver, module, file string) string {
 // nothing needed further investigation.
 func testMatchedNothing(out string) bool {
 	return strings.Contains(out, "no tests to run")
+}
+
+// testBuildFailed reports whether a `go test` invocation failed because
+// the target package didn't compile (or setup failed), not because any
+// test actually ran and failed. Go's own output distinguishes this with
+// a literal "[build failed]"/"[setup failed]" marker after FAIL, but
+// handleTest/handleTestByName used to fold this into the same generic
+// "SOME TESTS FAILED" as a genuine test failure -- confirmed via a real
+// cli-3997 trajectory where a pre-existing vet error produced exactly
+// this indistinguishable message, even though zero tests ran.
+func testBuildFailed(out string) bool {
+	return strings.Contains(out, "[build failed]") || strings.Contains(out, "[setup failed]")
 }

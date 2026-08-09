@@ -60,3 +60,41 @@ func TestHandleContext_RequiresQuestion(t *testing.T) {
 		t.Fatalf("expected IsError result when question is missing")
 	}
 }
+
+// TestHandleContext_LimitFileModuleScopeResults guards the #250 fix:
+// context accepted limit:/file:/module: params but silently ignored
+// all three -- every call searched/returned the whole repo capped at a
+// fixed top-5, with zero error or note. Same silent-drop class as
+// #241 (search's file:).
+func TestHandleContext_LimitFileModuleScopeResults(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, explainClient: nil}
+
+	// limit:1 must cap the bundle to a single def instead of the default 5.
+	result, _, err := s.handleContext(context.Background(), nil, codeParam{
+		Question: "greet farewell",
+		Limit:    1,
+	})
+	if err != nil {
+		t.Fatalf("context: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Top 1 of") {
+		t.Errorf("expected limit:1 to cap the bundle to 1 hit, got: %s", text)
+	}
+
+	// file: scoping to a file with no matches must exclude everything,
+	// proving file: actually filters instead of being a silent no-op.
+	result, _, err = s.handleContext(context.Background(), nil, codeParam{
+		Question: "greet farewell",
+		File:     "nonexistent.go",
+	})
+	if err != nil {
+		t.Fatalf("context with file: %v", err)
+	}
+	text = resultText(t, result)
+	if strings.Contains(text, "### Greet") || strings.Contains(text, "### Farewell") {
+		t.Errorf("file:\"nonexistent.go\" should have excluded every def, got: %s", text)
+	}
+}
