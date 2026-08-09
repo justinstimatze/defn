@@ -16,11 +16,31 @@ Three days (2026-08-07 to 2026-08-09) digging real `head-to-head-go`
 defn-arm trajectories (grpc-go, go-zero, cli/cli tasks) instead of
 theorizing about cost drivers — the standing practice this project
 follows because synthetic sweeps had previously missed exactly this
-class of bug. Nineteen real bugs came out of it (in defn's MCP tool,
-`internal/resolve`, and the bench's own scorer); full bug-by-bug
-detail lives in `git log --oneline v0.26.13..v0.26.22` and each
-commit's message, not repeated here. The durable, reusable lessons:
+class of bug. Twenty-one real bugs came out of it (in defn's MCP tool,
+`internal/emit`, `internal/resolve`, and the bench's own scorer); full
+bug-by-bug detail lives in `git log --oneline v0.26.13..v0.26.23` and
+each commit's message, not repeated here. The durable, reusable
+lessons:
 
+- **A module spanning multiple packages can silently corrupt files
+  that share a basename.** The most severe find: `emitModule` grouped
+  a module's definitions by `filepath.Base(SourceFile)` instead of the
+  full path. Since `store.Module` is per `go.mod` (see below), any
+  repo with two files sharing a basename in different packages — e.g.
+  `pkg/cmd/gist/create/create.go` and `pkg/cmd/repo/create/create.go`,
+  both reducing to `"create.go"` — had their definitions merged into
+  one write target on emit. One file got the other's content merged
+  in; its sibling was silently never re-emitted. A real trajectory
+  editing `repo/create`'s `createRun` corrupted `gist/create`'s
+  `createRun` with the wrong body and imports, a file the agent never
+  touched or referenced. Likely a significant, previously invisible
+  contributor to defn's measured "over-touching" on every real
+  multi-package repo tested (common basenames like `create.go`,
+  `delete.go`, `config.go` repeat across packages constantly) — the
+  corruption looked like the agent wrote extra files, when emit did.
+  Any time a per-file operation is keyed by something derived from a
+  path, ask whether two different real paths could produce the same
+  key before trusting it as a file identity.
 - **Sibling handlers drift.** When one operation has multiple entry
   points — `edit` vs `handleFragmentEdit` vs `apply`'s "edit" case;
   `create` vs `apply`'s "create" case — a correctness fix to one does
@@ -43,7 +63,13 @@ commit's message, not repeated here. The durable, reusable lessons:
   "scope to package X" argument through `findModule`/`findModuleByFile`
   without checking this silently scopes to "the whole repo" instead.
   Match against `source_file` substrings directly when the intent is
-  package-level, not repo-level, scoping.
+  package-level, not repo-level, scoping. Same root cause behind
+  `test:"TestX"` defaulting to a whole-repo `go test ./...`: an
+  unrelated, unbuildable sibling package elsewhere in a large repo
+  poisoned every named-test run regardless of whether the actual
+  target package was fine. Fixed by resolving the pattern itself
+  against the DB when no explicit scope is given, since it's usually
+  the literal test name.
 - **A feature exercised only in this repo's own dev loop is a feature
   that doesn't ship.** `hooks/defn-capture-question.sh` (grounds the
   `#203` starter bundle in the real user question) was wired only into
@@ -93,20 +119,20 @@ commit's message, not repeated here. The durable, reusable lessons:
   adapting. Fixed by having a block auto-batch every name seen since
   the last reset into one `expand` call instead of just saying no.
 
-**Net result on `head-to-head-go`** (real GitHub issues, n=10, live
-2-arm, same model, `v0.26.13` → `v0.26.22`):
-
-| | defn | files-mode |
-|---|---:|---:|
-| mean F1 | 0.790 | 0.680 |
-| F1≥0.5 hit-rate | 9/10 | 8/10 |
-| total cost | $2.97 | $4.24 |
-
-First time defn has led files-mode on correctness, hit-rate, and cost
-simultaneously on this benchmark, not just approached parity on one
-axis while trailing on another. n=10 on one model is not yet enough to
-call the ranking stable — growing the sample (more tasks, repeat runs)
-is the natural next step before treating this as settled.
+**On comparing against files-mode**: a single n=10 sample showed defn
+leading files-mode on correctness, hit-rate, and cost simultaneously —
+the first time that had happened on this benchmark. A second
+independent repeat sample did not confirm it: combined across both
+runs, defn's correctness came back down to roughly tied with
+files-mode's single run, while the cost advantage held up across both.
+Individual tasks swing a lot run to run (one task went from F1 1.00 to
+0.00 between runs) — real model non-determinism, not a regression from
+anything shipped here. Lesson: don't trust a single n=10 sample's
+correctness ranking, and don't rerun one arm without rerunning the
+other for symmetry. Comparative benchmarking was deprioritized after
+this in favor of just finding and fixing real defn bugs directly,
+which is what surfaced the emit corruption bug above — a better use of
+the same digging effort than chasing a stable comparison number.
 
 ## #209: enforcement alone made things worse, not better
 
