@@ -214,8 +214,19 @@ def arm_touched_files(arm_data, workdir_hint):
                     if f:
                         touched.add(normalize_path(f, workdir_hint))
                     else:
+                        # rename's identity fields are old_name/new_name, not
+                        # name -- args.get("name") is always None for this
+                        # op, so touched silently stayed empty for every
+                        # pure-rename fix even when the tool call succeeded
+                        # (confirmed 2026-08-09, go-zero-2787: a real rename
+                        # updating 16 callers scored touched=0). Resolve by
+                        # new_name: the workdir passed in here is the
+                        # AGENT'S OWN run directory, reflecting the final
+                        # post-rename DB state, not a pristine base-commit
+                        # clone -- old_name no longer exists to look up.
+                        defname = args.get("name") or args.get("new_name")
                         for f in resolve_defname_to_file(
-                            args.get("name"), workdir_hint, args.get("receiver")
+                            defname, workdir_hint, args.get("receiver")
                         ):
                             touched.add(normalize_path(f, workdir_hint))
                 elif op == "apply":
@@ -224,8 +235,9 @@ def arm_touched_files(arm_data, workdir_hint):
                         if f:
                             touched.add(normalize_path(f, workdir_hint))
                         else:
+                            defname = sub.get("name") or sub.get("new_name")
                             for f in resolve_defname_to_file(
-                                sub.get("name"), workdir_hint, sub.get("receiver")
+                                defname, workdir_hint, sub.get("receiver")
                             ):
                                 touched.add(normalize_path(f, workdir_hint))
             # files-mode arm: Edit/Write/MultiEdit are the actual write
