@@ -16,10 +16,10 @@ Three days (2026-08-07 to 2026-08-09) digging real `head-to-head-go`
 defn-arm trajectories (grpc-go, go-zero, cli/cli tasks) instead of
 theorizing about cost drivers — the standing practice this project
 follows because synthetic sweeps had previously missed exactly this
-class of bug. Twenty-seven real bugs came out of it (in defn's MCP
+class of bug. Twenty-eight real bugs came out of it (in defn's MCP
 tool, `internal/emit`, `internal/ingest`, `internal/resolve`, and the
 bench's own scorer); full bug-by-bug detail lives in
-`git log --oneline v0.26.13..v0.26.26` and each commit's message, not
+`git log --oneline v0.26.13..v0.26.27` and each commit's message, not
 repeated here. The durable, reusable lessons:
 
 - **A module spanning multiple packages can silently corrupt files
@@ -78,9 +78,19 @@ repeated here. The durable, reusable lessons:
 - **An accepted parameter isn't necessarily a wired-through one.**
   Schema acceptance and actual effect are separate claims. `search`'s
   `file:` param was silently ignored; `test:"TestX"`'s `module:`/
-  `file:` were never threaded to the handler at all. Both looked like
-  real scoping options to a caller and both silently ran unscoped —
-  worse than an error, because nothing signals the mistake.
+  `file:` were never threaded to the handler at all. `delete`'s
+  `dry_run:true` was the same gap at its most dangerous: `handleCode`'s
+  dispatch built `handleDelete`'s param struct without copying
+  `args.DryRun`, and that struct had no `DryRun` field to copy it into
+  even if it had — so a caller asking for a safe preview got a real,
+  silent, unpreviewed delete instead. `apply`'s own `dry_run` already
+  previewed deletes correctly, which is exactly why this was invisible
+  in testing that only exercised `apply`. Both looked like real
+  options to a caller and both silently did something other than what
+  was asked — worse than an error, because nothing signals the
+  mistake. When adding a flag to a shared param shape, grep every
+  dispatch site that constructs that struct, not just the handler that
+  reads it.
 - **`store.Module` is per `go.mod`, not per package.** A single-module
   repo (the common case: go-zero, grpc-go, cli/cli) has exactly one
   `Module` row covering every package. Any fix that resolves a
