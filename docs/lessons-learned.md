@@ -16,9 +16,9 @@ Three days (2026-08-07 to 2026-08-09) digging real `head-to-head-go`
 defn-arm trajectories (grpc-go, go-zero, cli/cli tasks) instead of
 theorizing about cost drivers — the standing practice this project
 follows because synthetic sweeps had previously missed exactly this
-class of bug. Twenty-one real bugs came out of it (in defn's MCP tool,
+class of bug. Twenty-four real bugs came out of it (in defn's MCP tool,
 `internal/emit`, `internal/resolve`, and the bench's own scorer); full
-bug-by-bug detail lives in `git log --oneline v0.26.13..v0.26.23` and
+bug-by-bug detail lives in `git log --oneline v0.26.13..v0.26.25` and
 each commit's message, not repeated here. The durable, reusable
 lessons:
 
@@ -118,6 +118,45 @@ lessons:
   consecutive refused calls (26% of its entire tool budget) before
   adapting. Fixed by having a block auto-batch every name seen since
   the last reset into one `expand` call instead of just saying no.
+- **When there's exactly one sensible interpretation of an unusual-but-
+  natural input, resolve it instead of erroring.** `rename` already
+  propagates every call site automatically (zero ambiguity — there's
+  only one correct new name at each site). `add-import` infers `file:`
+  when exactly one candidate exists. The circuit breaker auto-batches
+  probe-style calls into `expand` instead of just refusing. Extended
+  the same philosophy to Go's own `pkg.Symbol`/`pkg/path.Symbol`
+  qualified-name convention: a bare-name lookup failure now retries
+  that shape before giving up, since an agent reaching for it is
+  reusing Go's own disambiguation, not guessing. The line to hold: this
+  is for *resolving what was asked*, not *guessing what to change* — a
+  build-failure rollback deliberately does NOT auto-patch a broken
+  caller the same way, because the correct fix (what to pass for a new
+  param, what to do with a new return value) depends on intent defn
+  has no way to know. A mechanical placeholder that only makes the
+  build pass (discarding a new return value with `_`) could silently
+  ship something that compiles but drops the point of the edit — worse
+  than an honest rollback, because it would look done.
+- **The same fact, framed for the wrong risk, might as well be
+  missing.** `impact` already reported a def's caller count before a
+  real trajectory edited a return-arity-changing signature alone and
+  hit a rollback — but the existing warning framed that caller as a
+  test-coverage risk ("no test coverage — a change here may break code
+  no test will catch"), never as a "you're about to break this call
+  site" one. Same underlying data, wrong lens, so it didn't prevent
+  what it could have. Check whether an existing signal is actually
+  aimed at the risk a new fix cares about before assuming it already
+  covers the gap.
+- **A 45-hour-stale local MCP server produces very confusing edit
+  failures that look like product bugs.** Mid-session, edits that
+  reported "Updated X" and even ran without error stopped showing up
+  on disk at all. Root cause: this repo's own dogfooding `defn serve`
+  process was still running a binary built long before the session
+  started, silently disconnected from every source change made since
+  — `defn status` surfaces this directly ("Version skew: running serve
+  is 0.26.5 but $(which defn) is 0.26.14, restart to pick up"), but
+  only if you think to check it. When a local tool's edits stop
+  persisting for no visible reason, check for version/process skew
+  before assuming the tool's logic is broken.
 
 **On comparing against files-mode**: a single n=10 sample showed defn
 leading files-mode on correctness, hit-rate, and cost simultaneously —
