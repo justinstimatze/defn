@@ -81,7 +81,7 @@ func IngestFile(db store.Backend, modulePath string, filePath string) (int, erro
 	sourceFileMu.Unlock()
 
 	state := &ingestState{
-		initCounter: make(map[int64]int),
+		initCounter: make(map[string]int),
 		liveDefIDs:  make(map[int64]bool),
 	}
 

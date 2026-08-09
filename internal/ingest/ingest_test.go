@@ -356,3 +356,76 @@ func TestIngestStructFields(t *testing.T) {
 		t.Errorf("Server: kind=%s, want type", server.Kind)
 	}
 }
+
+// TestIngestFunc_InitNamingStableAcrossFilesAndIngestModes guards the
+// #241 fix: initCounter was keyed by module alone, so the Nth init()
+// encountered anywhere in the module (across every file, in whatever
+// order that specific ingest run happened to process them) determined
+// its synthetic name. A full-module ingest and a single-file sync
+// (IngestFile, which always starts a fresh ingestState per call) would
+// then assign DIFFERENT names to the SAME physical init() function --
+// and since name is part of UpsertDefinition's natural key, that
+// mismatch creates a new row instead of updating the existing one,
+// leaving the old name orphaned. Real trajectory (cli-513): mixing
+// file-level and module-level `sync` calls during one session
+// accumulated six separate, byte-identical copies of one physical
+// init() into the emitted file.
+//
+// Keying initCounter by (module, sourceFile) instead makes the Nth
+// init() in a given file always get the same name regardless of which
+// other files are ingested alongside it, or whether the file is
+// (re-)ingested via full-module Ingest or single-file IngestFile.
+func TestIngestFunc_InitNamingStableAcrossFilesAndIngestModes(t *testing.T) {
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, "alpha"), 0755)
+	os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	// Two files, each with exactly one init() -- a module-wide counter
+	// would number beta's init "init_1" (or higher) purely because
+	// alpha's file happened to be processed first in this ingest run.
+	os.WriteFile(filepath.Join(dir, "root.go"), []byte(`package testproj
+
+func init() {
+	println("root")
+}
+`), 0644)
+	os.WriteFile(filepath.Join(dir, "alpha", "alpha.go"), []byte(`package alpha
+
+func init() {
+	println("alpha")
+}
+`), 0644)
+
+	db := testDB(t)
+	if err := Ingest(db, dir); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	rootInit, err := db.GetDefinitionByName("init", "testproj")
+	if err != nil || rootInit == nil {
+		t.Fatalf("expected root.go's init() to be named bare \"init\", got err=%v", err)
+	}
+	alphaInit, err := db.GetDefinitionByName("init", "testproj/alpha")
+	if err != nil || alphaInit == nil {
+		t.Fatalf("expected alpha/alpha.go's init() to ALSO be named bare \"init\" (per-file counter, not module-wide), got err=%v", err)
+	}
+
+	// Re-ingest alpha's file alone via the fast single-file path (what
+	// `sync file:alpha/alpha.go` does) and confirm it assigns the SAME
+	// name as the full ingest did -- no orphaned "init_1" duplicate.
+	if _, err := IngestFile(db, dir, filepath.Join(dir, "alpha", "alpha.go")); err != nil {
+		t.Fatalf("IngestFile: %v", err)
+	}
+	defs, err := db.FindDefinitionsByFile("alpha", "alpha/alpha.go", 0)
+	if err != nil {
+		t.Fatalf("FindDefinitionsByFile: %v", err)
+	}
+	initCount := 0
+	for _, d := range defs {
+		if d.Name == "init" || strings.HasPrefix(d.Name, "init_") {
+			initCount++
+		}
+	}
+	if initCount != 1 {
+		t.Errorf("expected exactly 1 init-shaped definition in alpha/alpha.go after mixing ingest modes, got %d: %+v", initCount, defs)
+	}
+}

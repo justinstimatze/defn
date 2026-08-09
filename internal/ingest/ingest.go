@@ -50,7 +50,7 @@ func IngestPackages(db store.Backend, pkgs []*packages.Package, modulePath strin
 	}
 
 	state := &ingestState{
-		initCounter:     make(map[int64]int),
+		initCounter:     make(map[string]int),
 		liveDefIDs:      make(map[int64]bool),
 		liveFileSources: make(map[int64]map[string]bool),
 	}
@@ -503,7 +503,25 @@ func ingestComments(db store.Backend, fset *token.FileSet, file *ast.File, sourc
 // ingestState holds mutable state for a single ingest run.
 // Passed by pointer to avoid package-level mutable state.
 type ingestState struct {
-	initCounter map[int64]int  // tracks all init functions per module
+	// initCounter tracks init() occurrences keyed by "moduleID:sourceFile",
+	// NOT by module alone (#241). Multiple init() funcs are valid Go, and
+	// each needs a unique defn-internal name so they don't overwrite each
+	// other -- but a module-wide counter accumulates across every file in
+	// the module in whatever order that specific ingest run happened to
+	// process them, so the SAME physical init() in the SAME file gets a
+	// DIFFERENT synthetic name depending on which other files were
+	// ingested alongside it in that run. A full-module ingest and a
+	// single-file `sync` (IngestFile, which always starts a fresh
+	// ingestState per call) would then assign different names to the
+	// identical function -- and since name is part of UpsertDefinition's
+	// natural key, that mismatch creates a NEW row instead of updating
+	// the existing one, leaving the old name's row orphaned. Real
+	// trajectory (cli-513): mixing file-level and module-level `sync`
+	// calls during one session accumulated SIX separate, byte-identical
+	// copies of one physical init() into the emitted file. Scoping the
+	// counter per (module, file) makes the Nth init() in a given file
+	// always get the same name regardless of ingest mode or file order.
+	initCounter map[string]int
 	liveDefIDs  map[int64]bool // tracks all definition IDs seen
 	// liveFileSources tracks the (module_id, source_file) pairs written
 	// during this ingest. Used to prune file_sources rows for files
@@ -562,14 +580,18 @@ func ingestFunc(db store.Backend, fset *token.FileSet, mod *store.Module, file *
 	doc := fn.Doc.Text()
 
 	// Multiple init() functions are valid in Go. Give each a unique name
-	// so they don't overwrite each other in the database.
+	// so they don't overwrite each other in the database. Keyed by
+	// (module, sourceFile), not module alone -- see ingestState's
+	// initCounter doc comment for why a module-wide counter is unstable
+	// across ingest modes.
 	name := fn.Name.Name
 	if name == "init" {
-		n := state.initCounter[mod.ID]
+		key := fmt.Sprintf("%d:%s", mod.ID, sourceFile)
+		n := state.initCounter[key]
 		if n > 0 {
 			name = fmt.Sprintf("init_%d", n)
 		}
-		state.initCounter[mod.ID]++
+		state.initCounter[key]++
 	}
 
 	def := &store.Definition{
