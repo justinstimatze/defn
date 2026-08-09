@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.22"
+const Version = "0.26.23"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -4626,6 +4626,22 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 	if hint == "" {
 		hint = module
 	}
+	if hint == "" && testNamePattern.MatchString(pattern) {
+		// No explicit scope, but pattern is very often the literal test
+		// name being targeted (the documented, common case: reproduce an
+		// issue's named failing test in one call). Real trajectory
+		// (cli-2671): a pre-existing, unrelated compile error in a
+		// sibling package (pkg/cmd/gist/create) made every whole-repo
+		// `go test ./...` fail regardless of whether the agent's actual
+		// edit -- in a completely different package -- was correct.
+		// Scoping to the named test's own package sidesteps any sibling
+		// package that isn't even imported by it. Best-effort: silently
+		// falls through to ./... if the name doesn't resolve or is
+		// ambiguous across packages.
+		if d, err := s.backend.GetDefinitionByName(pattern, ""); err == nil && d != nil {
+			hint = d.SourceFile
+		}
+	}
 	if hint != "" {
 		if files, err := s.backend.DistinctSourceFiles(); err == nil {
 			for _, f := range files {
@@ -8082,3 +8098,10 @@ func alreadyFreshlyIngested(db store.Backend, projectDir string) bool {
 	})
 	return fresh
 }
+
+// testNamePattern matches a bare Go identifier -- used to decide whether
+// a test:"..." pattern is plausibly a literal test name (safe to resolve
+// via GetDefinitionByName) versus a regex/alternation the caller built
+// deliberately (e.g. "TestFoo|TestBar", "TestFoo$"), which must not be
+// treated as a literal name lookup.
+var testNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)

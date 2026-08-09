@@ -6004,3 +6004,76 @@ func TestGadget(t *testing.T) {
 		t.Errorf("expected TestWidget to pass, got: %s", text)
 	}
 }
+
+// TestHandleTestByName_InfersScopeFromPatternWhenNoHintGiven guards the
+// #241 followup: test:"TestX" with NO module:/file: hint still ran
+// go test ./... across the whole repo. Real trajectory (cli-2671): a
+// pre-existing, unrelated compile error in a sibling package (never
+// imported by the package actually being edited) made every such call
+// fail regardless of whether the agent's own edit was correct. Since
+// the pattern is very often the literal test name, resolve it via the
+// DB and scope to ITS OWN package instead of guessing the caller meant
+// to test everything.
+func TestHandleTestByName_InfersScopeFromPatternWhenNoHintGiven(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "alpha"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "alpha.go"), []byte(`package alpha
+
+func Widget() bool { return true }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "alpha_test.go"), []byte(`package alpha
+
+import "testing"
+
+func TestWidget(t *testing.T) {
+	if !Widget() {
+		t.Fatal("false")
+	}
+}
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	// beta is added to disk AFTER ingest, deliberately never re-ingested
+	// -- it stands in for "some other package in a large repo doesn't
+	// build," which a scope inferred from TestWidget's own package
+	// (alpha) must never need to care about. Untracked-by-the-DB is the
+	// realistic shape here: what actually broke the real cli-2671
+	// trajectory was defn's OWN emit corrupting an unrelated file the
+	// agent never touched (see the emitModule basename-collision fix),
+	// which is exactly "a package the DB doesn't expect to be broken."
+	os.MkdirAll(filepath.Join(projDir, "beta"), 0755)
+	os.WriteFile(filepath.Join(projDir, "beta", "beta.go"), []byte(`package beta
+
+func Broken() {
+	undefinedFunc()
+}
+`), 0644)
+
+	s := &server{backend: db, projectDir: projDir}
+
+	result, _, err := s.handleTestByName(context.Background(), nil, "TestWidget", "", "")
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "./alpha/...") {
+		t.Errorf("expected the go test target to be inferred as ./alpha/..., got: %s", text)
+	}
+	if !strings.Contains(text, "ALL TESTS PASSED") {
+		t.Errorf("expected TestWidget to pass without beta's broken package poisoning the build, got: %s", text)
+	}
+}
