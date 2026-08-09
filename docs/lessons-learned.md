@@ -10,7 +10,7 @@ in a session re-pays that cost at the cache-write rate, not the cache-read
 rate — so trimming it is a direct multiplier on the single biggest cost
 driver found in this project's own 2026-08 caching investigation.
 
-## 2026-08-07/08: thirteen real bugs from real trajectories, two design fixes
+## 2026-08-07/08: sixteen real bugs from real trajectories, two design fixes
 
 A two-day digging session working strictly from real `head-to-head-go`
 defn-arm trajectories (grpc-go, go-zero, cli/cli tasks on defn-bench)
@@ -20,7 +20,8 @@ this class of bug. Every fix below traces to a specific, read
 line-by-line tool-call sequence, not a guess. Commits: `773eeed`,
 `008e271` (both released as `v0.26.14`), `9506b09`, `1004ba9`,
 `60fb503`, `b272b6e` (`v0.26.15`), `38b5dc8`, `2ef68af`, `d19ba62`,
-`dd51c81`, `77ba9a8` (`v0.26.16`+), `6b231ac`, `c7738b9` (`v0.26.18`).
+`dd51c81`, `77ba9a8` (`v0.26.16`+), `6b231ac`, `c7738b9` (`v0.26.18`),
+`a23f2c5`, `51aeb99`, `8f65ee4` (`v0.26.19`-`v0.26.21`).
 
 - **`edit` silently corrupted a definition instead of rejecting a
   multi-decl body** (`b272b6e`) — the most serious of the six. A real
@@ -199,6 +200,118 @@ the letter of "verify before push" but missed whether a fix changed real
 agent behavior. The `apply` multi-decl fix above is the first one shipped
 under the new rule, and the pilot numbers are why it was worth the extra
 step: unit tests alone would never have surfaced the 90%/84% deltas.
+
+### 2026-08-08 continued: pilot = fresh trajectories, not just fix confirmation
+
+After the `apply`-rename fix (`c7738b9`) landed and two follow-up digs on
+*existing* trajectory data came up clean, the standing instruction was
+corrected: a pilot's job is to generate a fresh trajectory to dig into
+for the *next* bug, not just confirm the fix that motivated running it
+— and parity with files-mode is the floor, not the finish line ("we
+don't stop until defn is much better than files"). A fresh EC2 pilot
+turned up three more real bugs, all traced through one stubborn
+example task (`grpc-go-2630`, "grpclb should drop only when at least
+one connection is ready") that kept failing for a *different* reason
+each time:
+
+- **MCP startup always re-ran a full ingest, even when the DB was
+  already fresh** (`a23f2c5`, `v0.26.19`) — `newMCPServer`'s startup
+  goroutine unconditionally fired a full `packages.Load` + ingest +
+  resolve, even right after a CLI `defn ingest .` (exactly what `defn
+  init` and every bench harness setup step does) had just produced an
+  identical DB. Until `s.ready` flipped, read-shaped ops raced the
+  in-flight reingest — which *tears down and rebuilds* the defs table,
+  not just leaves it stale — and returned actively wrong results
+  tagged with only a soft "may be stale" text warning. Root-caused via
+  a live grpc-go-2630 trajectory: the first `search` call landed
+  mid-reingest and returned `Server`/`rpcStats`/`errDropped` instead of
+  `regeneratePicker`, and the agent confidently edited the wrong
+  function from that garbage. `alreadyFreshlyIngested` skips the
+  reload when `last_ingest` already covers every `.go` file on disk.
+  Live-verified: rerunning the same task on the fixed binary confirmed
+  the stale-ingest warning is gone.
+
+- **`search`'s `file:` param was accepted but silently ignored**
+  (`51aeb99`, `v0.26.20`) — every search ran repo-wide regardless of
+  the hint. Same trajectory: the agent called
+  `search(pattern:"drop", file:"grpclb")` expecting scoping and got
+  unfiltered results ranked by IDF instead. Fixed with a substring
+  match on `source_file` (not `findModuleByFile`'s directory-suffix
+  match used by read/outline/edit, which silently picks the wrong
+  module for a bare hint like `"grpclb"` with no path separator).
+  Regression-tested directly; did not by itself fix grpc-go-2630 (see
+  below).
+
+- **The `#203` starter bundle's "ground in the real question" path was
+  never wired up for real users** (`8f65ee4`, `v0.26.21`) — the
+  biggest find of the three. `lastUserQuestion()` reads
+  `.defn/.last-question`, written by a Claude Code
+  `UserPromptSubmit` hook (`hooks/defn-capture-question.sh`) — but that
+  hook was *only* ever wired into this repo's own local dev settings
+  (`.claude/settings.local.json`, gitignored). `defn init` never
+  installed it for consuming projects. Every real `defn init` user was
+  silently getting the weaker fallback (grounded on a bare search
+  pattern or op name) with no way to know the stronger path existed.
+  Confirmed on the same grpc-go-2630 trajectory: the starter bundle
+  fired as designed but grounded on the literal term `"drop"` instead
+  of the real problem statement, surfacing `Server.Drop`/`rpcStats.drop`
+  — a real, legitimate, *unrelated* "drop" feature elsewhere in the
+  same package. `writeClaudeHooks` embeds the script
+  (`cmd/defn/assets/`, kept in sync with the repo's own copy by
+  comment pointer since `go:embed` can't cross the `cmd/defn`
+  directory boundary) and merges a `UserPromptSubmit` entry into
+  `.claude/settings.json` — idempotent, provably preserves any
+  existing hooks. Live-verified the hook now actually fires under
+  headless `claude -p` (not just interactive sessions): `.last-question`
+  held the real problem statement on the next rerun.
+
+**Honest outcome on grpc-go-2630 itself**: four straight attempts
+across all three fixes still landed on the same wrong function
+(`(*lbPicker).Pick`) — not because the fixes didn't work (each was
+independently live-verified doing exactly what it claimed), but
+because the task is a genuinely hard lexical-disambiguation case:
+`lbPicker`'s own doc comment authentically discusses "drop" handling
+as part of normal per-request pick logic, so a keyword-driven approach
+has real textual grounds for the wrong answer, not just noise. This is
+a reasoning/disambiguation gap, not a defn tooling gap — flagged as
+its own harder thread rather than chased further, per the standing
+warning against benchmark-validity rabbit holes over fixing what's
+actually fixable. (A 5th, unrelated rerun as part of the full n=9 batch
+below did happen to land correctly — plausible model non-determinism,
+not attributed to any specific fix.)
+
+**A fourth bug, in the measurement tool, not the product**
+(`3ac708b`, bench-only, no version bump): rescoring the full n=9
+`head-to-head-go` set after the three fixes above showed
+`grpc-go-2631`'s F1 apparently regress from 0.67 to 0.00 across two
+otherwise-identical runs. Reading the actual trajectory showed a
+*correct* edit matching the gold patch exactly
+(`regeneratePicker`/`HandleSubConnStateChange`/`processServerList`) —
+the agent had called `edit` with a combined
+`name:"(*lbBalancer).regeneratePicker"` form instead of separate
+`name`+`receiver` fields, which defn itself resolves fine, but
+`score_correctness.py`'s injection-safety identifier gate rejected the
+parens/asterisk outright and scored it as a total miss. Fixed with a
+narrow, still-anchored regex for exactly this shape. A reminder,
+again, that the scorer needs the same trajectory-driven scrutiny as
+the thing it measures (see the receiver-resolve fix earlier in this
+doc for the first instance of this exact lesson).
+
+**Net result, full n=9 `head-to-head-go` set, same model, same tasks,
+before vs after this whole arc** (`v0.26.18` → `v0.26.21`, honestly
+rescored with the fixed scorer on both):
+
+| | defn | files-mode |
+|---|---:|---:|
+| mean F1 | 0.783 | 0.711 |
+| F1≥0.5 hit-rate | 7/9 | 8/9 |
+| total cost | $3.55 | $3.79 |
+
+For the first time on this benchmark, defn beats files-mode on *both*
+correctness and cost, not just approaches parity on one while trailing
+on the other. n=9 on one model is still not enough to call this
+stable — the next pilot should keep pushing for a larger, repeated
+sample before treating this ranking as settled.
 
 ## #209: enforcement alone made things worse, not better
 
