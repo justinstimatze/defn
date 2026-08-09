@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.24"
+const Version = "0.26.25"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -7983,7 +7983,42 @@ func (s *server) resolveEditTarget(name, receiver, module, file string) (*store.
 	}
 
 	if receiver == "" {
-		return s.backend.GetDefinitionByName(name, modulePath)
+		d, err := s.backend.GetDefinitionByName(name, modulePath)
+		if err == nil && d != nil {
+			return d, nil
+		}
+		// #241: a bare lookup can fail when the caller used Go's own
+		// "pkg.Symbol" (or "pkg/path.Symbol") qualified-name convention
+		// -- a completely natural thing to reach for, especially once a
+		// bare name has already come back ambiguous or ill-fitting.
+		// Real trajectory (go-zero-2283): read(name:"rest/internal/cors.Middleware")
+		// came back "not found" even though Middleware exists right
+		// there, forcing an extra outline+file: round trip to recover.
+		// Retry by splitting on the last "." and matching the prefix
+		// against source_file directly -- store.Module is too coarse
+		// for this (per go.mod, not per package), so findModuleByFile/
+		// findModule can't resolve a package-shaped hint like this on a
+		// single-module repo.
+		if idx := strings.LastIndex(name, "."); idx > 0 {
+			hint, bare := name[:idx], name[idx+1:]
+			if files, ferr := s.backend.DistinctSourceFiles(); ferr == nil {
+				for _, f := range files {
+					if !strings.Contains(f, hint) {
+						continue
+					}
+					// FilterDefinitions is metadata-only (its query hardcodes
+					// an empty body column) -- fetch the full definition by
+					// ID once it's located the right one.
+					if matches, merr := s.backend.FilterDefinitions(bare, "", f, 1); merr == nil && len(matches) > 0 {
+						if full, gerr := s.backend.GetDefinition(matches[0].ID); gerr == nil && full != nil {
+							return full, nil
+						}
+						return &matches[0], nil
+					}
+				}
+			}
+		}
+		return d, err
 	}
 
 	d, err := s.backend.GetDefinitionByNameAndReceiver(name, modulePath, receiver)

@@ -6133,3 +6133,56 @@ func TestHandleImpact_TipsCoupledChangeWhenProdCallersExist(t *testing.T) {
 		t.Errorf("expected a coupled-change tip when production callers exist, got: %s", text)
 	}
 }
+
+// TestHandleGetDefinition_ResolvesDottedQualifiedName guards the #241
+// fix: a bare-name lookup failure now retries Go's own natural
+// "pkg.Symbol"/"pkg/path.Symbol" qualified-name convention before
+// giving up. Real trajectory (go-zero-2283):
+// read(name:"rest/internal/cors.Middleware") came back "not found"
+// even though Middleware exists right there (also as an unrelated type
+// of the same name in a different package), forcing an extra
+// outline+file: round trip to recover.
+func TestHandleGetDefinition_ResolvesDottedQualifiedName(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "alpha"), 0755)
+	os.MkdirAll(filepath.Join(projDir, "beta"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	// Widget exists in BOTH packages under the same bare name -- a bare
+	// lookup alone is ambiguous; the dotted form must disambiguate.
+	os.WriteFile(filepath.Join(projDir, "alpha", "widget.go"), []byte(`package alpha
+
+func Widget() string { return "alpha" }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "beta", "widget.go"), []byte(`package beta
+
+func Widget() string { return "beta" }
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+
+	result, _, err := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "beta.Widget"})
+	if err != nil {
+		t.Fatalf("handleGetDefinition: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, `"beta"`) {
+		t.Errorf("expected beta.Widget's own body (returns \"beta\"), got: %s", text)
+	}
+	if strings.Contains(text, `"alpha"`) {
+		t.Errorf("resolved to the wrong package's Widget, got: %s", text)
+	}
+}
