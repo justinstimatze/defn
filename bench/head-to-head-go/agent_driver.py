@@ -28,13 +28,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TASKS = os.path.join(HERE, "tasks.jsonl")
 ARM_DIR = os.path.join(HERE, "arm_defn")
 ARM_DIR_FILES = os.path.join(HERE, "arm_files")
-WORKDIR_ROOT = "/tmp/defn-h2h-go"
+# Homedir, NOT /tmp: an EC2 stop/start cycle clears /tmp (systemd-tmpfiles
+# on boot), which silently destroyed every task's scoring workdir the
+# first time this bench got run across an instance restart (2026-08-09)
+# -- score_correctness.py's resolve_defname_to_file needs these to survive
+# between the agent run and a later (possibly next-session) scoring pass.
+# ~/.cache survives stop/start since it's on the persistent root volume.
+WORKDIR_ROOT = os.path.expanduser("~/.cache/defn-h2h-go")
 # Cached fresh .defn/ per (instance_id, defn_binary_hash). Contamination
 # fix (6abe8e1) forces a fresh ingest per arm — ~30-90s of pure CPU per
 # arm. Snapshot after first ingest, restore on subsequent runs; hit path
 # is ~2s (tarball extract) vs full re-parse. Invalidates on defn binary
 # change so DB schema drift doesn't corrupt cached DBs.
-DEFN_CACHE_ROOT = "/tmp/defn-h2h-go-cache"
+DEFN_CACHE_ROOT = os.path.expanduser("~/.cache/defn-h2h-go-cache")
 
 
 def _defn_binary_hash():

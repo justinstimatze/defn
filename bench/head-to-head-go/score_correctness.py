@@ -28,7 +28,9 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-WORKDIR_ROOT = "/tmp/defn-h2h-go"
+# Must match agent_driver.py's WORKDIR_ROOT -- homedir, not /tmp, so these
+# survive an EC2 stop/start between the agent run and a later scoring pass.
+WORKDIR_ROOT = os.path.expanduser("~/.cache/defn-h2h-go")
 
 
 def gold_files(fix_patch):
