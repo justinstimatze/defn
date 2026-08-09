@@ -156,7 +156,15 @@ func runMutationSequence(t *testing.T, synth *fuzzgen.SyntheticModule, seed uint
 		op, label, idx := pickMutation(r, live, i, db)
 		result, _, _ := s.handleCode(context.Background(), nil, op)
 		text := resultText(t, result)
-		failed := result.IsError || strings.Contains(text, "rolled back")
+		// BUILD FAILED (without "rolled back") is force:true delete's
+		// documented, intentional shape: force explicitly skips the
+		// build-rollback gate, so a build failure is reported but the
+		// mutation still commits. Treating this as a non-failure caused a
+		// false positive: force-deleting the corpus's own main() reported
+		// success by this check's original logic, and the independent
+		// rebuild below correctly (but misleadingly) caught defn's own
+		// documented behavior as if it were a bug.
+		failed := result.IsError || strings.Contains(text, "rolled back") || strings.Contains(text, "BUILD FAILED")
 
 		switch {
 		case label == "rename" && !failed:
@@ -183,6 +191,18 @@ func seedLiveDefs(t *testing.T, db store.Backend) []liveDef {
 	}
 	var live []liveDef
 	for _, d := range defs {
+		// "main" is excluded deliberately: a package main REQUIRES exactly
+		// one func main(), so deleting/renaming it always breaks the build
+		// by Go's own language rules regardless of defn's correctness --
+		// not a signal worth generating. Found the hard way: a force:true
+		// delete of main correctly skips defn's build-rollback gate (by
+		// design -- force is an explicit "may break the build" escape
+		// hatch) and reports "BUILD FAILED" without the "rolled back"
+		// phrase, which the harness's failure detector didn't originally
+		// recognize as an acknowledged failure.
+		if d.Name == "main" {
+			continue
+		}
 		if d.Kind == "function" || d.Kind == "method" {
 			live = append(live, liveDef{Name: d.Name, Kind: d.Kind, Receiver: d.Receiver})
 		}
