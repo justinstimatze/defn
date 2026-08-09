@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.27"
+const Version = "0.26.28"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -3323,9 +3323,6 @@ func inferOneDecl(decl ast.Decl) (name, kind, receiver string, isTest bool) {
 	return
 }
 
-// handleCreateMultiDecl authors multiple defs into a single file in one call.
-// Reached when handleCreate sees a multi-decl body and file: is set.
-// All-or-nothing: a single upsert error rolls back all prior upserts.
 func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult, any, error) {
 	decls, err := sliceDecls(args.Body)
 	if err != nil {
@@ -3333,31 +3330,11 @@ func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult
 	}
 
 	mod := s.findModuleByFile(args.File)
+	fileResolvedDirectly := mod != nil
 	if mod == nil && args.Module != "" {
 		mod = s.findModule(args.Module)
-	}
-	if mod == nil {
-		// New-package case: file: points at a directory not yet ingested.
-		// Fall back to the shortest-path module (matches single-decl create's
-		// fallback), which for a repo-rooted layout is the module root. Emit
-		// will place the file at args.File; the new package appears on next
-		// ingest.
-		mods, _ := s.backend.ListModules()
-		for i := range mods {
-			if mod == nil || len(mods[i].Path) < len(mod.Path) {
-				mod = &mods[i]
-			}
-		}
-	}
-	if mod == nil {
-		return errResult(fmt.Errorf("no modules found — run defn ingest first, or pass module: explicitly"))
-	}
-
-	// Pre-check: no name collides with an existing def in the target module.
-	for _, d := range decls {
-		if existing, err := s.backend.GetDefinitionByName(d.Name, mod.Path); err == nil {
-			recv := formatReceiver(existing.Receiver)
-			return errResult(fmt.Errorf("definition %s%s already exists in %s (id=%d) — use code(op:\"edit\") to modify it", recv, d.Name, mod.Path, existing.ID))
+		if mod == nil {
+			return errResult(fmt.Errorf("module %q not found", args.Module))
 		}
 	}
 
@@ -3366,6 +3343,56 @@ func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult
 		return errResult(txErr)
 	}
 	defer rollback()
+
+	// New-package case: file: points at a directory not yet ingested and
+	// no module: was given to disambiguate. Mirror handleCreate's #13 fix
+	// -- create a module genuinely scoped to the new directory. The prior
+	// behavior fell back to whichever EXISTING module happened to have
+	// the shortest registered path (e.g. this repo's own db/ module) and
+	// silently attributed every def in the new file to it -- wrong module
+	// association even with zero name collisions, and a false "already
+	// exists" error against that unrelated package's local helpers
+	// (testDB, declKey, ...) when a name did collide. Authoring a
+	// brand-new file in a brand-new package is this op's primary use
+	// case (the whole-file "new file with multiple functions" pattern),
+	// so this path must work, not just error out.
+	if !fileResolvedDirectly {
+		dir := filepath.ToSlash(filepath.Dir(args.File))
+		newPath := dir
+		if dir != "" && dir != "." {
+			mods, _ := s.backend.ListModules()
+			if root := emit.DetectModuleRoot(mods); root != "" {
+				newPath = root + "/" + dir
+			}
+		}
+		newMod, ensureErr := tx.EnsureModule(newPath, filepath.Base(dir), "")
+		if ensureErr != nil {
+			return errResult(fmt.Errorf("create module for new directory %q: %w", dir, ensureErr))
+		}
+		mod = newMod
+	}
+
+	// Pre-check: no name+receiver collides with an existing def in the
+	// target module. Same #220 receiver-disambiguation gap handleCreate
+	// already closed for its single-decl path -- a bare GetDefinitionByName
+	// ignores receiver and falls back to a blast-radius tiebreak, so
+	// creating (*Baz).Bar alongside an unrelated (*Foo).Bar in the same
+	// package would misreport a collision instead of correctly allowing
+	// two distinct receivers.
+	for _, d := range decls {
+		existing, existErr := s.backend.GetDefinitionByNameAndReceiver(d.Name, mod.Path, d.Receiver)
+		if existErr != nil && d.Receiver != "" {
+			if alt := strings.TrimPrefix(d.Receiver, "*"); alt != d.Receiver {
+				existing, existErr = s.backend.GetDefinitionByNameAndReceiver(d.Name, mod.Path, alt)
+			} else {
+				existing, existErr = s.backend.GetDefinitionByNameAndReceiver(d.Name, mod.Path, "*"+d.Receiver)
+			}
+		}
+		if existErr == nil {
+			recv := formatReceiver(existing.Receiver)
+			return errResult(fmt.Errorf("definition %s%s already exists in %s (id=%d) — use code(op:\"edit\") to modify it", recv, d.Name, mod.Path, existing.ID))
+		}
+	}
 
 	ids := make([]int64, 0, len(decls))
 	for _, d := range decls {
@@ -3693,22 +3720,47 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				mod := s.findModuleByFile(op.File)
 				if mod == nil && op.Module != "" {
 					mod = s.findModule(op.Module)
-				}
-				if mod == nil {
-					mods, _ := s.backend.ListModules()
-					for i := range mods {
-						if mod == nil || len(mods[i].Path) < len(mod.Path) {
-							mod = &mods[i]
-						}
+					if mod == nil {
+						errors = append(errors, fmt.Sprintf("create: module %q not found", op.Module))
+						continue
 					}
 				}
 				if mod == nil {
-					errors = append(errors, "create: no modules found")
-					continue
+					// New-package case, same #13-style fix as
+					// handleCreate/handleCreateMultiDecl: create a module
+					// scoped to the new directory instead of falling back
+					// to whichever existing module has the shortest
+					// registered path -- an arbitrary, unrelated package.
+					// See handleCreateMultiDecl's identical fix for the
+					// full story: this exact pattern silently
+					// mis-attributed a brand-new package's defs to this
+					// repo's own db/ module.
+					dir := filepath.ToSlash(filepath.Dir(op.File))
+					newPath := dir
+					if dir != "" && dir != "." {
+						mods, _ := s.backend.ListModules()
+						if root := emit.DetectModuleRoot(mods); root != "" {
+							newPath = root + "/" + dir
+						}
+					}
+					newMod, ensureErr := tx.EnsureModule(newPath, filepath.Base(dir), "")
+					if ensureErr != nil {
+						errors = append(errors, fmt.Sprintf("create: create module for new directory %q: %v", dir, ensureErr))
+						continue
+					}
+					mod = newMod
 				}
 				collided := false
 				for _, d := range decls {
-					if existing, err := tx.GetDefinitionByName(d.Name, mod.Path); err == nil {
+					existing, existErr := tx.GetDefinitionByNameAndReceiver(d.Name, mod.Path, d.Receiver)
+					if existErr != nil && d.Receiver != "" {
+						if alt := strings.TrimPrefix(d.Receiver, "*"); alt != d.Receiver {
+							existing, existErr = tx.GetDefinitionByNameAndReceiver(d.Name, mod.Path, alt)
+						} else {
+							existing, existErr = tx.GetDefinitionByNameAndReceiver(d.Name, mod.Path, "*"+d.Receiver)
+						}
+					}
+					if existErr == nil {
 						recv := formatReceiver(existing.Receiver)
 						errors = append(errors, fmt.Sprintf("create %s%s: already exists in %s (id=%d)", recv, d.Name, mod.Path, existing.ID))
 						collided = true

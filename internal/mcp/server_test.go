@@ -6232,3 +6232,105 @@ func TestHandleCode_DeleteDryRunDoesNotDelete(t *testing.T) {
 		t.Fatalf("Standalone should NOT have been deleted by a dry run, but it's gone: %v", err)
 	}
 }
+
+func TestHandleCreateMultiDecl_NewNestedPackageGetsOwnModule(t *testing.T) {
+	// Regression test for a real bug hit while authoring a brand-new
+	// package via multi-decl create: when file: points at a directory
+	// with no existing module (findModuleByFile returns nil),
+	// handleCreateMultiDecl fell back to "the existing module with the
+	// shortest registered path" instead of creating a module scoped to
+	// the new directory -- unlike handleCreate's own #13 fix for the same
+	// situation. In a large multi-package repo that shortest-path module
+	// is some ARBITRARY, unrelated package -- every def in the new file
+	// got silently attributed to it, and a name that happened to already
+	// exist there (a common local helper name like testDB) falsely
+	// refused as "already exists" against a completely unrelated def.
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	// Seed an unrelated existing def with a common local-helper name in
+	// the pre-existing (and, being the only module, shortest-path)
+	// module -- the collision this bug would trigger.
+	if _, _, err := s.handleCreate(context.Background(), nil, createParam{
+		Body: "func helper() int { return 1 }",
+	}); err != nil {
+		t.Fatalf("seed create: %v", err)
+	}
+
+	body := `func helper() int { return 2 }
+
+func Other() int { return 3 }`
+
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body: body,
+		File: "pkg/newthing/file.go",
+	})
+	text := resultText(t, result)
+	if result.IsError {
+		t.Fatalf("expected new-package create to succeed, got error: %s", text)
+	}
+	if !strings.Contains(text, "Created 2 defs") {
+		t.Fatalf("expected 'Created 2 defs', got: %s", text)
+	}
+	if strings.Contains(text, "testproj)") {
+		t.Fatalf("new nested package must NOT be attributed to the pre-existing root module, got: %s", text)
+	}
+	if !strings.Contains(text, "newthing") {
+		t.Fatalf("expected the new module's path to mention the new directory, got: %s", text)
+	}
+
+	defs, err := db.FindDefinitions("helper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) != 2 {
+		t.Fatalf("expected both the original and the new 'helper' to coexist as distinct defs, got %d: %+v", len(defs), defs)
+	}
+	if defs[0].ModuleID == defs[1].ModuleID {
+		t.Fatalf("new package's helper must not share ModuleID with the unrelated pre-existing module")
+	}
+}
+
+func TestHandleApply_CreateMultiDeclNewNestedPackageGetsOwnModule(t *testing.T) {
+	// Same regression as TestHandleCreateMultiDecl_NewNestedPackageGetsOwnModule,
+	// but through apply's own independent multi-decl "create" implementation
+	// -- a third sibling of the same concept (handleCreate, handleCreateMultiDecl,
+	// apply's inline create case), which had the identical shortest-path
+	// fallback bug and non-receiver-aware collision check.
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	if _, _, err := s.handleCreate(context.Background(), nil, createParam{
+		Body: "func helper() int { return 1 }",
+	}); err != nil {
+		t.Fatalf("seed create: %v", err)
+	}
+
+	body := `func helper() int { return 2 }
+
+func Other() int { return 3 }`
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{{Op: "create", Body: body, File: "pkg/newthing/file.go"}},
+	})
+	text := resultText(t, result)
+	if result.IsError {
+		t.Fatalf("expected new-package apply create to succeed, got error: %s", text)
+	}
+	if strings.Contains(text, "Errors") {
+		t.Fatalf("expected no errors, got: %s", text)
+	}
+
+	defs, err := db.FindDefinitions("helper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) != 2 {
+		t.Fatalf("expected both the original and the new 'helper' to coexist as distinct defs, got %d: %+v", len(defs), defs)
+	}
+	if defs[0].ModuleID == defs[1].ModuleID {
+		t.Fatalf("new package's helper must not share ModuleID with the unrelated pre-existing module")
+	}
+}
