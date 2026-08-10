@@ -25,9 +25,12 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TASKS = os.path.join(HERE, "tasks.jsonl")
-ARM_DIR = os.path.join(HERE, "arm_defn")
-ARM_DIR_FILES = os.path.join(HERE, "arm_files")
+# --corpus-dir (default: this script's own directory) picks which
+# tasks.jsonl / arm_defn / arm_files to use -- lets the same driver run
+# against any hand-curated or Multi-SWE-bench-sourced task set that
+# follows the same schema (e.g. bench/prometheus-repo/), not just the
+# original cli/grpc-go/go-zero corpus this script was built for.
+DEFAULT_CORPUS_DIR = HERE
 # Homedir, NOT /tmp: an EC2 stop/start cycle clears /tmp (systemd-tmpfiles
 # on boot), which silently destroyed every task's scoring workdir the
 # first time this bench got run across an instance restart (2026-08-09)
@@ -188,13 +191,14 @@ already have what you need.
 """.strip()
 
 
-def load_task(instance_id):
-    with open(TASKS) as f:
+def load_task(instance_id, corpus_dir=DEFAULT_CORPUS_DIR):
+    tasks_path = os.path.join(corpus_dir, "tasks.jsonl")
+    with open(tasks_path) as f:
         for line in f:
             r = json.loads(line)
             if r["instance_id"] == instance_id:
                 return r
-    raise KeyError(instance_id)
+    raise KeyError(f"{instance_id} not found in {tasks_path}")
 
 
 def setup_workspace(task, arm="defn"):
@@ -515,8 +519,8 @@ def apply_edits_via_defn(workdir):
         print(f"[emit] defn emit failed: {e}", file=sys.stderr)
 
 
-def run_one(instance_id, budget_usd, max_turns, arm="defn"):
-    task = load_task(instance_id)
+def run_one(instance_id, budget_usd, max_turns, arm="defn", corpus_dir=DEFAULT_CORPUS_DIR):
+    task = load_task(instance_id, corpus_dir)
     workdir = setup_workspace(task, arm=arm)
     prompt = build_prompt(task)
     events, rc, elapsed = run_claude(workdir, prompt, budget_usd, max_turns, arm=arm)
@@ -527,7 +531,7 @@ def run_one(instance_id, budget_usd, max_turns, arm="defn"):
         # DB's (untouched, since files-mode never called defn) stale state.
         apply_edits_via_defn(workdir)
 
-    out_dir = ARM_DIR if arm == "defn" else ARM_DIR_FILES
+    out_dir = os.path.join(corpus_dir, "arm_defn" if arm == "defn" else "arm_files")
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, instance_id + ".json")
     with open(out_path, "w") as f:
@@ -557,21 +561,27 @@ def main():
     ap.add_argument("--budget-usd", type=float, default=3.0)
     ap.add_argument("--max-turns", type=int, default=50)
     ap.add_argument("--arm", choices=["defn", "files"], default="defn")
+    ap.add_argument(
+        "--corpus-dir",
+        default=DEFAULT_CORPUS_DIR,
+        help="directory containing tasks.jsonl (and where arm_defn/arm_files get written); "
+        "default is this script's own directory (the original cli/grpc-go/go-zero corpus)",
+    )
     args = ap.parse_args()
 
     if args.all:
-        with open(TASKS) as f:
+        with open(os.path.join(args.corpus_dir, "tasks.jsonl")) as f:
             tasks = [json.loads(l)["instance_id"] for l in f]
         for i, tid in enumerate(tasks, 1):
             print(f"\n===== [{i}/{len(tasks)}] {tid} =====", file=sys.stderr)
             try:
-                run_one(tid, args.budget_usd, args.max_turns, arm=args.arm)
+                run_one(tid, args.budget_usd, args.max_turns, arm=args.arm, corpus_dir=args.corpus_dir)
             except Exception as e:
                 print(f"[fail] {tid}: {type(e).__name__}: {e}", file=sys.stderr)
     else:
         if not args.instance_id:
             ap.error("provide instance_id or --all")
-        run_one(args.instance_id, args.budget_usd, args.max_turns, arm=args.arm)
+        run_one(args.instance_id, args.budget_usd, args.max_turns, arm=args.arm, corpus_dir=args.corpus_dir)
 
 
 if __name__ == "__main__":
