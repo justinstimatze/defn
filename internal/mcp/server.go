@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.35"
+const Version = "0.26.36"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -885,8 +885,21 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return nil, nil, nil
 	}
 
+	// Dolt-era git-semantics ops removed in the v0.27 SQLite migration --
+	// "git-style branch/merge on definitions turned out to be a non-goal;
+	// users prefer git worktrees + `defn sync`" (docs/lessons-learned.md).
+	// Give a specific, honest answer instead of falling through to the
+	// generic "unknown op" default below, which listed every one of these
+	// names in its own "valid:" whitelist while rejecting them -- and, for
+	// branch/checkout/merge/commit/resolve/diff-defs, first ran real param
+	// validation (e.g. "branch: branch is required") that implied the op
+	// would work once that param was supplied, when it never could.
+	if removedDoltOps[args.Op] {
+		return errResult(fmt.Errorf("%s: not supported -- git-style branch/merge/commit/diff ops on definitions were removed in the v0.27 SQLite migration (users prefer git worktrees + op:\"sync\"); use plain git for version control", args.Op))
+	}
+
 	switch args.Op {
-	case "read", "outline", "impact", "delete", "history", "similar":
+	case "read", "outline", "impact", "delete", "similar":
 		if strings.TrimSpace(args.Name) == "" {
 			if strings.TrimSpace(args.File) != "" {
 				return errResult(fmt.Errorf("%s: name is required — pass name:\"<def>\" for one definition, or use op:\"overview\", file:%q to see every def in that file", args.Op, args.File))
@@ -1054,38 +1067,6 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if args.Direction != "callers" && args.Direction != "callees" {
 			return errResult(fmt.Errorf("traverse: direction must be 'callers' or 'callees', got %q", args.Direction))
 		}
-	case "checkout", "merge":
-		if r, o, e := need(args.Branch, "branch"); r != nil {
-			return r, o, e
-		}
-	case "commit":
-		if r, o, e := need(args.Message, "message"); r != nil {
-			return r, o, e
-		}
-	case "branch":
-		// Deleting requires branch; creating requires branch; listing needs nothing.
-		if args.Force && strings.TrimSpace(args.Branch) == "" {
-			return errResult(fmt.Errorf("branch: force requires branch"))
-		}
-	case "resolve":
-		// Either (name + body) for a custom resolution, or pick=ours|theirs
-		// for a one-shot shortcut. name alone with no body/pick is an error.
-		if args.Pick != "" {
-			if args.Pick != "ours" && args.Pick != "theirs" {
-				return errResult(fmt.Errorf("resolve: pick must be 'ours' or 'theirs', got %q", args.Pick))
-			}
-		} else {
-			if r, o, e := need(args.Name, "name"); r != nil {
-				return r, o, e
-			}
-			if r, o, e := need(args.Body, "body (or pick:'ours'|'theirs')"); r != nil {
-				return r, o, e
-			}
-		}
-	case "diff-defs":
-		if r, o, e := need(args.From, "from"); r != nil {
-			return r, o, e
-		}
 	case "emit":
 		if r, o, e := need(args.Out, "out"); r != nil {
 			return r, o, e
@@ -1103,7 +1084,18 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	// Tag results from read-only ops while startup ingest is still running.
 	stale := !s.ready.Load() && s.projectDir != ""
 	wrapStale := func(r *sdkmcp.CallToolResult, o any, e error) (*sdkmcp.CallToolResult, any, error) {
-		if stale && r != nil && !r.IsError {
+		// Previously gated on !r.IsError, which meant an error result
+		// during the startup race (e.g. overview(file:) hitting "no
+		// definitions found" because ingest hasn't reached that file
+		// yet) got no stale-index warning at all, while a NON-error "no
+		// matches" from search did -- an inconsistency a real trajectory
+		// (prometheus-18972) hit directly: overview(file:...) silently
+		// said "no definitions found" with nothing to suggest the index
+		// might just be incomplete, so the agent had no signal to try
+		// op:"sync" instead of concluding the path was wrong. An error
+		// during a stale window is exactly when this context matters
+		// most -- it's the case most likely to be a false negative.
+		if stale && r != nil {
 			if len(r.Content) > 0 {
 				if tc, ok := r.Content[0].(*sdkmcp.TextContent); ok {
 					tc.Text = "[startup ingest in progress — results may be stale]\n\n" + tc.Text
@@ -1404,7 +1396,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "gc":
 		return s.handleGC(ctx, req, args)
 	default:
-		return errResult(fmt.Errorf("unknown op %q — valid: read, read-and-verify, outline, slice, insert-precondition, replace-slice, replace-hunk, wrap-in-defer, rename-param, add-import, search, impact, explain, context, similar, untested, edit, create, delete, retarget-field-value, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc, resummarize, plan-dsl, plan-sexpr, plan", args.Op))
+		return errResult(fmt.Errorf("unknown op %q — valid: read, read-and-verify, outline, slice, insert-precondition, replace-slice, replace-hunk, wrap-in-defer, rename-param, add-import, search, impact, explain, context, similar, untested, edit, insert, create, delete, retarget-field-value, rename, move, test, apply, query, find, sync, test-coverage, batch-impact, simulate, file-defs, validate-plan, pragmas, literals, traverse, emit, gc, resummarize, plan-dsl, plan-sexpr, plan, overview, methods, patch, expand, read-file", args.Op))
 	}
 }
 
@@ -1722,18 +1714,31 @@ func (s *server) impactJSON(impact *store.Impact) (*sdkmcp.CallToolResult, any, 
 		}
 	}
 
-	callers := make([]impactDefRef, 0, len(impact.DirectCallers))
-	for _, c := range impact.DirectCallers {
+	callersTotal := len(impact.DirectCallers)
+	callers := make([]impactDefRef, 0, min(callersTotal, impactJSONCap))
+	for i, c := range impact.DirectCallers {
+		if i >= impactJSONCap {
+			break
+		}
 		callers = append(callers, toRef(c))
 	}
-	ifaceDispatch := make([]impactDefRef, 0, len(impact.InterfaceDispatchCallers))
-	for _, c := range impact.InterfaceDispatchCallers {
+	ifaceTotal := len(impact.InterfaceDispatchCallers)
+	ifaceDispatch := make([]impactDefRef, 0, min(ifaceTotal, impactJSONCap))
+	for i, c := range impact.InterfaceDispatchCallers {
+		if i >= impactJSONCap {
+			break
+		}
 		ifaceDispatch = append(ifaceDispatch, toRef(c))
 	}
-	tests := make([]impactDefRef, 0, len(impact.Tests))
-	for _, t := range impact.Tests {
+	testsTotal := len(impact.Tests)
+	tests := make([]impactDefRef, 0, min(testsTotal, impactJSONCap))
+	for i, t := range impact.Tests {
+		if i >= impactJSONCap {
+			break
+		}
 		tests = append(tests, toRef(t))
 	}
+	truncated := callersTotal > impactJSONCap || ifaceTotal > impactJSONCap || testsTotal > impactJSONCap
 
 	result := map[string]any{
 		"definition": impactDefRef{
@@ -1745,11 +1750,17 @@ func (s *server) impactJSON(impact *store.Impact) (*sdkmcp.CallToolResult, any, 
 		},
 		"module":                     impact.Module,
 		"direct_callers":             callers,
+		"direct_callers_total":       callersTotal,
 		"interface_dispatch_callers": ifaceDispatch,
+		"interface_dispatch_total":   ifaceTotal,
 		"transitive_count":           impact.TransitiveCount,
 		"tests":                      tests,
+		"tests_total":                testsTotal,
 		"uncovered_by":               impact.UncoveredBy,
 		"blast_radius":               blastRadius,
+	}
+	if truncated {
+		result["truncated"] = fmt.Sprintf("each list capped at %d entries -- use op:\"query\" or narrow with op:\"impact\", query:\"<term>\" to see more of a specific list", impactJSONCap)
 	}
 	text, err := toJSON(result)
 	if err != nil {
@@ -8750,3 +8761,38 @@ func testBuildFailed(out string) bool {
 func testPanicked(out string) bool {
 	return strings.Contains(out, "panic: ") && strings.Contains(out, "goroutine ")
 }
+
+// removedDoltOps names ops that existed under defn's pre-v0.27 Dolt
+// backend (git-style branch/merge/commit/diff on definitions) and were
+// deliberately dropped in the SQLite migration -- see
+// docs/lessons-learned.md's "Key Design Decisions" entry. handleCode
+// checks this before dispatch so these get one clear, specific answer
+// instead of the generic "unknown op" fallthrough.
+var removedDoltOps = map[string]bool{
+	"branch":      true,
+	"checkout":    true,
+	"merge":       true,
+	"commit":      true,
+	"status":      true,
+	"conflicts":   true,
+	"resolve":     true,
+	"merge-abort": true,
+	"diff":        true,
+	"diff-defs":   true,
+	"history":     true,
+}
+
+// impactJSONCap bounds each list in impactJSON's output (direct_callers,
+// interface_dispatch_callers, tests). format:"json" exists specifically
+// as the markdown path's own escape hatch ("... N more production
+// callers omitted; pass format:\"json\" for full list") -- but until
+// this cap existed, the escape hatch had no cap of its own. A real
+// trajectory (prometheus-18652, 2026-08-10) hit a def with 1,314
+// covering tests: impactJSON dumped all of them uncapped, producing a
+// 243,019-character/9,473-line response that exceeded the harness's own
+// tool-result size limit and got redirected to a file the agent never
+// successfully paged through -- the "full list" was less useful than
+// the capped markdown view it was supposed to supplement. Higher than
+// impactCallerCap (15) since JSON is the deliberately-fuller view, but
+// still bounded.
+const impactJSONCap = 200

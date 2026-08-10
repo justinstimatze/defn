@@ -101,7 +101,20 @@ func OpenSQLite(path string) (*SQLiteDB, error) {
 		}
 	}
 
-	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)"
+	// busy_timeout was 5000ms -- too short for the case that actually
+	// hits it in practice: an agent's foreground edit/create racing a
+	// large background startup ingest, which can hold/reacquire the
+	// write lock in bursts for the whole ingest's duration (minutes on
+	// a large repo like prometheus, not milliseconds). Real trajectory
+	// (prometheus-12024, 2026-08-10): raw "sqlite: update definition:
+	// database is locked (5) (SQLITE_BUSY)" surfaced directly to the
+	// agent from two SEQUENTIAL (not even parallel) edit calls while
+	// the "[startup ingest in progress]" banner was still attached to
+	// every tool result across the entire 638s session. 30s gives a
+	// foreground write a real chance to land during a long ingest
+	// instead of failing fast and pushing error recovery onto the
+	// model.
+	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(30000)"
 
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -829,8 +842,8 @@ func (s *SQLiteDB) UpsertDefinition(d *Definition) (int64, error) {
 	var existingHash string
 	err := s.db.QueryRowContext(ctx,
 		`SELECT id, hash FROM definitions
-		 WHERE module_id = ? AND name = ? AND kind = ? AND COALESCE(receiver,'') = COALESCE(?,'') AND test = ?`,
-		d.ModuleID, d.Name, d.Kind, d.Receiver, d.Test,
+		 WHERE module_id = ? AND name = ? AND kind = ? AND COALESCE(receiver,'') = COALESCE(?,'') AND test = ? AND source_file = ?`,
+		d.ModuleID, d.Name, d.Kind, d.Receiver, d.Test, d.SourceFile,
 	).Scan(&existingID, &existingHash)
 
 	if err == sql.ErrNoRows {
@@ -906,14 +919,15 @@ func (s *SQLiteDB) UpsertDefinitionsBulk(defs []*Definition) ([]int64, error) {
 	}
 
 	type natKey struct {
-		modID    int64
-		name     string
-		kind     string
-		receiver string
-		test     bool
+		modID      int64
+		name       string
+		kind       string
+		receiver   string
+		test       bool
+		sourceFile string
 	}
 	keyOf := func(d *Definition) natKey {
-		return natKey{d.ModuleID, d.Name, d.Kind, d.Receiver, d.Test}
+		return natKey{d.ModuleID, d.Name, d.Kind, d.Receiver, d.Test, d.SourceFile}
 	}
 	type existing struct {
 		id   int64
@@ -926,21 +940,21 @@ func (s *SQLiteDB) UpsertDefinitionsBulk(defs []*Definition) ([]int64, error) {
 	}
 	for modID := range modIDs {
 		rows, err := s.db.QueryContext(ctx,
-			`SELECT id, name, kind, COALESCE(receiver,''), test, hash
+			`SELECT id, name, kind, COALESCE(receiver,''), test, COALESCE(source_file,''), hash
 			 FROM definitions WHERE module_id = ?`, modID)
 		if err != nil {
 			return nil, fmt.Errorf("sqlite: UpsertDefinitionsBulk lookup module %d: %w", modID, err)
 		}
 		for rows.Next() {
 			var e existing
-			var name, kind, receiver, hash string
+			var name, kind, receiver, sourceFile, hash string
 			var test bool
-			if err := rows.Scan(&e.id, &name, &kind, &receiver, &test, &hash); err != nil {
+			if err := rows.Scan(&e.id, &name, &kind, &receiver, &test, &sourceFile, &hash); err != nil {
 				rows.Close()
 				return nil, fmt.Errorf("sqlite: UpsertDefinitionsBulk scan: %w", err)
 			}
 			e.hash = hash
-			existingByKey[natKey{modID, name, kind, receiver, test}] = e
+			existingByKey[natKey{modID, name, kind, receiver, test, sourceFile}] = e
 		}
 		rows.Close()
 	}
@@ -953,10 +967,10 @@ func (s *SQLiteDB) UpsertDefinitionsBulk(defs []*Definition) ([]int64, error) {
 	// variant (packages.Load Tests:true can produce overlapping pkg.Syntax
 	// under some layouts — FilterPackages catches the common case but not
 	// every one). Without this guard the batch INSERT hits the unique
-	// constraint on (module_id, name, kind, receiver, test) and the whole
-	// flush fails. Last-write-wins semantics: the later Definition value
-	// replaces the earlier one in the INSERT, and both input positions
-	// receive the same row ID after the insert.
+	// constraint on (module_id, name, kind, receiver, test, source_file)
+	// and the whole flush fails. Last-write-wins semantics: the later
+	// Definition value replaces the earlier one in the INSERT, and both
+	// input positions receive the same row ID after the insert.
 	pendingByKey := make(map[natKey]int) // key → index into toInsert
 	type dupPos struct{ inputPos, canonicalToInsertIdx int }
 	var dupes []dupPos

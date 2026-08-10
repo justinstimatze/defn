@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -8136,5 +8137,140 @@ func TestRankedSearchResult_ResultsIncludeSourceFile(t *testing.T) {
 	text := resultText(t, result)
 	if !strings.Contains(text, `"file"`) {
 		t.Errorf("expected ranked search results to include the source file, got:\n%s", text)
+	}
+}
+
+// TestHandleCode_RemovedDoltOpsGetSpecificAnswerNotUnknownOp guards a real
+// trajectory failure (prometheus-18712, 2026-08-10): op:"status" and
+// op:"diff" both fell through to the generic "unknown op" default, whose
+// own error message listed "status"/"diff" in its "valid:" whitelist while
+// rejecting them -- self-contradictory and misleading. Both ops (along
+// with the rest of the Dolt-era git-semantics family) were removed in the
+// v0.27 SQLite migration and were never coming back; the fix is a
+// specific, honest "not supported" answer instead of the generic
+// fallthrough.
+func TestHandleCode_RemovedDoltOpsGetSpecificAnswerNotUnknownOp(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	for _, op := range []string{"status", "diff", "branch", "checkout", "merge", "commit", "conflicts", "resolve", "merge-abort", "diff-defs", "history"} {
+		t.Run(op, func(t *testing.T) {
+			result, _, err := s.handleCode(context.Background(), nil, codeParam{Op: op, Branch: "x", Message: "x", Name: "x", Body: "x", From: "x"})
+			if err != nil {
+				t.Fatalf("handleCode(%q): %v", op, err)
+			}
+			text := resultText(t, result)
+			if strings.Contains(text, "unknown op") {
+				t.Errorf("op:%q got the generic unknown-op fallthrough, want a specific not-supported answer:\n%s", op, text)
+			}
+			if !strings.Contains(text, "not supported") {
+				t.Errorf("op:%q expected a \"not supported\" explanation, got:\n%s", op, text)
+			}
+			// The self-contradiction: an error must not list its own rejected
+			// op name inside a "valid:" whitelist.
+			if strings.Contains(text, "valid:") && strings.Contains(text, op) {
+				idx := strings.Index(text, "valid:")
+				if strings.Contains(text[idx:], op) {
+					t.Errorf("op:%q self-contradicts: appears in its own \"valid:\" whitelist:\n%s", op, text)
+				}
+			}
+		})
+	}
+}
+
+// TestHandleCode_StaleWarningAppliesToErrorResultsToo guards a real
+// trajectory failure (prometheus-18972, 2026-08-10): wrapStale only
+// prepended "[startup ingest in progress]" to non-error results, so
+// overview(file:...) during the startup race silently said "no
+// definitions found" with no hint the index might just be incomplete --
+// the agent had no signal to retry via op:"sync" instead of concluding
+// the path was wrong, which cost most of that task's 859s runtime.
+// search's "no matches" got the warning (it returns a plain text result,
+// not an error) while overview(file:)'s "no definitions found" (an error
+// result) didn't -- same underlying stale-index condition, inconsistent
+// signaling depending on which op hit it.
+func TestHandleCode_StaleWarningAppliesToErrorResultsToo(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: t.TempDir()} // ready left false: simulates startup ingest still running
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{Op: "overview", File: "nonexistent/path.go"})
+	if err != nil {
+		t.Fatalf("handleCode: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected an error result for a nonexistent file, got a success")
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "startup ingest in progress") {
+		t.Errorf("error result during startup race should carry the stale-index warning, got:\n%s", text)
+	}
+}
+
+// TestHandleImpact_JSONCapsLargeTestList guards a real trajectory failure
+// (prometheus-18652, 2026-08-10): impactJSON had no size guard at all,
+// unlike the markdown path (capped at impactCallerCap=15 with a "pass
+// format:\"json\" for full list" hint). A def with 1,314 covering tests
+// produced a 243,019-character/9,473-line response that blew past the
+// harness's own tool-result size limit and got redirected to a file the
+// agent never successfully paged through -- the JSON "full list" escape
+// hatch had no cap of its own to escape TO.
+func TestHandleImpact_JSONCapsLargeTestList(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := &server{backend: db}
+
+	m, _ := db.EnsureModule("example.com/lib", "lib", "")
+	target := &store.Definition{
+		ModuleID: m.ID, Name: "T", Kind: "function", Exported: true,
+		Body: "func T() {}", Signature: "func T()",
+	}
+	target.Hash = store.HashBody(target.Body)
+	targetID, _ := db.UpsertDefinition(target)
+
+	const n = impactJSONCap + 5
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("TestT_%d", i)
+		c := &store.Definition{
+			ModuleID: m.ID, Name: name, Kind: "function", Test: true,
+			Body: fmt.Sprintf("func %s(t *testing.T) { T() }", name),
+		}
+		c.Hash = store.HashBody(c.Body)
+		id, _ := db.UpsertDefinition(c)
+		_ = db.SetReferences(id, []store.Reference{{FromDef: id, ToDef: targetID, Kind: "call"}})
+	}
+
+	result, _, err := s.handleImpact(context.Background(), nil, codeParam{Name: "T", Format: "json"})
+	if err != nil {
+		t.Fatalf("handleImpact: %v", err)
+	}
+	text := resultText(t, result)
+
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(text), &parsed); err != nil {
+		t.Fatalf("impactJSON output is not valid JSON: %v\n%s", err, text)
+	}
+
+	tests, ok := parsed["tests"].([]any)
+	if !ok {
+		t.Fatalf("expected \"tests\" array in JSON, got: %v", parsed["tests"])
+	}
+	if len(tests) != impactJSONCap {
+		t.Errorf("expected tests capped at %d, got %d", impactJSONCap, len(tests))
+	}
+	testsTotal, _ := parsed["tests_total"].(float64)
+	if int(testsTotal) != n {
+		t.Errorf("expected tests_total=%d (uncapped true count), got %v", n, parsed["tests_total"])
+	}
+	if _, ok := parsed["truncated"]; !ok {
+		t.Errorf("expected a \"truncated\" field when the cap was hit, got none. Full response:\n%s", text)
+	}
+	if len(text) > 50000 {
+		t.Errorf("impactJSON response is %d bytes -- capping didn't bound the actual response size", len(text))
 	}
 }

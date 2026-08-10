@@ -1960,3 +1960,93 @@ func TestEmitModule_SameBasenameDifferentPackagesDontCollide(t *testing.T) {
 		t.Errorf("beta/create.go was corrupted with alpha's AlphaCreate:\n%s", betaSrc)
 	}
 }
+
+// TestEmitPreservesInitAcrossSiblingFilesInSamePackage guards a severe
+// data-corruption bug found via a real prometheus/prometheus head-to-head
+// trajectory (prometheus-19338/17395/19184/19114, 2026-08-10): Go
+// explicitly permits multiple func init() per package -- one per file is
+// the normal shape for generated code (every protoc-gogo .pb.go file gets
+// its own init() registering its enums/types) and for driver/plugin
+// registration patterns. definitions' natural key was (module_id, name,
+// kind, receiver, test) with NO source_file component, so two sibling
+// files in the SAME package each declaring their own (per-file-counter)
+// bare "init" collided on that key -- UpsertDefinition treated the
+// second file's init() as an UPDATE of the first's row instead of a
+// separate definition, silently discarding one file's init() content
+// and duplicating the other's onto both files on emit. Live symptom:
+// go test on packages the agent never touched panicked with "duplicate
+// enum registered" / "Config named ... is already registered", because
+// both on-disk files now independently called the same registration
+// code at runtime. Fixed by adding source_file to the UNIQUE constraint
+// (schema_sqlite.sql) and to UpsertDefinition/UpsertDefinitionsBulk's
+// natural key.
+func TestEmitPreservesInitAcrossSiblingFilesInSamePackage(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("github.com/x/y/pkgx", "pkgx", "")
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "init", Kind: "function", Exported: false,
+		Body: "func init() {\n\tACalls++\n}", SourceFile: "pkgx/a.go",
+	})
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "init", Kind: "function", Exported: false,
+		Body: "func init() {\n\tBCalls++\n}", SourceFile: "pkgx/b.go",
+	})
+
+	defs, err := db.FindDefinitionsByFile("pkgx", "pkgx/a.go", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) != 1 || defs[0].Name != "init" {
+		t.Fatalf("a.go: expected exactly 1 init def, got %+v", defs)
+	}
+	aID := defs[0].ID
+
+	defs, err = db.FindDefinitionsByFile("pkgx", "pkgx/b.go", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) != 1 || defs[0].Name != "init" {
+		t.Fatalf("b.go: expected exactly 1 init def, got %+v", defs)
+	}
+	bID := defs[0].ID
+
+	if aID == bID {
+		t.Fatalf("a.go and b.go's init() collided onto the same definition row (id=%d) -- source_file is not part of the natural key", aID)
+	}
+
+	outDir := t.TempDir()
+	if err := Emit(db, outDir); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+
+	aSrc, err := os.ReadFile(filepath.Join(outDir, "pkgx", "a.go"))
+	if err != nil {
+		t.Fatalf("pkgx/a.go was never written: %v", err)
+	}
+	bSrc, err := os.ReadFile(filepath.Join(outDir, "pkgx", "b.go"))
+	if err != nil {
+		t.Fatalf("pkgx/b.go was never written: %v", err)
+	}
+
+	if !strings.Contains(string(aSrc), "ACalls++") {
+		t.Errorf("pkgx/a.go missing its own init() body:\n%s", aSrc)
+	}
+	if strings.Contains(string(aSrc), "BCalls++") {
+		t.Errorf("pkgx/a.go was corrupted with b.go's init() body:\n%s", aSrc)
+	}
+	if !strings.Contains(string(bSrc), "BCalls++") {
+		t.Errorf("pkgx/b.go missing its own init() body:\n%s", bSrc)
+	}
+	if strings.Contains(string(bSrc), "ACalls++") {
+		t.Errorf("pkgx/b.go was corrupted with a.go's init() body:\n%s", bSrc)
+	}
+
+	// Both files must declare exactly one init() each -- not zero (dropped)
+	// and not two (duplicated from the other file).
+	if n := strings.Count(string(aSrc), "func init()"); n != 1 {
+		t.Errorf("pkgx/a.go has %d init() funcs, want 1:\n%s", n, aSrc)
+	}
+	if n := strings.Count(string(bSrc), "func init()"); n != 1 {
+		t.Errorf("pkgx/b.go has %d init() funcs, want 1:\n%s", n, bSrc)
+	}
+}

@@ -27,7 +27,18 @@ CREATE TABLE IF NOT EXISTS definitions (
     end_line    INTEGER,
     source_file TEXT DEFAULT '',
     hash        TEXT NOT NULL,
-    UNIQUE(module_id, name, kind, receiver, test),
+    -- source_file is part of the natural key, not just module/name/kind/
+    -- receiver/test: Go explicitly permits multiple func init() per
+    -- package (one per file), and it's the single most common source of
+    -- same-named declarations across sibling files in one package (also
+    -- common in generated code: protoc/goyacc output often has more than
+    -- one init() across a package's .pb.go files). Without source_file,
+    -- every file's first (unrenamed) "init" collided on this constraint,
+    -- and "last write wins" silently dropped one file's init() content
+    -- while duplicating the other's onto both files on emit -- corrupting
+    -- real, unrelated packages (proto enum / driver registration panics)
+    -- that were never touched by the edit that triggered a re-ingest.
+    UNIQUE(module_id, name, kind, receiver, test, source_file),
     FOREIGN KEY (module_id) REFERENCES modules(id)
 );
 
