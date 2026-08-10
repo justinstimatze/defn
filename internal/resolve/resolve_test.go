@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/justinstimatze/defn/internal/goload"
 	"github.com/justinstimatze/defn/internal/ingest"
 	"github.com/justinstimatze/defn/internal/store"
 )
@@ -733,5 +734,159 @@ func (s *Server) dispatch() int {
 
 	if !hasDispatchRef() {
 		t.Fatalf("ResolveFile (the path used after every real code(op:\"edit\")) silently wiped the dispatch -> (*SQLiteDB).Pick interface_dispatch ref computed by the prior full Resolve")
+	}
+}
+
+// TestResolvePackages_LoadAllInterfaceDispatch checks whether the exact
+// loading path the live server uses (ingestAndResolve -> goload.LoadAll ->
+// resolve.ResolvePackages) computes cross-package interface_dispatch refs
+// correctly -- goload.LoadAll deliberately omits packages.NeedDeps (unlike
+// resolve()'s own internal fallback loader used by plain Resolve/
+// ResolveModule), and that difference is unverified against pass 2's
+// interface-satisfaction check.
+func TestResolvePackages_LoadAllInterfaceDispatch(t *testing.T) {
+	dir := writeModule(t, map[string]string{
+		"store/store.go": `package store
+
+type Backend interface{ Pick() int }
+
+type SQLiteDB struct{ n int }
+
+func (p *SQLiteDB) Pick() int { return p.n }
+`,
+		"mcp/mcp.go": `package mcp
+
+import "example.com/refsbug/store"
+
+type Server struct{ backend store.Backend }
+
+func helper() int { return 1 }
+
+func (s *Server) dispatch() int {
+	return s.backend.Pick() + helper()
+}
+`,
+	})
+
+	db := testDB(t)
+	if err := ingest.Ingest(db, dir); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	pkgs, err := goload.LoadAll(dir)
+	if err != nil {
+		t.Fatalf("goload.LoadAll: %v", err)
+	}
+	if err := ResolvePackages(db, pkgs, dir); err != nil {
+		t.Fatalf("ResolvePackages: %v", err)
+	}
+
+	pick, err := db.GetDefinitionByNameAndReceiver("Pick", "", "*SQLiteDB")
+	if err != nil {
+		t.Fatalf("lookup (*SQLiteDB).Pick: %v", err)
+	}
+	refs, err := db.QueryRefs("dispatch", "", "interface_dispatch", 0)
+	if err != nil {
+		t.Fatalf("query interface_dispatch refs: %v", err)
+	}
+	found := false
+	for _, r := range refs {
+		if r.ToDef == pick.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ResolvePackages via goload.LoadAll (the live server's actual full-resolve path) failed to compute dispatch -> (*SQLiteDB).Pick, got %d interface_dispatch refs: %+v", len(refs), refs)
+	}
+}
+
+// TestResolve_InterfaceDispatchSurvivesTestVariantPreference is the real
+// root cause behind the two ResolveModule/ResolveFile bugs fixed above --
+// found by diagnosing why defn's own live dogfooding session still showed
+// zero interface-dispatch callers for store.Backend methods even after
+// those fixes and a full re-sync. Direct diagnostic against defn's own repo
+// (a standalone go/packages program) proved: internal/store.Backend.GetImpact's
+// method Object as seen from internal/store's OWN type-checking session has a
+// DIFFERENT pointer than the Object internal/mcp's call site resolves via
+// info.Uses -- identical String() representation, different addresses.
+//
+// Root cause: packages.Load(Tests:true) produces a separate "test variant"
+// *packages.Package for any package with its own _test.go files (bundling
+// test + non-test files into one type-checking session, distinct from the
+// plain variant). goload.FilterPackages deliberately PREFERS the test
+// variant when iterating a package directly ("superset of files") -- but a
+// package that IMPORTS it normally (never a test variant, per Go's own
+// import rules) gets Objects from the PLAIN variant's session. Two
+// structurally-identical *types.Func for "the same" method then have
+// different pointers. ifaceMethodToImpls, keyed by types.Object, silently
+// never matches across this boundary -- breaking cross-package interface
+// dispatch tracking for EVERY package with its own tests, i.e. nearly every
+// real package. This fixture reproduces it precisely: store/ has a _test.go
+// file (unlike the fixtures above, which never triggered FilterPackages'
+// preference at all and so never exercised this specific mechanism).
+func TestResolve_InterfaceDispatchSurvivesTestVariantPreference(t *testing.T) {
+	dir := writeModule(t, map[string]string{
+		"store/store.go": `package store
+
+type Backend interface{ Pick() int }
+
+type SQLiteDB struct{ n int }
+
+func (p *SQLiteDB) Pick() int { return p.n }
+`,
+		"store/store_test.go": `package store
+
+import "testing"
+
+func TestSomething(t *testing.T) {
+	var b Backend = &SQLiteDB{}
+	_ = b.Pick()
+}
+`,
+		"mcp/mcp.go": `package mcp
+
+import "example.com/refsbug/store"
+
+type Server struct{ backend store.Backend }
+
+func helper() int { return 1 }
+
+func (s *Server) dispatch() int {
+	return s.backend.Pick() + helper()
+}
+`,
+	})
+
+	db := testDB(t)
+	if err := ingest.Ingest(db, dir); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	// The exact real-world path: goload.LoadAll (Tests:true, triggers
+	// FilterPackages' test-variant preference for store/) + ResolvePackages.
+	pkgs, err := goload.LoadAll(dir)
+	if err != nil {
+		t.Fatalf("goload.LoadAll: %v", err)
+	}
+	if err := ResolvePackages(db, pkgs, dir); err != nil {
+		t.Fatalf("ResolvePackages: %v", err)
+	}
+
+	pick, err := db.GetDefinitionByNameAndReceiver("Pick", "", "*SQLiteDB")
+	if err != nil {
+		t.Fatalf("lookup (*SQLiteDB).Pick: %v", err)
+	}
+	refs, err := db.QueryRefs("dispatch", "", "interface_dispatch", 0)
+	if err != nil {
+		t.Fatalf("query interface_dispatch refs: %v", err)
+	}
+	found := false
+	for _, r := range refs {
+		if r.ToDef == pick.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("mcp.dispatch -> (*SQLiteDB).Pick interface_dispatch ref missing -- the caller package (mcp) imports store's PLAIN variant while pass 2 iterated store's TEST variant (preferred by FilterPackages since store/ has its own _test.go file), and a types.Object-keyed ifaceMethodToImpls map can never bridge the two. Got %d interface_dispatch refs: %+v", len(refs), refs)
 	}
 }

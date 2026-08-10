@@ -245,7 +245,7 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 		}
 	}
 
-	ifaceMethodToImpls := map[types.Object][]int64{}
+	ifaceMethodToImpls := map[string][]int64{}
 
 	// #253: this loop must NOT skip packages outside onlyModule the way
 	// pass 3 does. ifaceMethodToImpls is rebuilt from scratch on every
@@ -357,12 +357,14 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 					defRefs[concreteID] = append(defRefs[concreteID], store.Reference{ToDef: ifaceID, Kind: "implements"})
 				}
 
-				// Map interface method objects → concrete method def IDs.
+				// Map interface method identity (as a canonical string, not
+				// a types.Object -- see collectRefs's doc comment on the
+				// lookup side for why) → concrete method def IDs.
 				for ifaceMethod := range ifaceType.Methods() {
-					ifaceMethod := ifaceMethod
 					concreteMethodID := lookupMethodDefID(db, pkgPath, concrete.Obj().Name(), ifaceMethod.Name(), cache)
 					if concreteMethodID > 0 {
-						ifaceMethodToImpls[ifaceMethod] = append(ifaceMethodToImpls[ifaceMethod], concreteMethodID)
+						key := ifaceMethodKey(ifacePkgPath, iface.Obj().Name(), ifaceMethod.Name())
+						ifaceMethodToImpls[key] = append(ifaceMethodToImpls[key], concreteMethodID)
 					}
 				}
 			}
@@ -704,7 +706,7 @@ func lookupVarDefID(db store.Backend, pkgPath, name string, cache pkgIndexCache)
 // it only fires for objects that are themselves plausibly a top-level def
 // or a concrete (non-interface) method, using each object's OWN home
 // package scope rather than the caller's.
-func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef map[types.Object]int64, ifaceMethodToImpls map[types.Object][]int64, db store.Backend, cache pkgIndexCache) ([]store.Reference, []store.LiteralField) {
+func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef map[types.Object]int64, ifaceMethodToImpls map[string][]int64, db store.Backend, cache pkgIndexCache) ([]store.Reference, []store.LiteralField) {
 	seen := make(map[int64]string)
 	var refs []store.Reference
 	var litFields []store.LiteralField
@@ -832,13 +834,45 @@ func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef 
 			return true
 		}
 
-		// Interface method dispatch: obj is an interface method not in objToDef.
-		// Connect to all concrete implementations.
-		if implIDs, ok := ifaceMethodToImpls[obj]; ok {
-			for _, implID := range implIDs {
-				addRef(implID, "interface_dispatch")
+		// Interface method dispatch: obj is an interface method not in
+		// objToDef. Connect to all concrete implementations.
+		//
+		// Keyed by a canonical STRING (package path + interface name +
+		// method name), NOT by obj itself. Confirmed via direct diagnostic
+		// against defn's own repo: packages.Load(Tests:true) gives
+		// internal/store.Backend.GetImpact's method object TWO DIFFERENT
+		// *types.Object pointers with IDENTICAL String() representation --
+		// one from internal/store's own type-checking session (the
+		// "test variant" FilterPackages prefers when iterating that
+		// package directly in pass 2, since it bundles _test.go files),
+		// and a different one from internal/mcp's session (which imports
+		// the PLAIN, non-test variant, per normal Go import rules -- a
+		// non-test package can never import another package's test
+		// variant). A types.Object-keyed map built from one session's
+		// pointers can never match a lookup using the other session's --
+		// silently breaking cross-package interface dispatch for every
+		// call into any package that has its own _test.go files, which is
+		// nearly every real package. String identity is immune to this:
+		// pkgPath/name strings are equal regardless of which
+		// type-checking session produced the Object.
+		//
+		// obj's own receiver type (not sel.X) reliably gives a
+		// *types.Named for the interface, confirmed empirically -- no
+		// need to inspect the enclosing selector expression separately.
+		if fn, ok := obj.(*types.Func); ok {
+			if sig := fn.Type().(*types.Signature); sig.Recv() != nil {
+				if named, ok := sig.Recv().Type().(*types.Named); ok && types.IsInterface(named) {
+					if ifacePkg := named.Obj().Pkg(); ifacePkg != nil {
+						key := ifaceMethodKey(ifacePkg.Path(), named.Obj().Name(), fn.Name())
+						if implIDs, ok := ifaceMethodToImpls[key]; ok {
+							for _, implID := range implIDs {
+								addRef(implID, "interface_dispatch")
+							}
+							return true
+						}
+					}
+				}
 			}
-			return true
 		}
 
 		// Cross-package fallback -- see the doc comment above.
@@ -1021,4 +1055,12 @@ func receiverName(t types.Type) string {
 		return prefix + s[idx+1:]
 	}
 	return s
+}
+
+// ifaceMethodKey builds the canonical string key ifaceMethodToImpls is
+// keyed by: package path + interface name + method name. NOT keyed by
+// types.Object pointer identity -- see the doc comment where this is
+// populated (resolve's pass 2) for why pointer identity is unsafe here.
+func ifaceMethodKey(pkgPath, ifaceName, methodName string) string {
+	return pkgPath + "\x00" + ifaceName + "\x00" + methodName
 }
