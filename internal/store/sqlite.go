@@ -2351,7 +2351,7 @@ func (s *SQLiteDB) Query(query string) ([]map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	var results []map[string]any
+	results := make([]map[string]any, 0)
 	for rows.Next() {
 		vals := make([]any, len(cols))
 		ptrs := make([]any, len(cols))

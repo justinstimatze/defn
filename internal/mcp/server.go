@@ -2055,6 +2055,33 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		return errResult(err)
 	}
 
+	// #stale8: search doesn't apply Go's own "pkg.Symbol" qualified-name
+	// convention that name-based ops resolve via resolveDottedQualifiedName
+	// -- a caller reaching for search(pattern:"zrpc.WithUnaryClientInterceptor")
+	// got a literal substring match against a string no def's name/body
+	// actually contains verbatim (defs are named "WithUnaryClientInterceptor"
+	// alone), even though the bare symbol finds it trivially. Retry with
+	// just the part after the last "." when the qualified form comes up
+	// empty and looks like an identifier, not a file path or LIKE glob.
+	dottedNote := ""
+	if len(defs) == 0 {
+		if idx := strings.LastIndex(args.Pattern, "."); idx > 0 && !strings.ContainsAny(args.Pattern, "/%") {
+			bare := args.Pattern[idx+1:]
+			if bare != "" {
+				bareDefs, bareErr := s.backend.FindDefinitions("%" + bare + "%")
+				if bareErr == nil {
+					if ftsDefs, ftsErr := s.backend.SearchDefinitions(bare); ftsErr == nil {
+						bareDefs = mergeDefsByID(bareDefs, ftsDefs)
+					}
+					if len(bareDefs) > 0 {
+						defs = bareDefs
+						dottedNote = fmt.Sprintf("_note: no match for the qualified name %q -- retried with the bare symbol %q (search doesn't parse package qualifiers, unlike read/outline/edit). Pass file: to scope to the right package instead._\n\n", args.Pattern, bare)
+					}
+				}
+			}
+		}
+	}
+
 	// #250: include: is a real codeParam field, but only op:"expand" wires
 	// it up (graph-hop selection). A caller reaching for
 	// search(pattern:"X", include:["pkg"]) by analogy with expand's
@@ -2066,9 +2093,9 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// up on search entirely. Same precedent as #241's file: fix and
 	// expand's own "unsupported include kinds ignored" note -- surface it
 	// instead of silently dropping it.
-	includeNote := ""
+	includeNote := dottedNote
 	if len(args.Include) > 0 {
-		includeNote = fmt.Sprintf("_note: \"include\" has no effect on search (that's expand's graph-hop selector) -- ignored: %s. Use file:\"<hint>\" to scope search results by source path instead._\n\n", strings.Join(args.Include, ", "))
+		includeNote += fmt.Sprintf("_note: \"include\" has no effect on search (that's expand's graph-hop selector) -- ignored: %s. Use file:\"<hint>\" to scope search results by source path instead._\n\n", strings.Join(args.Include, ", "))
 	}
 
 	// #241: file: was accepted as a param but silently ignored -- every
@@ -2125,12 +2152,13 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	}
 
 	type summary struct {
-		Name     string `json:"name"`
-		Kind     string `json:"kind"`
-		Receiver string `json:"receiver,omitempty"`
-		Preview  string `json:"preview,omitempty"`
+		Name       string `json:"name"`
+		Kind       string `json:"kind"`
+		Receiver   string `json:"receiver,omitempty"`
+		SourceFile string `json:"file,omitempty"`
+		Preview    string `json:"preview,omitempty"`
 	}
-	var results []summary
+	results := make([]summary, 0, limit)
 	for _, d := range defs {
 		if len(results) >= limit {
 			break
@@ -2140,7 +2168,7 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		// corpus). Cap at 3 previews per response so it doesn't inflate
 		// on name-browse queries; cap each preview at 5 lines. Model can
 		// still call read for the full body.
-		s := summary{Name: d.Name, Kind: d.Kind, Receiver: d.Receiver}
+		s := summary{Name: d.Name, Kind: d.Kind, Receiver: d.Receiver, SourceFile: d.SourceFile}
 		if len(results) < searchPreviewCount {
 			s.Preview = topLinesOfBody(d.Body, searchPreviewLines)
 		}
@@ -2319,11 +2347,12 @@ func (s *server) rankedSearchResult(query string, defs []store.Definition, limit
 	scored := rank.Rank(query, cands, s.idf, rank.DefaultWeights)
 
 	type rankedSummary struct {
-		Name     string  `json:"name"`
-		Kind     string  `json:"kind"`
-		Receiver string  `json:"receiver,omitempty"`
-		Score    float64 `json:"score"`
-		Preview  string  `json:"preview,omitempty"`
+		Name       string  `json:"name"`
+		Kind       string  `json:"kind"`
+		Receiver   string  `json:"receiver,omitempty"`
+		SourceFile string  `json:"file,omitempty"`
+		Score      float64 `json:"score"`
+		Preview    string  `json:"preview,omitempty"`
 	}
 	out := make([]rankedSummary, 0, limit)
 	for i, r := range scored {
@@ -2332,7 +2361,7 @@ func (s *server) rankedSearchResult(query string, defs []store.Definition, limit
 		}
 		rs := rankedSummary{
 			Name: r.Def.Name, Kind: r.Def.Kind, Receiver: r.Def.Receiver,
-			Score: r.Score,
+			SourceFile: r.Def.SourceFile, Score: r.Score,
 		}
 		// #159: preview the top-N ranked hits — model can identify the
 		// winner from body head without a follow-up read.
@@ -4913,7 +4942,7 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 	case err != nil && testPanicked(outStr):
 		sb.WriteString("\nTEST BINARY PANICKED -- not a normal assertion failure; likely caused by state unrelated to your edit (e.g. duplicate flag/command registration shared across tests in one binary). Investigate the panic trace above before assuming your edit is wrong")
 	case ctx.Err() == context.DeadlineExceeded:
-		sb.WriteString(fmt.Sprintf("\nTIMED OUT after %s -- this is NOT a pass; the run was killed before finishing, likely a hang introduced by a recent edit", testTimeout))
+		sb.WriteString(fmt.Sprintf("\nTIMED OUT after %s -- this is NOT a pass; the run was killed before finishing. This may be a hang from your edit, or simply a large/slow test package -- set DEFN_TEST_TIMEOUT=<duration> (e.g. \"5m\") to allow more time before assuming a hang", testTimeout))
 	case err != nil:
 		sb.WriteString("\nSOME TESTS FAILED")
 	case testMatchedNothing(outStr):
@@ -4983,7 +5012,7 @@ func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args n
 	case err != nil && testPanicked(outStr):
 		sb.WriteString("\nTEST BINARY PANICKED -- not a normal assertion failure; likely caused by state unrelated to your edit (e.g. duplicate flag/command registration shared across tests in one binary). Investigate the panic trace above before assuming your edit is wrong")
 	case ctx.Err() == context.DeadlineExceeded:
-		sb.WriteString(fmt.Sprintf("\nTIMED OUT after %s -- this is NOT a pass; the run was killed before finishing, likely a hang introduced by a recent edit", testTimeout))
+		sb.WriteString(fmt.Sprintf("\nTIMED OUT after %s -- this is NOT a pass; the run was killed before finishing. This may be a hang from your edit, or simply a large/slow test package -- set DEFN_TEST_TIMEOUT=<duration> (e.g. \"5m\") to allow more time before assuming a hang", testTimeout))
 	case err != nil:
 		sb.WriteString("\nSOME TESTS FAILED")
 	case testMatchedNothing(outStr):
@@ -5470,7 +5499,7 @@ func (s *server) handleOverview(ctx context.Context, _ *sdkmcp.CallToolRequest, 
 
 	defs, err := s.backend.FindDefinitionsByFile(dir, sourceFile, 0)
 	if err != nil || len(defs) == 0 {
-		return errResult(fmt.Errorf("no definitions found for %s", file))
+		return errResult(fmt.Errorf("no definitions found for %s -- check the path (try op:\"overview\" with no file: for the project map, or op:\"search\" to find the right path)", file))
 	}
 
 	// #157 query-context: filter defs to those whose name/doc/
@@ -5769,7 +5798,7 @@ func (s *server) handleFind(_ context.Context, _ *sdkmcp.CallToolRequest, args f
 		return errResult(err)
 	}
 	if len(defs) == 0 {
-		return errResult(fmt.Errorf("no definitions found at %s:%d", args.File, args.Line))
+		return errResult(fmt.Errorf("no definitions found at %s:%d -- check the path (try op:\"overview\" with no file: for the project map, or op:\"search\" to find the right path)", args.File, args.Line))
 	}
 
 	var sb strings.Builder
@@ -6130,7 +6159,7 @@ func (s *server) handleFileDefs(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 	if total > limit {
 		defs = defs[:limit]
 	}
-	var results []defSummary
+	results := make([]defSummary, 0, len(defs))
 	for _, d := range defs {
 		results = append(results, defSummary{
 			Name: d.Name, Kind: d.Kind, Receiver: d.Receiver,
@@ -6494,7 +6523,7 @@ func (s *server) handleTestCoverage(_ context.Context, _ *sdkmcp.CallToolRequest
 	type testInfo struct {
 		Name string `json:"name"`
 	}
-	var tests []testInfo
+	tests := make([]testInfo, 0, len(impact.Tests))
 	for _, t := range impact.Tests {
 		tests = append(tests, testInfo{Name: t.Name})
 	}
@@ -7267,7 +7296,7 @@ func (s *server) handleAddImport(_ context.Context, _ *sdkmcp.CallToolRequest, a
 		return errResult(fmt.Errorf("add-import: locate file: %w", err))
 	}
 	if len(defs) == 0 {
-		return errResult(fmt.Errorf("add-import: no definitions found in file %q — cannot resolve module", file))
+		return errResult(fmt.Errorf("add-import: no definitions found in file %q -- cannot resolve module (check the path via op:\"overview\" or op:\"search\")", file))
 	}
 	moduleID := defs[0].ModuleID
 
@@ -8554,7 +8583,7 @@ func (s *server) coupledChangeHint(defIDs ...int64) string {
 	if len(names) == 0 {
 		return ""
 	}
-	return fmt.Sprintf("\nTip: %s has a direct caller (%s) -- if this build failure is from a coupled signature change, batch this edit together with a fix to it via op:\"apply\".\n",
+	return fmt.Sprintf("\nTip: this def has %s (%s) -- if this build failure is from a coupled signature change, batch this edit together with a fix to it via op:\"apply\".\n",
 		pluralizeCallers(len(names)), strings.Join(names, ", "))
 }
 

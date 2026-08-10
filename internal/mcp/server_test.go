@@ -7865,3 +7865,276 @@ func TestHandleMethods_SameNamedTypesAcrossFilesGetMergeWarning(t *testing.T) {
 		t.Errorf("a file:-scoped call should not warn about merging, got:\n%s", scopedText)
 	}
 }
+
+// TestCoupledChangeHint_GrammaticallyCorrectMessage guards the stale8
+// fix: the template combined with pluralizeCallers's output produced
+// duplicated/broken grammar -- "Tip: a direct caller has a direct
+// caller (Foo)" for n==1, "Tip: direct callers has a direct caller
+// (Foo, Bar)" for n>1 (also subject/verb disagreement). Verified
+// directly against the pre-fix source before fixing.
+func TestCoupledChangeHint_GrammaticallyCorrectMessage(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	// setupTestDB's fixture has a real caller relationship: Farewell
+	// calls Greet, populated via real ingest+resolve.
+	d, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hint := s.coupledChangeHint(d.ID)
+	if hint == "" {
+		t.Fatal("expected a non-empty hint since Farewell calls Greet")
+	}
+	if !strings.Contains(hint, "Farewell") {
+		t.Errorf("expected Farewell named as the caller, got: %q", hint)
+	}
+	if strings.Contains(hint, "caller has a direct caller") {
+		t.Errorf("regression: duplicated 'has a direct caller' phrase, got: %q", hint)
+	}
+	if strings.Contains(hint, "callers has a direct caller") {
+		t.Errorf("regression: subject/verb disagreement, got: %q", hint)
+	}
+	if !strings.Contains(hint, "this def has") {
+		t.Errorf("expected the fixed template's 'this def has' phrasing, got: %q", hint)
+	}
+}
+
+// TestHandleAddImport_NoDefinitionsFoundSuggestsRecovery is
+// TestHandleOverview_NoDefinitionsFoundSuggestsRecovery's counterpart
+// for add-import's own zero-match error, found in the same sweep.
+func TestHandleAddImport_NoDefinitionsFoundSuggestsRecovery(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.handleAddImport(context.Background(), nil, codeParam{File: "nonexistent/path.go", ImportPath: "fmt"})
+	if err != nil {
+		t.Fatalf("handleAddImport: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "search") && !strings.Contains(text, "overview") {
+		t.Errorf("expected a recovery hint pointing at search/overview, got:\n%s", text)
+	}
+}
+
+// TestHandleFileDefs_EmptyFileReturnsEmptyArrayNotNull guards the sweep
+// fix: `var results []defSummary` stayed nil for a file with zero
+// top-level declarations (e.g. a doc.go with just a package clause),
+// so the response read "0 definitions in doc.go:\n\nnull" instead of
+// an empty array.
+func TestHandleFileDefs_EmptyFileReturnsEmptyArrayNotNull(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "doc.go"), []byte("// Package testproj does nothing interesting.\npackage testproj\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package testproj\n\nfunc main() {}\n"), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+
+	s := &server{backend: db}
+	result, _, err := s.handleFileDefs(context.Background(), nil, codeParam{File: "doc.go"})
+	if err != nil {
+		t.Fatalf("handleFileDefs: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "null") {
+		t.Errorf("regression: bare 'null' embedded in the response, got:\n%s", text)
+	}
+	if !strings.Contains(text, "0 definitions in doc.go") {
+		t.Errorf("expected the zero-count header, got:\n%s", text)
+	}
+}
+
+// TestHandleFind_NoDefinitionsFoundSuggestsRecovery is
+// TestHandleOverview_NoDefinitionsFoundSuggestsRecovery's counterpart
+// for find's own zero-match error, found in the same sweep.
+func TestHandleFind_NoDefinitionsFoundSuggestsRecovery(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.handleFind(context.Background(), nil, findParam{File: "nonexistent/path.go"})
+	if err != nil {
+		t.Fatalf("handleFind: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "search") && !strings.Contains(text, "overview") {
+		t.Errorf("expected a recovery hint pointing at search/overview, got:\n%s", text)
+	}
+}
+
+// TestHandleOverview_NoDefinitionsFoundSuggestsRecovery guards the
+// stale8 sweep fix: overview's zero-match error was the one dead-end
+// message in the file with no recovery hint, unlike every sibling
+// zero-match path (search suggests overview; read/outline's
+// file-without-name error suggests overview too).
+func TestHandleOverview_NoDefinitionsFoundSuggestsRecovery(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+	s.ready.Store(true)
+
+	result, _, err := s.handleOverview(context.Background(), nil, codeParam{File: "nonexistent/path.go"})
+	if err != nil {
+		t.Fatalf("handleOverview: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "search") && !strings.Contains(text, "overview") {
+		t.Errorf("expected a recovery hint pointing at search/overview, got:\n%s", text)
+	}
+}
+
+// TestHandleQuery_ZeroRowsReturnsEmptyArrayNotNull guards the sweep
+// fix: internal/store's Query left `var results []map[string]any` nil
+// when a SELECT matched zero rows, so a perfectly normal empty result
+// set JSON-marshaled to a bare top-level "null" instead of "[]" --
+// indistinguishable from a crash.
+func TestHandleQuery_ZeroRowsReturnsEmptyArrayNotNull(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.handleQuery(context.Background(), nil, sqlParam{SQL: "SELECT id FROM definitions WHERE id = -1"})
+	if err != nil {
+		t.Fatalf("handleQuery: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.TrimSpace(text) == "null" {
+		t.Errorf("regression: bare 'null' response for a zero-row query, got:\n%s", text)
+	}
+	if !strings.Contains(text, "[]") {
+		t.Errorf("expected an empty JSON array, got:\n%s", text)
+	}
+}
+
+// TestHandleSearch_DottedQualifiedNameRetriesWithBareSymbol guards the
+// stale8 fix: search never applied Go's own "pkg.Symbol" convention
+// that read/outline/edit already resolve via resolveDottedQualifiedName
+// -- a real zero-1907 trajectory got "no matches" for
+// search(pattern:"zrpc.WithUnaryClientInterceptor") even though the
+// bare symbol existed and was found trivially on the next call.
+func TestHandleSearch_DottedQualifiedNameRetriesWithBareSymbol(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.handleSearch(context.Background(), nil, codeParam{Pattern: "somepkg.Greet"})
+	if err != nil {
+		t.Fatalf("handleSearch: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Greet") {
+		t.Errorf("expected the qualified-name retry to find Greet via its bare symbol, got:\n%s", text)
+	}
+	if !strings.Contains(text, "retried with the bare symbol") {
+		t.Errorf("expected a note disclosing the retry, got:\n%s", text)
+	}
+}
+
+// TestHandleSearch_MidStringWildcardNoMatchReturnsEmptyArrayNotNull
+// guards the stale8 fix: a pattern with '%' in the MIDDLE (e.g. a
+// printf-style path like "runs/%d/jobs") skipped the Stage-3 no-match
+// fallback entirely (strings.Trim only strips edges) and fell through
+// to toJSON(nil-slice), producing a bare top-level "null" instead of
+// an explanatory no-match response. Reproduced live against the
+// pre-fix build; this locks in the fix.
+func TestHandleSearch_MidStringWildcardNoMatchReturnsEmptyArrayNotNull(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.handleSearch(context.Background(), nil, codeParam{Pattern: "NoSuch%DefinitionXYZ123"})
+	if err != nil {
+		t.Fatalf("handleSearch: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.TrimSpace(text) == "null" {
+		t.Errorf("regression: bare 'null' response for a mid-string wildcard with no matches")
+	}
+}
+
+// TestHandleSearch_ResultsIncludeSourceFile guards the stale8 fix:
+// search's summary struct never included the definition's file
+// location, unlike read/outline/impact -- forcing a caller who wanted
+// to jump to `overview file:"<the file>"` to guess the path, which
+// directly caused a wasted round-trip in a real grpc-go-3476
+// trajectory.
+func TestHandleSearch_ResultsIncludeSourceFile(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.handleSearch(context.Background(), nil, codeParam{Pattern: "Greet"})
+	if err != nil {
+		t.Fatalf("handleSearch: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, `"file"`) {
+		t.Errorf("expected search results to include the source file, got:\n%s", text)
+	}
+	if !strings.Contains(text, "main.go") {
+		t.Errorf("expected the actual file path in results, got:\n%s", text)
+	}
+}
+
+// TestHandleTestCoverage_ZeroTestsReturnsEmptyArrayNotNull guards the
+// sweep fix: `var tests []testInfo` stayed nil for a def with zero
+// covering tests, so the JSON response read `"tests": null` instead
+// of `"tests": []` -- wrong shape for any consumer expecting an array.
+func TestHandleTestCoverage_ZeroTestsReturnsEmptyArrayNotNull(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+
+	// main() in setupTestDB's fixture is called by nothing and covered
+	// by no TestX function -- zero covering tests, unlike Greet/Farewell.
+	result, _, err := s.handleTestCoverage(context.Background(), nil, codeParam{Name: "main"})
+	if err != nil {
+		t.Fatalf("handleTestCoverage: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, `"tests": null`) {
+		t.Errorf("regression: tests field is null instead of an empty array, got:\n%s", text)
+	}
+	if !strings.Contains(text, `"tests": []`) {
+		t.Errorf("expected \"tests\": [] for a def with zero covering tests, got:\n%s", text)
+	}
+}
+
+// TestRankedSearchResult_ResultsIncludeSourceFile is
+// TestHandleSearch_ResultsIncludeSourceFile's counterpart for the
+// ranked-results path (search's OTHER result shape, hit when the
+// candidate set exceeds limit or rank:true is passed) -- it had the
+// identical missing-file-location gap in its own rankedSummary struct.
+func TestRankedSearchResult_ResultsIncludeSourceFile(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	defs, err := db.FindDefinitions("%")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) == 0 {
+		t.Fatal("expected at least one definition in the fixture")
+	}
+	result, _, err := s.rankedSearchResult("Greet", defs, 1)
+	if err != nil {
+		t.Fatalf("rankedSearchResult: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, `"file"`) {
+		t.Errorf("expected ranked search results to include the source file, got:\n%s", text)
+	}
+}
