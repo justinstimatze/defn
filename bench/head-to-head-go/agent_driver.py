@@ -267,17 +267,22 @@ def setup_workspace(task, arm="defn"):
         stderr=subprocess.DEVNULL,
     )
 
-    # Force a fresh .defn/ per arm. Keeping it across reruns wedges the DB
-    # in the previous run's post-write state (fabricated tests etc.);
-    # subsequent op:test would call emit.Emit and write that stale state
-    # back to the freshly-reset disk. Cache the fresh ingest result per
-    # (inst_id, defn binary hash) so repeat runs pay ~2s tarball extract
-    # instead of ~30-90s full re-parse.
+    # files-mode arm gets none of this: no .defn/, no defn-authored CLAUDE.md
+    # block. It must be the honest native baseline -- Read/Write/Edit/Bash
+    # against a repo that has never seen defn -- or the comparison isn't
+    # measuring what CLAUDE.md's "parity is the floor" rule requires (the
+    # real native baseline, not defn-on-defn). Found 2026-08-09: this function
+    # ran `defn init`/`ingest` unconditionally regardless of arm, so every
+    # files-mode workdir got a CLAUDE.md telling it to use `mcp__defn__code`
+    # for all Go work -- a tool that arm's allowlist doesn't grant it.
     import shutil
 
     defn_dir = os.path.join(workdir, ".defn")
     if os.path.isdir(defn_dir):
         shutil.rmtree(defn_dir)
+
+    if arm != "defn":
+        return workdir
 
     binhash = _defn_binary_hash()
     cache_path = _defn_cache_path(inst, binhash)
@@ -519,7 +524,15 @@ def apply_edits_via_defn(workdir):
         print(f"[emit] defn emit failed: {e}", file=sys.stderr)
 
 
-def run_one(instance_id, budget_usd, max_turns, arm="defn", corpus_dir=DEFAULT_CORPUS_DIR):
+def run_one(
+    instance_id, budget_usd, max_turns, arm="defn", corpus_dir=DEFAULT_CORPUS_DIR
+):
+    out_dir = os.path.join(corpus_dir, "arm_defn" if arm == "defn" else "arm_files")
+    out_path = os.path.join(out_dir, instance_id + ".json")
+    if os.path.exists(out_path):
+        print(f"[skip] {out_path} already exists", file=sys.stderr)
+        return
+
     task = load_task(instance_id, corpus_dir)
     workdir = setup_workspace(task, arm=arm)
     prompt = build_prompt(task)
@@ -531,9 +544,7 @@ def run_one(instance_id, budget_usd, max_turns, arm="defn", corpus_dir=DEFAULT_C
         # DB's (untouched, since files-mode never called defn) stale state.
         apply_edits_via_defn(workdir)
 
-    out_dir = os.path.join(corpus_dir, "arm_defn" if arm == "defn" else "arm_files")
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, instance_id + ".json")
     with open(out_path, "w") as f:
         json.dump(
             {
@@ -575,13 +586,25 @@ def main():
         for i, tid in enumerate(tasks, 1):
             print(f"\n===== [{i}/{len(tasks)}] {tid} =====", file=sys.stderr)
             try:
-                run_one(tid, args.budget_usd, args.max_turns, arm=args.arm, corpus_dir=args.corpus_dir)
+                run_one(
+                    tid,
+                    args.budget_usd,
+                    args.max_turns,
+                    arm=args.arm,
+                    corpus_dir=args.corpus_dir,
+                )
             except Exception as e:
                 print(f"[fail] {tid}: {type(e).__name__}: {e}", file=sys.stderr)
     else:
         if not args.instance_id:
             ap.error("provide instance_id or --all")
-        run_one(args.instance_id, args.budget_usd, args.max_turns, arm=args.arm, corpus_dir=args.corpus_dir)
+        run_one(
+            args.instance_id,
+            args.budget_usd,
+            args.max_turns,
+            arm=args.arm,
+            corpus_dir=args.corpus_dir,
+        )
 
 
 if __name__ == "__main__":
