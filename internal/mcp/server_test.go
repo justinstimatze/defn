@@ -8382,3 +8382,50 @@ func TestHandleValidatePlan_ReceiverDisambiguatesSameNamedMethod(t *testing.T) {
 		t.Errorf("validate-plan for receiver:\"*Foo\" resolved to Baz's Bar (2 callers) instead:\n%s", text)
 	}
 }
+
+// TestHandleTestByName_ResolvesFullModulePathHint guards a real bug
+// found via a prometheus-18534 trajectory (2026-08-10): the agent
+// explicitly passed module:"github.com/prometheus/prometheus/promql"
+// -- the same full-import-path shape "module:" takes everywhere else
+// in this API -- but testScopeTarget only substring-matched against
+// repo-relative source_file paths, which a full module path never
+// matches. The hint was silently ignored 3 calls in a row, each
+// falling back to a whole-repo `go test ./...` that exhausted the
+// box's disk compiling every unrelated cloud-SDK dependency.
+func TestHandleTestByName_ResolvesFullModulePathHint(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "promql"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "promql", "functions.go"), []byte("package promql\n\nfunc Functions() string { return \"fn\" }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "promql", "functions_test.go"), []byte("package promql\n\nimport \"testing\"\n\nfunc TestFunctions(t *testing.T) {\n\tif Functions() == \"\" {\n\t\tt.Fatal(\"promql-marker\")\n\t}\n}\n"), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleTestByName(context.Background(), nil, "TestFunctions", "testproj/promql", "")
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "across ./promql/...:") {
+		t.Errorf("expected module: hint to scope to \"./promql/...\", got:\n%s", text)
+	}
+	if !strings.Contains(text, "ALL TESTS PASSED") {
+		t.Errorf("expected TestFunctions to pass, got:\n%s", text)
+	}
+}

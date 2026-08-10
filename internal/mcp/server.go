@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.39"
+const Version = "0.26.40"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -8678,6 +8678,32 @@ func (s *server) resolveDottedQualifiedName(name string) (*store.Definition, err
 func (s *server) testScopeTarget(hint string) string {
 	if hint == "" {
 		return "./..."
+	}
+	// hint may be a full Go module/import path rather than a source-file
+	// substring -- the same shape "module:" takes everywhere else in this
+	// API (e.g. code(op:"impact", module:"github.com/x/y/z")), which a
+	// caller reasonably expects to work here too. That never
+	// substring-matches a repo-relative source_file path below, so it
+	// silently fell through to "./..." every time -- confirmed via a real
+	// prometheus-18534 trajectory where an explicit module: hint was
+	// ignored 3 calls in a row, each falling back to a whole-repo `go
+	// test ./...` that exhausted the box's disk compiling every unrelated
+	// cloud-SDK dependency. Try an exact module-path match first, using
+	// the same moduleRoot-stripping emitModule already does for on-disk
+	// paths.
+	if mods, err := s.backend.ListModules(); err == nil {
+		for _, m := range mods {
+			if m.Path != hint {
+				continue
+			}
+			root := emit.DetectModuleRoot(mods)
+			rel := strings.TrimPrefix(m.Path, root)
+			rel = strings.TrimPrefix(rel, "/")
+			if rel == "" {
+				return "."
+			}
+			return "./" + rel + "/..."
+		}
 	}
 	files, err := s.backend.DistinctSourceFiles()
 	if err != nil {
