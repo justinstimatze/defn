@@ -12,6 +12,7 @@ import (
 	"go/token"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -722,6 +723,12 @@ func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import,
 		}
 		filtered = append(filtered, imp)
 	}
+	// #new: this is the regenerate path -- there's no on-disk file to
+	// preserve a real per-file import block from, so restrict the
+	// per-module union down to what this file's own bodies actually
+	// reference (deduped on local name) rather than writing the whole
+	// union into every file. See relevantImportsForFile.
+	filtered = relevantImportsForFile(filtered, defs)
 	if len(filtered) > 0 {
 		src.WriteString("import (\n")
 		for _, imp := range filtered {
@@ -1486,4 +1493,49 @@ func DetectModuleRoot(modules []store.Module) string {
 		}
 	}
 	return prefix
+}
+
+// relevantImportsForFile filters imports down to the subset a single
+// file's own definition bodies actually reference, deduping on local
+// name so two same-name-but-different-path imports (e.g. several AWS
+// SDK "types" sub-packages sharing a package's per-module import
+// union) never both land in one file's import block -- see writeFile's
+// regenerate path, which has no on-disk file to preserve a real
+// per-file import block from and would otherwise write the FULL
+// per-module union into every file, including imports that file never
+// uses or that collide with each other on local name ("redeclared",
+// unrecoverable) rather than merely going unused ("undefined: X",
+// actionable).
+func relevantImportsForFile(imports []store.Import, defs []store.Definition) []store.Import {
+	referenced := func(name string) bool {
+		for _, d := range defs {
+			if strings.Contains(d.Body, name+".") {
+				return true
+			}
+		}
+		return false
+	}
+	localName := func(imp store.Import) string {
+		if imp.Alias != "" {
+			return imp.Alias
+		}
+		return path.Base(imp.ImportedPath)
+	}
+	seen := map[string]bool{}
+	var out []store.Import
+	for _, imp := range imports {
+		ln := localName(imp)
+		if ln == "_" || ln == "." {
+			out = append(out, imp)
+			continue
+		}
+		if seen[ln] {
+			continue
+		}
+		if referenced(ln) {
+			seen[ln] = true
+			out = append(out, imp)
+		}
+	}
+	return out
 }

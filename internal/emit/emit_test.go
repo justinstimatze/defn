@@ -2050,3 +2050,43 @@ func TestEmitPreservesInitAcrossSiblingFilesInSamePackage(t *testing.T) {
 		t.Errorf("pkgx/b.go has %d init() funcs, want 1:\n%s", n, bSrc)
 	}
 }
+
+func TestEmitRegeneratePathDedupesCollidingLocalImportNames(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("github.com/x/pkgy", "pkgy", "")
+	if err := db.SetImports(mod.ID, []store.Import{
+		{ModuleID: mod.ID, ImportedPath: "context"},
+		{ModuleID: mod.ID, ImportedPath: "github.com/x/ec2/types"},
+		{ModuleID: mod.ID, ImportedPath: "github.com/x/msk/types"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "UseEC2", Kind: "function", Exported: true,
+		Body:       "func UseEC2(ctx context.Context) types.Instance {\n\t_ = ctx\n\treturn types.Instance{}\n}",
+		SourceFile: "pkgy/ec2.go",
+	})
+
+	outDir := t.TempDir()
+	if err := Emit(db, outDir); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+
+	src, err := os.ReadFile(filepath.Join(outDir, "pkgy", "ec2.go"))
+	if err != nil {
+		t.Fatalf("pkgy/ec2.go was never written: %v", err)
+	}
+	s := string(src)
+
+	hasEC2 := strings.Contains(s, "github.com/x/ec2/types")
+	hasMSK := strings.Contains(s, "github.com/x/msk/types")
+	if hasEC2 && hasMSK {
+		t.Fatalf("pkgy/ec2.go got BOTH colliding \"types\" imports -- guaranteed \"redeclared\" compile error:\n%s", s)
+	}
+	if !hasEC2 && !hasMSK {
+		t.Fatalf("pkgy/ec2.go got NEITHER \"types\" import -- UseEC2 references types.Instance and won't compile:\n%s", s)
+	}
+	if !strings.Contains(s, `"context"`) {
+		t.Errorf("pkgy/ec2.go missing unrelated referenced import \"context\" -- filter over-restricted:\n%s", s)
+	}
+}
