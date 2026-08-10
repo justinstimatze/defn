@@ -8274,3 +8274,111 @@ func TestHandleImpact_JSONCapsLargeTestList(t *testing.T) {
 		t.Errorf("impactJSON response is %d bytes -- capping didn't bound the actual response size", len(text))
 	}
 }
+
+// TestHandleBatchImpact_ModuleDisambiguatesSameNamedType guards a real bug
+// class found sweeping for explain's #248-style resolution bug (2026-08-10):
+// handleBatchImpact received the full codeParam (Module/File/Receiver
+// already in scope) but called GetDefinitionByName(name, "") directly for
+// each name in the batch, discarding them -- an ambiguous name had no way
+// to be disambiguated even though the caller supplied the means to.
+func TestHandleBatchImpact_ModuleDisambiguatesSameNamedType(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	if err := os.MkdirAll(filepath.Join(projDir, "bft"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(projDir, "chess"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "bft", "engine.go"), []byte(`package bft
+
+func Engine() {}
+
+func UseBft() { Engine() }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "chess", "engine.go"), []byte(`package chess
+
+func Engine() {}
+
+func UseA() { Engine() }
+func UseB() { Engine() }
+func UseC() { Engine() }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleBatchImpact(context.Background(), nil, codeParam{
+		Names:  []string{"Engine"},
+		Module: "testproj/bft",
+	})
+	if err != nil {
+		t.Fatalf("handleBatchImpact: %v", err)
+	}
+	text := resultText(t, result)
+	// bft's Engine has 1 direct caller (UseBft); chess's has 3 (UseA/B/C).
+	// A wrong resolution to chess's Engine would report combined_callers=3.
+	if !strings.Contains(text, `"direct_callers": 1`) {
+		t.Errorf("module:\"testproj/bft\" should have resolved to bft's Engine (1 caller), got:\n%s", text)
+	}
+	if strings.Contains(text, `"direct_callers": 3`) {
+		t.Errorf("batch-impact scoped to module:\"testproj/bft\" returned chess's Engine (3 callers) instead:\n%s", text)
+	}
+}
+
+// TestHandleValidatePlan_ReceiverDisambiguatesSameNamedMethod guards the
+// same #248-class bug found in the 2026-08-10 sweep: Mutation carries
+// Receiver, but handleValidatePlan called plain GetDefinitionByName,
+// ignoring it -- validating a plan mutation for (*Foo).Bar could silently
+// resolve to an unrelated same-named method on a different receiver type.
+func TestHandleValidatePlan_ReceiverDisambiguatesSameNamedMethod(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	mod, _ := db.EnsureModule("example.com/lib", "lib", "")
+	foo := &store.Definition{ModuleID: mod.ID, Name: "Bar", Kind: "method", Receiver: "*Foo", Body: "func (f *Foo) Bar() {}"}
+	foo.Hash = store.HashBody(foo.Body)
+	db.UpsertDefinition(foo)
+	baz := &store.Definition{ModuleID: mod.ID, Name: "Bar", Kind: "method", Receiver: "*Baz", Body: "func (b *Baz) Bar() {}"}
+	baz.Hash = store.HashBody(baz.Body)
+	bazID, _ := db.UpsertDefinition(baz)
+	// Give Baz.Bar 2 callers, Foo.Bar 0 -- if the receiver is ignored, a
+	// blast-radius tiebreak resolves "Bar" to Baz's (more callers), which
+	// would silently validate the WRONG mutation.
+	for _, callerName := range []string{"CallerA", "CallerB"} {
+		c := &store.Definition{ModuleID: mod.ID, Name: callerName, Kind: "function", Body: "func " + callerName + "() { (&Baz{}).Bar() }"}
+		c.Hash = store.HashBody(c.Body)
+		cID, _ := db.UpsertDefinition(c)
+		_ = db.SetReferences(cID, []store.Reference{{FromDef: cID, ToDef: bazID, Kind: "call"}})
+	}
+
+	result, _, err := s.handleValidatePlan(context.Background(), nil, codeParam{
+		Mutations: []store.Mutation{{Type: "edit", Name: "Bar", Receiver: "*Foo"}},
+	})
+	if err != nil {
+		t.Fatalf("handleValidatePlan: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, `"direct_callers": 0`) {
+		t.Errorf("receiver:\"*Foo\" should have resolved to Foo's Bar (0 callers), got:\n%s", text)
+	}
+	if strings.Contains(text, `"direct_callers": 2`) {
+		t.Errorf("validate-plan for receiver:\"*Foo\" resolved to Baz's Bar (2 callers) instead:\n%s", text)
+	}
+}

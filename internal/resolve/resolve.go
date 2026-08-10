@@ -247,13 +247,36 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 
 	ifaceMethodToImpls := map[types.Object][]int64{}
 
+	// #253: this loop must NOT skip packages outside onlyModule the way
+	// pass 3 does. ifaceMethodToImpls is rebuilt from scratch on every
+	// resolve() call (never cached across calls) and is the ONLY thing
+	// collectRefs has to resolve an interface dispatch call site anywhere
+	// in the scoped module -- if the implementer lives in a DIFFERENT
+	// module than onlyModule (the overwhelmingly common shape: an
+	// interface's sole implementer is typically declared once, in its own
+	// package, while callers scattered across many other packages/modules
+	// invoke it through the interface), skipping that implementer's
+	// package here means ifaceMethodToImpls never gets an entry for it in
+	// THIS call. Pass 3 then finds nothing for the caller's dispatch call
+	// site, and SetManyReferences -- a full delete+reinsert per fromID --
+	// silently WIPES a previously-correct interface_dispatch ref a prior
+	// full Resolve had computed, the instant that caller's OWN module is
+	// what triggers a scoped resolve (i.e. on every edit to the calling
+	// code, which is normal and frequent). Confirmed via a real
+	// dogfooding session where op:"impact"/op:"traverse" on defn's own
+	// store.Backend methods reported near-zero callers despite dozens of
+	// real cross-package call sites in internal/mcp, because internal/mcp
+	// had been through many incremental per-file/per-module resolves
+	// since the codebase's last full one.
+	//
+	// The "implements" edge staged into defRefs below stays scoped to
+	// onlyModule, though (see the inline check) -- that write only
+	// belongs to defs actually being re-resolved this call; the ONLY
+	// thing that needs unscoped visibility is the dispatch map itself.
 	for _, pkg := range filtered {
 		pkgPath := pkg.PkgPath
 		if strings.HasSuffix(pkg.Name, "_test") {
 			pkgPath = strings.TrimSuffix(pkgPath, "_test")
-		}
-		if onlyModule != "" && pkgPath != onlyModule {
-			continue
 		}
 
 		scope := pkg.Types.Scope()
@@ -325,7 +348,12 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 				// at the end with all the other refs for concreteID so a
 				// later TypeSpec pass cannot wipe it (and so multiple
 				// interfaces don't overwrite each other within this loop).
-				if concreteID > 0 && ifaceID > 0 {
+				// Unlike ifaceMethodToImpls above, this write DOES stay
+				// scoped to onlyModule -- it only belongs to defs actually
+				// being re-resolved this call, not every package this now
+				// -unscoped loop happens to visit while building the
+				// dispatch map.
+				if concreteID > 0 && ifaceID > 0 && (onlyModule == "" || pkgPath == onlyModule) {
 					defRefs[concreteID] = append(defRefs[concreteID], store.Reference{ToDef: ifaceID, Kind: "implements"})
 				}
 
@@ -430,6 +458,43 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 
 	timeIt("pass3 body-refs", tPass)
 	tPass = time.Now()
+
+	// #253 part 2: ResolveFile's narrow load (preloaded != nil &&
+	// onlyModule != "") cannot see an interface's implementer at all if
+	// it lives in a package outside the single one loaded -- so
+	// ifaceMethodToImpls can never gain an entry for it here even with
+	// the pass-2 fix above, collectRefs finds nothing for that dispatch
+	// call site, and the flush below would silently drop a
+	// previously-correct interface_dispatch ref the same way the pass-2
+	// bug did, just via a different mechanism (missing data, not a
+	// scoping filter). Preserve existing interface_dispatch edges for
+	// every def this call is about to flush new refs for by merging them
+	// in -- mirrors the tradeoff ResolveFile's own doc comment already
+	// accepts for incoming cross-package refs ("those still flow from
+	// the prior full Resolve"), extended to outgoing dispatch edges.
+	// Best-effort and deduped against whatever collectRefs DID find (the
+	// implementer can legitimately be in the one loaded package too).
+	if preloaded != nil && onlyModule != "" {
+		for fromID, refs := range defRefs {
+			have := map[int64]bool{}
+			for _, r := range refs {
+				if r.Kind == "interface_dispatch" {
+					have[r.ToDef] = true
+				}
+			}
+			existing, err := db.Traverse(fromID, "callees", []string{"interface_dispatch"}, 1)
+			if err != nil {
+				continue
+			}
+			for _, r := range existing {
+				if have[r.Definition.ID] {
+					continue
+				}
+				have[r.Definition.ID] = true
+				defRefs[fromID] = append(defRefs[fromID], store.Reference{ToDef: r.Definition.ID, Kind: "interface_dispatch"})
+			}
+		}
+	}
 
 	// #108 (winze finding): wrap the entire flush in ONE transaction
 	// instead of letting Dolt autocommit each write call. On a 1.2GB

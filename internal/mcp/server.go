@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.36"
+const Version = "0.26.37"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -6451,7 +6451,26 @@ func (s *server) handleValidatePlan(_ context.Context, _ *sdkmcp.CallToolRequest
 	for _, m := range args.Mutations {
 		cr := changeResult{Name: m.Name, ChangeType: m.Type}
 
-		d, err := s.backend.GetDefinitionByName(m.Name, "")
+		// Mutation carries Receiver but this used to call plain
+		// GetDefinitionByName, ignoring it -- same #248-class bug as
+		// explain/batch-impact (2026-08-10 sweep): validating a plan
+		// mutation for (*Foo).Bar could silently resolve to an unrelated
+		// same-named method on a different receiver type instead of the
+		// one actually being changed.
+		var d *store.Definition
+		var err error
+		if m.Receiver != "" {
+			d, err = s.backend.GetDefinitionByNameAndReceiver(m.Name, "", m.Receiver)
+			if err != nil {
+				if alt := strings.TrimPrefix(m.Receiver, "*"); alt != m.Receiver {
+					d, err = s.backend.GetDefinitionByNameAndReceiver(m.Name, "", alt)
+				} else {
+					d, err = s.backend.GetDefinitionByNameAndReceiver(m.Name, "", "*"+m.Receiver)
+				}
+			}
+		} else {
+			d, err = s.backend.GetDefinitionByName(m.Name, "")
+		}
 		if err != nil {
 			cr.Error = fmt.Sprintf("definition %q not found", m.Name)
 			results = append(results, cr)
@@ -6614,7 +6633,13 @@ func (s *server) handleBatchImpact(ctx context.Context, _ *sdkmcp.CallToolReques
 	var perDef []map[string]any
 
 	for _, name := range names {
-		d, err := s.backend.GetDefinitionByName(name, "")
+		// Same #248-class bug as explain (2026-08-10, prometheus batch
+		// digging sweep): batch-impact receives the full codeParam
+		// (Module/File/Receiver already in scope) but called
+		// GetDefinitionByName(name, "") directly, discarding them --
+		// an ambiguous name in a multi-name batch had no way to be
+		// disambiguated even though the caller supplied the means to.
+		d, err := s.resolveEditTarget(name, args.Receiver, args.Module, args.File)
 		if err != nil {
 			perDef = append(perDef, map[string]any{"name": name, "error": "not found"})
 			continue
