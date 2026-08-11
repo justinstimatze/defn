@@ -8578,3 +8578,43 @@ func TestHandleCode_OpAliasesDispatchToAddImport(t *testing.T) {
 		})
 	}
 }
+
+func TestTestTimeoutFor_ScalesForLargeRunsRespectsExplicitOverride(t *testing.T) {
+	t.Run("small run keeps the default", func(t *testing.T) {
+		got := testTimeoutFor(10, "./tsdb/...")
+		if got != testTimeout {
+			t.Errorf("got %v, want default %v", got, testTimeout)
+		}
+	})
+	t.Run("many affected tests scales up", func(t *testing.T) {
+		got := testTimeoutFor(200, "./tsdb/...")
+		if got <= testTimeout {
+			t.Errorf("got %v, want > default %v for 200 affected tests", got, testTimeout)
+		}
+	})
+	t.Run("whole-repo scope scales up even with few tests", func(t *testing.T) {
+		got := testTimeoutFor(1, "./...")
+		if got <= testTimeout {
+			t.Errorf("got %v, want > default %v for a whole-repo scope", got, testTimeout)
+		}
+	})
+	t.Run("scaled timeout is capped", func(t *testing.T) {
+		got := testTimeoutFor(1_000_000, "./...")
+		if got > 5*time.Minute {
+			t.Errorf("got %v, want capped at 5m", got)
+		}
+	})
+	t.Run("an operator-set DEFN_TEST_TIMEOUT disables scaling entirely", func(t *testing.T) {
+		// testTimeout itself is resolved once at package init, so setting
+		// the env var here doesn't change ITS value -- what this actually
+		// verifies is that testTimeoutFor treats the env var's presence
+		// (checked fresh at call time) as "an operator made an explicit
+		// choice, don't second-guess it with scaling", not that it
+		// re-parses a new duration on every call.
+		t.Setenv("DEFN_TEST_TIMEOUT", "45s")
+		got := testTimeoutFor(1_000_000, "./...")
+		if got != testTimeout {
+			t.Errorf("got %v, want the unscaled package-level testTimeout %v -- an explicit env var must disable scaling, not just cap it", got, testTimeout)
+		}
+	})
+}

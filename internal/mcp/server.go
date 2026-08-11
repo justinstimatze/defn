@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.41"
+const Version = "0.26.42"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -4941,7 +4941,7 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 	}
 	target := s.testScopeTarget(hint)
 
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeoutFor(0, target))
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "go", "test", "-run", pattern, "-count=1", "-v", target)
 	cmd.Dir = s.projectDir
@@ -5009,7 +5009,7 @@ func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args n
 	// own package the same way.
 	target := s.testScopeTarget(d.SourceFile)
 
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeoutFor(len(testNames), target))
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "go", "test", "-run", runPattern, "-count=1", "-v", target)
 	cmd.Dir = s.projectDir
@@ -8911,4 +8911,30 @@ var opAliases = map[string]string{
 	"add_import":  "add-import",
 	"addimport":   "add-import",
 	"import_path": "add-import",
+}
+
+// testTimeoutFor scales the test timeout for genuinely large runs
+// instead of applying a flat one-size-fits-all default -- confirmed
+// hitting real prometheus trajectories repeatedly (19114/17395/18534
+// in a live rerun): "TIMED OUT after 1m0s" on runs covering 191-1166
+// affected tests, or a whole-repo "./..." scope fallback, wasting a
+// full retry with no path for the caller to recover. The timeout
+// message's own suggested remedy ("set DEFN_TEST_TIMEOUT=<duration>")
+// is structurally unactionable from inside a session -- it's a
+// server-side env var the MCP caller has no way to set mid-call. Only
+// scales the DEFAULT; an operator's explicit DEFN_TEST_TIMEOUT is
+// honored exactly as set, never extended on top of their choice.
+func testTimeoutFor(nTests int, target string) time.Duration {
+	if os.Getenv("DEFN_TEST_TIMEOUT") != "" {
+		return testTimeout
+	}
+	if nTests <= 50 && target != "./..." {
+		return testTimeout
+	}
+	scaled := testTimeout * 3
+	const maxTestTimeout = 5 * time.Minute
+	if scaled > maxTestTimeout {
+		return maxTestTimeout
+	}
+	return scaled
 }
