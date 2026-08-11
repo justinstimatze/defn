@@ -143,14 +143,55 @@ correctness — this result should be read as "cost improvement
 confirmed, correctness improvement unconfirmed" rather than a clean
 win, pending either a second rerun or real test-pass scoring.
 
+## v3 rerun (2026-08-11, defn arm only, v0.26.40, second confirmatory pass)
+
+Second full sequential rerun, same build as v2, to check whether v2's
+apparent cost win was real or noise. It was mostly noise:
+
+| | defn (orig) | defn (v2) | defn (v3) | files (unchanged) |
+|---|---:|---:|---:|---:|
+| total cost | $11.90 | $10.63 | $11.71 | $9.88 |
+| rc==0 | 13/15 | 12/15 | 11/15 | 13/15 |
+| mean F1 | 0.842 | 0.706 | 0.746 | — |
+| F1 >= 0.5 | 15/15 | 13/15 | 15/15 | — |
+| cost ratio (defn/files) | 1.20x | 1.08x | **1.19x** | — |
+
+v3's total cost lands almost exactly back at the original's level —
+v2's $10.63 was largely favorable variance on that specific run, not a
+reproducible effect. Per-task cost swings by 2-4x in both directions
+across all three runs (e.g. 19114: $0.23 -> $0.24 -> $1.04;
+12024: $1.63 -> $1.76 -> $1.50) — normal-sized runs of a 15-task,
+Sonnet-driven bench have enough inherent variance that a single rerun
+cannot be trusted for a "did it get better" verdict either way.
+
+What *did* hold across both reruns, 30/30 trajectories: **zero
+occurrences of the panic-storm signature** (`"redeclared"` /
+`"already registered"` / `"duplicate ... registered"`) that hit 4/15
+trajectories in the original run. That specific, verified defn bug is
+fixed and stays fixed. The two "new" per-run failures checked by hand
+(18534 in v3: `undefined: parser.ParseExpr`; 18765 across all three
+runs: `nic.IPAMIPIDs undefined`) are both agent hallucinations about
+external API shapes — defn's build-gate caught and rolled back both
+cleanly — not defn bugs.
+
+**Honest bottom line:** the specific bugs found and fixed this session
+are real, verified, and confirmed to stay fixed (panic-storm: 4/15 ->
+0/15, 0/15). Their *aggregate* cost/correctness impact on this
+15-task, n=1-2-run batch is within the batch's own run-to-run noise
+floor and cannot be claimed as a settled "defn now costs X% less"
+number without either many more reruns (to average out variance) or
+switching to a less noisy signal than a 15-task Sonnet-driven
+head-to-head.
+
 ## Not yet done
 
-- A second v2-shaped rerun to check whether the F1 dip is noise or
-  real (in progress).
 - Real correctness scoring (apply the produced patch, run the actual
   Multi-SWE-bench per-repo test image) instead of the files-touched
   proxy — the proxy's own scorer-bug history this round is a good
   argument for eventually doing this properly.
+- A larger task pool (30+) or multiple averaged reruns, if a trustworthy
+  aggregate cost/correctness number is wanted — 15 tasks x 1-2 runs has
+  shown too much run-to-run swing to support one.
 - Opus-based rerun, per standing instruction to use Opus for the "real"
   comparison later (Sonnet used here as the interim/cheaper pass).
 
