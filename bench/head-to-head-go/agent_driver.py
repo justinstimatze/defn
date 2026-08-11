@@ -38,6 +38,7 @@ DEFAULT_CORPUS_DIR = HERE
 # between the agent run and a later (possibly next-session) scoring pass.
 # ~/.cache survives stop/start since it's on the persistent root volume.
 WORKDIR_ROOT = os.path.expanduser("~/.cache/defn-h2h-go")
+DISK_FREE_MIN_GB = 5.0
 # Cached fresh .defn/ per (instance_id, defn_binary_hash). Contamination
 # fix (6abe8e1) forces a fresh ingest per arm — ~30-90s of pure CPU per
 # arm. Snapshot after first ingest, restore on subsequent runs; hit path
@@ -524,6 +525,41 @@ def apply_edits_via_defn(workdir):
         print(f"[emit] defn emit failed: {e}", file=sys.stderr)
 
 
+def _ensure_disk_space(min_gb=DISK_FREE_MIN_GB):
+    """Bail loudly instead of silently losing a task to "no space left
+    on device" -- found 2026-08-11: a 15-task prometheus rerun lost 2
+    tasks to disk exhaustion mid-run, and one of them didn't even
+    surface as an error -- the agent reported it as an "environment
+    blocker" in its own final message, scoring as a cheap, clean-looking
+    failure instead of the infra problem it actually was. Cleans go's
+    build cache and orphaned go-build temp dirs (the actual repeat
+    offender -- crashed/killed `go test`/`go vet` runs leave these
+    behind) before giving up."""
+    import glob
+    import shutil
+
+    free_gb = shutil.disk_usage(WORKDIR_ROOT).free / 1e9
+    if free_gb >= min_gb:
+        return
+    print(
+        f"[disk] {free_gb:.1f}GB free, below {min_gb}GB -- cleaning caches",
+        file=sys.stderr,
+    )
+    subprocess.run(
+        ["go", "clean", "-cache"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    for entry in glob.glob("/tmp/go-build*"):
+        shutil.rmtree(entry, ignore_errors=True)
+    free_gb = shutil.disk_usage(WORKDIR_ROOT).free / 1e9
+    print(f"[disk] {free_gb:.1f}GB free after cleanup", file=sys.stderr)
+    if free_gb < min_gb:
+        raise RuntimeError(
+            f"only {free_gb:.1f}GB free on {WORKDIR_ROOT}'s filesystem after "
+            f"cleanup (need {min_gb}GB) -- resize the volume or free space "
+            f"manually before continuing"
+        )
+
+
 def run_one(
     instance_id, budget_usd, max_turns, arm="defn", corpus_dir=DEFAULT_CORPUS_DIR
 ):
@@ -533,6 +569,7 @@ def run_one(
         print(f"[skip] {out_path} already exists", file=sys.stderr)
         return
 
+    _ensure_disk_space()
     task = load_task(instance_id, corpus_dir)
     workdir = setup_workspace(task, arm=arm)
     prompt = build_prompt(task)

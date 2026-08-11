@@ -50,13 +50,107 @@ result, not a synthetic sweep.
 yet cross-checked against whether the fix actually landed (correctness
 scoring not run yet, only cost/completion).
 
+## Correctness scoring and root-cause digging (2026-08-10/11)
+
+Ran `score_correctness.py`'s files-touched approximation (P/R/F1 against
+each task's gold `fix_patch`) against this batch. First pass showed defn
+*losing* on correctness too (mean F1 0.497 vs files' 0.590) — but this
+was a scorer artifact, not a real defn deficit: the scorer's
+name-to-file resolver needs a live `.defn` DB, which only existed on the
+ephemeral EC2 box the original run used, not locally. 47% of defn's
+write ops (`edit`/`replace-hunk` by `name`, defn's normal calling
+convention) have no `file` arg and were silently scored as touching 0
+files. Fixed by adding a gold-patch-name-search fallback
+(`bench/prometheus-repo/correctness_scores.json` holds the corrected
+run). Corrected original-batch numbers: **defn mean F1 0.842 vs files'
+0.590** — defn was more correct on this batch all along, just measured
+wrong.
+
+Digging into the trajectories (not just the scores) surfaced three real
+defn bugs actively costing money/turns in this exact batch, all fixed
+and committed:
+
+1. **Cross-package `interface_dispatch` object-identity mismatch**
+   (`internal/resolve/resolve.go`) — `packages.Load(Tests: true)` gives
+   the same interface method two different `*types.Object` pointers
+   depending on whether the implementer package has its own tests,
+   silently breaking `impact`/`test`/`traverse` accuracy for any
+   interface-dispatched call into a tested package. Fixed by switching
+   `ifaceMethodToImpls` from object-keyed to string-keyed.
+2. **`func init()` natural-key collision across sibling files**
+   (`internal/store/schema_sqlite.sql`) — two files in the same package
+   each declaring their own `init()` (the normal shape for generated
+   protobuf/SD-registration code) collided in the DB, corrupting the
+   emitted source into duplicate/wrong `init()` bodies. Live symptom:
+   `panic: proto: duplicate enum registered` and `discovery: Config
+   named "X" is already registered` — hit directly in 4 of 15
+   trajectories (17395, 19184, 19338, and indirectly 18765 via a
+   related import-collision, see below). Fixed by adding `source_file`
+   to the definitions table's unique key.
+3. **Emit's regenerate path wrote the whole per-module import union
+   into a single file** (`internal/emit/emit.go`) — imports are tracked
+   per-module (shared across every file in a package), but a brand-new
+   file (e.g. via `code(op:"create")`) has no on-disk content to
+   preserve a real per-file import block from, so it got the ENTIRE
+   union — including multiple same-local-name-but-different-path
+   imports (e.g. several AWS SDK `types` sub-packages) — causing an
+   unrecoverable `"types redeclared in this block"` compile error. Hit
+   directly in 17395 and 18765. Fixed by filtering to only imports a
+   file's own bodies actually reference, deduped by local name.
+4. **`test:"X"` silently ignored a `module:` scope hint shaped as a
+   full Go import path** (`internal/mcp/server.go`'s
+   `testScopeTarget`) — the same shape `module:` takes everywhere else
+   in this API, but the resolver only substring-matched relative
+   source-file paths, so it fell back to whole-repo `go test ./...`
+   every time. Hit 18534, whose whole-repo test run exhausted the
+   bench box's disk compiling every unrelated cloud-SDK dependency
+   (prometheus vendors AWS/Azure/GCP/DigitalOcean/Scaleway). Fixed by
+   trying an exact module-path match first.
+
+## v2 rerun (2026-08-11, defn arm only, v0.26.40, sequential on EC2)
+
+Full defn-arm-only rerun against a build with all four fixes above.
+files-mode arm unchanged (not re-run — nothing in its path was touched).
+Two tasks were lost to an unrelated EC2 disk-full incident mid-run
+(harness/box issue, not a defn bug) and backfilled individually after
+resizing the box's volume.
+
+| | defn (orig) | defn (v2) | files (unchanged) |
+|---|---:|---:|---:|
+| total cost | $11.90 | **$10.63** (-10.7%) | $9.88 |
+| mean cost | $0.79 | $0.71 | $0.66 |
+| median cost | $0.64 | $0.61 | $0.49 |
+| mean wall time | 395s | 304s | 331s |
+| rc==0 | 13/15 | 12/15 | 13/15 |
+| mean F1 (corrected scorer) | 0.842 | 0.706 | — |
+| F1 >= 0.5 | 15/15 | 13/15 | — |
+
+**Cost ratio (defn/files): 1.20x -> 1.08x.** The panic-storm signature
+(`"redeclared"` / `"already registered"` / `"duplicate ... registered"`)
+is completely gone from all 15 v2 trajectories, vs. 4/15 in the
+original — direct confirmation the fixes address a real, live cost
+driver in this exact batch, not just a synthetic concern.
+
+Correctness (F1 proxy) came in *lower* in v2, not higher — driven
+mostly by `prometheus-12024`, which ran out of budget/turns mid-fix
+this run (rc=1, $1.76) after already being a marginal 12-write-op task
+in the original run too (rc=0, $1.63) — reads as run-to-run variance on
+an already-hard task, not a new regression, but not confirmed either
+way. A few other tasks (18765, 19236, 18534) also came in with somewhat
+lower F1 despite similar-or-better cost. F1 here is a rough file-touch
+proxy (see `score_correctness.py`'s own caveats), not real test-pass
+correctness — this result should be read as "cost improvement
+confirmed, correctness improvement unconfirmed" rather than a clean
+win, pending either a second rerun or real test-pass scoring.
+
 ## Not yet done
 
-- Correctness scoring (does the produced diff actually fix the issue,
-  per each task's `fix_patch`) — only cost/wall-time/rc measured so far.
-- Digging into per-task swings (defn wins 18358/18712(rc)/19017/19114/
-  19236/19338 on cost; files wins the rest, several by 2-4x) to find a
-  root cause rather than reporting the aggregate as the whole story.
+- A second v2-shaped rerun to check whether the F1 dip is noise or
+  real (in progress).
+- Real correctness scoring (apply the produced patch, run the actual
+  Multi-SWE-bench per-repo test image) instead of the files-touched
+  proxy — the proxy's own scorer-bug history this round is a good
+  argument for eventually doing this properly.
 - Opus-based rerun, per standing instruction to use Opus for the "real"
   comparison later (Sonnet used here as the interim/cheaper pass).
 
