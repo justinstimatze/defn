@@ -8618,3 +8618,40 @@ func TestTestTimeoutFor_ScalesForLargeRunsRespectsExplicitOverride(t *testing.T)
 		}
 	})
 }
+
+// TestHandleReplaceHunk_NotFoundSuggestsWhitespaceNormalizedMatch guards
+// suggestClosestFragmentHint: a real trajectory (prometheus-18712)
+// burned 17 of 34 replace-hunk calls on bare "hunk not found in body"
+// errors with zero diagnostic information, each retry narrowing old to
+// a smaller guess rather than converging -- replace-hunk's success
+// response never shows the resulting body, so an agent making many
+// sequential edits to one large function has no way to see what its
+// remembered fragment's whitespace/indentation actually looks like now.
+// When old differs from the real body only in whitespace, the error
+// should show the exact real bytes to copy instead of a bare miss.
+func TestHandleReplaceHunk_NotFoundSuggestsWhitespaceNormalizedMatch(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	// Greet's real body line is exactly `\treturn "Hello, " + name` --
+	// pass a whitespace-mangled version (extra space, no tab) that will
+	// never byte-exact match.
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op:   "replace-hunk",
+		Name: "Greet",
+		Old:  `return  "Hello, " + name`,
+		New:  `return "Hi, " + name`,
+	})
+	if err != nil {
+		t.Fatalf("handleCode: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "hunk not found") {
+		t.Fatalf("expected the base 'not found' error to still be present, got: %s", text)
+	}
+	if !strings.Contains(text, `return "Hello, " + name`) {
+		t.Errorf("expected the hint to show the real body text to copy verbatim, got: %s", text)
+	}
+}

@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.42"
+const Version = "0.26.43"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -7539,6 +7539,11 @@ func (s *server) handleReplaceHunk(_ context.Context, req *sdkmcp.CallToolReques
 	}
 	newBody, err := projection.ReplaceHunk(d.Body, args.Old, args.New, args.Index)
 	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			if hint := suggestClosestFragmentHint(d.Body, args.Old); hint != "" {
+				return errResult(fmt.Errorf("%w%s", err, hint))
+			}
+		}
 		return errResult(err)
 	}
 	action := "replaced hunk"
@@ -8937,4 +8942,43 @@ func testTimeoutFor(nTests int, target string) time.Duration {
 		return maxTestTimeout
 	}
 	return scaled
+}
+
+// suggestClosestFragmentHint tries a whitespace-insensitive match of
+// old against body when the byte-exact replace-hunk match failed, and
+// if found, returns a hint showing the ACTUAL bytes at that location so
+// the caller can copy them verbatim instead of guessing narrower
+// fragments blind. Confirmed hitting a real trajectory
+// (prometheus-18712): replace-hunk's success response never shows the
+// resulting body, so an agent making many sequential edits to the same
+// large function has no way to see what changed -- it burned 17 of 34
+// replace-hunk calls on bare "hunk not found in body" errors, each
+// retry narrowing old to a smaller guess rather than converging,
+// almost certainly because its remembered fragment's whitespace/
+// indentation no longer matched the real bytes after prior edits.
+// Joins old's words with \s+ so it matches regardless of exact
+// whitespace differences, then returns the real substring straight
+// from body -- no index-mapping needed.
+func suggestClosestFragmentHint(body, old string) string {
+	fields := strings.Fields(old)
+	if len(fields) == 0 {
+		return ""
+	}
+	quoted := make([]string, len(fields))
+	for i, f := range fields {
+		quoted[i] = regexp.QuoteMeta(f)
+	}
+	re, err := regexp.Compile(strings.Join(quoted, `\s+`))
+	if err != nil {
+		return ""
+	}
+	loc := re.FindStringIndex(body)
+	if loc == nil {
+		return ""
+	}
+	actual := body[loc[0]:loc[1]]
+	if actual == old {
+		return ""
+	}
+	return fmt.Sprintf("\n\nhint: old didn't match exactly, but a whitespace-only-different version was found in the current body -- copy this verbatim as old:\n%s", actual)
 }
