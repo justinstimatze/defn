@@ -183,6 +183,64 @@ number without either many more reruns (to average out variance) or
 switching to a less noisy signal than a 15-task Sonnet-driven
 head-to-head.
 
+## v4 rerun (2026-08-11, defn arm only, v0.26.42, third confirmatory pass)
+
+Between v3 and v4, four more bugs were found and fixed by mining the
+v2/v3 trajectories themselves (no new bench run needed to find them):
+`testScopeTarget` resolving a short hint to the wrong subdirectory,
+`testMatchedNothing` discarding a real pass as "NO TESTS MATCHED"
+whenever a recursive scope touched an unrelated sibling package, three
+common `add-import` op-name misspellings erroring instead of
+dispatching, and a flat 60s test timeout that couldn't be raised by
+the calling agent (its own suggested remedy is a server-env-var the
+MCP caller can't set mid-session). Third full sequential rerun to
+check the combined effect:
+
+| | defn (orig) | defn (v2) | defn (v3) | defn (v4) | files |
+|---|---:|---:|---:|---:|---:|
+| total cost | $11.90 | $10.63 | $11.71 | **$9.90** | $9.88 |
+| rc==0 | 13/15 | 12/15 | 11/15 | **13/15** | 13/15 |
+| mean F1 | 0.842 | 0.706 | 0.746 | 0.665 | — |
+| cost ratio (defn/files) | 1.20x | 1.08x | 1.19x | **1.00x** | — |
+| "no tests matched" hits | — | 15 | 18 | **1** | — |
+| "TIMED OUT" hits | — | 3 | 1 | **0** | — |
+| "unknown op" hits | — | 1 | 10 | **0** | — |
+
+Two results worth separating. The friction-signature counts are a
+clean, direct, before/after confirmation that all four v3->v4 fixes
+work exactly as intended -- these aren't noisy proxies, they're literal
+occurrence counts of the exact strings each fix targets, and every one
+dropped to near-zero. `prometheus-18765` (the other import-collision
+task) also succeeded for the first time across all four runs (rc=1,
+1, 1 -> 0).
+
+The aggregate cost number is more encouraging than v2/v3 but still not
+something to over-claim: $9.90 total is effectively exact parity with
+files-mode's $9.88 (1.00x), and completion rate (13/15) matches the
+original, beating both reruns -- the best result on the two most
+concrete metrics across all four runs. Mean F1 is the lowest of the
+four, but per-task it's recall-driven (precision stays ~1.0; the agent
+edits the right file, just not always every gold file including
+docs/tests) rather than wrong-file misses -- consistent with the
+proxy's documented weakness (rewards touching every gold-diff file,
+not "did the fix work"), and consistent across all four runs, not a
+new v4 regression. One genuine miss confirmed by hand: 19236's agent
+fixed a plausible-but-wrong package (`discovery/refresh` instead of
+`discovery/moby`) -- a real reasoning miss, not a defn or scorer issue.
+
+**Bottom line, sharpened after three reruns:** the panic-storm fix
+(0/45 trajectories now) and the four test-tooling-friction fixes
+(near-zero occurrence counts, directly measured) are real, verified,
+and reproduce cleanly every time. The *aggregate* cost number is still
+noisy at n=15x4 runs -- v4's 1.00x is the best result yet and lines up
+with what the friction-signature drop would predict, but one run
+landing exactly at parity isn't proof the swing has permanently
+narrowed versus just being the run where variance happened to favor
+defn. Confidence in the specific, per-bug fixes is high; confidence in
+"defn is now at cost parity with files-mode" specifically needs the
+larger task pool or multi-run averaging already listed below before
+it's a claim worth publishing.
+
 ## Not yet done
 
 - Real correctness scoring (apply the produced patch, run the actual
@@ -190,8 +248,9 @@ head-to-head.
   proxy — the proxy's own scorer-bug history this round is a good
   argument for eventually doing this properly.
 - A larger task pool (30+) or multiple averaged reruns, if a trustworthy
-  aggregate cost/correctness number is wanted — 15 tasks x 1-2 runs has
-  shown too much run-to-run swing to support one.
+  aggregate cost/correctness number is wanted — 15 tasks x 3 runs has
+  shown too much run-to-run swing to support one on its own, though the
+  trend (1.20x -> 1.08x -> 1.19x -> 1.00x) is directionally encouraging.
 - Opus-based rerun, per standing instruction to use Opus for the "real"
   comparison later (Sonnet used here as the interim/cheaper pass).
 
