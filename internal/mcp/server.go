@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.40"
+const Version = "0.26.41"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -896,6 +896,10 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	// would work once that param was supplied, when it never could.
 	if removedDoltOps[args.Op] {
 		return errResult(fmt.Errorf("%s: not supported -- git-style branch/merge/commit/diff ops on definitions were removed in the v0.27 SQLite migration (users prefer git worktrees + op:\"sync\"); use plain git for version control", args.Op))
+	}
+
+	if canonical, ok := opAliases[args.Op]; ok {
+		args.Op = canonical
 	}
 
 	switch args.Op {
@@ -8709,17 +8713,42 @@ func (s *server) testScopeTarget(hint string) string {
 	if err != nil {
 		return "./..."
 	}
+	// DistinctSourceFiles has no ORDER BY -- picking the first substring
+	// match was picking whichever match SQLite happened to return first,
+	// with no preference for the package the hint actually names. A
+	// short hint like "tsdb" substring-matches every file under it too
+	// (tsdb/encoding/x.go, tsdb/wlog/y.go, ...), so it could resolve to
+	// an arbitrary, wrong subdirectory instead of the tsdb package root
+	// -- confirmed via a real prometheus-19114 trajectory where
+	// module:"tsdb" scoped to "./tsdb/encoding/..." and never found the
+	// target test living in tsdb/db_test.go, burning several dead test
+	// calls before giving up and falling back to guessing more names.
+	// Score every match and keep the best: an exact trailing path
+	// component (dir == hint or dir ends in "/"+hint) beats a mere
+	// substring match, and among equally-exact (or equally-inexact)
+	// matches the shallowest directory wins.
+	bestDir, bestDepth, bestExact, found := "", -1, false, false
 	for _, f := range files {
 		if !strings.Contains(f, hint) {
 			continue
 		}
 		dir := filepath.ToSlash(filepath.Dir(f))
-		if dir == "" || dir == "." {
-			return "."
+		if dir == "" {
+			dir = "."
 		}
-		return "./" + dir + "/..."
+		exact := dir == hint || strings.HasSuffix(dir, "/"+hint)
+		depth := strings.Count(dir, "/")
+		if !found || (exact && !bestExact) || (exact == bestExact && depth < bestDepth) {
+			bestDir, bestDepth, bestExact, found = dir, depth, exact, true
+		}
 	}
-	return "./..."
+	if !found {
+		return "./..."
+	}
+	if bestDir == "." {
+		return "."
+	}
+	return "./" + bestDir + "/..."
 }
 
 // overviewDefsCap bounds code(op:"overview") at directory/module scope --
@@ -8784,8 +8813,25 @@ func (s *server) ambiguityNote(name, receiver, module, file string) string {
 // a subtest, Test/TestFoo, not TestFoo) was targeted by its bare method
 // name, silently matched zero tests, and gave the agent false confidence
 // nothing needed further investigation.
+//
+// A bare substring check on "no tests to run" over-fires whenever the
+// scope target is a recursive "./pkg/..." with siblings: Go prints that
+// warning per-package for every subpackage under pkg that doesn't have a
+// matching test, even when the intended package's test ran and passed
+// fine. Confirmed via a real prometheus-19114 trajectory: `go test -run
+// TestQuerier ./tsdb/...` correctly ran and passed TestQuerier in tsdb
+// itself, but tsdb/encoding (a sibling with no such test) also printed
+// "no tests to run" -- the bare substring check flagged the whole run as
+// "NO TESTS MATCHED", discarding a real pass and sending the agent back
+// to guessing test names. Only report "matched nothing" when literally
+// no test executed anywhere in the combined output.
 func testMatchedNothing(out string) bool {
-	return strings.Contains(out, "no tests to run")
+	if !strings.Contains(out, "no tests to run") {
+		return false
+	}
+	return !strings.Contains(out, "=== RUN") &&
+		!strings.Contains(out, "--- PASS:") &&
+		!strings.Contains(out, "--- FAIL:")
 }
 
 // testBuildFailed reports whether a `go test` invocation failed because
@@ -8847,3 +8893,22 @@ var removedDoltOps = map[string]bool{
 // impactCallerCap (15) since JSON is the deliberately-fuller view, but
 // still bounded.
 const impactJSONCap = 200
+
+// opAliases maps common near-miss op-name guesses to the one real op
+// they unambiguously mean, so handleCode accepts them instead of
+// round-tripping an "unknown op" error. Confirmed hitting real
+// trajectories repeatedly (prometheus-17395/18765/18972/18841):
+// "import"/"add_import"/"import_path" for "add-import" -- every other
+// multi-word op name uses hyphens (add-import, replace-hunk,
+// insert-precondition), but underscore is the natural
+// programming-language-convention guess, and "import" alone is the
+// obvious short name for "add an import". Same precedent as this
+// file's other near-miss acceptances (old_fragment/new_fragment on
+// replace-hunk, query: as a pattern alias on search) -- fix the
+// mismatch instead of just explaining it in an error message.
+var opAliases = map[string]string{
+	"import":      "add-import",
+	"add_import":  "add-import",
+	"addimport":   "add-import",
+	"import_path": "add-import",
+}

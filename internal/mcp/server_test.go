@@ -8429,3 +8429,152 @@ func TestHandleTestByName_ResolvesFullModulePathHint(t *testing.T) {
 		t.Errorf("expected TestFunctions to pass, got:\n%s", text)
 	}
 }
+
+// TestHandleTestByName_ShortHintPrefersPackageRootOverSubdirectory guards
+// a real bug found via a prometheus-19114 trajectory (2026-08-11):
+// DistinctSourceFiles has no ORDER BY, so testScopeTarget's first-match
+// substring search picked whichever match SQLite happened to return
+// first. A short hint like "tsdb" substring-matches files in
+// tsdb/encoding/*.go just as well as tsdb/*.go itself, so it could
+// resolve to an arbitrary, wrong subdirectory instead of the package
+// the hint actually names -- the real trajectory scoped to
+// "./tsdb/encoding/..." and never found its target test, living in
+// tsdb/db_test.go, burning several dead test calls before giving up.
+func TestHandleTestByName_ShortHintPrefersPackageRootOverSubdirectory(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "tsdb", "encoding"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "tsdb", "db.go"), []byte("package tsdb\n\nfunc Open() string { return \"open\" }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "tsdb", "db_test.go"), []byte("package tsdb\n\nimport \"testing\"\n\nfunc TestQuerier(t *testing.T) {\n\tif Open() == \"\" {\n\t\tt.Fatal(\"tsdb-root-marker\")\n\t}\n}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "tsdb", "encoding", "enc.go"), []byte("package encoding\n\nfunc Encode() string { return \"enc\" }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "tsdb", "encoding", "enc_test.go"), []byte("package encoding\n\nimport \"testing\"\n\nfunc TestEncodingUnrelated(t *testing.T) {\n\tif Encode() == \"\" {\n\t\tt.Fatal(\"encoding-marker\")\n\t}\n}\n"), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleTestByName(context.Background(), nil, "TestQuerier", "tsdb", "")
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "across ./tsdb/...:") {
+		t.Errorf("expected hint \"tsdb\" to scope to the package root \"./tsdb/...\", not a subdirectory, got:\n%s", text)
+	}
+	if !strings.Contains(text, "ALL TESTS PASSED") {
+		t.Errorf("expected TestQuerier to be found and pass, got:\n%s", text)
+	}
+	if strings.Contains(text, "encoding-marker") {
+		t.Errorf("test run leaked into the unrelated tsdb/encoding subpackage:\n%s", text)
+	}
+}
+
+// TestTestMatchedNothing_IgnoresSiblingPackageNoise is the direct unit
+// test for the prometheus-19114 false positive: a recursive "./pkg/..."
+// scope prints "no tests to run" for every sibling subpackage lacking
+// the pattern, even when the target package's test ran and passed.
+func TestTestMatchedNothing_IgnoresSiblingPackageNoise(t *testing.T) {
+	cases := []struct {
+		name string
+		out  string
+		want bool
+	}{
+		{
+			name: "real pass alongside a sibling's no-op",
+			out: "=== RUN   TestQuerier\n" +
+				"--- PASS: TestQuerier (0.00s)\n" +
+				"PASS\n" +
+				"ok  \ttestproj/tsdb\t0.001s\n" +
+				"testing: warning: no tests to run\n" +
+				"PASS\n" +
+				"ok  \ttestproj/tsdb/encoding\t0.001s [no tests to run]\n",
+			want: false,
+		},
+		{
+			name: "real failure alongside a sibling's no-op",
+			out: "=== RUN   TestQuerier\n" +
+				"--- FAIL: TestQuerier (0.00s)\n" +
+				"FAIL\n" +
+				"testing: warning: no tests to run\n" +
+				"PASS\n" +
+				"ok  \ttestproj/tsdb/encoding\t0.001s [no tests to run]\n",
+			want: false,
+		},
+		{
+			name: "genuinely zero tests ran anywhere",
+			out: "testing: warning: no tests to run\n" +
+				"PASS\n" +
+				"ok  \ttestproj/tsdb\t0.001s [no tests to run]\n" +
+				"testing: warning: no tests to run\n" +
+				"PASS\n" +
+				"ok  \ttestproj/tsdb/encoding\t0.001s [no tests to run]\n",
+			want: true,
+		},
+		{
+			name: "no \"no tests to run\" text at all",
+			out:  "=== RUN   TestQuerier\n--- PASS: TestQuerier (0.00s)\nPASS\n",
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := testMatchedNothing(tc.out); got != tc.want {
+				t.Errorf("testMatchedNothing() = %v, want %v\noutput:\n%s", got, tc.want, tc.out)
+			}
+		})
+	}
+}
+
+// TestHandleCode_OpAliasesDispatchToAddImport guards opAliases: common
+// near-miss guesses for "add-import" (underscore convention, or the
+// bare short name) hit real trajectories repeatedly (prometheus-17395
+// tried it twice, plus 18765/18972/18841) and should dispatch exactly
+// like the real op instead of round-tripping an "unknown op" error.
+func TestHandleCode_OpAliasesDispatchToAddImport(t *testing.T) {
+	for _, alias := range []string{"import", "add_import", "addimport", "import_path"} {
+		t.Run(alias, func(t *testing.T) {
+			db, projDir := setupTestDB(t)
+			defer db.Close()
+			s := &server{backend: db, projectDir: projDir}
+			s.ready.Store(true)
+
+			result, _, err := s.handleCode(context.Background(), nil, codeParam{
+				Op:         alias,
+				File:       "main.go",
+				ImportPath: "hash/fnv",
+			})
+			if err != nil {
+				t.Fatalf("handleCode(op:%q): %v", alias, err)
+			}
+			text := resultText(t, result)
+			if strings.Contains(text, "unknown op") {
+				t.Fatalf("op:%q was not recognized as an add-import alias, got: %s", alias, text)
+			}
+			if !strings.Contains(text, "added import") {
+				t.Errorf("expected 'added import' in response for op:%q, got: %s", alias, text)
+			}
+
+			final, ferr := os.ReadFile(filepath.Join(projDir, "main.go"))
+			if ferr != nil {
+				t.Fatalf("read main.go: %v", ferr)
+			}
+			if !strings.Contains(string(final), "\"hash/fnv\"") {
+				t.Errorf("expected hash/fnv import to land on disk for op:%q, got:\n%s", alias, final)
+			}
+		})
+	}
+}
