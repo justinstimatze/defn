@@ -8655,3 +8655,52 @@ func TestHandleReplaceHunk_NotFoundSuggestsWhitespaceNormalizedMatch(t *testing.
 		t.Errorf("expected the hint to show the real body text to copy verbatim, got: %s", text)
 	}
 }
+
+// TestHandleCreate_NewFileInNestedModuleUsesNestedGoMod is a
+// regression for the etcd multi-module bench findings: handleCreate's
+// "brand new directory" path derived the new module's path via
+// emit.DetectModuleRoot(mods) + "/" + dir -- a DB-derived guess at
+// the repo's single common module root, wrong whenever the new file
+// actually sits inside its own nested go.mod (etcd's server/, tests/,
+// etcdctl/ each declare one). The new directory must resolve against
+// the real filesystem go.mod nearest it, not the DB's single-module
+// assumption.
+func TestHandleCreate_NewFileInNestedModuleUsesNestedGoMod(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	nestedDir := filepath.Join(projDir, "sub")
+	if err := os.MkdirAll(nestedDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nestedDir, "go.mod"), []byte("module sub.example/v2\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body:   "func NewSubFunc() int { return 1 }",
+		File:   "sub/newpkg/y.go",
+		Module: "testproj",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Created") {
+		t.Fatalf("expected 'Created', got: %s", text)
+	}
+
+	d, err := db.GetDefinitionByName("NewSubFunc", "")
+	if err != nil {
+		t.Fatalf("def not found: %v", err)
+	}
+	mod, err := db.GetModuleByPath("sub.example/v2/newpkg")
+	if err != nil || mod == nil {
+		t.Fatalf("expected module %q, got module=%v err=%v", "sub.example/v2/newpkg", mod, err)
+	}
+	if d.ModuleID != mod.ID {
+		t.Errorf("NewSubFunc landed in module id=%d, want id=%d (sub.example/v2/newpkg)", d.ModuleID, mod.ID)
+	}
+
+	if bogus, err := db.GetModuleByPath("testproj/sub/newpkg"); err == nil && bogus != nil {
+		t.Errorf("also created the bogus root-prefixed module %q (id=%d) -- new nested-module directories must resolve against their own go.mod, not the repo root's", "testproj/sub/newpkg", bogus.ID)
+	}
+}

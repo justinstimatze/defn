@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.43"
+const Version = "0.26.44"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -2950,25 +2950,22 @@ func (s *server) emitAndBuildAgainst(backend store.Backend, opts emit.Opts) stri
 	// with `go build .` (25ms). When TouchedFiles is set, scope the build
 	// to just the packages containing those files. Empty TouchedFiles
 	// (full-tree emit) keeps the old ./... behavior for correctness on
-	// broad changes.
-	buildTargets := buildTargetsForFiles(opts.TouchedFiles)
-	args := append([]string{"build"}, buildTargets...)
-	cmd := exec.CommandContext(ctx, "go", args...)
-	cmd.Dir = s.projectDir
-	out, err := cmd.CombinedOutput()
+	// broad changes. runScopedBuild further scopes each touched file's
+	// build to its NEAREST go.mod -- see its doc for why.
+	out, buildErr := s.runScopedBuild(ctx, opts.TouchedFiles)
 	if timing {
-		fmt.Fprintf(os.Stderr, "  [emit] go %s: %s\n", strings.Join(args, " "), time.Since(t).Round(time.Millisecond))
+		fmt.Fprintf(os.Stderr, "  [emit] go build: %s\n", time.Since(t).Round(time.Millisecond))
 	}
 	var sb strings.Builder
 	if len(warnings) > 0 {
 		sb.WriteString("WARNING: " + strings.Join(warnings, "\nWARNING: "))
 	}
-	if err != nil {
+	if buildErr != nil {
 		if sb.Len() > 0 {
 			sb.WriteString("\n\n")
 		}
-		sb.WriteString(fmt.Sprintf("BUILD FAILED:\n%s", string(out)))
-		sb.WriteString(s.suggestMissingImportFixes(string(out)))
+		sb.WriteString(fmt.Sprintf("BUILD FAILED:\n%s", out))
+		sb.WriteString(s.suggestMissingImportFixes(out))
 	}
 	return sb.String()
 }
@@ -3297,10 +3294,26 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// fallback's identity.
 	if !fileResolvedDirectly && args.File != "" {
 		if dir := filepath.ToSlash(filepath.Dir(args.File)); dir != "" && dir != "." {
-			mods, _ := s.backend.ListModules()
 			newPath := dir
-			if root := emit.DetectModuleRoot(mods); root != "" {
-				newPath = root + "/" + dir
+			// Prefer the real filesystem go.mod nearest this new
+			// directory (correct even when it's inside a nested
+			// module, e.g. etcd's server/, tests/, etcdctl/ each
+			// have their own go.mod) over the DB-derived common-prefix
+			// guess below, which is only right for single-module repos.
+			absDir := filepath.Join(s.projectDir, dir)
+			if modPrefix, modDir, mErr := ingest.ModuleForDir(absDir); mErr == nil {
+				if relPkgDir, rErr := filepath.Rel(modDir, absDir); rErr == nil {
+					if relPkgDir == "." {
+						newPath = modPrefix
+					} else {
+						newPath = modPrefix + "/" + filepath.ToSlash(relPkgDir)
+					}
+				}
+			} else {
+				mods, _ := s.backend.ListModules()
+				if root := emit.DetectModuleRoot(mods); root != "" {
+					newPath = root + "/" + dir
+				}
 			}
 			newMod, ensureErr := tx.EnsureModule(newPath, filepath.Base(dir), "")
 			if ensureErr != nil {
@@ -8981,4 +8994,69 @@ func suggestClosestFragmentHint(body, old string) string {
 		return ""
 	}
 	return fmt.Sprintf("\n\nhint: old didn't match exactly, but a whitespace-only-different version was found in the current body -- copy this verbatim as old:\n%s", actual)
+}
+
+// runBuildIn runs `go build` against targets with dir as the working
+// directory, returning combined output and the command's error (nil
+// on a clean build).
+func (s *server) runBuildIn(ctx context.Context, dir string, targets []string) (string, error) {
+	args := append([]string{"build"}, targets...)
+	cmd := exec.CommandContext(ctx, "go", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// runScopedBuild runs `go build` scoped to touchedFiles (repo-relative
+// paths), grouping them by nearest go.mod so files inside a nested
+// module (e.g. etcd's server/, tests/, etcdctl/, each with their own
+// go.mod) build against THEIR OWN module root instead of
+// s.projectDir's. Go's toolchain refuses to build a subtree that
+// declares its own go.mod from an outer module's context -- "main
+// module (X) does not contain package Y" -- which is exactly the
+// build-verification failure real multi-module bench trajectories
+// hit on every create/edit touching such a subtree, even once the
+// definition's own module attribution (see ingest.ModuleForDir) was
+// correct. Empty touchedFiles keeps the original full-tree ./...
+// behavior, scoped to s.projectDir.
+func (s *server) runScopedBuild(ctx context.Context, touchedFiles []string) (string, error) {
+	if len(touchedFiles) == 0 {
+		return s.runBuildIn(ctx, s.projectDir, []string{"./..."})
+	}
+
+	byModDir := map[string][]string{} // nearest module dir -> repo-relative files
+	for _, f := range touchedFiles {
+		absDir := filepath.Join(s.projectDir, filepath.Dir(f))
+		modDir := s.projectDir
+		if _, nearestDir, err := ingest.ModuleForDir(absDir); err == nil {
+			modDir = nearestDir
+		}
+		byModDir[modDir] = append(byModDir[modDir], f)
+	}
+
+	dirs := make([]string, 0, len(byModDir))
+	for d := range byModDir {
+		dirs = append(dirs, d)
+	}
+	sort.Strings(dirs)
+
+	var outputs []string
+	for _, modDir := range dirs {
+		relFiles := make([]string, len(byModDir[modDir]))
+		for i, f := range byModDir[modDir] {
+			absFile := filepath.Join(s.projectDir, f)
+			rel, err := filepath.Rel(modDir, absFile)
+			if err != nil {
+				rel = f
+			}
+			relFiles[i] = rel
+		}
+		targets := buildTargetsForFiles(relFiles)
+		out, err := s.runBuildIn(ctx, modDir, targets)
+		if err != nil {
+			outputs = append(outputs, out)
+			return strings.Join(outputs, "\n\n"), err
+		}
+	}
+	return "", nil
 }
