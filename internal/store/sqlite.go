@@ -588,18 +588,34 @@ func (s *SQLiteDB) FindDefinitions(namePattern string) ([]Definition, error) {
 }
 
 func (s *SQLiteDB) FindDefinitionsByFile(fileSuffix string, sourceFile string, line int) ([]Definition, error) {
-	query := `SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test,
+	// An exact sourceFile already disambiguates uniquely (it's the
+	// real repo-relative on-disk path) -- match on it alone rather
+	// than ALSO requiring m.path LIKE %fileSuffix%. That module-path
+	// filter assumes a module's Go import path is literally a
+	// filesystem-path suffix of the file's directory, which breaks
+	// for any nested module using semantic import versioning (e.g.
+	// etcd's go.etcd.io/etcd/client/pkg/v3/transport does NOT end
+	// with ".../client/pkg/transport" -- "v3" sits in the middle) --
+	// real definitions were silently dropped for every such file.
+	var query string
+	var args []any
+	if sourceFile != "" {
+		query = `SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test,
+	            COALESCE(d.receiver,''), COALESCE(d.signature,''),
+	            COALESCE(d.start_line,0), COALESCE(d.end_line,0),
+	            COALESCE(d.source_file,'')
+	          FROM definitions d
+	          WHERE d.source_file = ?`
+		args = []any{sourceFile}
+	} else {
+		query = `SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test,
 	            COALESCE(d.receiver,''), COALESCE(d.signature,''),
 	            COALESCE(d.start_line,0), COALESCE(d.end_line,0),
 	            COALESCE(d.source_file,'')
 	          FROM definitions d
 	          JOIN modules m ON d.module_id = m.id
 	          WHERE m.path LIKE ?`
-	args := []any{"%" + fileSuffix + "%"}
-
-	if sourceFile != "" {
-		query += " AND d.source_file = ?"
-		args = append(args, sourceFile)
+		args = []any{"%" + fileSuffix + "%"}
 	}
 	if line > 0 {
 		query += " AND d.start_line <= ? AND d.end_line >= ? AND d.start_line > 0"

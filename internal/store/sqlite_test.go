@@ -633,3 +633,50 @@ func TestGetDefinitionByNameAndReceiver_ExactModuleMatchOnly(t *testing.T) {
 		t.Fatalf("found Widget in module_id=%d, want %d", d.ModuleID, inner.ID)
 	}
 }
+
+// TestFindDefinitionsByFile_VersionedModulePathDoesNotBreakExactFileMatch
+// is a regression found via etcd bench trajectories: FindDefinitionsByFile
+// required BOTH an exact source_file match AND `m.path LIKE
+// %fileSuffix%`, where fileSuffix is the file's own repo-relative
+// directory. That LIKE filter assumes a module's Go import path is
+// literally a filesystem-path suffix of the file's directory -- true
+// for simple repos, but false for any module using semantic import
+// versioning: go.etcd.io/etcd/client/pkg/v3/transport does NOT end
+// with ".../client/pkg/transport", because "v3" sits in the middle.
+// Real trajectories hit this as code(op:"file-defs") (and overview,
+// read-file, add-import, etc., which share this helper) reporting
+// "0 definitions" for files that had just been synced with dozens of
+// real definitions.
+func TestFindDefinitionsByFile_VersionedModulePathDoesNotBreakExactFileMatch(t *testing.T) {
+	dir := t.TempDir()
+	db, err := OpenSQLite(filepath.Join(dir, "defn.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	mod, err := db.EnsureModule("go.etcd.io/etcd/client/pkg/v3/transport", "transport", "")
+	if err != nil {
+		t.Fatalf("EnsureModule: %v", err)
+	}
+
+	const sourceFile = "client/pkg/transport/listener.go"
+	if _, err := db.UpsertDefinition(&Definition{
+		ModuleID:   mod.ID,
+		Name:       "NewListener",
+		Kind:       "function",
+		SourceFile: sourceFile,
+		StartLine:  10,
+		EndLine:    20,
+	}); err != nil {
+		t.Fatalf("UpsertDefinition: %v", err)
+	}
+
+	defs, err := db.FindDefinitionsByFile("client/pkg/transport", sourceFile, 0)
+	if err != nil {
+		t.Fatalf("FindDefinitionsByFile: %v", err)
+	}
+	if len(defs) != 1 || defs[0].Name != "NewListener" {
+		t.Errorf("expected 1 def (NewListener), got %d: %+v", len(defs), defs)
+	}
+}
