@@ -8704,3 +8704,60 @@ func TestHandleCreate_NewFileInNestedModuleUsesNestedGoMod(t *testing.T) {
 		t.Errorf("also created the bogus root-prefixed module %q (id=%d) -- new nested-module directories must resolve against their own go.mod, not the repo root's", "testproj/sub/newpkg", bogus.ID)
 	}
 }
+
+// TestHandleCreate_NestedModuleAddDoesNotLoseSiblingDefs is a
+// regression probe for an etcd bench trajectory (etcd-io__etcd-20342,
+// v2 rerun with the ModuleForDir/runScopedBuild fixes already
+// applied): the agent successfully created a new function in an
+// already-synced nested-module file (server/embed/config.go, 37
+// existing defs), the build succeeded, but immediately afterward a
+// sibling definition in that SAME file that existed before the
+// create (configFromFile) came back "not found" -- and a fresh
+// search for it returned zero matches, as if the whole file's defs
+// had been dropped from the index. This test reproduces the shape
+// with a minimal nested-module fixture to determine whether creating
+// a new def in an already-ingested nested-module file corrupts its
+// existing sibling defs.
+func TestHandleCreate_NestedModuleAddDoesNotLoseSiblingDefs(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	nestedDir := filepath.Join(projDir, "sub")
+	if err := os.MkdirAll(filepath.Join(nestedDir, "pkg"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nestedDir, "go.mod"), []byte("module sub.example/v2\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	xGoPath := filepath.Join(nestedDir, "pkg", "x.go")
+	if err := os.WriteFile(xGoPath, []byte("package pkg\n\nfunc FuncA() int { return 1 }\n\nfunc FuncB() int { return 2 }\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mirror what code(op:"sync", file:...) does: register the
+	// nested-module file's existing defs before any create touches it.
+	if _, err := ingest.IngestFile(db, projDir, xGoPath); err != nil {
+		t.Fatalf("IngestFile: %v", err)
+	}
+	if before, err := db.GetDefinitionByName("FuncA", "sub.example/v2/pkg"); err != nil || before == nil {
+		t.Fatalf("precondition: FuncA should be findable right after IngestFile, got err=%v", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body:   "func FuncC() int { return 3 }",
+		File:   "sub/pkg/x.go",
+		Module: "sub.example/v2/pkg",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Created") {
+		t.Fatalf("expected 'Created', got: %s", text)
+	}
+
+	if _, err := db.GetDefinitionByName("FuncA", "sub.example/v2/pkg"); err != nil {
+		t.Errorf("FuncA vanished after creating a sibling def in the same nested-module file: %v", err)
+	}
+	if _, err := db.GetDefinitionByName("FuncB", "sub.example/v2/pkg"); err != nil {
+		t.Errorf("FuncB vanished after creating a sibling def in the same nested-module file: %v", err)
+	}
+}
