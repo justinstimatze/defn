@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.45"
+const Version = "0.26.46"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -2582,6 +2582,9 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 			sb.WriteString(fmt.Sprintf("\nFYI: %d callers, %d tests affected. Run code(op:\"test\", name:\"%s\") to verify.\n",
 				prodCallers, len(impact.Tests), d.Name))
 		}
+		if !d.Test {
+			sb.WriteString(s.testCoverageHint(d.ModuleID, d.SourceFile))
+		}
 	}
 	return textResult(sb.String()), nil, nil
 }
@@ -3397,6 +3400,9 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		fmt.Fprintf(&sb, "create %s%s rolled back — nothing was saved\n\n%s", recv, name, buildResult)
 	} else {
 		sb.WriteString(fmt.Sprintf("Created %s (id=%d, kind=%s) in %s\n", name, id, kind, loc))
+		if !isTest {
+			sb.WriteString(s.testCoverageHint(mod.ID, args.File))
+		}
 	}
 	return textResult(sb.String()), nil, nil
 }
@@ -9059,4 +9065,41 @@ func (s *server) runScopedBuild(ctx context.Context, touchedFiles []string) (str
 		}
 	}
 	return "", nil
+}
+
+// testCoverageHint fires on a SUCCESSFUL (non-rolled-back) write to a
+// non-test def when the def's package has existing test file(s) that
+// this write didn't touch. Bench trajectories across etcd/traefik/caddy
+// (2026-08 multi-repo investigation) found this the single largest
+// driver of a correctness gap vs plain Edit/Write: agents using defn
+// reliably fixed the source file correctly, then declared done without
+// ever looking at the paired _test.go, while files-mode agents working
+// from the same repos reliably added or updated one. coupledChangeHint
+// already covers the build-failure/rollback path for coupled PRODUCTION
+// callers; this covers the success path for paired TEST files.
+func (s *server) testCoverageHint(moduleID int64, touchedFile string) string {
+	sources, err := s.backend.ListFileSources(moduleID)
+	if err != nil {
+		return ""
+	}
+	var testFiles []string
+	for f := range sources {
+		if !strings.HasSuffix(f, "_test.go") || f == touchedFile {
+			continue
+		}
+		testFiles = append(testFiles, f)
+	}
+	if len(testFiles) == 0 {
+		return ""
+	}
+	sort.Strings(testFiles)
+	if len(testFiles) > 3 {
+		testFiles = testFiles[:3]
+	}
+	plural := ""
+	if len(testFiles) > 1 {
+		plural = "s"
+	}
+	return fmt.Sprintf("\nTip: this package has an existing test file%s (%s) this change didn't touch -- consider adding/updating a test case.\n",
+		plural, strings.Join(testFiles, ", "))
 }

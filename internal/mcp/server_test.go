@@ -8761,3 +8761,86 @@ func TestHandleCreate_NestedModuleAddDoesNotLoseSiblingDefs(t *testing.T) {
 		t.Errorf("FuncB vanished after creating a sibling def in the same nested-module file: %v", err)
 	}
 }
+
+// TestHandleEdit_SuccessSuggestsExistingUntouchedTestFile is a
+// regression for the etcd/traefik/caddy bench investigation: the
+// single largest driver of defn's correctness gap vs plain Edit/Write
+// was agents fixing the source file correctly, then never touching
+// the paired _test.go -- confirmed via real trajectories (e.g.
+// caddyserver__caddy-7729) where the agent ran existing tests to
+// verify nothing broke but never looked at the test file to add a new
+// case. setupTestDB's fixture project has main_test.go alongside
+// main.go; editing a non-test def there without touching main_test.go
+// should surface a hint pointing at it.
+func TestHandleEdit_SuccessSuggestsExistingUntouchedTestFile(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	newBody := `func Greet(name string) string {
+	return "Hi, " + name
+}`
+	result, _, _ := s.handleEdit(context.Background(), nil, editParam{Name: "Greet", NewBody: newBody})
+	text := resultText(t, result)
+
+	if !strings.Contains(text, "main_test.go") {
+		t.Errorf("expected a hint pointing at the untouched main_test.go, got: %s", text)
+	}
+}
+
+// TestHandleEdit_NoTestCoverageHintWhenEditingATestFunctionItself
+// checks testCoverageHint's isTest guard: editing a test function
+// itself shouldn't suggest touching "a test file" -- that's what's
+// already being edited.
+func TestHandleEdit_NoTestCoverageHintWhenEditingATestFunctionItself(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	newBody := `func TestGreet(t *testing.T) {
+	if Greet("x") == "" {
+		t.Fatal("empty")
+	}
+}`
+	result, _, _ := s.handleEdit(context.Background(), nil, editParam{Name: "TestGreet", NewBody: newBody})
+	text := resultText(t, result)
+
+	if strings.Contains(text, "Tip: this package has an existing test file") {
+		t.Errorf("expected no test-coverage hint when editing a test function itself, got: %s", text)
+	}
+}
+
+// TestHandleCreate_SuccessSuggestsExistingUntouchedTestFile mirrors
+// TestHandleEdit_SuccessSuggestsExistingUntouchedTestFile for the
+// create path: setupTestDB's module already has main_test.go, so
+// creating a new non-test function without touching it should surface
+// the same hint.
+func TestHandleCreate_SuccessSuggestsExistingUntouchedTestFile(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body: "func NewHelper() string { return \"help\" }",
+	})
+	text := resultText(t, result)
+
+	if !strings.Contains(text, "main_test.go") {
+		t.Errorf("expected a hint pointing at the untouched main_test.go, got: %s", text)
+	}
+}
+
+// TestHandleCreate_NoTestCoverageHintWhenNoModuleGiven checks
+// testCoverageHint degrades silently (empty string, not a crash) when
+// ListFileSources has nothing to offer -- e.g. module ID 0 for a
+// created def whose module lookup came back empty.
+func TestHandleCreate_NoTestCoverageHintWhenNoModuleGiven(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	hint := s.testCoverageHint(0, "")
+	if hint != "" {
+		t.Errorf("expected empty hint for a module with no file sources, got: %q", hint)
+	}
+}
