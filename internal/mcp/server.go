@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.46"
+const Version = "0.26.47"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -3159,6 +3159,9 @@ func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest
 			}
 			sb.WriteString(fmt.Sprintf("\nFYI: %d callers, %d tests affected.\n", prodCallers, len(impact.Tests)))
 		}
+		if !d.Test {
+			sb.WriteString(s.testCoverageHint(d.ModuleID, d.SourceFile))
+		}
 	}
 	return textResult(sb.String()), nil, nil
 }
@@ -3860,6 +3863,10 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	resolveSet := map[filePkg]bool{}
 	var allowedRemovals []string
 	var allowedAdds []string
+	// Tracks the module of the first non-test def this batch touches,
+	// so a successful batch that never touches a test file can nudge
+	// toward the paired test coverage -- see testCoverageHint's doc.
+	var firstNonTestModuleID int64
 	// #241: IDs of defs edited in this batch, so a rolled-back build can
 	// point at their callers via coupledChangeHint -- same rationale as
 	// handleEdit's singleton path, just collected across the batch since
@@ -3927,6 +3934,9 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		}
 		addTouched(d.SourceFile)
 		addResolve(d.SourceFile, d.ModuleID)
+		if !d.Test && firstNonTestModuleID == 0 {
+			firstNonTestModuleID = d.ModuleID
+		}
 		return fmt.Sprintf("~ %s on %s\n", op.Op, name), ""
 	}
 
@@ -4013,6 +4023,9 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 					addTouched(op.File)
 					addResolve(op.File, mod.ID)
 					allowedAdds = append(allowedAdds, emit.FuncIdentity(d.Name, d.Receiver))
+					if !d.IsTest && firstNonTestModuleID == 0 {
+						firstNonTestModuleID = mod.ID
+					}
 					sb.WriteString(fmt.Sprintf("+ created %s (id=%d)\n", d.Name, id))
 				}
 				continue
@@ -4082,6 +4095,9 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				addTouched(op.File)
 				addResolve(op.File, mod.ID)
 				allowedAdds = append(allowedAdds, emit.FuncIdentity(name, receiver))
+				if !isTest && firstNonTestModuleID == 0 {
+					firstNonTestModuleID = mod.ID
+				}
 				sb.WriteString(fmt.Sprintf("+ created %s (id=%d)\n", name, id))
 			}
 
@@ -4143,6 +4159,9 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				addTouched(d.SourceFile)
 				addResolve(d.SourceFile, d.ModuleID)
 				editedIDs = append(editedIDs, d.ID)
+				if !d.Test && firstNonTestModuleID == 0 {
+					firstNonTestModuleID = d.ModuleID
+				}
 				sb.WriteString(fmt.Sprintf("~ edited %s\n", op.Name))
 			}
 
@@ -4487,6 +4506,19 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			return textResult(fmt.Sprintf("apply rolled back — build failed, nothing was saved:\n\n%s%s", buildResult, s.coupledChangeHint(editedIDs...))), nil, nil
 		}
 		sb.WriteString("\n" + buildResult)
+	}
+
+	if buildResult == "" && firstNonTestModuleID != 0 {
+		touchedTestFile := false
+		for f := range touchedFiles {
+			if strings.HasSuffix(f, "_test.go") {
+				touchedTestFile = true
+				break
+			}
+		}
+		if !touchedTestFile {
+			sb.WriteString(s.testCoverageHint(firstNonTestModuleID, ""))
+		}
 	}
 
 	return textResult(sb.String()), nil, nil
@@ -7682,6 +7714,9 @@ func (s *server) applyEditTerse(session *sdkmcp.ServerSession, d *store.Definiti
 	// hint returns "" when session is nil (Measure* paths) or under threshold.
 	if s.hint != nil {
 		sb.WriteString(s.hint.note(session, d.SourceFile))
+	}
+	if buildResult == "" && !d.Test {
+		sb.WriteString(s.testCoverageHint(d.ModuleID, d.SourceFile))
 	}
 	return textResult(sb.String()), nil, nil
 }

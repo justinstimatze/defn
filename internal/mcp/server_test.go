@@ -8844,3 +8844,76 @@ func TestHandleCreate_NoTestCoverageHintWhenNoModuleGiven(t *testing.T) {
 		t.Errorf("expected empty hint for a module with no file sources, got: %q", hint)
 	}
 }
+
+// TestHandleFragmentEdit_SuccessSuggestsExistingUntouchedTestFile is
+// the fragment-edit/replace-hunk-shaped counterpart to
+// TestHandleEdit_SuccessSuggestsExistingUntouchedTestFile -- found
+// missing via a real confirmatory rerun (caddyserver__caddy-7734):
+// the agent used the fragment-edit write path, not handleEdit, so the
+// hint wired only into handleEdit never fired.
+func TestHandleFragmentEdit_SuccessSuggestsExistingUntouchedTestFile(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, _ := s.handleFragmentEdit(context.Background(), nil, codeParam{
+		Name:        "Greet",
+		OldFragment: "Hello",
+		NewFragment: "Hey",
+	})
+	text := resultText(t, result)
+
+	if !strings.Contains(text, "main_test.go") {
+		t.Errorf("expected a hint pointing at the untouched main_test.go, got: %s", text)
+	}
+}
+
+// TestHandleReplaceHunk_SuccessSuggestsExistingUntouchedTestFile
+// covers applyEditTerse (the shared success path for replace-hunk,
+// replace-slice, insert-precondition, wrap-in-defer, rename-param) --
+// the single most commonly used write path per CLAUDE.md's own
+// guidance, and the one a real confirmatory rerun (caddyserver__caddy-7734)
+// showed missing the test-coverage hint entirely.
+func TestHandleReplaceHunk_SuccessSuggestsExistingUntouchedTestFile(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op:   "replace-hunk",
+		Name: "Greet",
+		Old:  `return "Hello, " + name`,
+		New:  `return "Hi, " + name`,
+	})
+	if err != nil {
+		t.Fatalf("handleCode: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "main_test.go") {
+		t.Errorf("expected a hint pointing at the untouched main_test.go, got: %s", text)
+	}
+}
+
+// TestHandleApply_SuccessSuggestsExistingUntouchedTestFile covers the
+// apply-batch write path -- a batch that edits a non-test def without
+// touching any of the module's existing test files should surface the
+// same test-coverage hint as the single-op handlers.
+func TestHandleApply_SuccessSuggestsExistingUntouchedTestFile(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "edit", Name: "Greet", NewBody: `func Greet(name string) string {
+	return "Hi, " + name
+}`},
+		},
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "main_test.go") {
+		t.Errorf("expected a hint pointing at the untouched main_test.go, got: %s", text)
+	}
+}
