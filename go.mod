@@ -3,7 +3,7 @@ module github.com/justinstimatze/defn
 go 1.26.2
 
 require (
-	github.com/anthropics/anthropic-sdk-go v1.61.0
+	github.com/anthropics/anthropic-sdk-go v1.63.0
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	golang.org/x/tools v0.48.0
 	gopkg.in/yaml.v2 v2.4.0
