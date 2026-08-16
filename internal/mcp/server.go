@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.48"
+const Version = "0.26.49"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -3669,25 +3669,6 @@ func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult
 	return textResult(sb.String()), nil, nil
 }
 
-// findModuleByFile maps a source file path to its module. Tries the
-// filesystem first: walk up from the file's directory to the nearest
-// go.mod and compute the exact expected import path (modulePrefix +
-// relative dir), then look that up verbatim. This is required whenever
-// a module path has a semantic-version segment inserted mid-path (e.g.
-// "go.etcd.io/etcd/server/v3/embed" for a file under "server/embed/") —
-// a plain directory-suffix match against module Paths (the fallback
-// below) can never match that shape, since the "/v3" segment breaks
-// the suffix. Same bug class already fixed in ingest.ModuleForDir /
-// FindDefinitionsByFile; this copy was missed until a real etcd
-// trajectory (issue #20342) hit it: every create/edit resolving through
-// this function on a versioned nested module falsely reported "file
-// does not map to any known module", forcing repeated confused retries
-// with progressively wrong file:/module: combinations.
-//
-// Falls back to suffix-matching the directory against module Paths when
-// projectDir is unset (e.g. some unit tests construct a server with no
-// real files on disk) or the filesystem walk finds nothing. Accepts
-// repo-relative or absolute paths.
 func (s *server) findModuleByFile(file string) *store.Module {
 	mods, _ := s.backend.ListModules() // best effort — nil is safe
 	if len(mods) == 0 {
@@ -3695,19 +3676,8 @@ func (s *server) findModuleByFile(file string) *store.Module {
 	}
 	dir := filepath.ToSlash(filepath.Dir(file))
 	dir = strings.TrimPrefix(dir, "./")
-	if s.projectDir != "" && dir != "" && dir != "." {
-		absDir := filepath.Join(s.projectDir, dir)
-		if modPrefix, modDir, err := ingest.ModuleForDir(absDir); err == nil {
-			expected := modPrefix
-			if relPkgDir, rErr := filepath.Rel(modDir, absDir); rErr == nil && relPkgDir != "." {
-				expected = modPrefix + "/" + filepath.ToSlash(relPkgDir)
-			}
-			for i, m := range mods {
-				if m.Path == expected {
-					return &mods[i]
-				}
-			}
-		}
+	if mod := s.findModuleForRelDir(mods, dir); mod != nil {
+		return mod
 	}
 	if dir == "" || dir == "." {
 		// File sits at repo root — pick the module whose Path has no
@@ -5600,7 +5570,27 @@ func (s *server) handleOverview(ctx context.Context, _ *sdkmcp.CallToolRequest, 
 		dir = file
 	}
 
-	defs, err := s.backend.FindDefinitionsByFile(dir, sourceFile, 0)
+	// #253: for the bare-directory shape (no sourceFile), FindDefinitionsByFile
+	// falls back to `m.path LIKE %fileSuffix%`, which assumes a module's
+	// import path is literally a filesystem-path suffix of the directory --
+	// false for any nested module using semantic import versioning (etcd's
+	// server/embed/ -> go.etcd.io/etcd/server/v3/embed does not end with
+	// "/server/embed" because "v3" sits in the middle). Resolve via the
+	// filesystem first (same mechanism as findModuleByFile) and scope by
+	// exact module ID when that succeeds; only fall back to the LIKE-based
+	// lookup when it doesn't (e.g. `file:` was already a full import path,
+	// or projectDir is unset).
+	var defs []store.Definition
+	var err error
+	if sourceFile == "" {
+		mods, _ := s.backend.ListModules()
+		if mod := s.findModuleForRelDir(mods, dir); mod != nil {
+			defs, err = s.backend.GetModuleDefinitions(mod.ID)
+		}
+	}
+	if len(defs) == 0 {
+		defs, err = s.backend.FindDefinitionsByFile(dir, sourceFile, 0)
+	}
 	if err != nil || len(defs) == 0 {
 		return errResult(fmt.Errorf("no definitions found for %s -- check the path (try op:\"overview\" with no file: for the project map, or op:\"search\" to find the right path)", file))
 	}
@@ -9174,4 +9164,33 @@ func (s *server) testCoverageHint(moduleID int64, touchedFile string) string {
 	}
 	return fmt.Sprintf("\nTip: this package has an existing test file%s (%s) this change didn't touch -- consider adding/updating a test case.\n",
 		plural, strings.Join(testFiles, ", "))
+}
+
+// findModuleForRelDir resolves a repo-relative DIRECTORY (not a file
+// within it) to its exact module via the nearest go.mod -- the same
+// filesystem mechanism as findModuleByFile's first branch, factored
+// out so a caller that already has a directory doesn't have to fake up
+// a filename inside it just to reuse the walk. Returns nil when
+// projectDir is unset, the directory is empty/root, or the walk finds
+// no exactly-matching registered module (callers should fall back to
+// their own heuristic in that case, same as findModuleByFile does).
+func (s *server) findModuleForRelDir(mods []store.Module, relDir string) *store.Module {
+	if s.projectDir == "" || relDir == "" || relDir == "." {
+		return nil
+	}
+	absDir := filepath.Join(s.projectDir, relDir)
+	modPrefix, modDir, err := ingest.ModuleForDir(absDir)
+	if err != nil {
+		return nil
+	}
+	expected := modPrefix
+	if relPkgDir, rErr := filepath.Rel(modDir, absDir); rErr == nil && relPkgDir != "." {
+		expected = modPrefix + "/" + filepath.ToSlash(relPkgDir)
+	}
+	for i, m := range mods {
+		if m.Path == expected {
+			return &mods[i]
+		}
+	}
+	return nil
 }

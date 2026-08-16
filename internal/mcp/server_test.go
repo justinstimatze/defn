@@ -9010,3 +9010,59 @@ func TestHandleApply_CreateSingleDeclFallsBackToModuleWhenFileUnresolved(t *test
 		t.Fatalf("def not persisted under testproj/pkg: %v", err)
 	}
 }
+
+// TestHandleOverview_VersionedNestedModuleBareDirectoryResolves is a
+// regression for the etcd bench findings (issue #20342, follow-on sweep):
+// handleOverview's bare-directory shape (file: with no .go suffix, e.g.
+// "server/embed" rather than the full import path) resolved definitions
+// via FindDefinitionsByFile's `m.path LIKE %fileSuffix%` fallback, which
+// breaks whenever the module's import path has a semantic-version segment
+// inserted mid-path -- "go.etcd.io/etcd/server/v3/embed" does not contain
+// the contiguous substring "server/embed" because "v3" sits in between.
+// overview(file:"server/embed") on such a module silently returned "no
+// definitions found" even though the module was fully ingested with dozens
+// of real definitions -- the same failure shape as the already-fixed
+// findModuleByFile and FindDefinitionsByFile bugs, just reached through
+// handleOverview's bare-directory path instead.
+func TestHandleOverview_VersionedNestedModuleBareDirectoryResolves(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	serverDir := filepath.Join(projDir, "server")
+	if err := os.MkdirAll(filepath.Join(serverDir, "embed"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(serverDir, "go.mod"), []byte("module example.com/server/v3\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(serverDir, "embed", "config.go"), []byte("package embed\n\nfunc Existing() int { return 1 }\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	mod, err := db.EnsureModule("example.com/server/v3/embed", "embed", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.UpsertDefinition(&store.Definition{
+		ModuleID:   mod.ID,
+		Name:       "Existing",
+		Kind:       "function",
+		SourceFile: "server/embed/config.go",
+		StartLine:  3,
+		EndLine:    3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	result, _, err := s.handleOverview(context.Background(), nil, codeParam{File: "server/embed"})
+	if err != nil {
+		t.Fatalf("handleOverview error: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "no definitions found") {
+		t.Fatalf("overview should have resolved the versioned nested module via the filesystem, got: %s", text)
+	}
+	if !strings.Contains(text, "Existing") {
+		t.Fatalf("expected Existing in overview output, got: %s", text)
+	}
+}
