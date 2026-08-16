@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.49"
+const Version = "0.26.50"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -8786,6 +8786,32 @@ func (s *server) testScopeTarget(hint string) string {
 			if m.Path != hint {
 				continue
 			}
+			// #253: deriving the on-disk directory by stripping
+			// emit.DetectModuleRoot's guessed common prefix off the
+			// module's import PATH assumes import path == root prefix +
+			// relative directory -- false for any module using semantic
+			// import versioning (etcd's go.etcd.io/etcd/server/v3/embed,
+			// declared from directory "server/", has a "v3" segment in
+			// the import path with no corresponding directory level) or
+			// any nested module whose path doesn't share the repo's
+			// common prefix at all. Both produced a target directory
+			// that doesn't exist on disk, so `go test` silently matched
+			// zero packages. A definition's source_file is already the
+			// real, correct repo-relative path -- use it directly rather
+			// than reconstructing one via import-path arithmetic. Every
+			// definition in a module shares one directory (module =
+			// package = one directory in defn's model), so the first is
+			// as good as any.
+			if defs, dErr := s.backend.GetModuleDefinitions(m.ID); dErr == nil && len(defs) > 0 {
+				dir := filepath.ToSlash(filepath.Dir(defs[0].SourceFile))
+				if dir == "" || dir == "." {
+					return "."
+				}
+				return "./" + dir + "/..."
+			}
+			// No definitions yet (freshly created empty package) --
+			// fall back to the import-path heuristic; still best-effort
+			// per this function's contract.
 			root := emit.DetectModuleRoot(mods)
 			rel := strings.TrimPrefix(m.Path, root)
 			rel = strings.TrimPrefix(rel, "/")

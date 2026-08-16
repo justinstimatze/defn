@@ -9066,3 +9066,41 @@ func TestHandleOverview_VersionedNestedModuleBareDirectoryResolves(t *testing.T)
 		t.Fatalf("expected Existing in overview output, got: %s", text)
 	}
 }
+
+func TestHandleTestByName_VersionedNestedModuleHintScopesToRealDirectory(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	serverDir := filepath.Join(projDir, "server")
+	if err := os.MkdirAll(filepath.Join(serverDir, "embed"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(serverDir, "go.mod"), []byte("module example.com/server/v3\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(serverDir, "embed", "config.go"), []byte("package embed\n\nfunc Widget() string { return \"embed\" }\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	mod, err := db.EnsureModule("example.com/server/v3/embed", "embed", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.UpsertDefinition(&store.Definition{
+		ModuleID:   mod.ID,
+		Name:       "Widget",
+		Kind:       "function",
+		Body:       "func Widget() string { return \"embed\" }",
+		SourceFile: "server/embed/config.go",
+		StartLine:  3,
+		EndLine:    3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	got := s.testScopeTarget("example.com/server/v3/embed")
+	if got != "./server/embed/..." {
+		t.Errorf("testScopeTarget(%q) = %q, want %q (the real on-disk directory, not an import-path reconstruction)",
+			"example.com/server/v3/embed", got, "./server/embed/...")
+	}
+}
