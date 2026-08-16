@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.47"
+const Version = "0.26.48"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -3669,10 +3669,25 @@ func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult
 	return textResult(sb.String()), nil, nil
 }
 
-// findModuleByFile maps a source file path to its module by matching the
-// file's directory against module Paths (which are import paths like
-// "github.com/x/y/internal/code"). Accepts repo-relative or absolute paths;
-// matches by suffix on the directory component.
+// findModuleByFile maps a source file path to its module. Tries the
+// filesystem first: walk up from the file's directory to the nearest
+// go.mod and compute the exact expected import path (modulePrefix +
+// relative dir), then look that up verbatim. This is required whenever
+// a module path has a semantic-version segment inserted mid-path (e.g.
+// "go.etcd.io/etcd/server/v3/embed" for a file under "server/embed/") —
+// a plain directory-suffix match against module Paths (the fallback
+// below) can never match that shape, since the "/v3" segment breaks
+// the suffix. Same bug class already fixed in ingest.ModuleForDir /
+// FindDefinitionsByFile; this copy was missed until a real etcd
+// trajectory (issue #20342) hit it: every create/edit resolving through
+// this function on a versioned nested module falsely reported "file
+// does not map to any known module", forcing repeated confused retries
+// with progressively wrong file:/module: combinations.
+//
+// Falls back to suffix-matching the directory against module Paths when
+// projectDir is unset (e.g. some unit tests construct a server with no
+// real files on disk) or the filesystem walk finds nothing. Accepts
+// repo-relative or absolute paths.
 func (s *server) findModuleByFile(file string) *store.Module {
 	mods, _ := s.backend.ListModules() // best effort — nil is safe
 	if len(mods) == 0 {
@@ -3680,6 +3695,20 @@ func (s *server) findModuleByFile(file string) *store.Module {
 	}
 	dir := filepath.ToSlash(filepath.Dir(file))
 	dir = strings.TrimPrefix(dir, "./")
+	if s.projectDir != "" && dir != "" && dir != "." {
+		absDir := filepath.Join(s.projectDir, dir)
+		if modPrefix, modDir, err := ingest.ModuleForDir(absDir); err == nil {
+			expected := modPrefix
+			if relPkgDir, rErr := filepath.Rel(modDir, absDir); rErr == nil && relPkgDir != "." {
+				expected = modPrefix + "/" + filepath.ToSlash(relPkgDir)
+			}
+			for i, m := range mods {
+				if m.Path == expected {
+					return &mods[i]
+				}
+			}
+		}
+	}
 	if dir == "" || dir == "." {
 		// File sits at repo root — pick the module whose Path has no
 		// internal segment beyond the module root (shortest path wins).
@@ -4035,13 +4064,17 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				errors = append(errors, "create: couldn't infer name from body")
 				continue
 			}
+			// Mirrors handleCreate's precedence: file: is tried first (most
+			// specific) but a miss there falls through to module:, not an
+			// immediate error -- the two were previously inconsistent here.
+			// findModuleByFile legitimately returns nil for a real file on a
+			// versioned nested module in some fallback configurations (see
+			// its own #20342 fix); bailing out on that nil instead of trying
+			// the caller's explicit module: turned a resolvable request into
+			// a spurious "does not map to any known module" error.
 			var mod *store.Module
 			if op.File != "" {
 				mod = s.findModuleByFile(op.File)
-				if mod == nil {
-					errors = append(errors, fmt.Sprintf("create %s: file %q does not map to any known module", name, op.File))
-					continue
-				}
 			}
 			if mod == nil && op.Module != "" {
 				mod = s.findModule(op.Module)
@@ -4049,6 +4082,10 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 					errors = append(errors, fmt.Sprintf("create %s: module %q not found", name, op.Module))
 					continue
 				}
+			}
+			if mod == nil && op.File != "" {
+				errors = append(errors, fmt.Sprintf("create %s: file %q does not map to any known module", name, op.File))
+				continue
 			}
 			if mod == nil {
 				mods, _ := s.backend.ListModules()

@@ -8917,3 +8917,96 @@ func TestHandleApply_SuccessSuggestsExistingUntouchedTestFile(t *testing.T) {
 		t.Errorf("expected a hint pointing at the untouched main_test.go, got: %s", text)
 	}
 }
+
+// TestFindModuleByFile_VersionedNestedModuleResolvesViaFilesystem is a
+// regression for the etcd bench findings (issue #20342): findModuleByFile
+// matched a file's directory against module Paths via string-suffix
+// comparison, which silently breaks whenever the module's declared import
+// path has a semantic-version segment inserted mid-path -- e.g.
+// "example.com/server/v3/embed" does not end with "/server/embed" because
+// of the "/v3" in between. A real etcd trajectory hit this on every
+// create/edit against server/embed/config.go: findModuleByFile (and
+// everything downstream: handleCreate, handleApply, resolveEditTarget,
+// resolveApplyTarget) falsely reported the file unresolvable, forcing the
+// agent into a cascade of confused, wrong file:/module: retries.
+func TestFindModuleByFile_VersionedNestedModuleResolvesViaFilesystem(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	serverDir := filepath.Join(projDir, "server")
+	if err := os.MkdirAll(filepath.Join(serverDir, "embed"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(serverDir, "go.mod"), []byte("module example.com/server/v3\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(serverDir, "embed", "config.go"), []byte("package embed\n\nfunc Existing() int { return 1 }\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.EnsureModule("example.com/server/v3/embed", "embed", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	mod := s.findModuleByFile("server/embed/config.go")
+	if mod == nil {
+		t.Fatal("findModuleByFile returned nil for a real file under a versioned nested module")
+	}
+	if mod.Path != "example.com/server/v3/embed" {
+		t.Errorf("got module %q, want %q", mod.Path, "example.com/server/v3/embed")
+	}
+}
+
+// TestHandleApply_CreateSingleDeclFallsBackToModuleWhenFileUnresolved is a
+// regression: handleApply's single-decl "create" case bailed out with
+// "does not map to any known module" the instant findModuleByFile(file:)
+// returned nil, never trying an explicit module: the caller also passed --
+// unlike handleCreate's standalone path, which already fell through to
+// module: on a file: miss. A real etcd trajectory (#20342) hit this
+// directly: apply's create sub-op passed both a (mistyped) file: and a
+// correct module:, and got the same "does not map to any known module"
+// error even though the module unambiguously existed and module: alone
+// would have resolved it.
+func TestHandleApply_CreateSingleDeclFallsBackToModuleWhenFileUnresolved(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	pkgDir := filepath.Join(projDir, "pkg")
+	if err := os.MkdirAll(pkgDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkgDir, "pkg.go"), []byte("package pkg\n\nfunc Existing() int { return 1 }\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	result, _, err := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{
+				Op:     "create",
+				File:   "totally/bogus/path/file.go",
+				Module: "testproj/pkg",
+				Body:   "func NewApplyFallback() int { return 1 }",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleApply error: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "does not map to any known module") {
+		t.Fatalf("create should have fallen back to the explicit module: when file: didn't resolve, got: %s", text)
+	}
+	if !strings.Contains(text, "created NewApplyFallback") {
+		t.Fatalf("expected successful create, got: %s", text)
+	}
+	if _, err := db.GetDefinitionByName("NewApplyFallback", "testproj/pkg"); err != nil {
+		t.Fatalf("def not persisted under testproj/pkg: %v", err)
+	}
+}
