@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.56"
+const Version = "0.26.57"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -2421,6 +2421,9 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 		}
 		return s.notFoundOrErr(args.Name, err)
 	}
+	if msg := unsupportedFieldOp(d.Kind, "edit"); msg != "" {
+		return errResult(fmt.Errorf("%s", msg))
+	}
 
 	// Validate new body parses as Go.
 	src := "package x\n" + args.NewBody
@@ -3067,6 +3070,9 @@ func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest
 		}
 		return s.notFoundOrErr(args.Name, err)
 	}
+	if msg := unsupportedFieldOp(d.Kind, "edit"); msg != "" {
+		return errResult(fmt.Errorf("%s", msg))
+	}
 
 	// Reject empty old_fragment (strings.ReplaceAll inserts between every char).
 	if args.OldFragment == "" {
@@ -3170,6 +3176,9 @@ func (s *server) handleInsert(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	d, err := s.resolveWriteTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
+	}
+	if msg := unsupportedFieldOp(d.Kind, "insert"); msg != "" {
+		return errResult(fmt.Errorf("%s", msg))
 	}
 
 	idx := strings.Index(d.Body, args.After)
@@ -3786,14 +3795,18 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 					sb.WriteString(fmt.Sprintf("+ would create %s (%s)\n", name, kind))
 				}
 			case "edit":
-				if _, err := s.resolveApplyTarget(s.backend, op.Name, op.Receiver, op.Module, op.File); err != nil {
+				if d, err := s.resolveApplyTarget(s.backend, op.Name, op.Receiver, op.Module, op.File); err != nil {
 					errors = append(errors, fmt.Sprintf("edit %s: not found", op.Name))
+				} else if msg := unsupportedFieldOp(d.Kind, "edit"); msg != "" {
+					errors = append(errors, fmt.Sprintf("edit %s: %s", op.Name, msg))
 				} else {
 					sb.WriteString(fmt.Sprintf("~ would edit %s\n", op.Name))
 				}
 			case "delete":
-				if _, err := s.resolveApplyTarget(s.backend, op.Name, op.Receiver, op.Module, op.File); err != nil {
+				if d, err := s.resolveApplyTarget(s.backend, op.Name, op.Receiver, op.Module, op.File); err != nil {
 					errors = append(errors, fmt.Sprintf("delete %s: not found", op.Name))
+				} else if msg := unsupportedFieldOp(d.Kind, "delete"); msg != "" {
+					errors = append(errors, fmt.Sprintf("delete %s: %s", op.Name, msg))
 				} else {
 					sb.WriteString(fmt.Sprintf("- would delete %s\n", op.Name))
 				}
@@ -3815,8 +3828,10 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 						name = inferred
 					}
 				}
-				if _, err := s.resolveApplyTarget(s.backend, name, op.Receiver, op.Module, op.File); err != nil {
+				if d, err := s.resolveApplyTarget(s.backend, name, op.Receiver, op.Module, op.File); err != nil {
 					errors = append(errors, fmt.Sprintf("%s %s: not found", op.Op, name))
+				} else if msg := unsupportedFieldOp(d.Kind, op.Op); msg != "" {
+					errors = append(errors, fmt.Sprintf("%s %s: %s", op.Op, name, msg))
 				} else {
 					sb.WriteString(fmt.Sprintf("~ would %s on %s\n", op.Op, name))
 				}
@@ -3911,6 +3926,9 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		d, err := s.resolveApplyTarget(tx, name, op.Receiver, op.Module, op.File)
 		if err != nil {
 			return "", fmt.Sprintf("%s %s: not found", op.Op, name)
+		}
+		if msg := unsupportedFieldOp(d.Kind, op.Op); msg != "" {
+			return "", fmt.Sprintf("%s %s: %s", op.Op, name, msg)
 		}
 		newBody, err := compute(d.Body)
 		if err != nil {
@@ -4114,6 +4132,10 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				errors = append(errors, fmt.Sprintf("edit %s: not found", op.Name))
 				continue
 			}
+			if msg := unsupportedFieldOp(d.Kind, "edit"); msg != "" {
+				errors = append(errors, fmt.Sprintf("edit %s: %s", op.Name, msg))
+				continue
+			}
 			if op.OldFragment != "" {
 				count := strings.Count(d.Body, op.OldFragment)
 				if count == 0 {
@@ -4176,6 +4198,10 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			d, err := s.resolveApplyTarget(tx, op.Name, op.Receiver, op.Module, op.File)
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("delete %s: not found", op.Name))
+				continue
+			}
+			if msg := unsupportedFieldOp(d.Kind, "delete"); msg != "" {
+				errors = append(errors, fmt.Sprintf("delete %s: %s", op.Name, msg))
 				continue
 			}
 			if err := tx.DeleteDefinition(d.ID); err != nil {
@@ -4760,6 +4786,9 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	d, err := s.resolveWriteTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
+	}
+	if msg := unsupportedFieldOp(d.Kind, "delete"); msg != "" {
+		return errResult(fmt.Errorf("%s", msg))
 	}
 
 	// #105 safe-delete: refuse when references remain unless caller
@@ -5854,6 +5883,9 @@ func (s *server) handlePatch(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	d, err := s.resolveWriteTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
+	}
+	if msg := unsupportedFieldOp(d.Kind, "patch"); msg != "" {
+		return errResult(fmt.Errorf("%s", msg))
 	}
 
 	if !strings.Contains(d.Body, args.OldName) {
@@ -7474,7 +7506,7 @@ func (s *server) handleInsertPrecondition(_ context.Context, req *sdkmcp.CallToo
 		return errResult(err)
 	}
 	snippet := fmt.Sprintf("if %s {\n\t%s\n}", args.Condition, args.Ret)
-	return s.applyEditTerse(sessionOf(req), d, "inserted precondition at entry", snippet, newBody)
+	return s.applyEditTerse(sessionOf(req), d, "insert-precondition", "inserted precondition at entry", snippet, newBody)
 }
 
 // handleAddImport adds a new import (with optional alias) to the given
@@ -7613,7 +7645,7 @@ func (s *server) handleRenameParam(_ context.Context, req *sdkmcp.CallToolReques
 	if idx := strings.Index(newBody, "\n"); idx > 0 {
 		snippet = newBody[:idx]
 	}
-	return s.applyEditTerse(sessionOf(req), d, action, snippet, newBody)
+	return s.applyEditTerse(sessionOf(req), d, "rename-param", action, snippet, newBody)
 }
 
 // handleWrapInDefer inserts a `defer <defer_body>` statement immediately
@@ -7648,7 +7680,7 @@ func (s *server) handleWrapInDefer(_ context.Context, req *sdkmcp.CallToolReques
 	}
 	action := fmt.Sprintf("inserted defer before stmt #%d", stmtIdx)
 	snippet := fmt.Sprintf("defer %s", args.DeferBody)
-	return s.applyEditTerse(sessionOf(req), d, action, snippet, newBody)
+	return s.applyEditTerse(sessionOf(req), d, "wrap-in-defer", action, snippet, newBody)
 }
 
 // handleReplaceSlice replaces the Nth (1-based) match of the given AST
@@ -7697,7 +7729,7 @@ func (s *server) handleReplaceSlice(_ context.Context, req *sdkmcp.CallToolReque
 		return errResult(err)
 	}
 	action := fmt.Sprintf("replaced %s #%d", args.Slice, index)
-	return s.applyEditTerse(sessionOf(req), d, action, args.New, newBody)
+	return s.applyEditTerse(sessionOf(req), d, "replace-slice", action, args.New, newBody)
 }
 
 // handleReplaceHunk replaces a byte-exact occurrence of `old` inside
@@ -7743,24 +7775,13 @@ func (s *server) handleReplaceHunk(_ context.Context, req *sdkmcp.CallToolReques
 	if args.Index > 0 {
 		action = fmt.Sprintf("replaced hunk #%d", args.Index)
 	}
-	return s.applyEditTerse(sessionOf(req), d, action, args.New, newBody)
+	return s.applyEditTerse(sessionOf(req), d, "replace-hunk", action, args.New, newBody)
 }
 
-// applyEditTerse is the projection-op response path: takes a computed
-// newBody + a compact human summary of what changed, does the same DB
-// write + build that handleEdit does, and returns a much tighter
-// response so the agent doesn't feel compelled to Read-verify.
-//
-// Format:
-//
-//	F: <action>
-//	    <snippet-line-1>
-//	    <snippet-line-2>
-//	build: ok
-//
-// Snippet is truncated to ~200 chars / ~6 lines. Skips the caller-count
-// FYI nudge that handleEdit prints (agents can ask for impact if they want).
-func (s *server) applyEditTerse(session *sdkmcp.ServerSession, d *store.Definition, action, snippet, newBody string) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) applyEditTerse(session *sdkmcp.ServerSession, d *store.Definition, op, action, snippet, newBody string) (*sdkmcp.CallToolResult, any, error) {
+	if msg := unsupportedFieldOp(d.Kind, op); msg != "" {
+		return errResult(fmt.Errorf("%s", msg))
+	}
 	// #edit-disambiguation dispatch (gemot): this used to re-resolve its
 	// target by bare name (GetDefinitionByName(name, "")), discarding
 	// the caller's already-disambiguated d and silently undoing whatever
@@ -9491,4 +9512,31 @@ func (s *server) handleFieldRename(d *store.Definition, args renameParam) (*sdkm
 		sb.WriteString(fmt.Sprintf("\nNote: %d local variable(s) named %q were preserved (not renamed).\n", totalSkipped, args.OldName))
 	}
 	return textResult(sb.String()), nil, nil
+}
+
+// unsupportedFieldOp returns a clear, actionable refusal message when op
+// cannot safely target a struct-field definition, or "" if op is fine.
+// Struct fields are excluded from emit by design (#11) -- a field only
+// exists as text inside its declaring type's Body, not as its own
+// top-level declaration -- so a write op that resolves a field as its
+// target and doesn't specifically know how to rewrite the parent type's
+// Body alongside it silently diverges the DB from the file instead of
+// failing loudly. Confirmed live for delete (DB row vanishes, struct
+// declaration on disk untouched, reports "Deleted" anyway), patch (body
+// text patched in the DB, never reaches disk, reports "Patched" anyway),
+// and move (deletes+reinserts under a different module, same disk gap
+// plus a receiver that no longer resolves in the target package). The
+// edit-shaped ops (edit, fragment edit, insert, and the projection ops
+// funneled through applyEditTerse) already fail safely today via their
+// own "does newBody parse as top-level Go" check -- a bare field
+// snippet essentially never does -- but that protection was incidental,
+// not a decision, so this makes the same refusal explicit and
+// consistent everywhere instead of leaving it to chance. rename is the
+// one op with real support: see handleFieldRename / handleApply's
+// field-rename branch, which rewrite the parent type's Body directly.
+func unsupportedFieldOp(kind, op string) string {
+	if kind != "field" || op == "rename" {
+		return ""
+	}
+	return fmt.Sprintf("code(op:%q) does not support struct fields directly -- a field only exists as text inside its declaring type's body, not as an independent declaration. Use code(op:\"rename\") to rename a field, or target the declaring type to change its shape.", op)
 }

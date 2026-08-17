@@ -9431,3 +9431,208 @@ func combine(a A, b B) bool {
 		t.Errorf("expected main.go to be byte-identical after a rolled-back rename, got:\n%s", raw)
 	}
 }
+
+// TestHandleApply_DeleteRefusesStructField mirrors
+// TestHandleDelete_RefusesStructField but through handleApply's inline
+// delete case, which re-implements handleDelete's logic rather than
+// calling it -- the same duplication that let the original field-rename
+// bug diverge between the two paths. Verifies the batch is rolled back
+// and reports the field-specific refusal rather than deleting the row.
+func TestHandleApply_DeleteRefusesStructField(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "fieldproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module fieldproj\n\ngo 1.26\n"), 0644)
+	const src = `package fieldproj
+
+type Opts struct {
+	Count bool
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{{Op: "delete", Name: "Count", Receiver: "Opts"}},
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "does not support struct fields") {
+		t.Errorf("expected a struct-field refusal message, got: %s", text)
+	}
+
+	if _, err := db.GetDefinitionByNameAndReceiver("Count", "fieldproj", "Opts"); err != nil {
+		t.Errorf("expected the field's DB row to still exist after the rolled-back apply, got: %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != src {
+		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
+	}
+}
+
+// TestHandleDelete_RefusesStructField is the regression for the bug the
+// op/kind policy layer was built to close: handleDelete had no
+// field-kind check at all, so deleting a struct field's DB row (via
+// DeleteDefinition) succeeded, reported "Deleted", and left the struct
+// declaration on disk completely untouched -- the field kept existing
+// in the emitted file with no corresponding DB row, silently diverging
+// the two. Verifies the op is now refused up front, before either the
+// DB row or the file is touched.
+func TestHandleDelete_RefusesStructField(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "fieldproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module fieldproj\n\ngo 1.26\n"), 0644)
+	const src = `package fieldproj
+
+type Opts struct {
+	Count bool
+	Other int
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleDelete(context.Background(), nil, nameParam{
+		Name:     "Count",
+		Receiver: "Opts",
+		Force:    true,
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "Deleted") {
+		t.Fatalf("expected delete to be refused, got: %s", text)
+	}
+	if !strings.Contains(text, "does not support struct fields") {
+		t.Errorf("expected a struct-field refusal message, got: %s", text)
+	}
+
+	if _, err := db.GetDefinitionByNameAndReceiver("Count", "fieldproj", "Opts"); err != nil {
+		t.Errorf("expected the field's DB row to still exist after the refused delete, got: %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != src {
+		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
+	}
+}
+
+// TestHandlePatch_RefusesStructField is the second confirmed silent-
+// corruption path found while scoping the op/kind policy layer:
+// handlePatch has no syntax-validation guard at all (unlike edit/
+// fragment-edit/insert), so patching a struct field's body text wrote
+// straight into the DB row via UpsertDefinition and reported success,
+// while the struct declaration on disk -- the actual source of truth
+// for emit, since fields are excluded from emit by design (#11) --
+// never changed.
+func TestHandlePatch_RefusesStructField(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "fieldproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module fieldproj\n\ngo 1.26\n"), 0644)
+	const src = `package fieldproj
+
+type Opts struct {
+	Count bool
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handlePatch(context.Background(), nil, codeParam{
+		Name:     "Count",
+		Receiver: "Opts",
+		OldName:  "Count",
+		NewName:  "CountX",
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "Patched") {
+		t.Fatalf("expected patch to be refused, got: %s", text)
+	}
+	if !strings.Contains(text, "does not support struct fields") {
+		t.Errorf("expected a struct-field refusal message, got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != src {
+		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
+	}
+}
+
+// TestUnsupportedFieldOp is the policy-layer table: struct fields are
+// excluded from emit by design (#11), so every write op that resolves a
+// field as its target must either know how to rewrite the parent type's
+// Body alongside it (today, only rename does) or refuse explicitly
+// instead of silently diverging the DB from the file. Locks in the
+// policy so a new op added later doesn't quietly reopen the gap.
+func TestUnsupportedFieldOp(t *testing.T) {
+	for _, op := range []string{"delete", "edit", "patch", "insert", "move", "insert-precondition", "replace-slice", "replace-hunk", "wrap-in-defer", "rename-param"} {
+		if msg := unsupportedFieldOp("field", op); msg == "" {
+			t.Errorf("unsupportedFieldOp(%q, %q) = \"\", want a refusal message", "field", op)
+		}
+	}
+	if msg := unsupportedFieldOp("field", "rename"); msg != "" {
+		t.Errorf("unsupportedFieldOp(field, rename) = %q, want \"\" (rename has real field support)", msg)
+	}
+	for _, kind := range []string{"func", "method", "type", "var", "const"} {
+		if msg := unsupportedFieldOp(kind, "delete"); msg != "" {
+			t.Errorf("unsupportedFieldOp(%q, delete) = %q, want \"\" (only field kind is restricted)", kind, msg)
+		}
+	}
+}

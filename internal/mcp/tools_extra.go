@@ -78,6 +78,9 @@ func (s *server) handleMove(_ context.Context, _ *sdkmcp.CallToolRequest, args m
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", args.Name))
 	}
+	if msg := unsupportedFieldOp(d.Kind, "move"); msg != "" {
+		return errResult(fmt.Errorf("%s", msg))
+	}
 
 	// Find target module by fuzzy match.
 	targetMod := s.findModule(args.ToModule)
