@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.60"
+const Version = "0.26.61"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -7921,16 +7921,28 @@ func (s *server) applyEditTerse(session *sdkmcp.ServerSession, d *store.Definiti
 		buildResult = s.commitOrRollbackOnBuild(tx, commit, rollback, opts)
 	}
 
-	if buildResult == "" {
-		// #160: fire-and-forget summary regeneration. Body changed → any
-		// existing summary is stale. Worker computes async; if the queue
-		// is full or backend unconfigured we drop silently (the summary
-		// is best-effort, next mutation re-enqueues).
-		s.enqueueSummary(d)
-		s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
+	recv := formatReceiver(d.Receiver)
+	if buildResult != "" {
+		// commitOrRollbackOnEmit/OnBuild's contract: any non-empty result
+		// means the WHOLE transaction was rolled back -- nothing landed.
+		// This used to build the same success-shaped "recv+name: action\n
+		// <snippet>" header regardless, then append "build: FAILED..." --
+		// reading as a success note with a build problem attached, not a
+		// rollback, unlike handleEdit/handleRename/handleFieldRename's
+		// consistent "X rolled back — nothing was saved" framing for the
+		// exact same contract. Match that framing here too instead of
+		// leaving this one write path worded differently for the same
+		// underlying event.
+		return textResult(fmt.Sprintf("%s%s: %s rolled back — nothing was saved\n\n%s", recv, d.Name, action, buildResult)), nil, nil
 	}
 
-	recv := formatReceiver(d.Receiver)
+	// #160: fire-and-forget summary regeneration. Body changed → any
+	// existing summary is stale. Worker computes async; if the queue
+	// is full or backend unconfigured we drop silently (the summary
+	// is best-effort, next mutation re-enqueues).
+	s.enqueueSummary(d)
+	s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
+
 	var sb strings.Builder
 	sb.WriteString(recv)
 	sb.WriteString(d.Name)
@@ -7947,23 +7959,12 @@ func (s *server) applyEditTerse(session *sdkmcp.ServerSession, d *store.Definiti
 			sb.WriteString("\n")
 		}
 	}
-	if buildResult != "" {
-		// #244: previously kept only the first line of buildResult,
-		// discarding the actual compiler diagnostics (file/line, the
-		// undefined symbol, etc.) that handleEdit's failure path shows
-		// in full -- forcing an agent to blind-guess or fall back to
-		// the verbose edit op whenever a projection-op edit failed to
-		// build. Write the full result, matching handleEdit.
-		sb.WriteString("build: ")
-		sb.WriteString(buildResult)
-		sb.WriteString("\n")
-	}
 	// #158: nudge apply-batching after N serial mutations to one file.
 	// hint returns "" when session is nil (Measure* paths) or under threshold.
 	if s.hint != nil {
 		sb.WriteString(s.hint.note(session, d.SourceFile))
 	}
-	if buildResult == "" && !d.Test {
+	if !d.Test {
 		sb.WriteString(s.testCoverageHint(d.ModuleID, d.SourceFile))
 	}
 	return textResult(sb.String()), nil, nil
@@ -9664,6 +9665,27 @@ func (s *server) methodRenameRisksInterfaceBreak(tx store.Backend, d *store.Defi
 	if d.Kind != "method" || d.Receiver == "" {
 		return false
 	}
+	// commonStdlibInterfaceMethodNames stopgap: resolve()'s "implements"
+	// ref-graph edges only cover interfaces declared in the PROJECT's own
+	// packages (ifacesByPkg is built exclusively from the ./... package
+	// set) -- an interface from an external/stdlib package like io.Reader
+	// is never a candidate, even though go/packages.Load already has its
+	// type info loaded via NeedDeps, so no "implements" edge is ever
+	// staged for it. Confirmed live: renaming (Foo).Read to (Foo).ReadX
+	// where Foo satisfies io.Reader (via `func use() io.Reader { return
+	// Foo{} }`, no local interface involved at all) found zero implements
+	// edges below and reported clean success while shipping
+	// "Foo does not implement io.Reader (missing method Read)". The
+	// principled fix -- scanning imported external packages' interfaces
+	// too, with a synthetic identity for edges that have no local def-ID
+	// -- is real resolve.go/schema work, out of scope here. This is a
+	// deliberately small, conservative name-based allowlist covering the
+	// handful of single-method stdlib interfaces most likely to actually
+	// be satisfied by a project type -- it does NOT catch a custom
+	// interface from a third-party dependency, only these common ones.
+	if commonStdlibInterfaceMethodNames[oldName] {
+		return true
+	}
 	recvName := strings.TrimPrefix(d.Receiver, "*")
 	mp := s.modulePath(d.ModuleID)
 	recvType, err := tx.GetDefinitionByName(recvName, mp)
@@ -9688,4 +9710,33 @@ func (s *server) methodRenameRisksInterfaceBreak(tx store.Backend, d *store.Defi
 		}
 	}
 	return false
+}
+
+// commonStdlibInterfaceMethodNames is the deliberately small,
+// conservative name allowlist methodRenameRisksInterfaceBreak falls
+// back to when no local "implements" edge is found -- see its doc
+// comment for why resolve()'s ref-graph is structurally blind to
+// external/stdlib interfaces. These are the single-method (or
+// small-method-set, checked via the method's own name here) stdlib
+// interfaces most likely in practice to be satisfied by a project
+// type: io.Reader/Writer/Closer, fmt.Stringer, the error interface,
+// sort.Interface, http.Handler, and the common (Un)Marshal family. Not
+// exhaustive by design -- it does not, and cannot, catch a custom
+// interface from a third-party dependency; that needs the real
+// resolve.go-level fix (scanning imported external packages'
+// interfaces too), not a name list.
+var commonStdlibInterfaceMethodNames = map[string]bool{
+	"Read":          true,
+	"Write":         true,
+	"Close":         true,
+	"String":        true,
+	"Error":         true,
+	"Len":           true,
+	"Less":          true,
+	"Swap":          true,
+	"ServeHTTP":     true,
+	"MarshalJSON":   true,
+	"UnmarshalJSON": true,
+	"MarshalText":   true,
+	"UnmarshalText": true,
 }
