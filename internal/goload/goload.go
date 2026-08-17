@@ -4,17 +4,45 @@ package goload
 
 import (
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"golang.org/x/tools/go/packages"
 )
 
-// LoadAll loads every Go package in dir (module-wide, "./...") with
-// the superset of modes needed by both ingest and resolve. LoadAll is
-// LoadPattern with pattern "./..." -- see LoadPattern's doc for the
-// scoped-pattern use case.
+// LoadAll is LoadPattern with pattern "./..." (see LoadPattern's doc
+// for the scoped-pattern use case), PLUS every nested Go module found
+// under dir (see discoverNestedModuleDirs) -- "./..." never crosses a
+// nested go.mod boundary, so a plain single LoadPattern call silently
+// misses every nested module's packages entirely, not just filters
+// them out. Each nested module's own packages.Load is best-effort: a
+// broken/incomplete nested module (network-gated deps, a stray
+// experimental go.mod, etc.) is skipped with a warning rather than
+// failing the whole ingest over one subtree.
 func LoadAll(dir string) ([]*packages.Package, error) {
-	return LoadPattern(dir, "./...")
+	pkgs, err := LoadPattern(dir, "./...")
+	if err != nil {
+		return nil, err
+	}
+	nested, derr := discoverNestedModuleDirs(dir)
+	if derr != nil {
+		// Discovery is a plain filesystem walk with no packages.Load
+		// cost -- a failure here (e.g. permission error) shouldn't sink
+		// an otherwise-successful root ingest.
+		fmt.Fprintf(os.Stderr, "goload: warning: nested module discovery failed: %v\n", derr)
+		return pkgs, nil
+	}
+	for _, nd := range nested {
+		nestedPkgs, nerr := LoadPattern(nd, "./...")
+		if nerr != nil {
+			fmt.Fprintf(os.Stderr, "goload: warning: skipping nested module %s: %v\n", nd, nerr)
+			continue
+		}
+		pkgs = append(pkgs, nestedPkgs...)
+	}
+	return pkgs, nil
 }
 
 // FilterPackages removes synthetic test binaries and deduplicates packages
@@ -78,4 +106,53 @@ func LoadPattern(dir, pattern string) ([]*packages.Package, error) {
 		return nil, fmt.Errorf("load packages: %w", err)
 	}
 	return pkgs, nil
+}
+
+// discoverNestedModuleDirs walks rootDir for subdirectories containing
+// their own go.mod -- separate Go modules nested inside the project
+// (common in real multi-module repos: etcd's server/, tests/, client/v3
+// etc. each declare their own module, whether or not a go.work ties
+// them together). "./..." package-pattern expansion never crosses a
+// nested go.mod boundary -- that's standard go/packages behavior, not
+// a defn bug, but it means a plain LoadAll(rootDir) silently indexes
+// ONLY the root module. A real etcd bench trajectory (2026-08:
+// etcd-io/etcd#20929) hit this directly: the entire tests/ module
+// (tests/go.mod, declaring go.etcd.io/etcd/tests/v3) had zero
+// definitions in the database despite a full `defn ingest .` having
+// supposedly completed -- search/overview/sync all correctly reported
+// "not found" for real, existing code because it was never ingested in
+// the first place, not because of any per-op lookup bug. The agent
+// burned its entire turn budget searching exhaustively and guessing
+// file paths before giving up, having never had a chance to succeed.
+//
+// Mirrors cmd/defn's walkGoFiles skip-dir set. Root-relative go.mod
+// (rootDir itself) is excluded -- callers already load that via their
+// own LoadPattern(rootDir, "./...") call.
+func discoverNestedModuleDirs(rootDir string) ([]string, error) {
+	var nested []string
+	err := filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			return nil
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if name == ".defn" || name == ".git" || name == "vendor" ||
+			name == "node_modules" || name == "testdata" {
+			return filepath.SkipDir
+		}
+		if path == rootDir {
+			return nil
+		}
+		if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
+			nested = append(nested, path)
+			return filepath.SkipDir // a module's own go.mod may itself have nested modules; a future pass, not needed for any real repo seen so far
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return nested, nil
 }
