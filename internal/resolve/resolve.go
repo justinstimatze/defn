@@ -432,19 +432,38 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 			for _, decl := range file.Decls {
 				switch d := decl.(type) {
 				case *ast.FuncDecl:
-					if d.Body == nil {
-						continue
-					}
 					fromID := lookupFuncDefID(db, pkgPath, d, cache)
 					if fromID <= 0 {
 						continue
 					}
-					refs, litFields := collectRefs(d.Body, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls, db, cache)
-					if len(refs) > 0 {
-						defRefs[fromID] = append(defRefs[fromID], refs...)
+					// Collect refs from the signature (parameter/return
+					// types) AND the body. Both contribute to the same
+					// fromID; accumulate and flush once so the second
+					// collectRefs call doesn't wipe the first -- same
+					// pattern ValueSpec already uses for its value+type.
+					// Without this, a type used ONLY in a parameter or
+					// return type (never instantiated inside the body)
+					// was entirely invisible to GetCallers/impact --
+					// confirmed live via the mutation fuzzer: renaming an
+					// interface used only as `func F(g Greeter) ...`'s
+					// parameter type reported "Updated 0 callers" and
+					// left the now-undefined old name behind in F's
+					// signature, silently shipping a broken build.
+					var nodes []ast.Node
+					if d.Type != nil {
+						nodes = append(nodes, d.Type)
 					}
-					if len(litFields) > 0 {
-						defLitFields[fromID] = append(defLitFields[fromID], litFields...)
+					if d.Body != nil {
+						nodes = append(nodes, d.Body)
+					}
+					for _, node := range nodes {
+						refs, litFields := collectRefs(node, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls, db, cache)
+						if len(refs) > 0 {
+							defRefs[fromID] = append(defRefs[fromID], refs...)
+						}
+						if len(litFields) > 0 {
+							defLitFields[fromID] = append(defLitFields[fromID], litFields...)
+						}
 					}
 
 				case *ast.GenDecl:

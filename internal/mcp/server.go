@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.61"
+const Version = "0.26.62"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -3220,19 +3220,31 @@ func (s *server) handleInsert(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	d.Signature = extractSignature(newBody)
 	recv := formatReceiver(d.Receiver)
 
-	if _, err := s.backend.UpsertDefinition(d); err != nil {
+	// #12-class gap: this used to write straight to s.backend with no
+	// transaction at all, same shape as handleMove/handlePatch/
+	// handleRetargetFieldValue before their own #12 fixes -- a build
+	// failure after the write still left the DB durably mutated with
+	// nothing to show for it on disk.
+	tx, commit, rollback, txErr := s.backend.Begin()
+	if txErr != nil {
+		return errResult(txErr)
+	}
+	defer rollback()
+	if _, err := tx.UpsertDefinition(d); err != nil {
 		return errResult(err)
 	}
 
-	buildResult := s.autoEmitAndBuildForFile(d.SourceFile)
+	var opts emit.Opts
+	if d.SourceFile != "" {
+		opts = emit.Opts{GoimportsFiles: []string{d.SourceFile}, TouchedFiles: []string{d.SourceFile}}
+	}
+	buildResult := s.commitOrRollbackOnBuild(tx, commit, rollback, opts)
+	if buildResult != "" {
+		return textResult(fmt.Sprintf("insert into %s%s rolled back — nothing was saved\n\n%s", recv, d.Name, buildResult)), nil, nil
+	}
 	s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
 
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Inserted into %s%s\n", recv, d.Name))
-	if buildResult != "" {
-		sb.WriteString("\n" + buildResult)
-	}
-	return textResult(sb.String()), nil, nil
+	return textResult(fmt.Sprintf("Inserted into %s%s\n", recv, d.Name)), nil, nil
 }
 
 func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args createParam) (*sdkmcp.CallToolResult, any, error) {
@@ -4613,16 +4625,6 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	return textResult(sb.String()), nil, nil
 }
 
-// handleRetargetFieldValue rewrites composite-literal field values across
-// every def whose body contains a matching pattern. Winze use case: given
-// `Claim{Subject: "s", Object: "OldTarget"}` var-decls scattered across
-// many files, change every `Object: "OldTarget"` to `Object: "NewTarget"`
-// atomically. Native equivalent is `sed -i 's/Object: "OldTarget"/Object:
-// "NewTarget"/g'` + pray no unrelated occurrence collides — AST-safe here.
-//
-// MVP scope: matches Type{...Field: OLD...} where Field's value is a
-// string literal. Non-string values (idents, other composites) skipped;
-// return count reports affected defs so the model knows how much moved.
 func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	if args.Name == "" || args.Field == "" {
 		return errResult(fmt.Errorf("retarget-field-value: name (struct type) and field are required"))
@@ -4633,11 +4635,22 @@ func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolR
 	typeName := args.Name
 	field := args.Field
 
-	// Iterate all modules → all defs. Load once, filter AST-side.
 	mods, err := s.backend.ListModules()
 	if err != nil {
 		return errResult(fmt.Errorf("list modules: %w", err))
 	}
+
+	// #12-class gap: this used to loop over every module writing straight
+	// to s.backend with no transaction at all -- potentially dozens of
+	// UpsertDefinition calls with zero atomicity, so a build failure after
+	// the loop left an arbitrary PARTIAL subset of them durably committed
+	// with nothing on disk to show for it.
+	tx, commit, rollback, txErr := s.backend.Begin()
+	if txErr != nil {
+		return errResult(txErr)
+	}
+	defer rollback()
+
 	updated := 0
 	var affectedNames []string
 	// #109 pass 2: collect the (file, modulePath) tuples we touched so
@@ -4650,7 +4663,7 @@ func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolR
 	}
 	touched := make(map[filePkg]bool)
 	for _, m := range mods {
-		defs, err := s.backend.GetModuleDefinitions(m.ID)
+		defs, err := tx.GetModuleDefinitions(m.ID)
 		if err != nil {
 			continue
 		}
@@ -4661,7 +4674,7 @@ func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolR
 			}
 			d.Body = newBody
 			d.Signature = extractSignature(newBody)
-			if _, err := s.backend.UpsertDefinition(&d); err != nil {
+			if _, err := tx.UpsertDefinition(&d); err != nil {
 				return errResult(fmt.Errorf("update %s: %w", d.Name, err))
 			}
 			updated++
@@ -4681,10 +4694,14 @@ func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolR
 	for fp := range touched {
 		goimportsFiles = append(goimportsFiles, fp.file)
 	}
-	buildResult := s.autoEmitAndBuildWithOpts(emit.Opts{
+	buildResult := s.commitOrRollbackOnBuild(tx, commit, rollback, emit.Opts{
 		GoimportsFiles: goimportsFiles,
 		TouchedFiles:   goimportsFiles,
 	})
+	if buildResult != "" {
+		return textResult(fmt.Sprintf("retarget-field-value %s.%s rolled back — nothing was saved\n\n%s", typeName, field, buildResult)), nil, nil
+	}
+
 	// Scoped resolve: iterate the unique touched files instead of the
 	// whole project. Safety valve: if we couldn't collect any touched
 	// files (e.g., every def had empty SourceFile — shouldn't happen),
@@ -4706,9 +4723,6 @@ func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolR
 			suffix = fmt.Sprintf(" (+%d more)", updated-len(affectedNames))
 		}
 		sb.WriteString("  Affected: " + strings.Join(affectedNames, ", ") + suffix + "\n")
-	}
-	if buildResult != "" {
-		sb.WriteString("\n" + buildResult)
 	}
 	return textResult(sb.String()), nil, nil
 }
@@ -4996,6 +5010,9 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		return errResult(fmt.Errorf("get callers for rename: %w", err))
 	}
 	touchedFiles := map[string]bool{}
+	var allowedRemovals, allowedAdds []string
+	allowedRemovals = append(allowedRemovals, qualifiedOld)
+	allowedAdds = append(allowedAdds, emit.FuncIdentity(args.NewName, d.Receiver))
 	if d.SourceFile != "" {
 		touchedFiles[d.SourceFile] = true
 	}
@@ -5015,6 +5032,57 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 			updated++
 		}
 	}
+
+	// A type's methods are declared elsewhere as their OWN top-level
+	// definitions with the type name stored as a free-text Receiver
+	// string ("*Widget"), not as a refs-graph edge into the type's def
+	// -- GetCallers above never surfaces them. Renaming the type without
+	// also rewriting every method's receiver clause left them pointing
+	// at a type name that no longer existed, in a file rename never even
+	// touched, while still reporting success (#148-class bug: found via
+	// the mutation fuzzer after widening it to include type kinds).
+	// Bounded and cheap: methods can only be declared in the SAME
+	// package as their receiver type, so this is one same-module scan,
+	// not a project-wide search.
+	updatedReceivers := 0
+	if d.Kind == "type" {
+		siblings, sErr := tx.GetModuleDefinitions(d.ModuleID)
+		if sErr == nil {
+			for _, m := range siblings {
+				if m.Kind != "method" || m.ID == originalID {
+					continue
+				}
+				if strings.TrimPrefix(m.Receiver, "*") != oldBareName {
+					continue
+				}
+				oldRecv := m.Receiver
+				newRecv := args.NewName
+				if strings.HasPrefix(oldRecv, "*") {
+					newRecv = "*" + args.NewName
+				}
+				newMethodBody, mSkipped := astRename(m.Body, oldBareName, args.NewName)
+				totalSkipped += mSkipped
+				newMethodSig := extractSignature(newMethodBody)
+				// UpdateDefinitionReceiver, not UpsertDefinition: receiver
+				// is part of the natural key, so upserting a Definition
+				// whose Receiver field already changed would insert a
+				// second row instead of updating this one in place (see
+				// its doc comment -- caught live via the mutation fuzzer
+				// reporting an "unmatched want" for the OLD receiver
+				// identity, meaning the stale row was still there).
+				if err := tx.UpdateDefinitionReceiver(m.ID, newRecv, newMethodBody, newMethodSig); err != nil {
+					return errResult(fmt.Errorf("update method %s%s receiver: %w", oldRecv, m.Name, err))
+				}
+				allowedRemovals = append(allowedRemovals, emit.FuncIdentity(m.Name, oldRecv))
+				allowedAdds = append(allowedAdds, emit.FuncIdentity(m.Name, newRecv))
+				if m.SourceFile != "" {
+					touchedFiles[m.SourceFile] = true
+				}
+				updatedReceivers++
+			}
+		}
+	}
+
 	goimportsFiles := make([]string, 0, len(touchedFiles))
 	for f := range touchedFiles {
 		goimportsFiles = append(goimportsFiles, f)
@@ -5024,13 +5092,13 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// both so the merge can splice in-place (old name removed, new
 	// name spliced) instead of leaving the new name behind as drift.
 	opts := emit.Opts{
-		AllowedRemovals: []string{qualifiedOld},
-		AllowedAdds:     []string{emit.FuncIdentity(args.NewName, d.Receiver)},
+		AllowedRemovals: allowedRemovals,
+		AllowedAdds:     allowedAdds,
 		GoimportsFiles:  goimportsFiles,
 		TouchedFiles:    goimportsFiles,
 	}
 	var buildResult string
-	if riskyInterfaceRename {
+	if riskyInterfaceRename || updatedReceivers > 0 {
 		buildResult = s.commitOrRollbackOnBuild(tx, commit, rollback, opts)
 	} else {
 		// #148: rename is dispatch-safe by construction for the ref
@@ -5078,6 +5146,9 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Renamed %s → %s\n", args.OldName, args.NewName))
 	sb.WriteString(fmt.Sprintf("Updated %d callers\n", updated))
+	if updatedReceivers > 0 {
+		sb.WriteString(fmt.Sprintf("Updated %d method receiver(s)\n", updatedReceivers))
+	}
 	if totalSkipped > 0 {
 		sb.WriteString(fmt.Sprintf("\nNote: %d local variable(s) named %q were preserved (not renamed).\n", totalSkipped, args.OldName))
 	}
@@ -5946,19 +6017,28 @@ func (s *server) handlePatch(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	d.Body = strings.Replace(d.Body, args.OldName, args.NewName, 1)
 	d.Signature = extractSignature(d.Body)
 
-	if _, err := s.backend.UpsertDefinition(d); err != nil {
+	// #12-class gap: see handleInsert's comment -- this handler had the
+	// same unprotected direct-to-s.backend write.
+	tx, commit, rollback, txErr := s.backend.Begin()
+	if txErr != nil {
+		return errResult(txErr)
+	}
+	defer rollback()
+	if _, err := tx.UpsertDefinition(d); err != nil {
 		return errResult(err)
 	}
 
-	buildResult := s.autoEmitAndBuildForFile(d.SourceFile)
+	var opts emit.Opts
+	if d.SourceFile != "" {
+		opts = emit.Opts{GoimportsFiles: []string{d.SourceFile}, TouchedFiles: []string{d.SourceFile}}
+	}
+	buildResult := s.commitOrRollbackOnBuild(tx, commit, rollback, opts)
+	if buildResult != "" {
+		return textResult(fmt.Sprintf("patch %s rolled back — nothing was saved\n\n%s", args.Name, buildResult)), nil, nil
+	}
 	s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
 
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Patched %s: replaced %q → %q\n", args.Name, args.OldName, args.NewName))
-	if buildResult != "" {
-		sb.WriteString("\n" + buildResult)
-	}
-	return textResult(sb.String()), nil, nil
+	return textResult(fmt.Sprintf("Patched %s: replaced %q → %q\n", args.Name, args.OldName, args.NewName)), nil, nil
 }
 
 // astRename renames identifiers in Go source using go/parser.

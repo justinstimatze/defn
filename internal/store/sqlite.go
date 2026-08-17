@@ -2716,3 +2716,22 @@ func (s *SQLiteDB) ListFileSourceNames(moduleID int64) ([]string, error) {
 	}
 	return out, rows.Err()
 }
+
+func (s *SQLiteDB) UpdateDefinitionReceiver(id int64, newReceiver, newBody, newSignature string) error {
+	hash := HashBody(newBody)
+	ctx := s.Ctx()
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE definitions
+		 SET receiver = ?, signature = ?, hash = ?
+		 WHERE id = ?`,
+		newReceiver, newSignature, hash, id,
+	); err != nil {
+		return fmt.Errorf("sqlite: update definition receiver: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE bodies SET body = ? WHERE def_id = ?`, newBody, id,
+	); err != nil {
+		return fmt.Errorf("sqlite: update receiver body: %w", err)
+	}
+	return nil
+}

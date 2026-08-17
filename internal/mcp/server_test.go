@@ -1784,6 +1784,8 @@ type Claim struct {
 var C1 = Claim{Subject: "s1", Object: "OldTarget"}
 var C2 = Claim{Subject: "s2", Object: "OldTarget"}
 var C3 = Claim{Subject: "s3", Object: "Different"}
+
+func main() {}
 `), 0644)
 	if err := ingest.Ingest(db, projDir); err != nil {
 		t.Fatal("ingest:", err)

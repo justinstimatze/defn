@@ -56,6 +56,17 @@ type Backend interface {
 	UpsertDefinitionsBulk(defs []*Definition) ([]int64, error)
 	DeleteDefinition(id int64) error
 	RenameDefinition(id int64, newName, newBody, newSignature string, exported bool) error
+	// UpdateDefinitionReceiver rewrites a method's receiver clause (plus
+	// the body/signature an AST rename of the old receiver identifier
+	// necessarily also touches) by ID. UpsertDefinition can't be reused
+	// for this: receiver is part of the natural key (module_id, name,
+	// kind, receiver, test, source_file) -- writing a Definition whose
+	// Receiver field already changed just INSERTS a second row under the
+	// new key instead of updating the existing one in place, silently
+	// orphaning the original (confirmed live: a type rename that also
+	// tried to repoint its methods' receivers via UpsertDefinition left
+	// both the stale-receiver and new-receiver rows in the DB at once).
+	UpdateDefinitionReceiver(id int64, newReceiver, newBody, newSignature string) error
 	PruneStaleDefinitions(liveIDs map[int64]bool) (int, error)
 
 	// References / call graph

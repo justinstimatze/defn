@@ -372,4 +372,54 @@ func use() int {
 		op:          codeParam{Op: "rename", OldName: "Compute", NewName: "ComputeX", Receiver: "Foo"},
 		wantSuccess: true,
 	},
+	{
+		// Regression for a bug the mutation fuzzer found after being
+		// widened to include type-kind defs: renaming a TYPE never
+		// updated its methods' receiver clauses at all, since a method's
+		// receiver is a free-text field on the method's OWN Definition
+		// row, not a refs-graph edge GetCallers would surface. defn
+		// reported success while leaving "func (w *Widget) MethodA()"
+		// on disk pointing at a type name that no longer existed.
+		name: "type_rename_updates_method_receiver_succeeds",
+		fixture: `package proj
+
+type Widget struct {
+	N int
+}
+
+func (w *Widget) Double() int {
+	return w.N * 2
+}
+
+func use() int {
+	w := Widget{N: 1}
+	return w.Double()
+}
+`,
+		op:          codeParam{Op: "rename", OldName: "Widget", NewName: "WidgetV2"},
+		wantSuccess: true,
+	},
+	{
+		// Regression the mutation fuzzer found (corpus entry
+		// 04f64e9f0f97f1e0) after the interface_satisfaction hazard was
+		// added: resolve()'s FuncDecl reference pass only ever scanned
+		// d.Body, never d.Type (the parameter/return type list) -- a
+		// type used ONLY in a signature (never instantiated inside the
+		// body) was invisible to GetCallers. Renaming Greeter here used
+		// to report "Updated 0 callers" and leave UseGreeter's parameter
+		// type referencing the now-undefined old name.
+		name: "type_rename_updates_signature_only_reference_succeeds",
+		fixture: `package proj
+
+type Greeter interface {
+	Greet() string
+}
+
+func UseGreeter(g Greeter) string {
+	return g.Greet()
+}
+`,
+		op:          codeParam{Op: "rename", OldName: "Greeter", NewName: "GreeterV2"},
+		wantSuccess: true,
+	},
 }
