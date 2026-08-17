@@ -567,7 +567,7 @@ func ingestFunc(db store.Backend, fset *token.FileSet, mod *store.Module, file *
 
 	var receiver string
 	if fn.Recv != nil && len(fn.Recv.List) > 0 {
-		receiver = typeString(fn.Recv.List[0].Type)
+		receiver = receiverTypeName(fn.Recv.List[0].Type)
 	}
 
 	kind := "function"
@@ -836,4 +836,31 @@ type structFieldCtx struct {
 	isTest     bool
 	sourceFile string
 	state      *ingestState
+}
+
+// receiverTypeName extracts a method's receiver type name for storage in
+// Definition.Receiver, stripping pointer and generic type-param syntax
+// down to the bare type name -- mirrors emit.recvTypeName exactly, which
+// every receiver-qualified lookup downstream (GetDefinitionByNameAndReceiver,
+// resolve.go's method lookups keyed off concrete.Obj().Name(), FuncIdentity
+// matching during emit) already assumes a bare name for. typeString (used
+// for composite-literal types, where the full "Stack[T]" form is correct)
+// is the wrong tool here: its *ast.IndexExpr case renders the full
+// bracketed form, and it has no case at all for *ast.IndexListExpr (2+
+// type params, e.g. Pair[K, V]) -- falling through to the literal string
+// "<unknown>", corrupting Receiver for every method on such a type from
+// ingest time onward. Confirmed live: func (p *Pair[K, V]) Swap() stored
+// Receiver == "*<unknown>".
+func receiverTypeName(e ast.Expr) string {
+	switch t := e.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.StarExpr:
+		return "*" + receiverTypeName(t.X)
+	case *ast.IndexExpr:
+		return receiverTypeName(t.X)
+	case *ast.IndexListExpr:
+		return receiverTypeName(t.X)
+	}
+	return ""
 }

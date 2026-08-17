@@ -227,15 +227,7 @@ func funcNameKindReceiver(d *ast.FuncDecl) (name, kind, receiver string) {
 	if d.Recv == nil || len(d.Recv.List) == 0 {
 		return d.Name.Name, "function", ""
 	}
-	recv := ""
-	switch t := d.Recv.List[0].Type.(type) {
-	case *ast.Ident:
-		recv = t.Name
-	case *ast.StarExpr:
-		if id, ok := t.X.(*ast.Ident); ok {
-			recv = "*" + id.Name
-		}
-	}
+	recv := receiverExprName(d.Recv.List[0].Type)
 	recvBase := strings.TrimPrefix(recv, "*")
 	return recvBase + "." + d.Name.Name, "method", recv
 }
@@ -262,4 +254,24 @@ func extractSignature(fset *token.FileSet, d *ast.FuncDecl) string {
 		return strings.TrimSpace(full[:idx])
 	}
 	return strings.TrimSpace(full)
+}
+
+// receiverExprName mirrors internal/ingest's receiverTypeName and
+// internal/emit's recvTypeName: strips pointer and generic type-param
+// syntax down to the bare receiver type name. The previous inline
+// switch here only matched *ast.Ident directly under *ast.StarExpr, so
+// a generic receiver like *Stack[T] (an *ast.IndexExpr, not *ast.Ident,
+// under the StarExpr) silently produced an empty receiver.
+func receiverExprName(e ast.Expr) string {
+	switch t := e.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.StarExpr:
+		return "*" + receiverExprName(t.X)
+	case *ast.IndexExpr:
+		return receiverExprName(t.X)
+	case *ast.IndexListExpr:
+		return receiverExprName(t.X)
+	}
+	return ""
 }
