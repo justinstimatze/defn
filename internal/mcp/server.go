@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.59"
+const Version = "0.26.60"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -2502,6 +2502,23 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 	recv := formatReceiver(d.Receiver)
 
 	sigStable := oldSignature == d.Signature
+	// extractSignature's *ast.TypeSpec case collapses to just "type
+	// <Name>" regardless of the type's actual shape -- it can't tell a
+	// struct/interface whose fields or methods changed from one that
+	// didn't, so the plain signature-string comparison above is always
+	// true for a type/interface-kind edit no matter what changed inside.
+	// Confirmed live: removing a method from an interface, or a field
+	// from a struct, via this exact edit path reported "Updated X" and
+	// wrote it to disk while every caller/composite-literal still
+	// referencing the removed member no longer compiled -- with zero
+	// warning, since sigStable routed it through the no-build-gate fast
+	// path. For these two kinds the whole body IS the shape (there's no
+	// meaningful body/signature split the way a func has), so only a
+	// byte-identical body is provably safe to fast-path; any real change
+	// forces the real build gate below.
+	if d.Kind == "type" || d.Kind == "interface" {
+		sigStable = oldBody == args.NewBody
+	}
 	var buildResult string
 	if sigStable {
 		opts := emit.Opts{}
@@ -7855,9 +7872,19 @@ func (s *server) applyEditTerse(session *sdkmcp.ServerSession, d *store.Definiti
 	// -- same distinction handleEdit already draws for its own body/sig
 	// split.
 	oldSignature := extractSignature(d.Body)
+	oldBody := d.Body
 	d.Body = newBody
 	d.Signature = extractSignature(newBody)
 	sigStable := oldSignature == d.Signature
+	// See handleEdit's identical guard: extractSignature's *ast.TypeSpec
+	// case collapses to "type <Name>" regardless of shape, so it can't
+	// tell a struct/interface body change from a no-op for a type/
+	// interface-kind target (e.g. a replace-hunk landing directly on an
+	// interface's method list). Only a byte-identical body is provably
+	// safe to fast-path for these two kinds.
+	if d.Kind == "type" || d.Kind == "interface" {
+		sigStable = oldBody == newBody
+	}
 
 	// #12: write and emit-gate through a transaction so a failure leaves
 	// neither the DB nor the file changed -- this was missed when #12

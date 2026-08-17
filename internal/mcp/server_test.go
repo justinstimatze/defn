@@ -9913,3 +9913,185 @@ func use() int {
 		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
 	}
 }
+
+// TestHandleEdit_InterfaceMethodRemovalGatesOnRealBuild is the
+// regression for the highest-leverage bug found this session:
+// extractSignature's *ast.TypeSpec case collapses to just "type
+// <Name>" regardless of the type's actual shape, so handleEdit's
+// oldSignature==newSignature sig-stable check was always true for a
+// type/interface-kind edit no matter what changed inside the braces.
+// Removing a method from an interface via the single most commonly
+// used write op reported "Updated Reader" as a clean success and
+// wrote it to disk while a caller still invoking that method no
+// longer compiled, with zero warning. Verifies this now gates on a
+// real build and rolls back cleanly with the actual diagnostic.
+func TestHandleEdit_InterfaceMethodRemovalGatesOnRealBuild(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "ifaceproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module ifaceproj\n\ngo 1.26\n"), 0644)
+	const src = `package ifaceproj
+
+type Reader interface {
+	Bar() int
+	Qux() string
+}
+
+func use(r Reader) string {
+	return r.Qux()
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleEdit(context.Background(), nil, editParam{
+		Name:    "Reader",
+		NewBody: "type Reader interface {\n\tBar() int\n}",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "rolled back") {
+		t.Fatalf("expected the edit to be rolled back, got: %s", text)
+	}
+	if !strings.Contains(text, "Qux undefined") {
+		t.Errorf("expected the real compiler diagnostic, got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != src {
+		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
+	}
+}
+
+// TestHandleEdit_StructFieldRemovalGatesOnRealBuild is the struct-kind
+// variant of TestHandleEdit_InterfaceMethodRemovalGatesOnRealBuild --
+// same extractSignature blind spot, this time removing a struct field
+// still referenced by a composite literal elsewhere.
+func TestHandleEdit_StructFieldRemovalGatesOnRealBuild(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "structproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module structproj\n\ngo 1.26\n"), 0644)
+	const src = `package structproj
+
+type Opts struct {
+	Count int
+}
+
+func use() Opts {
+	return Opts{Count: 5}
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleEdit(context.Background(), nil, editParam{
+		Name:    "Opts",
+		NewBody: "type Opts struct {\n}",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "rolled back") {
+		t.Fatalf("expected the edit to be rolled back, got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != src {
+		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
+	}
+}
+
+// TestHandleReplaceHunk_InterfaceMethodRemovalGatesOnRealBuild covers
+// the same extractSignature blind spot via applyEditTerse (the shared
+// response path for the 5 projection ops), confirming replace-hunk
+// landing directly on an interface's method list also gates on a real
+// build now instead of the sig-stable fast path.
+func TestHandleReplaceHunk_InterfaceMethodRemovalGatesOnRealBuild(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "ifaceproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module ifaceproj\n\ngo 1.26\n"), 0644)
+	const src = `package ifaceproj
+
+type Reader interface {
+	Bar() int
+	Qux() string
+}
+
+func use(r Reader) string {
+	return r.Qux()
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleReplaceHunk(context.Background(), nil, codeParam{
+		Name: "Reader",
+		Old:  "Bar() int\n\tQux() string",
+		New:  "Bar() int",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "BUILD FAILED") {
+		t.Fatalf("expected the build failure to be surfaced, got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != src {
+		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
+	}
+}
