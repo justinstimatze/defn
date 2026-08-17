@@ -9788,3 +9788,128 @@ func use(r Reader) int {
 		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
 	}
 }
+
+// TestHandleReplaceHunk_SignatureTypeChangeGatesOnRealBuild is the
+// regression for a live-confirmed bug: applyEditTerse (the shared
+// response path for all 5 projection ops) assumed every projection op
+// is "AST-guaranteed sig-stable" and unconditionally skipped the build
+// gate. That's true for insert-precondition/wrap-in-defer (body-
+// statement-only) and rename-param (renames an identifier, never a
+// type), but replace-hunk is deliberately content-addressed and
+// kind-agnostic -- it can target a function's own signature line
+// directly. Renaming a parameter's TYPE (not its name/receiver, so the
+// existing identity check never fires) reported "replaced hunk" as a
+// clean success while shipping a caller that no longer type-checks.
+// Verifies this now gates on a real build and rolls back cleanly.
+func TestHandleReplaceHunk_SignatureTypeChangeGatesOnRealBuild(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "sigproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module sigproj\n\ngo 1.26\n"), 0644)
+	const src = `package sigproj
+
+func double(x int) int {
+	return x * 2
+}
+
+func use() int {
+	return double(5)
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleReplaceHunk(context.Background(), nil, codeParam{
+		Name: "double",
+		Old:  "x int) int {\n\treturn x * 2",
+		New:  "x string) int {\n\treturn len(x) * 2",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "BUILD FAILED") {
+		t.Fatalf("expected the build failure to be surfaced, got: %s", text)
+	}
+	if !strings.Contains(text, "cannot use 5") {
+		t.Errorf("expected the real compiler diagnostic, got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != src {
+		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
+	}
+}
+
+// TestHandleReplaceSlice_SignatureKindTypeChangeGatesOnRealBuild covers
+// the same applyEditTerse gap via replace-slice's documented
+// slice:"signature" kind, which -- like replace-hunk -- can change a
+// parameter or return type directly.
+func TestHandleReplaceSlice_SignatureKindTypeChangeGatesOnRealBuild(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "sigproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module sigproj\n\ngo 1.26\n"), 0644)
+	const src = `package sigproj
+
+func double(x int) int {
+	return x * 2
+}
+
+func use() int {
+	return double(5)
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleReplaceSlice(context.Background(), nil, codeParam{
+		Name:  "double",
+		Slice: "signature",
+		New:   "func double(x string) int",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "BUILD FAILED") {
+		t.Fatalf("expected the build failure to be surfaced, got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != src {
+		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
+	}
+}

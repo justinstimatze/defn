@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.58"
+const Version = "0.26.59"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -7839,8 +7839,25 @@ func (s *server) applyEditTerse(session *sdkmcp.ServerSession, d *store.Definiti
 	if newName, _, newReceiver, _ := s.inferFromBody(newBody); newName != "" && (newName != d.Name || newReceiver != d.Receiver) {
 		return errResult(fmt.Errorf("%s%s: new_body declares %s%s, which changes its name/receiver — use code(op:\"rename\") to rename a definition; this op only changes body content", formatReceiver(d.Receiver), d.Name, formatReceiver(newReceiver), newName))
 	}
+
+	// #148's "AST-guaranteed sig-stable" claim was only actually true for
+	// insert-precondition/wrap-in-defer (body-statement-only edits) and
+	// rename-param (renames an identifier, never a type). replace-hunk is
+	// deliberately content-addressed and kind-agnostic -- it can target a
+	// function's own signature line directly -- and replace-slice accepts
+	// slice:"signature" as one of its documented kinds. Both can change a
+	// parameter or return TYPE without touching name/receiver, sailing
+	// past the identity check above. Confirmed live: replace-hunk turned
+	// `func double(x int) int` into `func double(x string) int` and
+	// reported "replaced hunk" while every caller still passed an int,
+	// with zero warning since the build gate below was unconditionally
+	// skipped. Compare the real old vs new signature instead of assuming
+	// -- same distinction handleEdit already draws for its own body/sig
+	// split.
+	oldSignature := extractSignature(d.Body)
 	d.Body = newBody
 	d.Signature = extractSignature(newBody)
+	sigStable := oldSignature == d.Signature
 
 	// #12: write and emit-gate through a transaction so a failure leaves
 	// neither the DB nor the file changed -- this was missed when #12
@@ -7858,17 +7875,24 @@ func (s *server) applyEditTerse(session *sdkmcp.ServerSession, d *store.Definiti
 		return errResult(err)
 	}
 
-	// #148: projection ops (all callers of applyEditTerse) are AST-
-	// guaranteed sig-stable — skip the go-build gate to actually deliver
-	// the "faster than native because the index is maintained" thesis.
-	// commitOrRollbackOnEmit preserves that (emit-only, no build) while
-	// still gating commit on the result coming back clean. Set
-	// DEFN_STRICT_BUILD=1 to force the old per-mutation build.
 	var opts emit.Opts
 	if d.SourceFile != "" {
 		opts = emit.Opts{GoimportsFiles: []string{d.SourceFile}, TouchedFiles: []string{d.SourceFile}}
 	}
-	buildResult := s.commitOrRollbackOnEmit(tx, commit, rollback, opts)
+	var buildResult string
+	if sigStable {
+		// #148: the common case (insert-precondition/wrap-in-defer
+		// always; replace-hunk/replace-slice/rename-param whenever they
+		// happen not to touch the signature) really is dispatch-safe --
+		// skip the go-build gate to actually deliver the "faster than
+		// native because the index is maintained" thesis.
+		// commitOrRollbackOnEmit preserves the same snapshot/rollback
+		// protection against an emit-level WARNING, and itself still
+		// escalates to a real build when DEFN_STRICT_BUILD=1 is set.
+		buildResult = s.commitOrRollbackOnEmit(tx, commit, rollback, opts)
+	} else {
+		buildResult = s.commitOrRollbackOnBuild(tx, commit, rollback, opts)
+	}
 
 	if buildResult == "" {
 		// #160: fire-and-forget summary regeneration. Body changed → any
