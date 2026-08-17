@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.50"
+const Version = "0.26.51"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -9166,12 +9166,15 @@ func (s *server) runScopedBuild(ctx context.Context, touchedFiles []string) (str
 // already covers the build-failure/rollback path for coupled PRODUCTION
 // callers; this covers the success path for paired TEST files.
 func (s *server) testCoverageHint(moduleID int64, touchedFile string) string {
-	sources, err := s.backend.ListFileSources(moduleID)
+	// Filenames only (ListFileSourceNames), not ListFileSources' full raw
+	// file content -- this fires on every successful write, the hottest
+	// path in the system, and only needs to check suffixes.
+	sources, err := s.backend.ListFileSourceNames(moduleID)
 	if err != nil {
 		return ""
 	}
 	var testFiles []string
-	for f := range sources {
+	for _, f := range sources {
 		if !strings.HasSuffix(f, "_test.go") || f == touchedFile {
 			continue
 		}

@@ -2691,3 +2691,28 @@ func (s *SQLiteDB) CountDefinitionsByName(name string) (int, error) {
 	}
 	return n, nil
 }
+
+// ListFileSourceNames is the metadata-only sibling of ListFileSources --
+// same WHERE clause, but selects source_file alone instead of source_file
+// + raw. Callers that only need filenames (e.g. testCoverageHint checking
+// for an existing _test.go sibling on every successful write) previously
+// paid for the full raw source text of every file in the module on every
+// call -- a real, avoidable cost on the hottest path in the system,
+// scaling with total file size in the package rather than file count.
+func (s *SQLiteDB) ListFileSourceNames(moduleID int64) ([]string, error) {
+	rows, err := s.db.QueryContext(s.Ctx(),
+		`SELECT source_file FROM file_sources WHERE module_id = ?`, moduleID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var sf string
+		if err := rows.Scan(&sf); err != nil {
+			return nil, err
+		}
+		out = append(out, sf)
+	}
+	return out, rows.Err()
+}

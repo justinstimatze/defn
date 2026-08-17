@@ -92,6 +92,11 @@ type Backend interface {
 	SetFileSource(moduleID int64, sourceFile, raw string) error
 	GetFileSource(moduleID int64, sourceFile string) (string, error)
 	ListFileSources(moduleID int64) (map[string]string, error)
+	// ListFileSourceNames is the metadata-only sibling of ListFileSources --
+	// same scope, but filenames only, no raw file content. Use this when a
+	// caller only needs to know WHICH files exist (e.g. checking for a
+	// sibling _test.go), not their content.
+	ListFileSourceNames(moduleID int64) ([]string, error)
 	DistinctSourceFiles() ([]string, error)
 	PruneStaleFileSources(live map[int64]map[string]bool) (int, error)
 	DeleteFile(sourceFile string) error
