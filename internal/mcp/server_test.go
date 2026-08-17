@@ -9104,3 +9104,120 @@ func TestHandleTestByName_VersionedNestedModuleHintScopesToRealDirectory(t *test
 			"example.com/server/v3/embed", got, "./server/embed/...")
 	}
 }
+
+// TestHandleTestByName_DoesNotRewriteUnrelatedFiles mirrors
+// TestHandleTest_DoesNotRewriteUnrelatedFiles for handleTestByName's own
+// separate "ensure files are current" emit call, scoped by module:/file:
+// rather than by a resolved def.
+func TestHandleTestByName_DoesNotRewriteUnrelatedFiles(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "other"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc RootFunc() string { return \"root\" }\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main_test.go"), []byte("package main\n\nimport \"testing\"\n\nfunc TestRootFunc(t *testing.T) {\n\tif RootFunc() == \"\" {\n\t\tt.Fatal(\"empty\")\n\t}\n}\n"), 0644)
+	otherSrc := "package other\n\nimport (\n\t\"strings\"\n\t\"fmt\"\n)\n\nfunc OtherFunc() string { return fmt.Sprintf(\"%s\", strings.ToUpper(\"x\")) }\n"
+	otherPath := filepath.Join(projDir, "other", "other.go")
+	os.WriteFile(otherPath, []byte(otherSrc), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	before, err := os.ReadFile(otherPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, _, err := s.handleTestByName(context.Background(), nil, "TestRootFunc", "", "")
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	if !strings.Contains(resultText(t, result), "ALL TESTS PASSED") {
+		t.Fatalf("expected TestRootFunc to pass, got: %s", resultText(t, result))
+	}
+
+	after, err := os.ReadFile(otherPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Errorf("handleTestByName rewrote an unrelated file it never needed to touch:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+// TestHandleTest_DoesNotRewriteUnrelatedFiles is a regression for a real
+// etcd bench trajectory (2026-08-17): handleTest's "ensure files are
+// current" step called the fully unscoped emit.Emit, which re-serializes
+// and goimports-normalizes EVERY file in the whole project on every
+// single code(op:"test") call -- not just the file(s) relevant to what's
+// being tested. On a real multi-module repo this silently rewrote the
+// import grouping of unrelated generated files nothing about the task
+// ever touched, corrupting an otherwise-exact edit's file-touch
+// precision. This fixture's "other" package has an on-disk import order
+// that doesn't match goimports' canonical grouping (deliberately, to
+// detect any full-project goimports pass) -- handleTest for RootFunc
+// must leave it untouched, byte for byte.
+func TestHandleTest_DoesNotRewriteUnrelatedFiles(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "other"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc RootFunc() string { return \"root\" }\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main_test.go"), []byte("package main\n\nimport \"testing\"\n\nfunc TestRootFunc(t *testing.T) {\n\tif RootFunc() == \"\" {\n\t\tt.Fatal(\"empty\")\n\t}\n}\n"), 0644)
+	// Non-canonical import grouping (stdlib imports NOT alphabetized/grouped
+	// the way goimports would write them) -- any full-project goimports pass
+	// would rewrite this file's import block.
+	otherSrc := "package other\n\nimport (\n\t\"strings\"\n\t\"fmt\"\n)\n\nfunc OtherFunc() string { return fmt.Sprintf(\"%s\", strings.ToUpper(\"x\")) }\n"
+	otherPath := filepath.Join(projDir, "other", "other.go")
+	os.WriteFile(otherPath, []byte(otherSrc), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	before, err := os.ReadFile(otherPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, _, err := s.handleTest(context.Background(), nil, nameParam{Name: "RootFunc"})
+	if err != nil {
+		t.Fatalf("handleTest: %v", err)
+	}
+	if !strings.Contains(resultText(t, result), "ALL TESTS PASSED") {
+		t.Fatalf("expected RootFunc's test to pass, got: %s", resultText(t, result))
+	}
+
+	after, err := os.ReadFile(otherPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Errorf("handleTest rewrote an unrelated file it never needed to touch:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}

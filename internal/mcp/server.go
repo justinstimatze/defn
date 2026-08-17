@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.52"
+const Version = "0.26.53"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -4957,11 +4957,6 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 	if pattern == "" {
 		return errResult(fmt.Errorf("test: pattern is empty"))
 	}
-	// Ensure files reflect any pending DB edits so the test sees them.
-	if err := emit.Emit(s.backend, s.projectDir); err != nil {
-		return errResult(fmt.Errorf("emit: %w", err))
-	}
-
 	// store.Module is per go.mod, not per package -- a single-module repo
 	// (the common case: go-zero, grpc-go, cli all have exactly one go.mod
 	// at the root) has exactly one Module row covering every package, so
@@ -4998,6 +4993,55 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 		}
 	}
 	target := s.testScopeTarget(hint)
+
+	// Ensure files reflect any pending DB edits so the test sees them.
+	// Every write op already emits its own touched file(s) immediately
+	// on success (commitOrRollbackOnBuild/autoEmitAndBuild) -- this is a
+	// defensive catch-all for the rare case a DB write landed without
+	// going through that path, not a routine "the project has pending
+	// edits" step. A full unscoped emit.Emit here used to re-serialize
+	// and goimports-normalize EVERY file in the whole project on every
+	// single test run, silently rewriting the import grouping of files
+	// nothing about this task ever touched (confirmed via a real etcd
+	// bench trajectory: unrelated generated .pb.gw.go files in
+	// completely different modules got their imports reordered by a
+	// test call, tanking that run's precision even though the actual
+	// edit was exact). Scope to whatever directory testScopeTarget
+	// already resolved -- same scope the go test invocation itself
+	// uses below, so this can never under-cover what's about to run.
+	// Only the genuinely-unscoped "./..." case (no hint resolved at
+	// all) still pays the full emit, same as before.
+	if target == "./..." {
+		if err := emit.Emit(s.backend, s.projectDir); err != nil {
+			return errResult(fmt.Errorf("emit: %w", err))
+		}
+	} else {
+		scopeDir := strings.TrimSuffix(strings.TrimPrefix(target, "./"), "/...")
+		var scopedFiles []string
+		if all, err := s.backend.DistinctSourceFiles(); err == nil {
+			for _, f := range all {
+				switch {
+				case scopeDir == ".":
+					// testScopeTarget's "." means the root package ONLY
+					// (distinct from "./..." recursive-everything) --
+					// match root-level files alone, not every file.
+					if !strings.Contains(f, "/") {
+						scopedFiles = append(scopedFiles, f)
+					}
+				case f == scopeDir || strings.HasPrefix(f, scopeDir+"/"):
+					scopedFiles = append(scopedFiles, f)
+				}
+			}
+		}
+		if len(scopedFiles) > 0 {
+			if _, err := emit.EmitWithOpts(s.backend, s.projectDir, emit.Opts{
+				TouchedFiles:   scopedFiles,
+				GoimportsFiles: scopedFiles,
+			}); err != nil {
+				return errResult(fmt.Errorf("emit: %w", err))
+			}
+		}
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeoutFor(0, target))
 	defer cancel()
@@ -5048,8 +5092,25 @@ func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args n
 		return errResult(fmt.Errorf("no project directory configured"))
 	}
 
-	// Ensure files are current.
-	if err := emit.Emit(s.backend, s.projectDir); err != nil {
+	// Ensure the target def's own file is current. Every write op already
+	// emits its own touched file(s) immediately on success
+	// (commitOrRollbackOnBuild/autoEmitAndBuild) -- this is a defensive
+	// catch-all for the rare case a DB write landed without going
+	// through that path, not a routine "the project has pending edits"
+	// step. A full unscoped emit.Emit here used to re-serialize and
+	// goimports-normalize EVERY file in the whole project on every
+	// single test run, silently rewriting the import grouping of files
+	// nothing about this task ever touched (confirmed via a real etcd
+	// bench trajectory: three unrelated generated .pb.gw.go files in
+	// completely different modules got their imports reordered by a
+	// code(op:"test") call, tanking that run's precision even though
+	// the actual edit was exact). Scoping to just the def's file removes
+	// that blast radius entirely while still covering the one case this
+	// exists for.
+	if _, err := emit.EmitWithOpts(s.backend, s.projectDir, emit.Opts{
+		TouchedFiles:   []string{d.SourceFile},
+		GoimportsFiles: []string{d.SourceFile},
+	}); err != nil {
 		return errResult(fmt.Errorf("emit: %w", err))
 	}
 
