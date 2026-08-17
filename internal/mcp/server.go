@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.55"
+const Version = "0.26.56"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -4199,18 +4199,44 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				errors = append(errors, fmt.Sprintf("rename %s: not found", op.Name))
 				continue
 			}
-			// See handleRename's identical guard for the full story: field
-			// defs are excluded from emit by design (#11), so renaming one
-			// can never update its actual declaration -- only refuse here,
-			// don't silently rewrite callers to a field name that was
-			// never really declared.
+			// Struct fields are excluded from emit by design (#11) -- the
+			// enclosing TYPE's own Body (a separate row) is what's really
+			// emitted, so it has to be rewritten too, via renameFieldInType
+			// (safe against astRename's caller-body collision risk since
+			// field names are unique within one struct -- see
+			// handleFieldRename's doc comment for the full story). Written
+			// through tx like everything else in this batch, so the tail's
+			// existing commitOrRollbackOnBuild gives this real build
+			// validation for free -- unlike handleRename's singleton path,
+			// which normally skips the build gate and has to open its own
+			// transaction just for this case.
+			var parentType *store.Definition
 			if d.Kind == "field" {
-				errors = append(errors, fmt.Sprintf("rename %s: struct field rename not supported (field declarations live inside their struct's body text, which rename cannot update yet) — use op:\"edit\" on the struct type instead", op.Name))
-				continue
+				mp := s.modulePath(d.ModuleID)
+				pt, ptErr := tx.GetDefinitionByName(d.Receiver, mp)
+				if ptErr != nil || pt == nil || pt.Kind != "type" {
+					errors = append(errors, fmt.Sprintf("rename %s: could not find its declaring type %q to update the struct declaration", op.Name, d.Receiver))
+					continue
+				}
+				newParentBody, renamedCount := renameFieldInType(pt.Body, d.Name, op.NewName)
+				if renamedCount == 0 {
+					errors = append(errors, fmt.Sprintf("rename %s: could not locate its declaration inside %s's struct body", op.Name, d.Receiver))
+					continue
+				}
+				pt.Body = newParentBody
+				pt.Signature = extractSignature(newParentBody)
+				if _, err := tx.UpsertDefinition(pt); err != nil {
+					errors = append(errors, fmt.Sprintf("rename %s: update struct declaration for %s: %v", op.Name, d.Receiver, err))
+					continue
+				}
+				addTouched(pt.SourceFile)
+				parentType = pt
 			}
 			// Reserve the qualified pre-rename name so safeWriteGoFile lets
 			// the disappearing decl actually vanish from the file (same as
-			// handleRename's qualifiedOld).
+			// handleRename's qualifiedOld). Meaningless for a field (its
+			// row is excluded from emit's FuncDecl matching) but harmless
+			// to still set -- it simply never matches anything there.
 			qualifiedOld := emit.FuncIdentity(d.Name, d.Receiver)
 			allowedRemovals = append(allowedRemovals, qualifiedOld)
 			addTouched(d.SourceFile)
@@ -4256,7 +4282,11 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			}
 			// #109: rename is ID-preserving semantic transform — refs edges
 			// unchanged. Skip adding to resolveSet.
-			sb.WriteString(fmt.Sprintf("→ renamed %s → %s (%d callers updated)\n", op.Name, op.NewName, callerCount))
+			if parentType != nil {
+				sb.WriteString(fmt.Sprintf("→ renamed %s → %s (struct declaration + %d callers updated)\n", op.Name, op.NewName, callerCount))
+			} else {
+				sb.WriteString(fmt.Sprintf("→ renamed %s → %s (%d callers updated)\n", op.Name, op.NewName, callerCount))
+			}
 
 		case "insert-precondition":
 			line, errStr := projEdit(op, func(body string) (string, error) {
@@ -4849,20 +4879,15 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// Type.Field lookup (GetCallers/impact), but they aren't independent
 	// top-level declarations -- a field only exists syntactically inside
 	// its struct's braces, and emitModule deliberately EXCLUDES field-kind
-	// defs from emit (#11: writing a bare field Body as a floating
-	// top-level decl would corrupt the file). RenameDefinition below would
-	// update the field's own DB row, but that write can never reach the
-	// struct's actual source text -- the enclosing TYPE def's Body (a
-	// separate row) is what's really emitted, and it stays untouched. The
-	// net effect used to be a safe no-op (0 callers, since fields were
-	// also invisible to the ref graph); now that field references resolve
-	// correctly, this would instead rewrite every caller to a field name
-	// that was never actually declared -- confirmed via a live etcd
-	// RangeOptions.Count rename that silently broke the build while
-	// reporting success. Refuse until the parent type's Body can be
-	// updated too.
+	// defs from emit (#11). The rest of this function's fast, no-build-gate
+	// path assumes rename is a name-preserving, dispatch-safe transform --
+	// true for funcs/methods/types/vars, but not for a field, which also
+	// needs the enclosing TYPE's own Body rewritten (a separate DB row)
+	// and pays for real build validation (astRename's caller-body rewrite
+	// can't tell this field apart from an unrelated same-named field on
+	// some other type -- confirmed live). See handleFieldRename.
 	if d.Kind == "field" {
-		return errResult(fmt.Errorf("rename of struct field %q is not supported: field declarations live inside their struct's body text, which rename cannot update yet (their def row is excluded from emit by design). Use code(op:\"edit\", name:%q) on the struct type to rename the field, then fix up call sites", args.OldName, d.Receiver))
+		return s.handleFieldRename(d, args)
 	}
 
 	// Compose the qualified old-name the safety net compares against (methods
@@ -9312,4 +9337,158 @@ func (s *server) findModuleForRelDir(mods []store.Module, relDir string) *store.
 		}
 	}
 	return nil
+}
+
+// renameFieldInType renames a single field's name within a TYPE
+// definition's own struct body text -- the emitted source, unlike the
+// field's own (emit-excluded, #11) DB row. Unlike astRename walking a
+// whole caller body, this only touches *ast.Field.Names within THIS
+// struct's own StructType: Go disallows two fields of the same name on
+// one struct, so every match is unambiguously the target field, with
+// none of astRename's same-name-on-an-unrelated-type collision risk.
+func renameFieldInType(typeBody, oldName, newName string) (string, int) {
+	src := "package x\n" + typeBody
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	if err != nil {
+		return typeBody, 0
+	}
+	renamed := 0
+	ast.Inspect(f, func(n ast.Node) bool {
+		st, ok := n.(*ast.StructType)
+		if !ok || st.Fields == nil {
+			return true
+		}
+		for _, field := range st.Fields.List {
+			for _, name := range field.Names {
+				if name.Name == oldName {
+					name.Name = newName
+					renamed++
+				}
+			}
+		}
+		return true
+	})
+	if renamed == 0 {
+		return typeBody, 0
+	}
+	var buf strings.Builder
+	if err := format.Node(&buf, fset, f); err != nil {
+		return typeBody, 0
+	}
+	result := buf.String()
+	if idx := strings.Index(result, "\n"); idx >= 0 {
+		result = strings.TrimLeft(result[idx+1:], "\n")
+	} else {
+		return typeBody, 0
+	}
+	return result, renamed
+}
+
+// handleFieldRename is handleRename's struct-field path. Field defs are
+// excluded from emit by design (#11) -- a field only exists as text
+// inside its struct's body, so the field's own DB row update can never
+// reach the actual source; the enclosing TYPE def's Body (a separate
+// row) has to be rewritten too, via renameFieldInType.
+//
+// Also unlike a normal rename, this pays for a real build validation
+// instead of #148's build-gate skip: astRename's caller-body rewrite
+// can't tell this field's name apart from an unrelated same-named field
+// on some other type referenced in the same caller body -- confirmed
+// live (RangeOptions.Count vs an unrelated RangeResult.Count in the
+// same function). #148's skip is only sound for a name-preserving,
+// dispatch-safe rename; a field rename with a body collision isn't one.
+func (s *server) handleFieldRename(d *store.Definition, args renameParam) (*sdkmcp.CallToolResult, any, error) {
+	mp := s.modulePath(d.ModuleID)
+	parentType, ptErr := s.backend.GetDefinitionByName(d.Receiver, mp)
+	if ptErr != nil || parentType == nil || parentType.Kind != "type" {
+		return errResult(fmt.Errorf("rename of struct field %q: could not find its declaring type %q to update the struct declaration", args.OldName, d.Receiver))
+	}
+	newParentBody, renamedCount := renameFieldInType(parentType.Body, d.Name, args.NewName)
+	if renamedCount == 0 {
+		return errResult(fmt.Errorf("rename of struct field %q: could not locate its declaration inside %s's struct body", args.OldName, d.Receiver))
+	}
+
+	tx, commit, rollback, txErr := s.backend.Begin()
+	if txErr != nil {
+		return errResult(txErr)
+	}
+	defer rollback()
+
+	oldBareName := d.Name
+	newBody, _ := astRename(d.Body, oldBareName, args.NewName)
+	newSig := extractSignature(newBody)
+	exported := len(args.NewName) > 0 && args.NewName[0] >= 'A' && args.NewName[0] <= 'Z'
+	if err := tx.RenameDefinition(d.ID, args.NewName, newBody, newSig, exported); err != nil {
+		return errResult(err)
+	}
+
+	touchedFiles := map[string]bool{}
+	if d.SourceFile != "" {
+		touchedFiles[d.SourceFile] = true
+	}
+
+	callers, err := tx.GetCallers(d.ID)
+	if err != nil {
+		return errResult(fmt.Errorf("get callers for rename: %w", err))
+	}
+	totalSkipped := 0
+	updated := 0
+	for _, caller := range callers {
+		if strings.Contains(caller.Body, oldBareName) {
+			var skipped int
+			caller.Body, skipped = astRename(caller.Body, oldBareName, args.NewName)
+			totalSkipped += skipped
+			caller.Signature = extractSignature(caller.Body)
+			if _, err := tx.UpsertDefinition(&caller); err != nil {
+				return errResult(fmt.Errorf("update caller %s: %w", caller.Name, err))
+			}
+			if caller.SourceFile != "" {
+				touchedFiles[caller.SourceFile] = true
+			}
+			updated++
+		}
+	}
+
+	parentType.Body = newParentBody
+	parentType.Signature = extractSignature(newParentBody)
+	if _, err := tx.UpsertDefinition(parentType); err != nil {
+		return errResult(fmt.Errorf("update struct declaration for %s: %w", d.Receiver, err))
+	}
+	if parentType.SourceFile != "" {
+		touchedFiles[parentType.SourceFile] = true
+	}
+
+	goimportsFiles := make([]string, 0, len(touchedFiles))
+	for f := range touchedFiles {
+		goimportsFiles = append(goimportsFiles, f)
+	}
+
+	buildResult := s.commitOrRollbackOnBuild(tx, commit, rollback, emit.Opts{
+		GoimportsFiles: goimportsFiles,
+		TouchedFiles:   goimportsFiles,
+	})
+
+	var sb strings.Builder
+	if buildResult != "" {
+		sb.WriteString(fmt.Sprintf("rename %s → %s rolled back — nothing was saved\n\n%s", args.OldName, args.NewName, buildResult))
+		return textResult(sb.String()), nil, nil
+	}
+
+	if s.idf != nil {
+		s.idf.Invalidate()
+	}
+	d.Name = args.NewName
+	d.Body = newBody
+	d.Signature = newSig
+	d.Exported = exported
+	s.enqueueSummary(d)
+
+	sb.WriteString(fmt.Sprintf("Renamed %s → %s\n", args.OldName, args.NewName))
+	sb.WriteString(fmt.Sprintf("Updated struct declaration in %s\n", parentType.SourceFile))
+	sb.WriteString(fmt.Sprintf("Updated %d callers\n", updated))
+	if totalSkipped > 0 {
+		sb.WriteString(fmt.Sprintf("\nNote: %d local variable(s) named %q were preserved (not renamed).\n", totalSkipped, args.OldName))
+	}
+	return textResult(sb.String()), nil, nil
 }

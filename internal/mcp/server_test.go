@@ -9222,14 +9222,15 @@ func TestHandleTest_DoesNotRewriteUnrelatedFiles(t *testing.T) {
 	}
 }
 
-// TestHandleRename_RefusesStructField is the safety-net regression for the
-// silent-corruption bug found via a real etcd bench trajectory: struct
-// field defs are excluded from emit by design (#11, internal/emit/emit.go),
-// so RenameDefinition on a field's own row can never actually update the
-// struct's declaration -- only its callers' bodies (via astRename), which
-// would then reference a field name the struct never declares. Must refuse
-// cleanly instead of reporting false success.
-func TestHandleRename_RefusesStructField(t *testing.T) {
+// TestHandleRename_StructFieldRenamesDeclarationAndCallers is the
+// positive regression: struct fields are excluded from emit by design
+// (#11), so a field rename has to rewrite the enclosing TYPE's own Body
+// (a separate DB row) in addition to the field's own row and its
+// callers. Verifies the struct declaration on disk actually changes,
+// both selector and keyed-composite-literal callers are rewritten, and
+// the result still builds (handleFieldRename pays for a real build gate
+// unlike the rest of rename).
+func TestHandleRename_StructFieldRenamesDeclarationAndCallers(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, ".defn")
 	db, err := store.OpenBackend(dbPath)
@@ -9241,14 +9242,18 @@ func TestHandleRename_RefusesStructField(t *testing.T) {
 	projDir := filepath.Join(dir, "fieldproj")
 	os.MkdirAll(projDir, 0755)
 	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module fieldproj\n\ngo 1.26\n"), 0644)
-	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package main
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package fieldproj
 
 type Opts struct {
 	Count bool
 }
 
-func read(o Opts) bool {
+func readSelector(o Opts) bool {
 	return o.Count
+}
+
+func buildLiteral() Opts {
+	return Opts{Count: true}
 }
 `), 0644)
 
@@ -9259,7 +9264,7 @@ func read(o Opts) bool {
 		t.Fatal("resolve:", err)
 	}
 
-	s := &server{backend: db}
+	s := &server{backend: db, projectDir: projDir}
 	s.ready.Store(true)
 
 	result, _, _ := s.handleRename(context.Background(), nil, renameParam{
@@ -9268,25 +9273,39 @@ func read(o Opts) bool {
 		Receiver: "Opts",
 	})
 	text := resultText(t, result)
-	if !strings.Contains(text, "not supported") {
-		t.Errorf("expected a clear refusal mentioning field rename is not supported, got: %s", text)
+	if strings.Contains(text, "rolled back") || strings.Contains(text, "not supported") {
+		t.Fatalf("expected rename to succeed, got: %s", text)
+	}
+	if !strings.Contains(text, "struct declaration") {
+		t.Errorf("expected the response to confirm the struct declaration was updated, got: %s", text)
 	}
 
-	// The struct declaration must be untouched -- no silent partial rename.
 	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), "Count bool") {
-		t.Errorf("expected struct field declaration to remain unchanged, got:\n%s", raw)
+	src := string(raw)
+	if strings.Contains(src, "Count bool") {
+		t.Errorf("expected the struct declaration to be renamed, still has old field:\n%s", src)
+	}
+	if !strings.Contains(src, "CountOnly bool") {
+		t.Errorf("expected the struct declaration to declare CountOnly, got:\n%s", src)
+	}
+	if !strings.Contains(src, "o.CountOnly") {
+		t.Errorf("expected the selector-expression caller to be rewritten, got:\n%s", src)
+	}
+	if !strings.Contains(src, "Opts{CountOnly: true}") {
+		t.Errorf("expected the keyed composite literal caller to be rewritten, got:\n%s", src)
 	}
 }
 
-// TestHandleApply_RenameRefusesStructField is handleApply's rename case's
-// half of the same regression as TestHandleRename_RefusesStructField --
+// TestHandleApply_RenameStructFieldRenamesDeclarationAndCallers is
+// handleApply's rename case's half of the same regression as
+// TestHandleRename_StructFieldRenamesDeclarationAndCallers --
 // handleApply duplicates handleRename's rename logic inline rather than
-// calling it, so the same field-kind guard has to be applied there too.
-func TestHandleApply_RenameRefusesStructField(t *testing.T) {
+// calling it, so the same struct-declaration-rewrite fix has to be
+// applied there too.
+func TestHandleApply_RenameStructFieldRenamesDeclarationAndCallers(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, ".defn")
 	db, err := store.OpenBackend(dbPath)
@@ -9298,13 +9317,13 @@ func TestHandleApply_RenameRefusesStructField(t *testing.T) {
 	projDir := filepath.Join(dir, "fieldproj")
 	os.MkdirAll(projDir, 0755)
 	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module fieldproj\n\ngo 1.26\n"), 0644)
-	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package main
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package fieldproj
 
 type Opts struct {
 	Count bool
 }
 
-func read(o Opts) bool {
+func readSelector(o Opts) bool {
 	return o.Count
 }
 `), 0644)
@@ -9325,18 +9344,90 @@ func read(o Opts) bool {
 		},
 	})
 	text := resultText(t, result)
-	if !strings.Contains(text, "not supported") {
-		t.Errorf("expected a clear refusal mentioning field rename is not supported, got: %s", text)
-	}
-	if !strings.Contains(text, "rolled back") {
-		t.Errorf("expected the batch to report a rollback (errors present, transaction never committed), got: %s", text)
+	if strings.Contains(text, "rolled back") {
+		t.Fatalf("expected rename to succeed, got: %s", text)
 	}
 
 	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), "Count bool") {
-		t.Errorf("expected struct field declaration to remain unchanged, got:\n%s", raw)
+	src := string(raw)
+	if strings.Contains(src, "Count bool") {
+		t.Errorf("expected the struct declaration to be renamed, still has old field:\n%s", src)
+	}
+	if !strings.Contains(src, "CountOnly bool") {
+		t.Errorf("expected the struct declaration to declare CountOnly, got:\n%s", src)
+	}
+	if !strings.Contains(src, "o.CountOnly") {
+		t.Errorf("expected the selector-expression caller to be rewritten, got:\n%s", src)
+	}
+}
+
+// TestHandleRename_StructFieldNameCollisionInCallerRollsBackNotCorrupts
+// is the safety-net regression for the exact failure mode found via a
+// live etcd bench trajectory: astRename's caller-body rewrite is bare-
+// identifier-based, so a caller that references TWO different types'
+// same-named field (e.g. a.Count and b.Count, two unrelated structs)
+// gets BOTH renamed when only one was the actual target -- corrupting
+// a reference to a field that was never supposed to change. Before
+// handleFieldRename added a real build gate for struct field renames
+// (unlike the rest of rename, which skips it for perf), this shipped
+// silently: defn reported success while the emitted code no longer
+// compiled. Must roll back cleanly instead.
+func TestHandleRename_StructFieldNameCollisionInCallerRollsBackNotCorrupts(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "fieldproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module fieldproj\n\ngo 1.26\n"), 0644)
+	src := `package fieldproj
+
+type A struct {
+	Count bool
+}
+
+type B struct {
+	Count int
+}
+
+func combine(a A, b B) bool {
+	return a.Count == (b.Count > 0)
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleRename(context.Background(), nil, renameParam{
+		OldName:  "Count",
+		NewName:  "CountOnly",
+		Receiver: "A",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "rolled back") {
+		t.Fatalf("expected the build-breaking collision to roll back the whole rename, got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != src {
+		t.Errorf("expected main.go to be byte-identical after a rolled-back rename, got:\n%s", raw)
 	}
 }
