@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.62"
+const Version = "0.26.63"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -9745,24 +9745,26 @@ func (s *server) methodRenameRisksInterfaceBreak(tx store.Backend, d *store.Defi
 	if d.Kind != "method" || d.Receiver == "" {
 		return false
 	}
-	// commonStdlibInterfaceMethodNames stopgap: resolve()'s "implements"
-	// ref-graph edges only cover interfaces declared in the PROJECT's own
-	// packages (ifacesByPkg is built exclusively from the ./... package
-	// set) -- an interface from an external/stdlib package like io.Reader
-	// is never a candidate, even though go/packages.Load already has its
-	// type info loaded via NeedDeps, so no "implements" edge is ever
-	// staged for it. Confirmed live: renaming (Foo).Read to (Foo).ReadX
-	// where Foo satisfies io.Reader (via `func use() io.Reader { return
-	// Foo{} }`, no local interface involved at all) found zero implements
-	// edges below and reported clean success while shipping
-	// "Foo does not implement io.Reader (missing method Read)". The
-	// principled fix -- scanning imported external packages' interfaces
-	// too, with a synthetic identity for edges that have no local def-ID
-	// -- is real resolve.go/schema work, out of scope here. This is a
-	// deliberately small, conservative name-based allowlist covering the
+	// def_external_interfaces: resolve()'s real signal for external
+	// (stdlib/third-party) interface satisfaction -- computed via
+	// types.Implements against every interface reachable through the
+	// method's own package imports (ifacesByPkg widened in resolve.go),
+	// keyed by the concrete method's own def ID since an external
+	// interface has no defn row of its own to hang an "implements" ref
+	// off of. Confirmed live: a type satisfying io.ReaderAt (method
+	// ReadAt) via `func use() io.ReaderAt { return T{} }`, no local
+	// interface anywhere, used to report clean rename success while
+	// shipping a build that no longer compiled -- this closes that gap
+	// for any external interface, not just a hardcoded few.
+	if extIfaces, err := tx.GetExternalInterfaces(d.ID); err == nil && len(extIfaces) > 0 {
+		return true
+	}
+	// commonStdlibInterfaceMethodNames: defensive fallback for a DB that
+	// hasn't been resolved since this method's interface satisfaction
+	// last changed (def_external_interfaces above is only as fresh as
+	// the last resolve()). Deliberately small and conservative -- the
 	// handful of single-method stdlib interfaces most likely to actually
-	// be satisfied by a project type -- it does NOT catch a custom
-	// interface from a third-party dependency, only these common ones.
+	// be satisfied by a project type.
 	if commonStdlibInterfaceMethodNames[oldName] {
 		return true
 	}

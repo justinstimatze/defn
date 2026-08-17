@@ -69,6 +69,18 @@ type Backend interface {
 	UpdateDefinitionReceiver(id int64, newReceiver, newBody, newSignature string) error
 	PruneStaleDefinitions(liveIDs map[int64]bool) (int, error)
 
+	// SetManyExternalInterfaces replaces, per def_id key present in the
+	// map, the full set of external-interface names that method
+	// satisfies (delete-then-insert, mirroring SetManyReferences). A
+	// def_id absent from the map is left untouched -- callers only
+	// include def_ids they actually recomputed this call, same scoping
+	// contract SetManyReferences already follows for defRefs.
+	SetManyExternalInterfaces(namesByDef map[int64][]string) error
+	// GetExternalInterfaces returns the external interface names (e.g.
+	// "io.Reader") the method at defID is known to satisfy, or nil if
+	// none/not yet resolved.
+	GetExternalInterfaces(defID int64) ([]string, error)
+
 	// References / call graph
 	QueryRefs(fromName, toName, kind string, limit int) ([]Reference, error)
 	SetReferences(fromDef int64, refs []Reference) error

@@ -196,6 +196,24 @@ CREATE INDEX IF NOT EXISTS idx_litfield_type_field ON literal_fields(type_name, 
 -- all — SQLite cannot use an index for LIKE while case_sensitive_like is OFF.
 CREATE INDEX IF NOT EXISTS idx_litfield_value ON literal_fields(field_value);
 
+-- def_external_interfaces: per-method record of which EXTERNAL (stdlib or
+-- third-party dependency) interfaces a concrete method satisfies, computed
+-- at resolve() time via types.Implements against every interface reachable
+-- through the method's own package imports. Unlike the `refs` "implements"
+-- kind, iface_name has no def_id to point at -- external packages are never
+-- ingested into this DB, so there's no row for io.Reader to reference. This
+-- is the ID-less sidecar that makes that satisfaction queryable anyway:
+-- methodRenameRisksInterfaceBreak checks it by def_id (the concrete
+-- method's own row) instead of the small commonStdlibInterfaceMethodNames
+-- name-list heuristic it used to be limited to.
+CREATE TABLE IF NOT EXISTS def_external_interfaces (
+    def_id     INTEGER NOT NULL,
+    iface_name TEXT NOT NULL,
+    PRIMARY KEY (def_id, iface_name),
+    FOREIGN KEY (def_id) REFERENCES definitions(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_def_ext_iface_def ON def_external_interfaces(def_id);
+
 CREATE TABLE IF NOT EXISTS defn_meta (
     "key"   TEXT PRIMARY KEY,
     "value" TEXT NOT NULL

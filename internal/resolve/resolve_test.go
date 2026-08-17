@@ -1020,3 +1020,53 @@ func readSelector(o a.Opts) bool {
 		t.Errorf("expected cross-package readSelector (o.Count selector) to be a caller of a.Opts.Count, got: %+v", names)
 	}
 }
+
+// TestResolveExternalInterfaceSatisfaction is the resolve-level regression
+// for widening ifacesByPkg to external (stdlib/third-party) packages: a
+// type satisfying io.ReaderAt with no local interface declared anywhere
+// used to be entirely invisible to interface-satisfaction tracking (the
+// "implements" ref-graph edge needs a defn ID on both sides, and io.ReaderAt
+// has none -- it was never ingested). def_external_interfaces is the
+// ID-less sidecar that closes that gap: this checks the concrete method's
+// own def row gets "io.ReaderAt" recorded via GetExternalInterfaces.
+func TestResolveExternalInterfaceSatisfaction(t *testing.T) {
+	dir := writeModule(t, map[string]string{
+		"main.go": `package extifacebug
+
+import "io"
+
+type File struct{ n int }
+
+func (f *File) ReadAt(p []byte, off int64) (int, error) { return 0, nil }
+
+func use() io.ReaderAt { return &File{} }
+`,
+	})
+
+	db := testDB(t)
+	if err := ingest.Ingest(db, dir); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if err := Resolve(db, dir); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	readAt, err := db.GetDefinitionByNameAndReceiver("ReadAt", "", "*File")
+	if err != nil {
+		t.Fatalf("lookup (*File).ReadAt: %v", err)
+	}
+
+	extIfaces, err := db.GetExternalInterfaces(readAt.ID)
+	if err != nil {
+		t.Fatalf("GetExternalInterfaces: %v", err)
+	}
+	found := false
+	for _, name := range extIfaces {
+		if name == "io.ReaderAt" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected (*File).ReadAt to be recorded as satisfying io.ReaderAt, got: %v", extIfaces)
+	}
+}

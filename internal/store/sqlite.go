@@ -2735,3 +2735,93 @@ func (s *SQLiteDB) UpdateDefinitionReceiver(id int64, newReceiver, newBody, newS
 	}
 	return nil
 }
+
+// SetManyExternalInterfaces mirrors SetManyReferences's delete-then-insert
+// shape: for every def_id key present in namesByDef, wipe its existing
+// def_external_interfaces rows and reinsert the current set. A def_id
+// absent from the map is left untouched.
+func (s *SQLiteDB) SetManyExternalInterfaces(namesByDef map[int64][]string) error {
+	if len(namesByDef) == 0 {
+		return nil
+	}
+	ctx := s.Ctx()
+
+	defIDs := make([]int64, 0, len(namesByDef))
+	for id := range namesByDef {
+		defIDs = append(defIDs, id)
+	}
+	for start := 0; start < len(defIDs); start += 500 {
+		end := start + 500
+		if end > len(defIDs) {
+			end = len(defIDs)
+		}
+		chunk := defIDs[start:end]
+		placeholders := strings.Repeat("?,", len(chunk))
+		placeholders = placeholders[:len(placeholders)-1]
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		q := "DELETE FROM def_external_interfaces WHERE def_id IN (" + placeholders + ")"
+		if _, err := s.db.ExecContext(ctx, q, args...); err != nil {
+			return fmt.Errorf("sqlite: SetManyExternalInterfaces delete: %w", err)
+		}
+	}
+
+	type row struct {
+		defID int64
+		iface string
+	}
+	seen := make(map[row]bool)
+	var rows []row
+	for defID, names := range namesByDef {
+		for _, name := range names {
+			r := row{defID, name}
+			if seen[r] {
+				continue
+			}
+			seen[r] = true
+			rows = append(rows, r)
+		}
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	for start := 0; start < len(rows); start += 500 {
+		end := start + 500
+		if end > len(rows) {
+			end = len(rows)
+		}
+		chunk := rows[start:end]
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, 2*len(chunk))
+		for i, r := range chunk {
+			placeholders[i] = "(?, ?)"
+			args = append(args, r.defID, r.iface)
+		}
+		q := "INSERT OR IGNORE INTO def_external_interfaces (def_id, iface_name) VALUES " +
+			strings.Join(placeholders, ", ")
+		if _, err := s.db.ExecContext(ctx, q, args...); err != nil {
+			return fmt.Errorf("sqlite: SetManyExternalInterfaces insert: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *SQLiteDB) GetExternalInterfaces(defID int64) ([]string, error) {
+	ctx := s.Ctx()
+	rows, err := s.db.QueryContext(ctx, `SELECT iface_name FROM def_external_interfaces WHERE def_id = ?`, defID)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: get external interfaces: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("sqlite: scan external interface: %w", err)
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
+}

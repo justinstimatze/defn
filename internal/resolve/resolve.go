@@ -290,6 +290,60 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 		}
 	}
 
+	// Widen ifacesByPkg to also cover EXTERNAL (stdlib/third-party)
+	// packages reachable via any filtered package's direct imports.
+	// go/packages' NeedDeps mode already loads full go/types info for
+	// these (that's required for the importing package to type-check at
+	// all), so no extra package load is needed -- pkg.Imports[path].Types
+	// is already populated. This is what turns the candidateIfaces lookup
+	// below from "project interfaces only" into "project + every
+	// interface a project package can see", closing the gap
+	// methodRenameRisksInterfaceBreak used to paper over with a small
+	// hardcoded name list (io.Reader/Writer/Closer, fmt.Stringer, ...) --
+	// confirmed live: a type satisfying io.ReaderAt (method ReadAt, not on
+	// that list) via `func use() io.ReaderAt { return T{} }` with no local
+	// interface anywhere let a rename of T.ReadAt ship a build that no
+	// longer compiled, reported as a clean success.
+	scannedIfacePkgs := map[string]bool{}
+	for _, pkg := range filtered {
+		for importPath, impPkg := range pkg.Imports {
+			if _, already := ifacesByPkg[importPath]; already {
+				continue
+			}
+			if scannedIfacePkgs[importPath] {
+				continue
+			}
+			scannedIfacePkgs[importPath] = true
+			if impPkg == nil || impPkg.Types == nil {
+				continue
+			}
+			scope := impPkg.Types.Scope()
+			if scope == nil {
+				continue
+			}
+			for _, name := range scope.Names() {
+				obj := scope.Lookup(name)
+				tn, ok := obj.(*types.TypeName)
+				if !ok {
+					continue
+				}
+				named, ok := tn.Type().(*types.Named)
+				if !ok {
+					continue
+				}
+				if types.IsInterface(named) {
+					ifacesByPkg[importPath] = append(ifacesByPkg[importPath], named)
+				}
+			}
+		}
+	}
+
+	// defExternalIfaces accumulates, per concrete method def ID, the
+	// external interfaces (no local defn ID, so no "implements" ref is
+	// possible) it satisfies -- flushed via SetManyExternalInterfaces
+	// below and read back by methodRenameRisksInterfaceBreak.
+	defExternalIfaces := map[int64][]string{}
+
 	ifaceMethodToImpls := map[string][]int64{}
 
 	// #253: this loop must NOT skip packages outside onlyModule the way
@@ -351,9 +405,10 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 
 		// Candidate interfaces: this package's own, plus every directly
 		// imported package's (map keys in pkg.Imports already dedup by
-		// path). Interfaces from packages outside `filtered` (e.g. stdlib)
-		// never resolve to a defn ID below anyway, so it's harmless that
-		// they're absent from ifacesByPkg.
+		// path) -- including external/stdlib packages now that ifacesByPkg
+		// is widened above. An external interface never resolves to a defn
+		// ID (lookupTypeDefID below), so it can never gain an "implements"
+		// ref; it's staged into defExternalIfaces instead.
 		candidateIfaces := append([]*types.Named{}, ifacesByPkg[pkgPath]...)
 		for importPath := range pkg.Imports {
 			candidateIfaces = append(candidateIfaces, ifacesByPkg[importPath]...)
@@ -410,6 +465,19 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 					if concreteMethodID > 0 {
 						key := ifaceMethodKey(ifacePkgPath, iface.Obj().Name(), ifaceMethod.Name())
 						ifaceMethodToImpls[key] = append(ifaceMethodToImpls[key], concreteMethodID)
+						// ifaceID == 0 means this interface has no defn row --
+						// it's external (stdlib/third-party), never ingested.
+						// Record the satisfaction directly on the concrete
+						// method's own def ID instead, scoped the same way the
+						// "implements" edge above is: only for defs actually
+						// being re-resolved this call.
+						if ifaceID == 0 && (onlyModule == "" || pkgPath == onlyModule) {
+							qualified := iface.Obj().Name()
+							if ifacePkgPath != "" {
+								qualified = ifacePkgPath + "." + qualified
+							}
+							defExternalIfaces[concreteMethodID] = append(defExternalIfaces[concreteMethodID], qualified)
+						}
 					}
 				}
 			}
@@ -605,6 +673,14 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 		return err
 	}
 	timeIt("flush SetManyLiteralFields", tLit)
+	tExtIfaces := time.Now()
+	if err := flushDB.SetManyExternalInterfaces(defExternalIfaces); err != nil {
+		if txWrapped {
+			rollback()
+		}
+		return err
+	}
+	timeIt("flush SetManyExternalInterfaces", tExtIfaces)
 	if txWrapped {
 		tCommit := time.Now()
 		if err := commit(); err != nil {
