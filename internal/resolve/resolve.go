@@ -159,22 +159,67 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 			pkgPath = strings.TrimSuffix(pkgPath, "_test")
 		}
 		pkgScope := pkg.Types.Scope()
+
+		// Struct fields never satisfy isPackageLevelOrMethod below --
+		// obj.Parent() is nil for a field, same as a param or local var,
+		// so the object alone can't distinguish them. A companion AST
+		// walk maps each field's declaring *ast.Ident to its struct
+		// type's name, mirroring how ingestStructFields assigns
+		// Receiver: typeName when it stores the field's own DB row --
+		// letting the receiver-qualified lookup below find that same
+		// row. Without this, a field's *types.Var object never enters
+		// objToDef, so collectRefs can never resolve a selector
+		// expression (ro.Count) or keyed composite literal (T{Count:...})
+		// back to the field's def ID -- GetCallers on a renamed struct
+		// field always reports 0 callers, forcing callers to be found
+		// and fixed by hand even though go/types resolves both those use
+		// forms to the same object identity the field's own Defs entry
+		// has (confirmed empirically: Info.Uses IS populated for both).
+		fieldOwners := map[types.Object]string{}
+		for _, file := range pkg.Syntax {
+			ast.Inspect(file, func(n ast.Node) bool {
+				ts, ok := n.(*ast.TypeSpec)
+				if !ok {
+					return true
+				}
+				st, ok := ts.Type.(*ast.StructType)
+				if !ok || st.Fields == nil {
+					return true
+				}
+				for _, field := range st.Fields.List {
+					for _, name := range field.Names {
+						if obj := pkg.TypesInfo.Defs[name]; obj != nil {
+							fieldOwners[obj] = ts.Name.Name
+						}
+					}
+				}
+				return true
+			})
+		}
+
 		for ident, obj := range pkg.TypesInfo.Defs {
 			if obj == nil || ident.Name == "_" {
 				continue
 			}
 			// #107: skip identifiers that can't map to a top-level def
-			// in the DB — params, local vars, struct fields, etc. Without
-			// this filter every local var in the file triggers a
-			// GetDefinitionByName miss (7s on cli/cli's command package).
-			// A method is scoped to its receiver, not the package, so we
-			// keep those explicitly.
-			if !isPackageLevelOrMethod(obj, pkgScope) {
+			// in the DB — params, local vars, etc. Without this filter
+			// every local var in the file triggers a GetDefinitionByName
+			// miss (7s on cli/cli's command package). A method is scoped
+			// to its receiver, not the package, so we keep those
+			// explicitly; struct fields are handled below via
+			// fieldOwners since they need the same receiver-qualified
+			// lookup but aren't identifiable from the object alone.
+			if isPackageLevelOrMethod(obj, pkgScope) {
+				defID := lookupDefID(db, pkgPath, ident, obj, cache)
+				if defID > 0 {
+					objToDef[obj] = defID
+				}
 				continue
 			}
-			defID := lookupDefID(db, pkgPath, ident, obj, cache)
-			if defID > 0 {
-				objToDef[obj] = defID
+			if owner, ok := fieldOwners[obj]; ok {
+				if id := lookupFieldDefID(db, pkgPath, ident.Name, owner, cache); id > 0 {
+					objToDef[obj] = id
+				}
 			}
 		}
 	}
@@ -777,6 +822,20 @@ func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef 
 							if !ok {
 								continue
 							}
+							// Resolve the keyed field itself as a
+							// reference via the DB, not objToDef/object
+							// identity: FilterPackages prefers the test
+							// variant of any package with _test.go
+							// files, so a field declared there has a
+							// different types.Object identity than what
+							// an ordinary (non-test) importer's own
+							// TypesInfo resolves the same field key to
+							// -- see lookupFieldDefID's doc comment.
+							if fieldPkg := named.Obj().Pkg(); fieldPkg != nil {
+								if toID := lookupFieldDefID(db, fieldPkg.Path(), ident.Name, named.Obj().Name(), cache); toID > 0 {
+									addRef(toID, "field_ref")
+								}
+							}
 							fieldValue, ok := evalStringLiteral(kv.Value)
 							if !ok {
 								var buf bytes.Buffer
@@ -791,6 +850,33 @@ func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef 
 								FieldValue: fieldValue,
 								Line:       fset.Position(kv.Pos()).Line,
 							})
+						}
+					}
+				}
+			}
+			return true
+		case *ast.SelectorExpr:
+			// Direct field access: x.Field. Resolved via the DB, not
+			// objToDef/object identity -- same rationale as the keyed
+			// composite-literal case above (see lookupFieldDefID's doc
+			// comment on the test-variant identity mismatch). Only
+			// len(Index())==1 (a field declared directly on x's own
+			// static type, not promoted through an embedded field) --
+			// sel.Recv() is x's OWN type, which is the wrong owner to
+			// look up a promoted field's def under; skipping those
+			// is a silent miss, same as today's behavior, not a
+			// regression.
+			if sel, ok := info.Selections[x]; ok && sel.Kind() == types.FieldVal && len(sel.Index()) == 1 {
+				if v, ok := sel.Obj().(*types.Var); ok && v.IsField() {
+					recvType := sel.Recv()
+					if ptr, ok := recvType.(*types.Pointer); ok {
+						recvType = ptr.Elem()
+					}
+					if named, ok := recvType.(*types.Named); ok {
+						if fieldPkg := named.Obj().Pkg(); fieldPkg != nil {
+							if toID := lookupFieldDefID(db, fieldPkg.Path(), v.Name(), named.Obj().Name(), cache); toID > 0 {
+								addRef(toID, "field_ref")
+							}
 						}
 					}
 				}
@@ -1063,4 +1149,25 @@ func receiverName(t types.Type) string {
 // populated (resolve's pass 2) for why pointer identity is unsafe here.
 func ifaceMethodKey(pkgPath, ifaceName, methodName string) string {
 	return pkgPath + "\x00" + ifaceName + "\x00" + methodName
+}
+
+// lookupFieldDefID resolves a struct field's def ID by (package, field
+// name, declaring type name) -- the same receiver-qualified shape methods
+// use, since ingestStructFields stores each field's Receiver as its
+// declaring type's bare name. Deliberately DB-backed rather than
+// object-identity-backed (unlike the objToDef fast path): FilterPackages
+// prefers the test variant of any package with _test.go files, so a
+// field declared in such a package has a different types.Object identity
+// than what an ordinary (non-test) importer's own TypesInfo resolves the
+// same field access to -- object identity alone silently misses every
+// cross-package reference to a field in a tested package.
+func lookupFieldDefID(db store.Backend, pkgPath, fieldName, owner string, cache pkgIndexCache) int64 {
+	if id := cache.get(db, pkgPath).lookupMethod(fieldName, owner); id > 0 {
+		return id
+	}
+	d, err := db.GetDefinitionByNameAndReceiver(fieldName, pkgPath, owner)
+	if err != nil {
+		return 0
+	}
+	return d.ID
 }

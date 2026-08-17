@@ -890,3 +890,133 @@ func (s *Server) dispatch() int {
 		t.Fatalf("mcp.dispatch -> (*SQLiteDB).Pick interface_dispatch ref missing -- the caller package (mcp) imports store's PLAIN variant while pass 2 iterated store's TEST variant (preferred by FilterPackages since store/ has its own _test.go file), and a types.Object-keyed ifaceMethodToImpls map can never bridge the two. Got %d interface_dispatch refs: %+v", len(refs), refs)
 	}
 }
+
+// TestResolveTracksStructFieldReferences is the regression for the
+// "rename struct field updates 0 callers" bug: struct field objects
+// never entered objToDef (obj.Parent() is nil for a field, same as a
+// param/local var, so isPackageLevelOrMethod filtered them out), so
+// collectRefs could never resolve a selector expression (ro.Count) or
+// keyed composite literal (T{Count: ...}) back to the field's def ID.
+// GetCallers on the field then always reported zero, so code(op:"rename")
+// on a struct field silently failed to propagate to any call site --
+// confirmed via a real bench trajectory (etcd RangeOptions.Count ->
+// CountOnly) where this forced ~15 extra manual search/read/edit calls
+// to hand-propagate a rename the tool was supposed to do atomically.
+func TestResolveTracksStructFieldReferences(t *testing.T) {
+	src := `package fieldrefs
+
+type Opts struct {
+	Count bool
+}
+
+func readSelector(o Opts) bool {
+	return o.Count
+}
+
+func buildLiteral() Opts {
+	return Opts{Count: true}
+}
+`
+	dir := writeModule(t, map[string]string{"main.go": src})
+
+	db := testDB(t)
+	if err := ingest.Ingest(db, dir); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if err := Resolve(db, dir); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	field, err := db.GetDefinitionByNameAndReceiver("Count", "example.com/refsbug", "Opts")
+	if err != nil {
+		t.Fatalf("get field def: %v", err)
+	}
+
+	callers, err := db.GetCallers(field.ID)
+	if err != nil {
+		t.Fatalf("get callers: %v", err)
+	}
+	names := map[string]bool{}
+	for _, c := range callers {
+		names[c.Name] = true
+	}
+	if !names["readSelector"] {
+		t.Errorf("expected readSelector (o.Count selector) to be a caller of Opts.Count, got: %+v", names)
+	}
+	if !names["buildLiteral"] {
+		t.Errorf("expected buildLiteral (Opts{Count: ...} keyed literal) to be a caller of Opts.Count, got: %+v", names)
+	}
+}
+
+// TestResolveTracksCrossPackageStructFieldReferences is the second half of
+// the struct-field-ref regression (see
+// TestResolveTracksStructFieldReferences for the same-package case).
+// Real-world bench trajectory: renaming go.etcd.io/etcd's
+// RangeOptions.Count -> CountOnly updated same-package callers fine but
+// left a keyed composite literal in a DIFFERENT package
+// (mvcc.RangeOptions{Count: ...} inside etcdserver/txn) untouched --
+// because mvcc has _test.go files, FilterPackages prefers its test
+// variant for objToDef, and a field declared there gets a DIFFERENT
+// types.Object identity than what an ordinary (non-test) importer's own
+// TypesInfo resolves the same field access to. Object-identity lookups
+// alone can never see this; only a DB-backed lookup (lookupFieldDefID)
+// can. This fixture mirrors that exact shape: package a has a _test.go
+// file (forcing FilterPackages to prefer a's test variant), package b
+// has no tests and references a.Opts.Count both via a keyed composite
+// literal and a plain selector.
+func TestResolveTracksCrossPackageStructFieldReferences(t *testing.T) {
+	dir := writeModule(t, map[string]string{
+		"a/a.go": `package a
+
+type Opts struct {
+	Count bool
+}
+`,
+		"a/a_test.go": `package a
+
+import "testing"
+
+func TestNothing(t *testing.T) {}
+`,
+		"b/b.go": `package b
+
+import "example.com/refsbug/a"
+
+func buildLiteral() a.Opts {
+	return a.Opts{Count: true}
+}
+
+func readSelector(o a.Opts) bool {
+	return o.Count
+}
+`,
+	})
+
+	db := testDB(t)
+	if err := ingest.Ingest(db, dir); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if err := Resolve(db, dir); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	field, err := db.GetDefinitionByNameAndReceiver("Count", "example.com/refsbug/a", "Opts")
+	if err != nil {
+		t.Fatalf("get field def: %v", err)
+	}
+
+	callers, err := db.GetCallers(field.ID)
+	if err != nil {
+		t.Fatalf("get callers: %v", err)
+	}
+	names := map[string]bool{}
+	for _, c := range callers {
+		names[c.Name] = true
+	}
+	if !names["buildLiteral"] {
+		t.Errorf("expected cross-package buildLiteral (a.Opts{Count: ...} keyed literal) to be a caller of a.Opts.Count, got: %+v", names)
+	}
+	if !names["readSelector"] {
+		t.Errorf("expected cross-package readSelector (o.Count selector) to be a caller of a.Opts.Count, got: %+v", names)
+	}
+}

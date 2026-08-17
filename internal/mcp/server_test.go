@@ -9221,3 +9221,122 @@ func TestHandleTest_DoesNotRewriteUnrelatedFiles(t *testing.T) {
 		t.Errorf("handleTest rewrote an unrelated file it never needed to touch:\nbefore:\n%s\nafter:\n%s", before, after)
 	}
 }
+
+// TestHandleRename_RefusesStructField is the safety-net regression for the
+// silent-corruption bug found via a real etcd bench trajectory: struct
+// field defs are excluded from emit by design (#11, internal/emit/emit.go),
+// so RenameDefinition on a field's own row can never actually update the
+// struct's declaration -- only its callers' bodies (via astRename), which
+// would then reference a field name the struct never declares. Must refuse
+// cleanly instead of reporting false success.
+func TestHandleRename_RefusesStructField(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "fieldproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module fieldproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package main
+
+type Opts struct {
+	Count bool
+}
+
+func read(o Opts) bool {
+	return o.Count
+}
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleRename(context.Background(), nil, renameParam{
+		OldName:  "Count",
+		NewName:  "CountOnly",
+		Receiver: "Opts",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "not supported") {
+		t.Errorf("expected a clear refusal mentioning field rename is not supported, got: %s", text)
+	}
+
+	// The struct declaration must be untouched -- no silent partial rename.
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "Count bool") {
+		t.Errorf("expected struct field declaration to remain unchanged, got:\n%s", raw)
+	}
+}
+
+// TestHandleApply_RenameRefusesStructField is handleApply's rename case's
+// half of the same regression as TestHandleRename_RefusesStructField --
+// handleApply duplicates handleRename's rename logic inline rather than
+// calling it, so the same field-kind guard has to be applied there too.
+func TestHandleApply_RenameRefusesStructField(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "fieldproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module fieldproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package main
+
+type Opts struct {
+	Count bool
+}
+
+func read(o Opts) bool {
+	return o.Count
+}
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "rename", Name: "Count", Receiver: "Opts", NewName: "CountOnly"},
+		},
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "not supported") {
+		t.Errorf("expected a clear refusal mentioning field rename is not supported, got: %s", text)
+	}
+	if !strings.Contains(text, "rolled back") {
+		t.Errorf("expected the batch to report a rollback (errors present, transaction never committed), got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "Count bool") {
+		t.Errorf("expected struct field declaration to remain unchanged, got:\n%s", raw)
+	}
+}

@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.54"
+const Version = "0.26.55"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -4199,6 +4199,15 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				errors = append(errors, fmt.Sprintf("rename %s: not found", op.Name))
 				continue
 			}
+			// See handleRename's identical guard for the full story: field
+			// defs are excluded from emit by design (#11), so renaming one
+			// can never update its actual declaration -- only refuse here,
+			// don't silently rewrite callers to a field name that was
+			// never really declared.
+			if d.Kind == "field" {
+				errors = append(errors, fmt.Sprintf("rename %s: struct field rename not supported (field declarations live inside their struct's body text, which rename cannot update yet) — use op:\"edit\" on the struct type instead", op.Name))
+				continue
+			}
 			// Reserve the qualified pre-rename name so safeWriteGoFile lets
 			// the disappearing decl actually vanish from the file (same as
 			// handleRename's qualifiedOld).
@@ -4834,6 +4843,26 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	d, err := s.resolveWriteTarget(args.OldName, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.OldName, err)
+	}
+
+	// Struct fields are indexed as their own "field" kind def for
+	// Type.Field lookup (GetCallers/impact), but they aren't independent
+	// top-level declarations -- a field only exists syntactically inside
+	// its struct's braces, and emitModule deliberately EXCLUDES field-kind
+	// defs from emit (#11: writing a bare field Body as a floating
+	// top-level decl would corrupt the file). RenameDefinition below would
+	// update the field's own DB row, but that write can never reach the
+	// struct's actual source text -- the enclosing TYPE def's Body (a
+	// separate row) is what's really emitted, and it stays untouched. The
+	// net effect used to be a safe no-op (0 callers, since fields were
+	// also invisible to the ref graph); now that field references resolve
+	// correctly, this would instead rewrite every caller to a field name
+	// that was never actually declared -- confirmed via a live etcd
+	// RangeOptions.Count rename that silently broke the build while
+	// reporting success. Refuse until the parent type's Body can be
+	// updated too.
+	if d.Kind == "field" {
+		return errResult(fmt.Errorf("rename of struct field %q is not supported: field declarations live inside their struct's body text, which rename cannot update yet (their def row is excluded from emit by design). Use code(op:\"edit\", name:%q) on the struct type to rename the field, then fix up call sites", args.OldName, d.Receiver))
 	}
 
 	// Compose the qualified old-name the safety net compares against (methods
