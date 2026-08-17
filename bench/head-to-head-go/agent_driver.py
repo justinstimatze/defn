@@ -511,9 +511,37 @@ def events_to_fncall_messages(events):
 
 
 def apply_edits_via_defn(workdir):
-    """After the agent finishes, `defn emit` writes the mutated DB back to
-    .go files so the workdir reflects the agent's changes. This lets the
-    correctness scorer diff files."""
+    """DEAD CODE, deliberately unused as of 2026-08-17 -- see run_one's
+    comment for why it's no longer called. Kept only as a documented
+    historical marker in case some future defn regression makes writes
+    NOT land on disk in real time again, in which case this is the
+    fallback to reach for -- not as a matter of course.
+
+    Originally: "After the agent finishes, `defn emit` writes the
+    mutated DB back to .go files so the workdir reflects the agent's
+    changes. This lets the correctness scorer diff files." That premise
+    was stale by the time this was traced down: every defn write op
+    (edit/create/apply/rename/...) already emits its own touched file(s)
+    to disk immediately on success (commitOrRollbackOnBuild /
+    autoEmitAndBuild), confirmed exhaustively this session via direct
+    MCP replay + the DEFN_EMIT_DEBUG instrumentation (internal/emit's
+    emitDebugf). This function's own `defn emit workdir` call -- bare,
+    unscoped, run AFTER every single defn-arm task regardless of what
+    the agent touched -- was the actual, sole source of a real mystery
+    that looked exactly like a defn correctness bug: three unrelated
+    generated .pb.gw.go files in etcd, whose on-disk import grouping
+    doesn't match goimports' canonical output, got silently rewritten
+    on every defn-arm run, tanking that run's file-touch precision on
+    every single etcd task scored this way -- not because of anything
+    defn's request handlers or the agent did, but because this
+    unconditional post-step re-normalized the WHOLE project's formatting
+    every time. Confirmed by bisecting a live DEFN_EMIT_DEBUG trace:
+    the exact three files logged "WROTE ... scoped=false" from a
+    completely separate `defn emit <workdir>` CLI invocation -- not
+    from anything inside the MCP server's own request handling -- right
+    after the agent's Claude process exited (rc=0), with the log's own
+    "emitting to ..." banner matching cmdEmit's stdout verbatim.
+    """
     try:
         subprocess.check_call(
             ["defn", "emit", workdir],
@@ -575,11 +603,16 @@ def run_one(
     prompt = build_prompt(task)
     events, rc, elapsed = run_claude(workdir, prompt, budget_usd, max_turns, arm=arm)
     traj, cost = events_to_fncall_messages(events)
-    if arm == "defn":
-        # files-mode already writes directly to disk via Edit/Write --
-        # calling `defn emit` here would overwrite those changes with the
-        # DB's (untouched, since files-mode never called defn) stale state.
-        apply_edits_via_defn(workdir)
+    # 2026-08-17: deliberately NOT calling apply_edits_via_defn(workdir)
+    # here anymore -- see its docstring. Every defn write op already
+    # writes its own touched file(s) to disk in real time; a redundant
+    # unscoped `defn emit` afterward was the actual source of a real,
+    # multi-hour "why does defn touch unrelated generated files" chase
+    # that turned out to be this harness re-normalizing the WHOLE
+    # project's formatting after every single defn-arm task, not a defn
+    # bug. The scorer diffs the live workdir directly (score_gitdiff.py),
+    # which already reflects every real-time write -- nothing further
+    # needed here for scoring to work correctly.
 
     os.makedirs(out_dir, exist_ok=True)
     with open(out_path, "w") as f:
