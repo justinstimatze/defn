@@ -9717,3 +9717,74 @@ func direct() int {
 		t.Errorf("expected Foo.Bar's DB row to still exist after rollback, got def=%v err=%v", d, err)
 	}
 }
+
+// TestHandleRename_RefusesEmbeddedInterfaceBreakingMethodRename covers
+// a variant of TestHandleRename_RefusesInterfaceBreakingMethodRename
+// where the method is declared on an EMBEDDED interface (Reader embeds
+// BaseReader, which declares Bar()) rather than directly. This works
+// not because methodRenameRisksInterfaceBreak understands embedding
+// syntax, but because resolve() stages an "implements" edge for every
+// interface a type structurally satisfies independently -- Foo
+// satisfies BaseReader on its own merits, so that edge exists
+// alongside the one to the composite Reader, and BaseReader's own body
+// directly declares Bar(). Locks in that the embedded case is covered.
+func TestHandleRename_RefusesEmbeddedInterfaceBreakingMethodRename(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "ifaceproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module ifaceproj\n\ngo 1.26\n"), 0644)
+	const src = `package ifaceproj
+
+type BaseReader interface {
+	Bar() int
+}
+
+type Reader interface {
+	BaseReader
+}
+
+type Foo struct{}
+
+func (f Foo) Bar() int { return 1 }
+
+func use(r Reader) int {
+	return r.Bar()
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleRename(context.Background(), nil, renameParam{
+		OldName:  "Bar",
+		NewName:  "Baz",
+		Receiver: "Foo",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "rolled back") {
+		t.Fatalf("expected the rename to be rolled back, got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != src {
+		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
+	}
+}
