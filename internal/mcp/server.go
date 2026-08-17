@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.57"
+const Version = "0.26.58"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -4919,6 +4919,15 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		return s.handleFieldRename(d, args)
 	}
 
+	// See methodRenameRisksInterfaceBreak's doc comment: renaming a
+	// method that also satisfies an interface under the old name can
+	// silently ship code that no longer compiles, since nothing here
+	// rewrites the interface's own (separately-stored) method text. When
+	// at risk, pay for a real build gate below instead of skipping it, so
+	// a break surfaces as an honest rollback with the real compiler
+	// diagnostic instead of silently-written broken code.
+	riskyInterfaceRename := s.methodRenameRisksInterfaceBreak(s.backend, d, d.Name)
+
 	// Compose the qualified old-name the safety net compares against (methods
 	// use "<Recv>.Name", pointer receivers unwrapped). Reserve it BEFORE we
 	// mutate d so the emit path knows this decl-name is *intentionally*
@@ -4935,6 +4944,17 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// operation instead of the possibly-qualified args.OldName.
 	oldBareName := d.Name
 
+	// #12/#218-class protection: route every write through a transaction
+	// so a build failure (risky path) or an emit-level WARNING (either
+	// path) leaves neither the DB nor the file changed, instead of the
+	// prior plain s.backend writes which always committed immediately
+	// regardless of what emit reported.
+	tx, commit, rollback, txErr := s.backend.Begin()
+	if txErr != nil {
+		return errResult(txErr)
+	}
+	defer rollback()
+
 	// Update the definition name in its own body using AST rename.
 	// Only renames identifiers — preserves comments and string literals.
 	totalSkipped := 0
@@ -4946,23 +4966,15 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// Do NOT use UpsertDefinition here: it looks up by (module,name,kind,recv,test)
 	// and would INSERT a new row for the new name, leaving the old row orphaned
 	// in the DB and both defs in the emitted file.
-	if err := s.backend.RenameDefinition(originalID, args.NewName, newBody, newSig, exported); err != nil {
+	if err := tx.RenameDefinition(originalID, args.NewName, newBody, newSig, exported); err != nil {
 		return errResult(err)
 	}
-	// #160: renamed def has new intent (name is a strong signal in the
-	// summary prompt) — regenerate. Body/receiver/kind stay the same
-	// otherwise; enqueue uses the post-rename shape.
-	d.Name = args.NewName
-	d.Body = newBody
-	d.Signature = newSig
-	d.Exported = exported
-	s.enqueueSummary(d)
 
 	// Update all callers' bodies that reference the old name. Also collect
 	// each touched file so goimports can scope to just those (#109 pass 3):
 	// rename touches the def's own file + every caller's file, typically a
 	// small handful vs the whole project tree.
-	callers, err := s.backend.GetCallers(originalID)
+	callers, err := tx.GetCallers(originalID)
 	if err != nil {
 		return errResult(fmt.Errorf("get callers for rename: %w", err))
 	}
@@ -4977,7 +4989,7 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 			caller.Body, skipped = astRename(caller.Body, oldBareName, args.NewName)
 			totalSkipped += skipped
 			caller.Signature = extractSignature(caller.Body)
-			if _, err := s.backend.UpsertDefinition(&caller); err != nil {
+			if _, err := tx.UpsertDefinition(&caller); err != nil {
 				return errResult(fmt.Errorf("update caller %s: %w", caller.Name, err))
 			}
 			if caller.SourceFile != "" {
@@ -4991,29 +5003,54 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		goimportsFiles = append(goimportsFiles, f)
 	}
 
-	// #148: rename is dispatch-safe by construction — refs are by def-ID,
-	// no ID changes on rename, so the ref graph and interface satisfaction
-	// are preserved regardless of build outcome. Skip the build gate;
-	// this is the biggest single win of #148 (rename was 187ms wall on
-	// winze with 148ms in go build; drops to ~40ms).
 	// #163: rename = delete-old + create-new to the emit path. Declare
 	// both so the merge can splice in-place (old name removed, new
 	// name spliced) instead of leaving the new name behind as drift.
-	buildResult := s.autoEmitOnlyWithOpts(emit.Opts{
+	opts := emit.Opts{
 		AllowedRemovals: []string{qualifiedOld},
 		AllowedAdds:     []string{emit.FuncIdentity(args.NewName, d.Receiver)},
 		GoimportsFiles:  goimportsFiles,
 		TouchedFiles:    goimportsFiles,
-	})
+	}
+	var buildResult string
+	if riskyInterfaceRename {
+		buildResult = s.commitOrRollbackOnBuild(tx, commit, rollback, opts)
+	} else {
+		// #148: rename is dispatch-safe by construction for the ref
+		// graph — refs are by def-ID, no ID changes on rename — so the
+		// go build check itself is skippable here; this is the biggest
+		// single win of #148 (rename was 187ms wall on winze with 148ms
+		// in go build; drops to ~40ms). Still routed through the real
+		// commit/rollback machinery (not a bare emit) so an emit-level
+		// WARNING gets the same #218 rollback protection every other
+		// write path has, rather than being reported as informational
+		// text after the DB write already landed.
+		buildResult = s.commitOrRollbackOnEmit(tx, commit, rollback, opts)
+	}
+
+	if buildResult != "" {
+		return textResult(fmt.Sprintf("rename %s → %s rolled back — nothing was saved\n\n%s", args.OldName, args.NewName, buildResult)), nil, nil
+	}
+
+	// #160: renamed def has new intent (name is a strong signal in the
+	// summary prompt) — regenerate. Body/receiver/kind stay the same
+	// otherwise; enqueue uses the post-rename shape.
+	d.Name = args.NewName
+	d.Body = newBody
+	d.Signature = newSig
+	d.Exported = exported
+	s.enqueueSummary(d)
+
 	// #109: rename is a name-preserving semantic transform — every from_def
 	// → to_def edge in the refs table is ID-based, and no def IDs change
 	// on rename. Caller bodies were already rewritten via astRename so
 	// their AST-shape matches, but the edge SET is identical. Interface
-	// satisfaction is preserved because it's driven by types.Object
-	// identities (also stable). Skipping autoResolve here removes the
-	// full-module ResolveModule call that dominated a single-symbol
-	// rename on winze (5,239 refs re-derived for one name change).
-	// Still autocommit so the DB working set stays clean.
+	// satisfaction is preserved when riskyInterfaceRename was false (the
+	// common case); when true, the build gate above already confirmed it
+	// still compiles. Skipping autoResolve here removes the full-module
+	// ResolveModule call that dominated a single-symbol rename on winze
+	// (5,239 refs re-derived for one name change). Still autocommit so
+	// the DB working set stays clean.
 	if err := s.autoCommit(); err != nil {
 		fmt.Fprintf(os.Stderr, "defn: auto-commit failed (post-rename): %v\n", err)
 	}
@@ -5026,9 +5063,6 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	sb.WriteString(fmt.Sprintf("Updated %d callers\n", updated))
 	if totalSkipped > 0 {
 		sb.WriteString(fmt.Sprintf("\nNote: %d local variable(s) named %q were preserved (not renamed).\n", totalSkipped, args.OldName))
-	}
-	if buildResult != "" {
-		sb.WriteString("\n" + buildResult)
 	}
 	return textResult(sb.String()), nil, nil
 }
@@ -9539,4 +9573,68 @@ func unsupportedFieldOp(kind, op string) string {
 		return ""
 	}
 	return fmt.Sprintf("code(op:%q) does not support struct fields directly -- a field only exists as text inside its declaring type's body, not as an independent declaration. Use code(op:\"rename\") to rename a field, or target the declaring type to change its shape.", op)
+}
+
+// interfaceDeclaresMethod reports whether an interface definition's
+// stored Body declares a method with the given bare name. Interface
+// methods live inline in the interface's own Body, not as independent
+// rows -- same #11 shape as struct fields -- so this parses the Body
+// the same way methodsFromInterfaceBody does rather than querying a
+// separate row that doesn't exist.
+func interfaceDeclaresMethod(body, name string) bool {
+	src := "package x\n" + body
+	f, err := parser.ParseFile(token.NewFileSet(), "", src, 0)
+	if err != nil || len(f.Decls) == 0 {
+		return false
+	}
+	gen, ok := f.Decls[0].(*ast.GenDecl)
+	if !ok || len(gen.Specs) == 0 {
+		return false
+	}
+	ts, ok := gen.Specs[0].(*ast.TypeSpec)
+	if !ok {
+		return false
+	}
+	iface, ok := ts.Type.(*ast.InterfaceType)
+	if !ok {
+		return false
+	}
+	for _, field := range iface.Methods.List {
+		for _, ident := range field.Names {
+			if ident.Name == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *server) methodRenameRisksInterfaceBreak(tx store.Backend, d *store.Definition, oldName string) bool {
+	if d.Kind != "method" || d.Receiver == "" {
+		return false
+	}
+	recvName := strings.TrimPrefix(d.Receiver, "*")
+	mp := s.modulePath(d.ModuleID)
+	recvType, err := tx.GetDefinitionByName(recvName, mp)
+	if err != nil || recvType == nil {
+		return false
+	}
+	ifaces, err := tx.Traverse(recvType.ID, "callees", []string{"implements"}, 1)
+	if err != nil {
+		return false
+	}
+	for _, r := range ifaces {
+		// Traverse's query hardcodes an empty string for the body column
+		// (a perf tradeoff for lightweight graph queries) -- r.Definition.Body
+		// is always "" here regardless of the real def, so a full fetch is
+		// required before this can parse the interface's method set.
+		iface, err := tx.GetDefinition(r.Definition.ID)
+		if err != nil || iface == nil {
+			continue
+		}
+		if interfaceDeclaresMethod(iface.Body, oldName) {
+			return true
+		}
+	}
+	return false
 }

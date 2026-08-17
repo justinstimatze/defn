@@ -9636,3 +9636,84 @@ func TestUnsupportedFieldOp(t *testing.T) {
 		}
 	}
 }
+
+// TestHandleRename_RefusesInterfaceBreakingMethodRename is the
+// regression for a live-confirmed bug: #148 skips rename's build gate
+// on the assumption that renaming a method is always dispatch-safe.
+// That assumption is false when the method's receiver type also
+// satisfies an interface declaring a method under the OLD name --
+// interface methods live inline in the interface's own Body (same
+// #11 shape as struct fields), so nothing rewrote the interface's
+// text, and the caller-rewrite loop happily turned a valid
+// interface-dispatch call site (r.Bar()) into one that doesn't
+// compile (r.Baz undefined). Verifies the rename now routes through a
+// real build gate in this case and rolls back cleanly with the actual
+// compiler diagnostic instead of silently shipping broken code.
+func TestHandleRename_RefusesInterfaceBreakingMethodRename(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "ifaceproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module ifaceproj\n\ngo 1.26\n"), 0644)
+	const src = `package ifaceproj
+
+type Reader interface {
+	Bar() int
+}
+
+type Foo struct{}
+
+func (f Foo) Bar() int { return 1 }
+
+func use(r Reader) int {
+	return r.Bar()
+}
+
+func direct() int {
+	f := Foo{}
+	return f.Bar()
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleRename(context.Background(), nil, renameParam{
+		OldName:  "Bar",
+		NewName:  "Baz",
+		Receiver: "Foo",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "rolled back") {
+		t.Fatalf("expected the rename to be rolled back, got: %s", text)
+	}
+	if !strings.Contains(text, "Baz undefined") {
+		t.Errorf("expected the real compiler diagnostic to be surfaced, got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != src {
+		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
+	}
+
+	if d, err := db.GetDefinitionByNameAndReceiver("Bar", "ifaceproj", "Foo"); err != nil || d == nil {
+		t.Errorf("expected Foo.Bar's DB row to still exist after rollback, got def=%v err=%v", d, err)
+	}
+}
