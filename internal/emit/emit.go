@@ -152,6 +152,16 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, []
 		}
 		touchedSet[filepath.ToSlash(clean)] = true
 	}
+	emitDebugf("scope: touchedFiles=%d goimportsFiles=%d skipGoimports=%v allowedRemovals=%d allowedAdds=%d",
+		len(opts.TouchedFiles), len(opts.GoimportsFiles), opts.SkipGoimports, len(opts.AllowedRemovals), len(opts.AllowedAdds))
+	if scoped {
+		names := make([]string, 0, len(touchedSet))
+		for f := range touchedSet {
+			names = append(names, f)
+		}
+		sort.Strings(names)
+		emitDebugf("touchedSet: %v", names)
+	}
 
 	// Write project-level files (go.mod, go.sum). Kept unconditional even
 	// in scoped mode: a fresh tempdir needs go.mod to build, and the cost
@@ -266,6 +276,7 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, []
 		} else {
 			args = append(args, outDir)
 		}
+		emitDebugf("goimports args: %v", args)
 		if out, err := exec.Command(goimports, args...).CombinedOutput(); err != nil {
 			return nil, nil, fmt.Errorf("goimports: %s", out)
 		}
@@ -481,8 +492,16 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 					break
 				}
 			}
-			if projectRel == "" || touchedSet[projectRel] {
+			keep := projectRel == "" || touchedSet[projectRel]
+			if keep {
+				reason := "in touchedSet"
+				if projectRel == "" {
+					reason = "no def in this file has a SourceFile (fresh file-less create fallback)"
+				}
+				emitDebugf("  KEEP %s/%s (sourceFile=%q): %s", mod.Path, file, projectRel, reason)
 				kept = append(kept, file)
+			} else {
+				emitDebugf("  DROP %s/%s (sourceFile=%q): not in touchedSet", mod.Path, file, projectRel)
 			}
 		}
 		fileNames = kept
@@ -609,6 +628,7 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 		if warning != "" {
 			warnings = append(warnings, warning)
 		}
+		emitDebugf("  WROTE %s (module=%s sourceFile=%q scoped=%v)", path, mod.Path, projectRelByFile[file], scoped)
 		allLocs = append(allLocs, locs...)
 		written = append(written, writtenFile{
 			Path:       path,
@@ -1538,4 +1558,31 @@ func relevantImportsForFile(imports []store.Import, defs []store.Definition) []s
 		}
 	}
 	return out
+}
+
+// emitDebugf prints a trace line to stderr when DEFN_EMIT_DEBUG=1,
+// prefixed for easy grepping. No-op (and effectively free -- one env
+// lookup) otherwise. Companion to the existing DEFN_SYNC_TIMING /
+// DEFN_MEASURE_TIMING dev-instrumentation env vars; re-checks the env
+// var on every call rather than caching it at package init so tests
+// can toggle it per-case via t.Setenv and a long-lived `defn serve`
+// process doesn't need a restart to pick up the flag.
+//
+// Built to trace a real, unresolved mystery (2026-08-17): a scoped
+// emit during a real etcd bench trajectory rewrote three unrelated
+// generated .pb.gw.go files' import grouping even after every known
+// unscoped-emit call site had been found and fixed. Static reading of
+// emitWithOpts/emitModule's ~450 combined lines couldn't pin down
+// which of several plausible branches was responsible. This gives
+// live per-file keep/drop reasoning and the actual goimports
+// invocation for the next time that (or a similar) mystery shows up --
+// meant to stay in the tree as a permanent, reusable dev tool, not a
+// one-off diagnostic ripped out after use.
+//
+// Usage: DEFN_EMIT_DEBUG=1 defn <ingest|serve|...> 2>&1 | grep emit-debug
+func emitDebugf(format string, args ...any) {
+	if os.Getenv("DEFN_EMIT_DEBUG") != "1" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[emit-debug] "+format+"\n", args...)
 }

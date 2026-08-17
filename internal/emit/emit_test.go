@@ -2090,3 +2090,62 @@ func TestEmitRegeneratePathDedupesCollidingLocalImportNames(t *testing.T) {
 		t.Errorf("pkgy/ec2.go missing unrelated referenced import \"context\" -- filter over-restricted:\n%s", s)
 	}
 }
+
+// TestEmitDebug_TracesKeepDropAndWriteDecisions verifies the
+// DEFN_EMIT_DEBUG=1 instrumentation added 2026-08-17 (see emitDebugf's
+// doc comment for the mystery it exists to help debug next time) --
+// both as a regression against silently breaking the trace output,
+// and as executable documentation of what a scoped emit's debug
+// log actually looks like.
+func TestEmitDebug_TracesKeepDropAndWriteDecisions(t *testing.T) {
+	t.Setenv("DEFN_EMIT_DEBUG", "1")
+
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test/pkg", "pkg", "")
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Touched", Kind: "function", Exported: true,
+		Body: "func Touched() {}", SourceFile: "pkg/touched.go",
+	})
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Untouched", Kind: "function", Exported: true,
+		Body: "func Untouched() {}", SourceFile: "pkg/untouched.go",
+	})
+	outDir := t.TempDir()
+	if err := Emit(db, outDir); err != nil {
+		t.Fatal(err)
+	}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	origStderr := os.Stderr
+	os.Stderr = w
+	_, emitErr := EmitWithOpts(db, outDir, Opts{TouchedFiles: []string{"pkg/touched.go"}})
+	w.Close()
+	os.Stderr = origStderr
+	if emitErr != nil {
+		t.Fatal(emitErr)
+	}
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+
+	for _, want := range []string{
+		"[emit-debug] scope: touchedFiles=1",
+		"[emit-debug] touchedSet: [pkg/touched.go]",
+		"KEEP example.com/test/pkg/pkg/touched.go",
+		"DROP example.com/test/pkg/pkg/untouched.go",
+		"WROTE",
+		"goimports args:",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected debug output to contain %q, got:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "WROTE") && strings.Contains(out, "untouched.go)") {
+		t.Errorf("debug log claims untouched.go was written, but the scoped emit should never touch it:\n%s", out)
+	}
+}
