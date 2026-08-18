@@ -10497,3 +10497,86 @@ func TestHandleCreateScaffoldFile_ActuallyWritesFileToDisk(t *testing.T) {
 		t.Errorf("existing.go lost Real() as a side effect of scaffolding a sibling file:\n%s", realSrc)
 	}
 }
+
+// TestHandleCode_DryRunNeverWritesForAnyWriteOp is the single
+// authoritative table for dry_run:true across every write-capable op.
+// It exists because dry_run turned out to be a "silently ignored
+// param" class of bug, not a one-off: edit and delete each had their
+// own independent fix at different times (#246 and its sibling), and
+// this session found the SAME gap freshly in create, add-import, and
+// all five projection ops (insert-precondition, replace-slice,
+// replace-hunk, wrap-in-defer, rename-param) -- confirmed live in a
+// real trajectory (prometheus-18712, v4 mining round) where 30+
+// replace-hunk calls with dry_run:true silently wrote for real. Rather
+// than let each op accumulate its own bespoke dry-run test (the same
+// "slightly different duplicated guardrails" risk as the bug itself),
+// every op that accepts dry_run gets one row here. Adding a new write
+// op should mean adding one row, not writing a new test from scratch.
+func TestHandleCode_DryRunNeverWritesForAnyWriteOp(t *testing.T) {
+	cases := []struct {
+		name string
+		args codeParam
+	}{
+		{"edit", codeParam{Op: "edit", Name: "Greet", NewBody: "func Greet(name string) string {\n\treturn \"Hi, \" + name\n}", DryRun: true}},
+		{"delete", codeParam{Op: "delete", Name: "Greet", Force: true, DryRun: true}},
+		{"create", codeParam{Op: "create", Body: "func Zorp() int {\n\treturn 1\n}", File: "main.go", DryRun: true}},
+		{"add-import", codeParam{Op: "add-import", File: "main.go", ImportPath: "fmt", DryRun: true}},
+		{"insert-precondition", codeParam{Op: "insert-precondition", Name: "Greet", Condition: `name == ""`, Ret: `return ""`, DryRun: true}},
+		{"replace-slice", codeParam{Op: "replace-slice", Name: "Greet", Slice: "return", New: `return "Hi, " + name`, DryRun: true}},
+		{"replace-hunk", codeParam{Op: "replace-hunk", Name: "Greet", Old: "Hello, ", New: "Hi, ", DryRun: true}},
+		{"wrap-in-defer", codeParam{Op: "wrap-in-defer", Name: "Greet", DeferBody: `println("done")`, DryRun: true}},
+		{"rename-param", codeParam{Op: "rename-param", Name: "Greet", OldParam: "name", NewParam: "n", DryRun: true}},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			db, projDir := setupTestDB(t)
+			defer db.Close()
+			s := &server{backend: db, projectDir: projDir}
+			s.ready.Store(true)
+
+			before, err := db.GetDefinitionByName("Greet", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			diskBefore, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			result, _, err := s.handleCode(context.Background(), nil, c.args)
+			if err != nil {
+				t.Fatalf("handleCode: %v", err)
+			}
+			text := resultText(t, result)
+			if result.IsError {
+				t.Fatalf("expected dry-run %s to succeed, got error: %s", c.name, text)
+			}
+			if !strings.Contains(text, "dry run") {
+				t.Errorf("expected dry-run preview text for %s, got: %s", c.name, text)
+			}
+
+			after, err := db.GetDefinitionByName("Greet", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.Body != before.Body {
+				t.Errorf("%s: Greet's body changed under dry_run:true\nbefore:\n%s\nafter:\n%s", c.name, before.Body, after.Body)
+			}
+
+			diskAfter, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(diskAfter) != string(diskBefore) {
+				t.Errorf("%s: main.go changed on disk under dry_run:true\nbefore:\n%s\nafter:\n%s", c.name, diskBefore, diskAfter)
+			}
+
+			if c.name == "create" {
+				if _, err := db.GetDefinitionByName("Zorp", ""); err == nil {
+					t.Errorf("create: Zorp should NOT have been created under dry_run:true, but it exists in the DB")
+				}
+			}
+		})
+	}
+}

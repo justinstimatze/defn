@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.69"
+const Version = "0.26.70"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -587,6 +587,7 @@ type createParam struct {
 	Body   string `json:"body"`
 	Module string `json:"module,omitempty"`
 	File   string `json:"file,omitempty"`
+	DryRun bool   `json:"dry_run,omitempty"`
 }
 
 type applyParam struct {
@@ -1327,7 +1328,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "insert":
 		return s.handleInsert(ctx, req, args)
 	case "create":
-		return s.handleCreate(ctx, req, createParam{Body: args.Body, Module: args.Module, File: args.File})
+		return s.handleCreate(ctx, req, createParam{Body: args.Body, Module: args.Module, File: args.File, DryRun: args.DryRun})
 	case "delete":
 		return s.handleDelete(ctx, req, nameParam{Name: args.Name, Force: args.Force, DryRun: args.DryRun, Receiver: args.Receiver, Module: args.Module, File: args.File})
 	case "rename":
@@ -2510,7 +2511,7 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 	// All validation above (parse, multi-decl, identity) has already
 	// run, so a dry-run report here is a genuine preview, not a guess.
 	if args.DryRun {
-		return textResult(fmt.Sprintf("- would update %s%s (id=%d)\n\n(dry run — no changes made)", formatReceiver(d.Receiver), d.Name, d.ID)), nil, nil
+		return dryRunResult(fmt.Sprintf("- would update %s%s (id=%d)", formatReceiver(d.Receiver), d.Name, d.ID))
 	}
 
 	// Capture the pre-edit signature so we can decide whether the build
@@ -2883,24 +2884,6 @@ func (s *server) watchFiles(ctx context.Context) {
 // to edit files directly and use defn as a read-only acceleration layer).
 func (s *server) autoEmitAndBuild() string {
 	return s.autoEmitAndBuildWithOpts(emit.Opts{})
-}
-
-// autoEmitAndBuildForFile is the file-scoped variant: pass the single
-// source file the mutation touched, get goimports AND emit scoped to
-// that file via emit.Opts.GoimportsFiles + Opts.TouchedFiles. On
-// cli/cli warm rename this dropped goimports from 707ms → 11ms (#109
-// pass 3); #117 adds the same scoping to emit itself so we don't
-// rewrite every file in the tree for a single-def mutation (winze:
-// 1.2s full-emit → per-touched-file cost). Empty file falls through
-// to the full-project recursive form.
-func (s *server) autoEmitAndBuildForFile(sourceFile string) string {
-	if sourceFile == "" {
-		return s.autoEmitAndBuild()
-	}
-	return s.autoEmitAndBuildWithOpts(emit.Opts{
-		GoimportsFiles: []string{sourceFile},
-		TouchedFiles:   []string{sourceFile},
-	})
 }
 
 // autoEmitOnly emits without running `go build` — for projection ops
@@ -3427,6 +3410,23 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	if existErr == nil {
 		recv := formatReceiver(existing.Receiver)
 		return errResult(fmt.Errorf("definition %s%s already exists in %s (id=%d) — use code(op:\"edit\") to modify it", recv, name, mod.Path, existing.ID))
+	}
+
+	// #dry-run-create: create's own instance of the same "accepted by the
+	// shared codeParam schema but silently dropped" gap #246 fixed for
+	// edit/delete and the projection-op family above -- createParam had
+	// no DryRun field at all, so dry_run:true on op:"create" wrote for
+	// real with no signal anything was off. Placed after every validation
+	// gate above (multi-decl/scaffold routing, name inference, module
+	// resolution, the existing-definition collision check) so the
+	// preview genuinely reflects what create would do, not a guess.
+	if args.DryRun {
+		recv := formatReceiver(receiver)
+		loc := mod.Path
+		if args.File != "" {
+			loc = args.File + " (" + mod.Path + ")"
+		}
+		return dryRunResult(fmt.Sprintf("would create %s%s (kind=%s) in %s", recv, name, kind, loc))
 	}
 
 	exported := len(name) > 0 && name[0] >= 'A' && name[0] <= 'Z'
@@ -4892,7 +4892,7 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	recv := formatReceiver(d.Receiver)
 
 	if args.DryRun {
-		return textResult(fmt.Sprintf("- would delete %s%s (id=%d)\n\n(dry run — no changes made)", recv, d.Name, d.ID)), nil, nil
+		return dryRunResult(fmt.Sprintf("- would delete %s%s (id=%d)", recv, d.Name, d.ID))
 	}
 
 	// #12: delete + build-gate through a transaction so a build failure
@@ -7687,7 +7687,7 @@ func (s *server) handleInsertPrecondition(_ context.Context, req *sdkmcp.CallToo
 		return errResult(err)
 	}
 	snippet := fmt.Sprintf("if %s {\n\t%s\n}", args.Condition, args.Ret)
-	return s.applyEditTerse(sessionOf(req), d, "insert-precondition", "inserted precondition at entry", snippet, newBody)
+	return s.applyEditTerse(sessionOf(req), d, "insert-precondition", "inserted precondition at entry", snippet, newBody, args.DryRun)
 }
 
 // handleAddImport adds a new import (with optional alias) to the given
@@ -7745,6 +7745,21 @@ func (s *server) handleAddImport(_ context.Context, _ *sdkmcp.CallToolRequest, a
 		return errResult(fmt.Errorf("add-import: no definitions found in file %q -- cannot resolve module (check the path via op:\"overview\" or op:\"search\")", file))
 	}
 	moduleID := defs[0].ModuleID
+
+	// #dry-run-add-import: add-import's own instance of the same
+	// silently-dropped dry_run gap fixed for edit/delete/create/the
+	// projection-op family -- this handler never checked args.DryRun at
+	// all, so dry_run:true on op:"add-import" wrote to disk for real.
+	// Placed after file/module resolution so the preview reflects a
+	// genuinely resolvable target, but before patchImportOnDisk actually
+	// touches anything.
+	if args.DryRun {
+		snippet := fmt.Sprintf("%q", args.ImportPath)
+		if args.Alias != "" {
+			snippet = fmt.Sprintf("%s %q", args.Alias, args.ImportPath)
+		}
+		return dryRunResult(fmt.Sprintf("%s: would add import %s", file, snippet))
+	}
 
 	changed, perr := s.patchImportOnDisk(moduleID, file, args.ImportPath, args.Alias)
 	if perr != nil {
@@ -7826,7 +7841,7 @@ func (s *server) handleRenameParam(_ context.Context, req *sdkmcp.CallToolReques
 	if idx := strings.Index(newBody, "\n"); idx > 0 {
 		snippet = newBody[:idx]
 	}
-	return s.applyEditTerse(sessionOf(req), d, "rename-param", action, snippet, newBody)
+	return s.applyEditTerse(sessionOf(req), d, "rename-param", action, snippet, newBody, args.DryRun)
 }
 
 // handleWrapInDefer inserts a `defer <defer_body>` statement immediately
@@ -7861,7 +7876,7 @@ func (s *server) handleWrapInDefer(_ context.Context, req *sdkmcp.CallToolReques
 	}
 	action := fmt.Sprintf("inserted defer before stmt #%d", stmtIdx)
 	snippet := fmt.Sprintf("defer %s", args.DeferBody)
-	return s.applyEditTerse(sessionOf(req), d, "wrap-in-defer", action, snippet, newBody)
+	return s.applyEditTerse(sessionOf(req), d, "wrap-in-defer", action, snippet, newBody, args.DryRun)
 }
 
 // handleReplaceSlice replaces the Nth (1-based) match of the given AST
@@ -7910,7 +7925,7 @@ func (s *server) handleReplaceSlice(_ context.Context, req *sdkmcp.CallToolReque
 		return errResult(err)
 	}
 	action := fmt.Sprintf("replaced %s #%d", args.Slice, index)
-	return s.applyEditTerse(sessionOf(req), d, "replace-slice", action, args.New, newBody)
+	return s.applyEditTerse(sessionOf(req), d, "replace-slice", action, args.New, newBody, args.DryRun)
 }
 
 // handleReplaceHunk replaces a byte-exact occurrence of `old` inside
@@ -7956,10 +7971,10 @@ func (s *server) handleReplaceHunk(_ context.Context, req *sdkmcp.CallToolReques
 	if args.Index > 0 {
 		action = fmt.Sprintf("replaced hunk #%d", args.Index)
 	}
-	return s.applyEditTerse(sessionOf(req), d, "replace-hunk", action, args.New, newBody)
+	return s.applyEditTerse(sessionOf(req), d, "replace-hunk", action, args.New, newBody, args.DryRun)
 }
 
-func (s *server) applyEditTerse(session *sdkmcp.ServerSession, d *store.Definition, op, action, snippet, newBody string) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) applyEditTerse(session *sdkmcp.ServerSession, d *store.Definition, op, action, snippet, newBody string, dryRun bool) (*sdkmcp.CallToolResult, any, error) {
 	if msg := unsupportedFieldOp(d.Kind, op); msg != "" {
 		return errResult(fmt.Errorf("%s", msg))
 	}
@@ -8001,6 +8016,22 @@ func (s *server) applyEditTerse(session *sdkmcp.ServerSession, d *store.Definiti
 	// skipped. Compare the real old vs new signature instead of assuming
 	// -- same distinction handleEdit already draws for its own body/sig
 	// split.
+	// #dry-run-projection-ops: same "accepted by the schema but silently
+	// dropped before it could matter" gap #246 already fixed for
+	// handleEdit/handleDelete -- every projection op (insert-precondition,
+	// replace-slice, replace-hunk, wrap-in-defer, rename-param) funnels
+	// through this one shared write path, and none of them threaded
+	// args.DryRun through to it, so dry_run:true silently performed the
+	// real write anyway. Confirmed live in a real trajectory
+	// (prometheus-18712, v4 mining round): 30+ replace-hunk calls with
+	// dry_run:true each wrote for real, repeatedly re-emitting a large
+	// function while the caller believed it was only probing for a
+	// match -- a real contributor to that trajectory's DB/disk
+	// divergence and eventual task failure.
+	if dryRun {
+		return dryRunResult(fmt.Sprintf("%s%s: would %s", formatReceiver(d.Receiver), d.Name, action))
+	}
+
 	oldSignature := extractSignature(d.Body)
 	oldBody := d.Body
 	d.Body = newBody
@@ -9904,4 +9935,17 @@ var commonStdlibInterfaceMethodNames = map[string]bool{
 	"UnmarshalJSON": true,
 	"MarshalText":   true,
 	"UnmarshalText": true,
+}
+
+// dryRunResult is the single formatting/return-shape point for every
+// write op's dry_run:true preview. Centralizing this (instead of each
+// write handler building its own "(dry run — no changes made)" string)
+// means a future write op that forgets to call it produces an
+// obviously-absent dry_run check rather than a subtly-different one --
+// the failure mode that let create and add-import silently perform
+// real writes under dry_run:true despite the field being accepted by
+// the shared codeParam schema. msg should already name what WOULD have
+// happened (e.g. "Foo: would replace hunk #1").
+func dryRunResult(msg string) (*sdkmcp.CallToolResult, any, error) {
+	return textResult(msg + "\n\n(dry run — no changes made)"), nil, nil
 }
