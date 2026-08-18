@@ -10769,3 +10769,120 @@ func TestWidget(t *testing.T) {
 		t.Errorf("expected a near-instant fast-fail with no subprocess, took %s", elapsed)
 	}
 }
+
+// TestHandleReadFile_LineRangeNarrowsToOverlappingDefs locks in the
+// read-file line_range extension: real trajectory motivation
+// (prometheus-18534, prometheus-18358, Opus) -- the model called
+// read-file(line_range:...) on a large file expecting the same
+// narrowing op:"read" already supports, and silently got the WHOLE
+// file back every time (once erroring "exceeds maximum allowed
+// tokens" on a 3,485-line file) because read-file never wired the
+// param up at all.
+func TestHandleReadFile_LineRangeNarrowsToOverlappingDefs(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	// Fixture (setupTestDB's main.go): Greet at lines 3-6 (doc+func),
+	// Farewell at lines 8-11. Requesting 8-11 should keep only Farewell.
+	result, _, err := s.handleReadFile(context.Background(), nil, codeParam{File: "main.go", LineRange: "8-11"})
+	if err != nil {
+		t.Fatalf("read-file: %v", err)
+	}
+	text := resultText(t, result)
+
+	if !strings.Contains(text, "## Farewell") {
+		t.Errorf("expected Farewell's definition header in output, got: %s", text)
+	}
+	if strings.Contains(text, "## Greet") {
+		t.Errorf("expected Greet's definition header to be excluded (out of range), got: %s", text)
+	}
+	if strings.Contains(text, "Hello, ") {
+		t.Errorf("expected Greet's own body text to be excluded, got: %s", text)
+	}
+	if !strings.Contains(text, "line_range read-file") {
+		t.Errorf("expected a line_range hint header, got: %s", text)
+	}
+}
+
+// TestHandleReadFile_LineRangeNoOverlapReturnsHelpfulMessage confirms a
+// range with no overlapping definitions fails gracefully instead of
+// silently returning the whole file or an empty body.
+func TestHandleReadFile_LineRangeNoOverlapReturnsHelpfulMessage(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.handleReadFile(context.Background(), nil, codeParam{File: "main.go", LineRange: "500-600"})
+	if err != nil {
+		t.Fatalf("read-file: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "no definitions overlap") {
+		t.Errorf("expected a no-overlap message, got: %s", text)
+	}
+	if result.IsError {
+		t.Errorf("no-overlap should be a plain informative result, not an error result: %s", text)
+	}
+}
+
+// TestHandleSync_PrunesStaleDefSoSubsequentWritesToSameFileSucceed is
+// the end-to-end regression for the real prometheus-18712 (Opus)
+// trajectory: a stale def orphaned by an out-of-band file edit made
+// EVERY subsequent write to that same file fail with "could not be
+// matched to an on-disk declaration" -- and the warning's own
+// suggested remedy (code(op:"sync", file:...)) didn't actually clear
+// it, because IngestFile never pruned. This confirms the fix at the
+// level a caller actually experiences it: sync the file, then edit an
+// UNRELATED def in it, and the edit must land cleanly with no warning.
+func TestHandleSync_PrunesStaleDefSoSubsequentWritesToSameFileSucceed(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	mod, err := db.GetModuleByPath("testproj")
+	if err != nil {
+		t.Fatalf("find testproj module: %v", err)
+	}
+
+	// Simulate a stale def: a row in the DB with no corresponding
+	// on-disk declaration in main.go (as if it had been removed by an
+	// edit outside defn's own write path).
+	if _, err := db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "agentOnlyFlags", Kind: "var",
+		Body: "agentOnlyFlags = \"hidden\"", SourceFile: "main.go",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// code(op:"sync", file:"main.go") -- the exact remedy the real
+	// warning message suggests.
+	if _, _, err := s.handleCode(context.Background(), nil, codeParam{Op: "sync", File: "main.go"}); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if _, err := db.GetDefinitionByName("agentOnlyFlags", "testproj"); err == nil {
+		t.Fatal("expected the stale def to be pruned by sync, but it still exists")
+	}
+
+	// Now edit a real, unrelated def in the SAME file. Before the fix,
+	// this would roll back with "could not be matched to an on-disk
+	// declaration... [agentOnlyFlags]" even though this edit has
+	// nothing to do with that name.
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op: "edit", Name: "Greet",
+		NewBody: `func Greet(name string) string {
+	return "Hi, " + name
+}`,
+	})
+	if err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "could not be matched") || strings.Contains(text, "rolled back") {
+		t.Errorf("expected the edit to land cleanly after the stale def was pruned, got: %s", text)
+	}
+	if !strings.Contains(text, "Updated") {
+		t.Errorf("expected a normal success response, got: %s", text)
+	}
+}

@@ -12,13 +12,6 @@ import (
 	"github.com/justinstimatze/defn/internal/store"
 )
 
-// IngestFile re-parses a single Go file and updates definitions in the database.
-// This is much faster than a full Ingest (~10ms vs ~30s) because it uses
-// go/parser directly instead of packages.Load.
-//
-// It updates bodies, signatures, and line numbers for existing definitions,
-// and adds new definitions found in the file. It does NOT update references
-// (call graph) — use resolve.Resolve for that after structural changes.
 func IngestFile(db store.Backend, modulePath string, filePath string) (int, error) {
 	absModule, err := filepath.Abs(modulePath)
 	if err != nil {
@@ -85,6 +78,32 @@ func IngestFile(db store.Backend, modulePath string, filePath string) (int, erro
 	delete(sourceFileCache, absFile)
 	sourceFileMu.Unlock()
 
+	// #NEW: snapshot this file's currently-known def IDs BEFORE
+	// re-parsing, so any not reproduced below (removed/renamed on disk
+	// -- e.g. a var dropped from a grouped `var (...)` block) can be
+	// pruned. Full-project ingest already does this project-wide via
+	// PruneStaleDefinitions, but this fast single-file path (what
+	// op:"sync", file:... actually runs) never did -- a def orphaned
+	// this way stayed in the DB forever, and every future write to that
+	// file hit emit's "could not be matched to an on-disk declaration"
+	// warning, whose own suggested remedy ("run code(op:\"sync\",
+	// file:...)") never actually cleared it. Confirmed live
+	// (prometheus-18712, Opus): the model called sync on the affected
+	// file twice (once with a full resync) and got the identical
+	// warning both times, only unblocked by manually force-deleting the
+	// stale def after ~15 rounds of trial and error.
+	dirForLookup := ""
+	if idx := strings.LastIndex(relFile, "/"); idx >= 0 {
+		dirForLookup = relFile[:idx]
+	}
+	var previousIDs map[int64]bool
+	if existing, existErr := db.FindDefinitionsByFile(dirForLookup, relFile, 0); existErr == nil {
+		previousIDs = make(map[int64]bool, len(existing))
+		for _, d := range existing {
+			previousIDs[d.ID] = true
+		}
+	}
+
 	state := &ingestState{
 		initCounter: make(map[string]int),
 		liveDefIDs:  make(map[int64]bool),
@@ -109,6 +128,15 @@ func IngestFile(db store.Backend, modulePath string, filePath string) (int, erro
 	// #125: flush buffered defs. Single-file ingest → single flush at end.
 	if err := state.flushDefs(db); err != nil {
 		return updated, fmt.Errorf("flush defs: %w", err)
+	}
+
+	// Prune defs this file used to have that this parse didn't reproduce.
+	for id := range previousIDs {
+		if !state.liveDefIDs[id] {
+			if err := db.DeleteDefinition(id); err != nil {
+				return updated, fmt.Errorf("prune stale def %d: %w", id, err)
+			}
+		}
 	}
 
 	// #224: link doc/pragma comments to this file's defs. Must run AFTER
