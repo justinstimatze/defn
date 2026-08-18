@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -10347,5 +10348,25 @@ func Widget() string { return "beta" }
 	}
 	if !strings.Contains(text, "Widget") {
 		t.Errorf("expected Widget's outline in the result, got: %s", text)
+	}
+}
+
+// TestExtractQueryTokensLower_MatchesProjectionMirrorOnNonASCII is the
+// regression for the calque-found drift between this function and its
+// declared mirror, internal/projection's extractQueryTokens (#157):
+// this copy checked ASCII-only 'a'-'z'/'0'-'9' ranges while the
+// projection version used unicode.IsLetter/IsDigit, so a non-ASCII
+// identifier rune (a legal Go identifier character) was silently
+// treated as a token separator here but not there. See
+// TestExtractQueryTokens_MatchesMCPMirrorOnNonASCII in
+// internal/projection for the same expected literal asserted against
+// the other copy -- extractQueryTokens is unexported, so the two
+// can't call each other across packages; asserting both against the
+// same literal is the cross-check.
+func TestExtractQueryTokensLower_MatchesProjectionMirrorOnNonASCII(t *testing.T) {
+	got := extractQueryTokensLower("café über λambda")
+	want := []string{"café", "über", "λambda"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("extractQueryTokensLower(%q) = %v, want %v", "café über λambda", got, want)
 	}
 }

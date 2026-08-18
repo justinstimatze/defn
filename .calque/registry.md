@@ -207,6 +207,36 @@ Result: 13 pairs, 6 clusters. Adjudicated: **0 drift**, 5 contracted-twin-ok,
     different projections. If a future kind like `blast-radius` is added
     to expand's include set, this pair MUST fold into a shared helper.
 
+## Added 2026-08-17 (project-wide rookie-mistake sweep + calque scan)
+
+- pair: internal/mcp/server.go::extractQueryTokensLower | internal/projection/query_filter.go::extractQueryTokens
+  - verdict: drift (fixed)
+  - reviewed: 2026-08-17
+  - note: extractQueryTokensLower's own doc comment already declared it a
+    deliberate inline mirror of extractQueryTokens (#157, kept unexported
+    rather than shared to avoid an internal/mcp -> internal/projection
+    export). The two had silently drifted: extractQueryTokensLower checked
+    ASCII-only `r >= 'a' && r <= 'z'` / `'0'-'9'`, while extractQueryTokens
+    used `unicode.IsLetter`/`unicode.IsDigit`. A non-ASCII identifier rune
+    (legal in a Go identifier) tokenized differently depending on which
+    copy ran -- silently inconsistent search/filter token matching for
+    non-ASCII-named identifiers. Fixed by aligning
+    extractQueryTokensLower's rune check to unicode.IsLetter/IsDigit.
+    Deliberately did NOT unify into one shared exported function -- #157's
+    reasoning for keeping this an inline copy still stands; this was a
+    same-logic-drifted-apart fix, not a dedup.
+
+- pair: internal/mcp/server.go::astRename | internal/mcp/server.go::renameFieldInType
+  - verdict: contracted-twin-ok
+  - reviewed: 2026-08-17
+  - note: renameFieldInType's own doc comment explains the distinction:
+    astRename walks a whole caller body and can collide with an unrelated
+    same-named field on a different type (confirmed live in an earlier
+    fix this session); renameFieldInType is scoped to one struct's own
+    *ast.StructType, where Go's no-duplicate-field-names-per-struct rule
+    makes every match unambiguously the target field. Different collision
+    risk, deliberately different implementation -- not drift.
+
 ## Follow-up refactors (deferred, not drift)
 
 None of these are gate-worthy — mild ergonomics wins surfaced by the scan:
@@ -218,3 +248,10 @@ None of these are gate-worthy — mild ergonomics wins surfaced by the scan:
    a shared upstream package is possible).
 3. Op-name list extracted from `handleCode` switch to a `map[string]struct{}`
    so `TestHandleCodeValidation` and `handleApply` read the same source.
+4. `humanSize(n int64) string` (2026-08-17 calque scan) — byte-for-byte
+   identical between cmd/defn/commands.go and internal/mcp/server.go.
+   No active drift/bug (they're currently identical), but a future edit
+   to one copy without the other would reintroduce the exact class of bug
+   this session fixed three separate times elsewhere (receiver-name
+   stripping). Low priority: trivial formatting helper, low change
+   frequency.

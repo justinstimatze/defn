@@ -1,6 +1,7 @@
 package projection
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -162,4 +163,21 @@ func stringSlicesEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestExtractQueryTokens_MatchesMCPMirrorOnNonASCII asserts the same
+// expected literal as internal/mcp's
+// TestExtractQueryTokensLower_MatchesProjectionMirrorOnNonASCII --
+// extractQueryTokensLower is documented as a deliberate inline mirror
+// of this function (#157), and the two had silently drifted on
+// non-ASCII input (this version already used unicode.IsLetter/IsDigit;
+// the mirror was ASCII-only). extractQueryTokens is unexported, so
+// this can't call the mcp copy directly -- asserting both against the
+// same literal is the cross-check.
+func TestExtractQueryTokens_MatchesMCPMirrorOnNonASCII(t *testing.T) {
+	got := extractQueryTokens("café über λambda")
+	want := []string{"café", "über", "λambda"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("extractQueryTokens(%q) = %v, want %v", "café über λambda", got, want)
+	}
 }

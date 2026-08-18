@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.65"
+const Version = "0.26.66"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -1540,7 +1540,14 @@ func extractQueryTokensLower(query string) []string {
 		cur.Reset()
 	}
 	for _, r := range low {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+		// unicode.IsLetter/IsDigit, not an ASCII a-z/0-9 range check --
+		// the two "mirror" copies had silently drifted: this one only
+		// recognized ASCII letters as token characters, so a non-ASCII
+		// identifier character (a real, legal Go identifier rune) got
+		// treated as a separator here but not in extractQueryTokens,
+		// producing different tokens for the same query depending on
+		// which of the two copies ran.
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
 			cur.WriteRune(r)
 		} else {
 			flush()
