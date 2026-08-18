@@ -63,6 +63,22 @@ def _defn_cache_path(inst_id, binhash):
     return os.path.join(DEFN_CACHE_ROOT, f"{inst_id}__{binhash}.tar")
 
 
+def _defn_version_string():
+    """Output of `defn version` (e.g. "0.26.71") — stamped into every
+    trajectory alongside _defn_binary_hash() so a trajectory file is
+    self-describing about exactly which build produced it. Added
+    2026-08-18 after a real investigation (etcd-multifile bench) burned
+    several calls doing git-log archaeology to work out whether a
+    trajectory ran on pre- or post-fix code, only reachable by comparing
+    the trajectory's file mtime against when a commit landed. That
+    should never require archaeology again — it's answerable by reading
+    one field in the file itself."""
+    try:
+        return subprocess.check_output(["defn", "version"], text=True).strip()
+    except subprocess.CalledProcessError:
+        return "unknown"
+
+
 DEFN_MCP_CONFIG = {
     "mcpServers": {"defn": {"type": "stdio", "command": "defn", "args": ["serve"]}}
 }
@@ -634,6 +650,8 @@ def run_one(
                 "elapsed_sec": elapsed,
                 "cost_usd": cost,
                 "n_raw_events": len(events),
+                "defn_version": _defn_version_string() if arm == "defn" else None,
+                "defn_binary_hash": _defn_binary_hash() if arm == "defn" else None,
             },
             f,
         )
