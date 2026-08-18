@@ -10580,3 +10580,34 @@ func TestHandleCode_DryRunNeverWritesForAnyWriteOp(t *testing.T) {
 		})
 	}
 }
+
+// TestHandleCode_VersionReportsBuildIdentity locks in op:"version": a
+// cheap, no-param self-check for "is the process answering my tool
+// calls actually running current code." Added after a real friction
+// point in this session -- defn's auto-sharing HTTP architecture
+// means reconnecting the MCP client can re-attach to an
+// already-running, stale serve process instead of spawning a fresh
+// one from a just-rebuilt binary, and the only prior signal for that
+// was an indirect, confusing schema-validation failure on a
+// brand-new param. This gives a direct one-call answer instead.
+func TestHandleCode_VersionReportsBuildIdentity(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{Op: "version"})
+	if err != nil {
+		t.Fatalf("handleCode: %v", err)
+	}
+	text := resultText(t, result)
+	if result.IsError {
+		t.Fatalf("expected op:version to succeed, got error: %s", text)
+	}
+	if !strings.Contains(text, "defn "+Version) {
+		t.Errorf("expected version string %q in response, got: %s", Version, text)
+	}
+	if !strings.Contains(text, "pid:") {
+		t.Errorf("expected pid in response, got: %s", text)
+	}
+}
