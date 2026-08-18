@@ -352,7 +352,7 @@ Use defn's code MCP for all source access. When done, stop — do not open a she
 """
 
 
-def run_claude(workdir, prompt, budget_usd, max_turns, arm="defn"):
+def run_claude(workdir, prompt, budget_usd, max_turns, arm="defn", model="sonnet"):
     """Invoke claude -p with the given arm's tool set; return list of stream-json event dicts."""
     mcp_config_path = os.path.join(workdir, ".mcp-defn-only.json")
     with open(mcp_config_path, "w") as f:
@@ -373,16 +373,18 @@ def run_claude(workdir, prompt, budget_usd, max_turns, arm="defn"):
         # CLAUDE.md may still fire; use --strict-mcp-config + tool filters
         # to isolate. Set CLAUDE_CODE_SIMPLE=1 in env for lighter runs.
         #
-        # --model sonnet: this bench had been running on the CLI's default
-        # (Opus 5, confirmed via the raw stream-json "model" field) with
-        # no explicit pin. Every bug found so far -- test op parameter
-        # confusion, receiver disambiguation, cross-module name collisions
-        # -- is basic tool-API friction, not something that needs
-        # frontier-tier reasoning to surface. Pinning Sonnet keeps the
-        # bug-finding signal while making reruns (this bench has needed
-        # several in one session) much cheaper.
+        # model defaults to "sonnet": this bench had been running on the
+        # CLI's default (Opus 5, confirmed via the raw stream-json "model"
+        # field) with no explicit pin. Every bug found so far -- test op
+        # parameter confusion, receiver disambiguation, cross-module name
+        # collisions -- is basic tool-API friction, not something that
+        # needs frontier-tier reasoning to surface. Pinning Sonnet keeps
+        # the bug-finding signal while making exploratory reruns (this
+        # bench has needed several in one session) much cheaper. Pass
+        # --model opus for the "real", trusted-for-publication comparison
+        # per the standing instruction to use Opus for that pass.
         "--model",
-        "sonnet",
+        model,
         "--mcp-config",
         mcp_config_path,
         "--strict-mcp-config",
@@ -589,7 +591,12 @@ def _ensure_disk_space(min_gb=DISK_FREE_MIN_GB):
 
 
 def run_one(
-    instance_id, budget_usd, max_turns, arm="defn", corpus_dir=DEFAULT_CORPUS_DIR
+    instance_id,
+    budget_usd,
+    max_turns,
+    arm="defn",
+    corpus_dir=DEFAULT_CORPUS_DIR,
+    model="sonnet",
 ):
     out_dir = os.path.join(corpus_dir, "arm_defn" if arm == "defn" else "arm_files")
     out_path = os.path.join(out_dir, instance_id + ".json")
@@ -601,7 +608,9 @@ def run_one(
     task = load_task(instance_id, corpus_dir)
     workdir = setup_workspace(task, arm=arm)
     prompt = build_prompt(task)
-    events, rc, elapsed = run_claude(workdir, prompt, budget_usd, max_turns, arm=arm)
+    events, rc, elapsed = run_claude(
+        workdir, prompt, budget_usd, max_turns, arm=arm, model=model
+    )
     traj, cost = events_to_fncall_messages(events)
     # 2026-08-17: deliberately NOT calling apply_edits_via_defn(workdir)
     # here anymore -- see its docstring. Every defn write op already
@@ -643,6 +652,12 @@ def main():
     ap.add_argument("--max-turns", type=int, default=50)
     ap.add_argument("--arm", choices=["defn", "files"], default="defn")
     ap.add_argument(
+        "--model",
+        default="sonnet",
+        help="claude -p --model value (default sonnet, cheap exploratory pass; "
+        "pass 'opus' for the real, trusted-for-publication comparison)",
+    )
+    ap.add_argument(
         "--corpus-dir",
         default=DEFAULT_CORPUS_DIR,
         help="directory containing tasks.jsonl (and where arm_defn/arm_files get written); "
@@ -662,6 +677,7 @@ def main():
                     args.max_turns,
                     arm=args.arm,
                     corpus_dir=args.corpus_dir,
+                    model=args.model,
                 )
             except Exception as e:
                 print(f"[fail] {tid}: {type(e).__name__}: {e}", file=sys.stderr)
@@ -674,6 +690,7 @@ def main():
             args.max_turns,
             arm=args.arm,
             corpus_dir=args.corpus_dir,
+            model=args.model,
         )
 
 
