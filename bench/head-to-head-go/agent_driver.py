@@ -91,13 +91,31 @@ EMPTY_MCP_CONFIG = {"mcpServers": {}}
 # `code` covers all source access. If a task truly requires arbitrary bash
 # (e.g., `go build` for compile check), it will fail visibly rather than
 # silently exec unknown commands.
-ALLOWED_TOOLS = "mcp__defn__code TodoWrite"
+#
+# 2026-08-18: Read/Write/Edit added back for NON-Go files only (see
+# SYSTEM_APPEND's rule below) after a real Opus trajectory
+# (prometheus-18972) proved the prior Go-only-defn-only isolation was
+# too strict to be a fair comparison: the gold fix required a
+# docs/configuration/configuration.md edit, the defn arm had
+# structurally NO way to make it (code's scope is Go source only, by
+# design -- see this project's own CLAUDE.md), and the model correctly
+# diagnosed the needed doc change but explicitly said it had no tool to
+# make it with. 6 of 15 tasks in the prometheus-repo-opus corpus have
+# at least one non-.go gold file; this was silently costing defn recall
+# on every one of them, an artifact of the harness's tool isolation,
+# not of defn itself. Real-world defn usage always pairs `code` for Go
+# with Edit/Write for everything else (CLAUDE.md's own documented
+# convention) -- this restores that pairing for the bench too, while
+# keeping Grep/Glob/Bash/MultiEdit closed to preserve the original
+# "no escape hatch dilutes the Go-side measurement" protection below.
+ALLOWED_TOOLS = "mcp__defn__code TodoWrite Read Write Edit"
 # Escape hatches close: Grep/Glob let the model bypass defn's `search` op;
 # Agent/Task* let it spawn subagents that use full tool set; dispatch is
 # cross-session messaging. n=10 measurement 2026-07-20 found 170k / 481k
 # (35%) of measured wire went to these off-tool paths, invisibly diluting
 # every defn-side lever we measured. Closing them here so the "defn arm"
-# actually is defn-only.
+# actually is defn-only for its GO-side measurement (see the Read/Write/
+# Edit carve-out above for non-Go files).
 #
 # 2026-08-07: found the hard way that this list goes stale every time
 # Claude Code ships a new tool -- Monitor didn't exist when this list was
@@ -114,7 +132,7 @@ ALLOWED_TOOLS = "mcp__defn__code TodoWrite"
 # `claude -p ... -- "list your tools"` output before trusting any future
 # run's arm isolation.
 DISALLOWED_TOOLS = (
-    "Read Write Edit MultiEdit NotebookEdit Bash "
+    "MultiEdit NotebookEdit Bash "
     "Grep Glob "
     "Agent Task TaskCreate TaskUpdate TaskGet TaskList TaskOutput TaskStop "
     "mcp__dispatch__dispatch mcp__dispatch__peek mcp__dispatch__ack "
@@ -126,12 +144,16 @@ DISALLOWED_TOOLS = (
 )
 
 SYSTEM_APPEND = """
-IMPORTANT — this session is Go-only, defn-only. Use `mcp__defn__code` for ALL
-Go source access and edits: op:overview for project shape, op:outline for a
-def's shape, op:search for symbol/text search, op:read for a def body, op:edit
-/ op:replace-hunk / op:create for writes. Never call Read/Write/Edit on .go
-files — those are disabled. For running tests, use code op:test (scoped to
-defs) — direct shell is not available. Complete the task and stop.
+IMPORTANT — this session measures `mcp__defn__code` against files-mode on Go
+source specifically. Use `mcp__defn__code` for ALL Go (.go) source access and
+edits: op:overview for project shape, op:outline for a def's shape, op:search
+for symbol/text search, op:read for a def body, op:edit / op:replace-hunk /
+op:create for writes. Never call Read/Write/Edit on .go files — use `code` for
+every one of those, no exceptions. Read/Write/Edit ARE available, but ONLY for
+non-Go files (docs/*.md, testdata, config, etc.) that the fix may also need to
+touch — `code`'s scope is Go source only, by design. For running tests, use
+code op:test (scoped to defs) — direct shell is not available. Complete the
+task and stop.
 
 The issue describes a bug that CURRENTLY EXISTS in this codebase. Assume
 the fix is not already in place until you have PROVEN it — either by
