@@ -10700,3 +10700,72 @@ func useWrong(w Wrong) int {
 		t.Errorf("expected useWrong's selector to be left completely untouched, got:\n%s", src)
 	}
 }
+
+// TestHandleTestByName_NonexistentLiteralNameFailsFastInsteadOfWholeRepoSweep
+// is the negative counterpart to InfersScopeFromPatternWhenNoHintGiven:
+// when the pattern is a bare identifier (no regex metachars) that
+// matches NO definition anywhere in the project's index, go test's
+// -run can never match it in any scope either -- running a full
+// "./..." compile+scan to confirm that is pure waste. Real trajectory
+// (prometheus-12024, Opus): test(test:"TestTargetScraper") -- a name
+// that was never a real function anywhere in that codebase -- spent
+// 120.8s running across the whole repo only to report "no tests to
+// run". This locks in the fast-fail instead: no go test subprocess at
+// all, just an immediate, honest "not found" pointing at op:"sync" as
+// the likely fix if the test was just created.
+func TestHandleTestByName_NonexistentLiteralNameFailsFastInsteadOfWholeRepoSweep(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "alpha"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "alpha.go"), []byte(`package alpha
+
+func Widget() bool { return true }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "alpha_test.go"), []byte(`package alpha
+
+import "testing"
+
+func TestWidget(t *testing.T) {
+	if !Widget() {
+		t.Fatal("false")
+	}
+}
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+
+	start := time.Now()
+	result, _, err := s.handleTestByName(context.Background(), nil, "TestDoesNotExistAnywhereInThisRepo", "", "")
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "No test named") || !strings.Contains(text, "project's index") {
+		t.Errorf("expected an immediate not-found message, got: %s", text)
+	}
+	if strings.Contains(text, "./...") {
+		t.Errorf("must not have run a whole-repo go test sweep, got: %s", text)
+	}
+	// A real go test invocation (even a fast one) takes real subprocess
+	// spawn + compile time; a fast-fail should be near-instant. Generous
+	// bound to avoid flaking on a loaded CI box while still catching a
+	// regression back to actually shelling out.
+	if elapsed > 2*time.Second {
+		t.Errorf("expected a near-instant fast-fail with no subprocess, took %s", elapsed)
+	}
+}

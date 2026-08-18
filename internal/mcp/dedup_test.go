@@ -633,3 +633,115 @@ func TestDedupOpKey_ReadKeyIncludesLineRange(t *testing.T) {
 		t.Errorf("two different line_range values on the same def collided on one dedup key: %q", key2)
 	}
 }
+
+// TestHandleCode_TestDedup_RepeatedIdenticalTestServesCachedResult locks
+// in the test-dedup short-circuit: unlike every other dedup'd op (which
+// swaps in a cached response AFTER the real handler already ran --
+// fine when the handler is cheap), op:"test"'s expensive part is the
+// real `go test` subprocess itself. A repeated, identical test call
+// with no write in between must skip the handler entirely, not just
+// the response bytes. Real trajectory motivation: prometheus-12024
+// (Opus) ran the same def-scoped test target twice with no code
+// change between the two calls, each paying a real ~30s subprocess.
+func TestHandleCode_TestDedup_RepeatedIdenticalTestServesCachedResult(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+
+	sess := &sdkmcp.ServerSession{}
+	req := &sdkmcp.CallToolRequest{Session: sess}
+
+	result1, _, err := s.handleCode(context.Background(), req, codeParam{Op: "test", Name: "Greet"})
+	if err != nil {
+		t.Fatalf("first test call: %v", err)
+	}
+	text1 := resultText(t, result1)
+	if strings.Contains(text1, "test dedup") {
+		t.Fatalf("first call should be a real run, not a dedup hit: %s", text1)
+	}
+
+	result2, _, err := s.handleCode(context.Background(), req, codeParam{Op: "test", Name: "Greet"})
+	if err != nil {
+		t.Fatalf("second test call: %v", err)
+	}
+	text2 := resultText(t, result2)
+	if !strings.Contains(text2, "test dedup") {
+		t.Errorf("expected the repeated identical test call to hit the dedup cache, got: %s", text2)
+	}
+	// The cached body (everything before the dedup note) must match the
+	// first call's real result verbatim -- it's the same answer, not a
+	// different or truncated one.
+	if !strings.Contains(text2, strings.TrimSpace(text1)) {
+		t.Errorf("cached response should contain the original result verbatim\nfirst: %s\nsecond: %s", text1, text2)
+	}
+}
+
+// TestHandleCode_TestDedup_InvalidatedByAnyIntervalWrite confirms the
+// dedup cache is invalidated by ANY write in the session, even one
+// touching a completely unrelated def -- deliberately coarser than the
+// scoped invalidation reads get (invalidateNames). A test's pass/fail
+// depends on an unbounded surface of code it exercises, not just the
+// one def it's nominally scoped to, so scoping this narrowly risks
+// serving a stale "still passes" result after a real, relevant change.
+func TestHandleCode_TestDedup_InvalidatedByAnyIntervalWrite(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+
+	sess := &sdkmcp.ServerSession{}
+	req := &sdkmcp.CallToolRequest{Session: sess}
+
+	if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "test", Name: "Greet"}); err != nil {
+		t.Fatalf("first test call: %v", err)
+	}
+
+	// Edit a COMPLETELY UNRELATED def (Farewell, not Greet).
+	if _, _, err := s.handleCode(context.Background(), req, codeParam{
+		Op: "edit", Name: "Farewell",
+		NewBody: `func Farewell(name string) string {
+	return Greet(name) + " and see you"
+}`,
+	}); err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+
+	result, _, err := s.handleCode(context.Background(), req, codeParam{Op: "test", Name: "Greet"})
+	if err != nil {
+		t.Fatalf("second test call: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "test dedup") {
+		t.Errorf("an unrelated write must invalidate ALL pending test cache entries, but got a dedup hit: %s", text)
+	}
+}
+
+// TestHandleCode_TestDedup_ForceBypassesCache confirms force:true skips
+// the dedup cache and always pays for a real rerun, same convention as
+// delete's force:true (safety-check bypass) and dry_run's escape
+// hatches -- useful when the caller genuinely wants to re-verify (e.g.
+// after a change outside defn's own write path, like a manual file
+// edit defn hasn't resolved yet).
+func TestHandleCode_TestDedup_ForceBypassesCache(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+
+	sess := &sdkmcp.ServerSession{}
+	req := &sdkmcp.CallToolRequest{Session: sess}
+
+	if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "test", Name: "Greet"}); err != nil {
+		t.Fatalf("first test call: %v", err)
+	}
+
+	result, _, err := s.handleCode(context.Background(), req, codeParam{Op: "test", Name: "Greet", Force: true})
+	if err != nil {
+		t.Fatalf("forced test call: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "test dedup") {
+		t.Errorf("force:true must bypass the dedup cache and force a real rerun, got a dedup hit: %s", text)
+	}
+}

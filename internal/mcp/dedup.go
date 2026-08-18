@@ -64,6 +64,21 @@ type sessionCache struct {
 	// include "body" instead of silently downgrading a read into an
 	// outline+callers-only response. See #250.
 	pendingWantsBody bool
+	// lastTestRun caches op:"test"'s own response text, keyed by
+	// testDedupKey (target-scoped, not response-content-scoped -- unlike
+	// entries/cacheEntry, which dedup by comparing response BYTES after
+	// the handler already ran). test's expensive part is the real `go
+	// test` subprocess itself (seconds to low minutes on a real repo),
+	// so dedup has to short-circuit BEFORE dispatching to the handler,
+	// not after -- swapping in a cached response post-hoc (like every
+	// other dedup'd op) would still pay the full subprocess cost.
+	// Cleared wholesale by ANY write (see invalidate/invalidateNames):
+	// unlike a read, which depends only on one def's own current body,
+	// a test's pass/fail depends on an unbounded surface of code it
+	// exercises, so scoping invalidation to "just the touched names"
+	// the way invalidateNames does for reads isn't safe here -- any
+	// determinable-or-not write invalidates every pending test result.
+	lastTestRun map[string]string
 }
 
 type cacheEntry struct {
@@ -217,6 +232,7 @@ func (c *respCache) invalidate(sess *sdkmcp.ServerSession) {
 	if sc, ok := c.sessions[sess]; ok {
 		sc.entries = map[string]cacheEntry{}
 		sc.bodyServed = nil
+		sc.lastTestRun = nil
 	}
 }
 
@@ -401,6 +417,12 @@ func (c *respCache) invalidateNames(sess *sdkmcp.ServerSession, names, files []s
 	for _, name := range names {
 		delete(sc.bodyServed, name)
 	}
+	// A test's pass/fail depends on an unbounded surface of code it
+	// exercises, not just the names/files this write's blast radius
+	// could determine -- unlike the scoped clears above, every pending
+	// cached test result is invalidated regardless of scope. See
+	// lastTestRun's doc comment.
+	sc.lastTestRun = nil
 }
 
 // readOpsWithNameKey lists dedup ops whose cache key is anchored on a
@@ -517,3 +539,54 @@ func writeTargets(args codeParam) (names, files []string, ok bool) {
 // evidence supports; revisit if a larger sample of real repeat-hits
 // surfaces a failure below distance 5.
 const staleEpochThreshold = 4
+
+// testRunCached looks up a previously-recorded op:"test" response for
+// key (see testDedupKey) in this session. ok=false means no cached
+// run, or one that's since been invalidated by a write -- either way,
+// the caller must run the real test.
+func (c *respCache) testRunCached(sess *sdkmcp.ServerSession, key string) (string, bool) {
+	if sess == nil {
+		return "", false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sc, ok := c.sessions[sess]
+	if !ok || sc.lastTestRun == nil {
+		return "", false
+	}
+	resp, hit := sc.lastTestRun[key]
+	return resp, hit
+}
+
+// recordTestRun stores response as the cached result for key (see
+// testDedupKey) so an identical, immediately-repeated op:"test" call
+// can skip the real subprocess. Only called after a genuinely
+// successful run -- see the call site in handleCode.
+func (c *respCache) recordTestRun(sess *sdkmcp.ServerSession, key, response string) {
+	if sess == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sc := c.getSession(sess)
+	if sc.lastTestRun == nil {
+		sc.lastTestRun = map[string]string{}
+	}
+	sc.lastTestRun[key] = response
+}
+
+// testDedupKey builds the cache key for op:"test"'s pre-dispatch
+// short-circuit. Two disjoint namespaces mirror handleCode's own
+// test/name branch: a named-test reproduction (args.Test set) keys on
+// the literal test name; a def-coverage run keys on the resolved
+// target's own disambiguators. Real trajectory motivation
+// (prometheus-12024, Opus): test(file:"scrape/scrape.go") immediately
+// followed by test(name:"scrape") with no edit in between -- two
+// calls, same effective target, no code change between them, yet the
+// real `go test` subprocess ran twice (each 20-30s of real wall time).
+func testDedupKey(args codeParam) string {
+	if strings.TrimSpace(args.Test) != "" {
+		return fmt.Sprintf("test:%s|%s|%s", args.Test, args.Module, args.File)
+	}
+	return fmt.Sprintf("name:%s|%s|%s|%s", args.Name, args.Receiver, args.Module, args.File)
+}
