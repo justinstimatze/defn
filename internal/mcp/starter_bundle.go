@@ -11,12 +11,24 @@ func (s *server) maybeAppendStarterBundle(req *sdkmcp.CallToolRequest, question 
 	if req == nil || s.respCache == nil || stripped("starter-bundle") {
 		return ""
 	}
-	s.respCache.mu.Lock()
-	sc := s.respCache.sessions[req.Session]
-	if sc == nil {
-		sc = &sessionCache{entries: map[string]cacheEntry{}}
-		s.respCache.sessions[req.Session] = sc
+	// Check before consuming the one-shot flag below: an empty question
+	// means there was nothing for handleContext to work with anyway, so
+	// this call shouldn't burn the session's only starter-bundle
+	// opportunity on a no-op. Previously the flag was set unconditionally
+	// before this check, so a first orient-shaped call that happened to
+	// resolve to an empty question permanently forfeited the bundle for
+	// every later call in the session, even once a real question showed
+	// up.
+	if strings.TrimSpace(question) == "" {
+		return ""
 	}
+	// getSession is lock-free by design, safe to call while already
+	// holding respCache.mu -- this used to hand-inline getSession's own
+	// logic instead of calling it, byte-identical but drifting risk: a
+	// future change to sessionCache{}'s zero-value init would be easy to
+	// miss updating here.
+	s.respCache.mu.Lock()
+	sc := s.respCache.getSession(req.Session)
 	if sc.starterInjected {
 		s.respCache.mu.Unlock()
 		return ""
@@ -24,9 +36,6 @@ func (s *server) maybeAppendStarterBundle(req *sdkmcp.CallToolRequest, question 
 	sc.starterInjected = true
 	s.respCache.mu.Unlock()
 
-	if strings.TrimSpace(question) == "" {
-		return ""
-	}
 	// Delegate to context op -- it does the heavy lifting.
 	r, _, err := s.handleContext(context.Background(), req, codeParam{
 		Op:       "context",

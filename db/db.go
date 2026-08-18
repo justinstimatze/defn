@@ -32,7 +32,10 @@ import (
 	"github.com/justinstimatze/defn/internal/store"
 )
 
-// DB is a read-only handle to a defn database.
+// DB is a handle to a defn database: mostly read access, plus a few
+// narrow write paths (SetMeta, Sync, SyncPattern) -- see each method's
+// own doc comment. Not a read-only guarantee an external caller can
+// rely on for e.g. safe concurrent sharing.
 type DB struct {
 	mu sync.Mutex
 	s  store.Backend
@@ -69,7 +72,8 @@ func (db *DB) Ping(ctx context.Context) error {
 }
 
 // Query executes a read-only SQL query and returns rows as maps.
-// Only SELECT, SHOW, DESCRIBE, EXPLAIN, and WITH (CTE) queries are allowed.
+// Only SELECT, WITH (CTE), EXPLAIN, and PRAGMA queries are allowed --
+// SQLite doesn't parse SHOW/DESCRIBE (those are MySQL syntax).
 func (db *DB) Query(sql string) ([]map[string]any, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()

@@ -17,6 +17,7 @@ import (
 
 	"github.com/justinstimatze/defn/internal/goload"
 	"github.com/justinstimatze/defn/internal/ingest"
+	"github.com/justinstimatze/defn/internal/planformat"
 	"github.com/justinstimatze/defn/internal/resolve"
 	"github.com/justinstimatze/defn/internal/store"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -10095,5 +10096,256 @@ func use(r Reader) string {
 	}
 	if string(raw) != src {
 		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
+	}
+}
+
+// TestHandleCreateScaffoldFile_RoutesThroughTransactionAndStillSucceeds
+// is the regression for wrapping handleCreateScaffoldFile's write in a
+// transaction (#12-class fix -- every sibling write handler already had
+// this): confirms the DB-side behavior is unaffected by the fix -- the
+// file_sources row is durably committed and reports success. See #276
+// for a separate, pre-existing, deeper issue this test does NOT cover:
+// emitModule builds its write set exclusively from Definitions, so a
+// zero-def scaffold file may never actually be written to disk in any
+// scenario -- that's unrelated to (and unfixed by) the transaction wrap
+// here, which only protects DB-vs-disk consistency for whatever emit
+// actually does end up doing.
+func TestHandleCreateScaffoldFile_RoutesThroughTransactionAndStillSucceeds(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "proj")
+	os.MkdirAll(filepath.Join(projDir, "pkg"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module proj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "pkg", "existing.go"), []byte("package pkg\n\nfunc Real() int {\n\treturn 1\n}\n"), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op:   "create",
+		File: "pkg/newfile.go",
+		Body: "import \"fmt\"\n",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Scaffolded") {
+		t.Fatalf("expected a successful scaffold, got: %s", text)
+	}
+
+	mods, err := db.ListModules()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var modID int64
+	for _, m := range mods {
+		if m.Path == "proj/pkg" || strings.HasSuffix(m.Path, "/pkg") {
+			modID = m.ID
+		}
+	}
+	if modID == 0 {
+		t.Fatalf("could not find pkg module among: %+v", mods)
+	}
+	src, err := db.GetFileSource(modID, "pkg/newfile.go")
+	if err != nil || src == "" {
+		t.Fatalf("scaffold content not committed to file_sources: err=%v src=%q", err, src)
+	}
+	if !strings.Contains(src, "import \"fmt\"") {
+		t.Errorf("committed file_sources missing expected content: %q", src)
+	}
+
+	// The pre-existing Real() def must be untouched.
+	real, err := db.GetDefinitionByName("Real", "")
+	if err != nil || real == nil {
+		t.Fatalf("Real definition should still exist: %v", err)
+	}
+}
+
+// TestHandleDelete_ForceWithBuildFailureStillRunsPostDeleteCleanup is the
+// regression for the shared buildResult=="" gate incorrectly covering
+// both the normal and force:true paths: on the force path, commit()
+// always runs regardless of buildResult (force is an explicit
+// acknowledgment the delete may break the build), so gating the
+// post-delete idf.Invalidate()/autoCommit() step on buildResult=="" too
+// skipped it whenever force:true's delete happened to also break the
+// build -- even though the delete was already durable. This confirms
+// the delete itself lands (durability, the directly observable half of
+// the fix) under exactly that force+build-failure combination.
+func TestHandleDelete_ForceWithBuildFailureStillRunsPostDeleteCleanup(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "proj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module proj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package main
+
+func Helper() int { return 1 }
+
+func Caller() int { return Helper() }
+
+func main() {}
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	// Force-delete Helper while Caller still references it -- the
+	// build will fail (undefined: Helper), but force:true means the
+	// delete must still land.
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op:    "delete",
+		Name:  "Helper",
+		Force: true,
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Deleted") {
+		t.Fatalf("expected the force delete to report Deleted despite the build failure, got: %s", text)
+	}
+
+	if _, err := db.GetDefinitionByName("Helper", ""); err == nil {
+		t.Fatal("Helper should be gone from the DB after a force delete")
+	}
+}
+
+// TestHandleApply_EditResolvesDottedQualifiedName is the regression for
+// resolveApplyTarget missing the dotted-qualified-name fallback
+// resolveEditTarget already has (#241): a batched edit for
+// "beta.Widget" used to fail with resolveApplyTarget's own ambiguous-
+// name refusal (two Widgets share the bare name across packages) even
+// though the dotted form unambiguously names one of them -- the exact
+// same shape code(op:"edit", name:"beta.Widget") already resolves
+// outside a batch.
+func TestHandleApply_EditResolvesDottedQualifiedName(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "alpha"), 0755)
+	os.MkdirAll(filepath.Join(projDir, "beta"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "widget.go"), []byte(`package alpha
+
+func Widget() string { return "alpha" }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "beta", "widget.go"), []byte(`package beta
+
+func Widget() string { return "beta" }
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op: "apply",
+		Operations: []applyOp{
+			{Op: "edit", Name: "beta.Widget", NewBody: `func Widget() string { return "beta-edited" }`},
+		},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "ambiguous") || strings.Contains(text, "not found") {
+		t.Fatalf("expected the dotted name to disambiguate, got: %s", text)
+	}
+
+	betaWidget, err := db.GetDefinitionByName("Widget", "testproj/beta")
+	if err != nil {
+		t.Fatalf("lookup beta.Widget: %v", err)
+	}
+	if !strings.Contains(betaWidget.Body, "beta-edited") {
+		t.Errorf("beta.Widget was not edited, body: %s", betaWidget.Body)
+	}
+
+	alphaWidget, err := db.GetDefinitionByName("Widget", "testproj/alpha")
+	if err != nil {
+		t.Fatalf("lookup alpha.Widget: %v", err)
+	}
+	if strings.Contains(alphaWidget.Body, "beta-edited") {
+		t.Errorf("alpha.Widget was wrongly edited instead of beta.Widget: %s", alphaWidget.Body)
+	}
+}
+
+// TestRunPlanSteps_ResolvesDottedQualifiedName is the regression for
+// runPlanSteps resolving step targets via a bare GetDefinitionByName
+// instead of resolveEditTarget: a step naming "beta.Widget" (Go's own
+// qualified-name convention) used to report not-found even though the
+// identical name resolves fine via read/outline/every other op, since
+// the bare lookup has no dotted-name fallback and Widget is ambiguous
+// by bare name alone (two packages each declare one).
+func TestRunPlanSteps_ResolvesDottedQualifiedName(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "alpha"), 0755)
+	os.MkdirAll(filepath.Join(projDir, "beta"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "widget.go"), []byte(`package alpha
+
+func Widget() string { return "alpha" }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "beta", "widget.go"), []byte(`package beta
+
+func Widget() string { return "beta" }
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+
+	result, _, err := s.runPlanSteps([]planformat.Step{
+		{Target: "beta.Widget", Field: "outline"},
+	})
+	if err != nil {
+		t.Fatalf("runPlanSteps: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "not found") {
+		t.Fatalf("expected beta.Widget to resolve, got: %s", text)
+	}
+	if !strings.Contains(text, "Widget") {
+		t.Errorf("expected Widget's outline in the result, got: %s", text)
 	}
 }

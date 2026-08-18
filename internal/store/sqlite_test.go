@@ -680,3 +680,64 @@ func TestFindDefinitionsByFile_VersionedModulePathDoesNotBreakExactFileMatch(t *
 		t.Errorf("expected 1 def (NewListener), got %d: %+v", len(defs), defs)
 	}
 }
+
+// TestSetDefSummaryMinHash_PreservesOneLineAndModel is the regression for
+// SetDefSummaryMinHash's prior INSERT OR REPLACE bug: that statement does
+// a full row DELETE+INSERT, silently resetting one_line/summary_body_hash/
+// summary_model to NULL every time a minhash was (re)computed for a def
+// that already had a real #160 summary -- e.g. every routine edit, since
+// UpsertDefinition's body-hash-changed branch calls this. Confirmed live
+// before the fix: a def with a summary set via SetDefSummary lost its
+// OneLine/Model the instant SetDefSummaryMinHash ran afterward.
+func TestSetDefSummaryMinHash_PreservesOneLineAndModel(t *testing.T) {
+	dir := t.TempDir()
+	db, err := OpenSQLite(filepath.Join(dir, "defn.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	mod, err := db.EnsureModule("example.com/proj", "proj", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defID, err := db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "F", Kind: "function", Exported: true,
+		Body: "func F() {}",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.SetDefSummary(defID, &DefSummary{
+		OneLine: "does F things", BodyHash: "abc", Model: "test-model",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.SetDefSummaryMinHash(defID, []byte{1, 2, 3, 4}); err != nil {
+		t.Fatal(err)
+	}
+
+	sum, err := db.GetDefSummary(defID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum == nil {
+		t.Fatal("expected a summary row to still exist after SetDefSummaryMinHash")
+	}
+	if sum.OneLine != "does F things" {
+		t.Errorf("OneLine was wiped by SetDefSummaryMinHash: got %q", sum.OneLine)
+	}
+	if sum.Model != "test-model" {
+		t.Errorf("Model was wiped by SetDefSummaryMinHash: got %q", sum.Model)
+	}
+
+	all, err := db.AllDefSummaryMinHashes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(all[defID]) != string([]byte{1, 2, 3, 4}) {
+		t.Errorf("minhash not stored correctly: got %v", all[defID])
+	}
+}

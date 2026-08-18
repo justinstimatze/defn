@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.64"
+const Version = "0.26.65"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -4900,7 +4900,14 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// autoResolve removes the full-project ResolveModule walk on every
 	// delete. force:true delete still applies (safe-delete's caller
 	// check gates unforced deletes at zero-callers anyway).
-	if buildResult == "" {
+	// buildResult=="" means committed (both paths). The force path also
+	// always commits regardless of buildResult (that's the whole point
+	// of force -- see the comment above) -- gating this solely on
+	// buildResult=="" skipped it there even though the delete was
+	// already durable, leaving the search-index cache stale (pointing
+	// at a definition that's actually gone) until some later successful
+	// write happened to invalidate it.
+	if buildResult == "" || args.Force {
 		if err := s.autoCommit(); err != nil {
 			fmt.Fprintf(os.Stderr, "defn: auto-commit failed (post-delete): %v\n", err)
 		}
@@ -8296,21 +8303,36 @@ func (s *server) handleCreateScaffoldFile(args createParam) (*sdkmcp.CallToolRes
 		return errResult(fmt.Errorf("no modules found — run defn ingest first, or pass module: explicitly"))
 	}
 
-	if err := s.backend.SetFileSource(mod.ID, args.File, body); err != nil {
+	// #12-class protection, missed when the rest of the write handlers
+	// got it: this used to write straight to s.backend and emit
+	// unconditionally, so an emit-level WARNING (e.g. a goimports
+	// failure) still left the file_sources row durably committed while
+	// reporting the outcome inline as if it were informational rather
+	// than a rolled-back write, unlike every sibling handler's
+	// "rolled back — nothing was saved" framing for the same contract.
+	tx, commit, rollback, txErr := s.backend.Begin()
+	if txErr != nil {
+		return errResult(txErr)
+	}
+	defer rollback()
+
+	if err := tx.SetFileSource(mod.ID, args.File, body); err != nil {
 		return errResult(fmt.Errorf("write file source: %w", err))
 	}
 
-	// Emit + goimports the touched file. No defs changed, but the
-	// file_sources row is the emit-side truth so a scoped emit lands
-	// this content on disk. Skip build gate — no def graph changed.
-	buildResult := s.autoEmitOnly(args.File)
-	if buildResult == "" {
-		buildResult = "ok"
+	// No defs changed here, only a raw file_sources row -- same
+	// dispatch-safe reasoning autoEmitOnly's callers rely on, so this
+	// only needs the emit-level WARNING guard, not a real build.
+	buildResult := s.commitOrRollbackOnEmit(tx, commit, rollback, emit.Opts{
+		GoimportsFiles: []string{args.File},
+		TouchedFiles:   []string{args.File},
+	})
+	if buildResult != "" {
+		return textResult(fmt.Sprintf("scaffold %s rolled back — nothing was saved\n\n%s", args.File, buildResult)), nil, nil
 	}
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Scaffolded %s (%s) — %d bytes, no defs yet\n", args.File, mod.Path, len(body)))
-	sb.WriteString("emit: " + strings.ToLower(strings.SplitN(buildResult, "\n", 2)[0]) + "\n")
 	sb.WriteString("_add defs with follow-up `code(op:\"create\", file:\"" + args.File + "\", body:\"...\")` calls._\n")
 	return textResult(sb.String()), nil, nil
 }
@@ -8532,7 +8554,14 @@ func (s *server) patchImportOnDisk(moduleID int64, file, importPath, alias strin
 			return false, fmt.Errorf("write %s: %w", file, err)
 		}
 	}
-	_ = s.backend.SetFileSource(moduleID, file, updatedSrc)
+	// Disk is authoritative here (the write above already succeeded),
+	// so a failure updating the DB's secondary file_sources cache
+	// doesn't block the caller -- but silently discarding it broke this
+	// file's own logging discipline (every other "best effort" write
+	// elsewhere here logs on failure).
+	if err := s.backend.SetFileSource(moduleID, file, updatedSrc); err != nil {
+		fmt.Fprintf(os.Stderr, "defn: file_sources update failed after add-import to %s: %v\n", file, err)
+	}
 	return true, nil
 }
 
@@ -8829,7 +8858,7 @@ func (s *server) resolveEditTarget(name, receiver, module, file string) (*store.
 		if err == nil && d != nil {
 			return d, nil
 		}
-		if dotted, derr := s.resolveDottedQualifiedName(name); derr == nil && dotted != nil {
+		if dotted, derr := s.resolveDottedQualifiedName(s.backend, name); derr == nil && dotted != nil {
 			return dotted, nil
 		}
 		return d, err
@@ -8883,6 +8912,15 @@ func (s *server) resolveApplyTarget(backend store.Backend, name, receiver, modul
 	if receiver == "" {
 		d, err := backend.GetDefinitionByName(name, modulePath)
 		if err != nil {
+			// #241/#248 parity with resolveEditTarget: a caller using Go's
+			// own "pkg.Symbol" qualified-name convention inside an apply
+			// batch used to get "not found" here even when resolveEditTarget
+			// would have resolved the exact same name outside a batch --
+			// resolveApplyTarget's own doc comment claims parity with
+			// resolveEditTarget's precedence, but this fallback was missing.
+			if dotted, derr := s.resolveDottedQualifiedName(backend, name); derr == nil && dotted != nil {
+				return dotted, nil
+			}
 			return d, err
 		}
 		// #248: same refusal as resolveWriteTarget -- apply's edit/delete/
@@ -9030,14 +9068,16 @@ func pluralizeCallers(n int) string {
 // bare name lookup fails -- see resolveEditTarget's doc comment for
 // the full rationale and the real trajectory that motivated it.
 // Returns (nil, nil) when name has no dot or nothing matches, letting
-// the caller fall through to its own not-found error.
-func (s *server) resolveDottedQualifiedName(name string) (*store.Definition, error) {
+// the caller fall through to its own not-found error. Takes backend
+// explicitly (same reason resolveApplyTarget does) so it works for a
+// batch's own uncommitted tx as well as s.backend.
+func (s *server) resolveDottedQualifiedName(backend store.Backend, name string) (*store.Definition, error) {
 	idx := strings.LastIndex(name, ".")
 	if idx <= 0 {
 		return nil, nil
 	}
 	hint, bare := name[:idx], name[idx+1:]
-	files, err := s.backend.DistinctSourceFiles()
+	files, err := backend.DistinctSourceFiles()
 	if err != nil {
 		return nil, nil
 	}
@@ -9048,11 +9088,11 @@ func (s *server) resolveDottedQualifiedName(name string) (*store.Definition, err
 		// FilterDefinitions is metadata-only (its query hardcodes an
 		// empty body column) -- fetch the full definition by ID once it
 		// has located the right one.
-		matches, merr := s.backend.FilterDefinitions(bare, "", f, 1)
+		matches, merr := backend.FilterDefinitions(bare, "", f, 1)
 		if merr != nil || len(matches) == 0 {
 			continue
 		}
-		if full, gerr := s.backend.GetDefinition(matches[0].ID); gerr == nil && full != nil {
+		if full, gerr := backend.GetDefinition(matches[0].ID); gerr == nil && full != nil {
 			return full, nil
 		}
 		return &matches[0], nil

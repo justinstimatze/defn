@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/justinstimatze/defn/internal/astutil"
 	"github.com/justinstimatze/defn/internal/store"
 )
 
@@ -933,19 +934,11 @@ func topLevelDeclNames(src []byte) ([]string, error) {
 }
 
 // recvTypeName extracts the receiver type name for a method declaration,
-// unwrapping pointer receivers and generic type params.
+// unwrapping pointer receivers and generic type params. Delegates to
+// astutil.BareReceiverName -- see its doc comment for why this used to
+// be an independently-maintained copy.
 func recvTypeName(e ast.Expr) string {
-	switch t := e.(type) {
-	case *ast.Ident:
-		return t.Name
-	case *ast.StarExpr:
-		return "*" + recvTypeName(t.X)
-	case *ast.IndexExpr:
-		return recvTypeName(t.X)
-	case *ast.IndexListExpr:
-		return recvTypeName(t.X)
-	}
-	return ""
+	return astutil.BareReceiverName(e)
 }
 
 // buildLocIndex re-reads an emitted file and finds each definition's line.
@@ -1135,15 +1128,24 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 			reps = append(reps, replacement{s, e, body})
 			delete(wantFuncs, ident)
 		case *ast.GenDecl:
-			// Whole-decl removal via allowedRemovals: matches on the
-			// first spec name (same key as whole-decl replacement).
-			// Only applies when the whole GenDecl represents a single
-			// removable unit (single-spec block or grouped block whose
-			// first-spec name is the one being deleted).
-			if name := firstSpecName(d); name != "" && remove[name] {
-				sp, ep := declRange(d.Pos(), d.End(), d.Doc, true)
-				reps = append(reps, replacement{sp, ep, ""})
-				continue
+			// Whole-decl removal via allowedRemovals: only for a genuinely
+			// single-spec (ungrouped) GenDecl, where the whole decl IS the
+			// one removable unit. A grouped (parenthesized) block's removal
+			// is handled per-spec below instead -- using this same
+			// firstSpecName shortcut for a grouped block used to either
+			// silently no-op (removing a NON-first member matched nothing
+			// here, and the per-spec loop below never checked `remove` at
+			// all) or, when the target WAS first, delete the entire block
+			// including untouched sibling specs that were never authorized
+			// for removal (caught by safeWriteGoFile's data-loss check, so
+			// it failed safe, but made "delete A" unconditionally refused
+			// whenever A shared a group with anything else).
+			if !d.Lparen.IsValid() {
+				if name := firstSpecName(d); name != "" && remove[name] {
+					sp, ep := declRange(d.Pos(), d.End(), d.Doc, true)
+					reps = append(reps, replacement{sp, ep, ""})
+					continue
+				}
 			}
 			// Whole-decl replacement: ingest bundles iota const blocks
 			// (and any future whole-GenDecl case) under the first spec
@@ -1163,6 +1165,20 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 				switch s := spec.(type) {
 				case *ast.TypeSpec:
 					if d.Tok != token.TYPE {
+						continue
+					}
+					// Per-spec removal: the whole-decl shortcut above only
+					// fires for an ungrouped GenDecl, so a grouped block's
+					// member -- first or not -- is removed here, scoped to
+					// just its own spec range. Sibling specs are untouched.
+					if remove[s.Name.Name] {
+						if grouped {
+							sp, ep := declRange(s.Pos(), s.End(), nil, false)
+							reps = append(reps, replacement{sp, ep, ""})
+						} else {
+							sp, ep := declRange(d.Pos(), d.End(), d.Doc, true)
+							reps = append(reps, replacement{sp, ep, ""})
+						}
 						continue
 					}
 					body, ok := wantTypes[s.Name.Name]
@@ -1186,6 +1202,18 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 						continue
 					}
 					name := s.Names[0].Name
+					// Per-spec removal -- same rationale as the TypeSpec case
+					// above.
+					if remove[name] {
+						if grouped {
+							sp, ep := declRange(s.Pos(), s.End(), nil, false)
+							reps = append(reps, replacement{sp, ep, ""})
+						} else {
+							sp, ep := declRange(d.Pos(), d.End(), d.Doc, true)
+							reps = append(reps, replacement{sp, ep, ""})
+						}
+						continue
+					}
 					var body string
 					var ok bool
 					switch d.Tok {

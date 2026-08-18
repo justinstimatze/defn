@@ -2149,3 +2149,65 @@ func TestEmitDebug_TracesKeepDropAndWriteDecisions(t *testing.T) {
 		t.Errorf("debug log claims untouched.go was written, but the scoped emit should never touch it:\n%s", out)
 	}
 }
+
+// TestMergeDeclsIntoSource_RemovesFirstGroupedMemberWithoutTouchingSiblings
+// is the companion direction: deleting the FIRST member of a grouped
+// block used to remove the entire parenthesized GenDecl -- including
+// untouched sibling specs never authorized for removal -- because the
+// whole-decl shortcut matched on firstSpecName regardless of grouping.
+// That got caught by safeWriteGoFile's data-loss check and refused, but
+// meant "delete A" was unconditionally blocked whenever A shared a
+// group with anything else.
+func TestMergeDeclsIntoSource_RemovesFirstGroupedMemberWithoutTouchingSiblings(t *testing.T) {
+	existing := []byte(`package p
+
+type (
+	A struct{ N int }
+	B struct{ S string }
+)
+`)
+	defs := []store.Definition{
+		{Name: "B", Kind: "type", Body: "B struct{ S string }"},
+	}
+	merged, ok, unmatched := mergeDeclsIntoSource(existing, defs, []string{"A"}, nil)
+	if !ok {
+		t.Fatalf("mergeDeclsIntoSource returned ok=false, unmatched=%v", unmatched)
+	}
+	got := string(merged)
+	if strings.Contains(got, "A struct") {
+		t.Errorf("A was not removed:\n%s", got)
+	}
+	if !strings.Contains(got, "B struct{ S string }") {
+		t.Errorf("B was incorrectly removed alongside A (first-member-removes-whole-block bug):\n%s", got)
+	}
+}
+
+// TestMergeDeclsIntoSource_RemovesNonFirstGroupedMember is the
+// regression for the grouped-decl delete asymmetry: the removal check
+// used to only fire via a whole-GenDecl shortcut keyed on the FIRST
+// spec's name (firstSpecName), so deleting a non-first member of a
+// grouped type/const/var block matched nothing at all and silently
+// left the on-disk decl in place while the DB believed it was gone.
+func TestMergeDeclsIntoSource_RemovesNonFirstGroupedMember(t *testing.T) {
+	existing := []byte(`package p
+
+type (
+	A struct{ N int }
+	B struct{ S string }
+)
+`)
+	defs := []store.Definition{
+		{Name: "A", Kind: "type", Body: "A struct{ N int }"},
+	}
+	merged, ok, unmatched := mergeDeclsIntoSource(existing, defs, []string{"B"}, nil)
+	if !ok {
+		t.Fatalf("mergeDeclsIntoSource returned ok=false, unmatched=%v", unmatched)
+	}
+	got := string(merged)
+	if strings.Contains(got, "B struct") {
+		t.Errorf("B was not removed from the grouped block:\n%s", got)
+	}
+	if !strings.Contains(got, "A struct{ N int }") {
+		t.Errorf("A was incorrectly removed alongside B:\n%s", got)
+	}
+}

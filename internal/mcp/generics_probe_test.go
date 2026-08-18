@@ -113,4 +113,3 @@ func main() {
 		t.Errorf("old Push decl was not removed:\n%s", src)
 	}
 }
-

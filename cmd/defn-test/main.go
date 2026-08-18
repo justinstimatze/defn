@@ -111,7 +111,11 @@ func main() {
 
 	// Run workflow tests (SWE-bench patterns).
 	fmt.Println()
-	runWorkflowTests()
+	workflowFailed, workflowSkipped := runWorkflowTests()
+	failed += workflowFailed
+	if workflowSkipped {
+		skipped++
+	}
 
 	// Selfhost round-trip. Runs against the defn repo itself, isolated
 	// from whatever .defn/ the user has open, so it works concurrently
@@ -123,6 +127,18 @@ func main() {
 	} else {
 		fmt.Printf("  FAIL: %s\n", selfhost.message)
 		failed++
+	}
+
+	// A default (non -selfhost) run assumes network access -- every
+	// project clone plus the workflow suite's own clone failing is not
+	// "nothing to report," it's the run having validated NOTHING
+	// against any real upstream project while still reporting whatever
+	// passed==0/failed==0 would otherwise print as a clean summary.
+	// Confirmed reachable: skipped was tracked but never checked before
+	// this, so an all-network-down run exited 0.
+	if skipped > 0 && passed == 0 {
+		fmt.Printf("\nFAIL: every project (and/or the workflow suite) was skipped -- network access is a precondition for this run; use -selfhost for an offline check\n")
+		os.Exit(1)
 	}
 
 	if failed > 0 {

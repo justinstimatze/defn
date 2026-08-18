@@ -2413,15 +2413,20 @@ func (s *SQLiteDB) Simulate(mutations []Mutation) (*SimulationResult, error) {
 	return nil, ErrNotImplemented
 }
 
-// SetDefSummaryMinHash stores a precomputed MinHash signature for defID.
-// Idempotent — INSERT OR REPLACE keys off def_id. Called at UpsertDefinition
-// time (below) and by the backfill pass on OpenSQLite.
+// SetDefSummaryMinHash writes/updates just the def_summaries.minhash
+// column for defID. Uses ON CONFLICT DO UPDATE targeting only minhash --
+// not INSERT OR REPLACE, which does a full row DELETE+INSERT and would
+// silently reset one_line/summary_body_hash/summary_model to NULL on
+// every call, wiping out a previously-generated #160 summary. Mirrors
+// SetDefSummary's own fix for the identical hazard in the other
+// direction (see its doc comment).
 func (s *SQLiteDB) SetDefSummaryMinHash(defID int64, minhash []byte) error {
 	_, err := s.db.ExecContext(s.Ctx(),
-		`INSERT OR REPLACE INTO def_summaries(def_id, minhash) VALUES (?, ?)`,
+		`INSERT INTO def_summaries(def_id, minhash) VALUES (?, ?)
+		 ON CONFLICT(def_id) DO UPDATE SET minhash = excluded.minhash`,
 		defID, minhash)
 	if err != nil {
-		return fmt.Errorf("sqlite: set def summary %d: %w", defID, err)
+		return fmt.Errorf("sqlite: set def summary minhash %d: %w", defID, err)
 	}
 	return nil
 }

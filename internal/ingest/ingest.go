@@ -17,6 +17,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/justinstimatze/defn/internal/astutil"
 	"github.com/justinstimatze/defn/internal/goload"
 	"github.com/justinstimatze/defn/internal/store"
 	"golang.org/x/tools/go/packages"
@@ -839,28 +840,10 @@ type structFieldCtx struct {
 }
 
 // receiverTypeName extracts a method's receiver type name for storage in
-// Definition.Receiver, stripping pointer and generic type-param syntax
-// down to the bare type name -- mirrors emit.recvTypeName exactly, which
-// every receiver-qualified lookup downstream (GetDefinitionByNameAndReceiver,
-// resolve.go's method lookups keyed off concrete.Obj().Name(), FuncIdentity
-// matching during emit) already assumes a bare name for. typeString (used
-// for composite-literal types, where the full "Stack[T]" form is correct)
-// is the wrong tool here: its *ast.IndexExpr case renders the full
-// bracketed form, and it has no case at all for *ast.IndexListExpr (2+
-// type params, e.g. Pair[K, V]) -- falling through to the literal string
-// "<unknown>", corrupting Receiver for every method on such a type from
-// ingest time onward. Confirmed live: func (p *Pair[K, V]) Swap() stored
-// Receiver == "*<unknown>".
+// Definition.Receiver. Delegates to astutil.BareReceiverName -- see its
+// doc comment for why this used to be an independently-maintained copy
+// (and why typeString, used for composite-literal types, is the wrong
+// tool for a receiver identity key).
 func receiverTypeName(e ast.Expr) string {
-	switch t := e.(type) {
-	case *ast.Ident:
-		return t.Name
-	case *ast.StarExpr:
-		return "*" + receiverTypeName(t.X)
-	case *ast.IndexExpr:
-		return receiverTypeName(t.X)
-	case *ast.IndexListExpr:
-		return receiverTypeName(t.X)
-	}
-	return ""
+	return astutil.BareReceiverName(e)
 }

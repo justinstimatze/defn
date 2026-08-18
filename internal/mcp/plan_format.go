@@ -74,7 +74,14 @@ func (s *server) runPlanSteps(steps []planformat.Step) (*sdkmcp.CallToolResult, 
 	var notFound []string
 	resolved := 0
 	for _, step := range steps {
-		d, err := s.backend.GetDefinitionByName(step.Target, "")
+		// resolveEditTarget instead of a bare GetDefinitionByName for
+		// parity with every other name-resolving op (read/outline/
+		// impact/explain/etc all route through it) -- in particular its
+		// #241 dotted-qualified-name ("pkg.Symbol") retry, which a bare
+		// lookup doesn't get. A step.Target of "pkg/path.Symbol" used to
+		// report not-found here even when the identical name resolves
+		// fine outside a plan.
+		d, err := s.resolveEditTarget(step.Target, "", "", "")
 		if err != nil {
 			notFound = append(notFound, step.Target)
 			continue

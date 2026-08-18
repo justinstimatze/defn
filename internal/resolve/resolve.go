@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/justinstimatze/defn/internal/astutil"
 	"github.com/justinstimatze/defn/internal/goload"
 	"github.com/justinstimatze/defn/internal/store"
 	"golang.org/x/tools/go/packages"
@@ -1199,7 +1200,7 @@ func lookupDefID(db store.Backend, pkgPath string, ident *ast.Ident, obj types.O
 func lookupFuncDefID(db store.Backend, pkgPath string, fn *ast.FuncDecl, cache pkgIndexCache) int64 {
 	// For methods, include receiver in lookup.
 	if fn.Recv != nil && len(fn.Recv.List) > 0 {
-		recv := types.ExprString(fn.Recv.List[0].Type)
+		recv := astutil.BareReceiverName(fn.Recv.List[0].Type)
 		if id := cache.get(db, pkgPath).lookupMethod(fn.Name.Name, recv); id > 0 {
 			return id
 		}
@@ -1221,21 +1222,31 @@ func lookupFuncDefID(db store.Backend, pkgPath string, fn *ast.FuncDecl, cache p
 // receiverName extracts a short receiver name from a types.Type.
 // e.g., *Context, JSON, *node
 func receiverName(t types.Type) string {
+	// A method receiver is always a named type or a pointer to one --
+	// unwrap structurally via types.Named.Obj().Name() instead of
+	// string-splitting t.String() on ".". The old string-split approach
+	// never stripped a generic instantiation's bracket suffix ("*Context"
+	// vs "*Pair[K,V]"), and for a package-qualified type ARGUMENT inside
+	// the brackets (e.g. Pair[K, sql.NullString]) it could find the wrong
+	// "." entirely -- both silently produced a receiver key that never
+	// matched the bare name Definition.Receiver is stored under,
+	// confirmed live: two generic types sharing a method name in one
+	// package (Stack[T].Len / Queue[T].Len) had their callers merged
+	// onto a single def via the receiver-agnostic fallback lookup.
+	prefix := ""
+	if ptr, ok := t.(*types.Pointer); ok {
+		prefix = "*"
+		t = ptr.Elem()
+	}
+	if named, ok := t.(*types.Named); ok {
+		return prefix + named.Obj().Name()
+	}
+	// Fallback for anything structurally unexpected for a receiver.
 	s := t.String()
-	// Strip package path: "github.com/gin-gonic/gin.*Context" → "*Context"
 	if idx := strings.LastIndex(s, "."); idx >= 0 {
-		prefix := ""
-		// Check if it's a pointer.
-		if strings.Contains(s[:idx], "*") {
-			prefix = "*"
-			s = strings.Replace(s, "*", "", 1)
-			if idx2 := strings.LastIndex(s, "."); idx2 >= 0 {
-				return prefix + s[idx2+1:]
-			}
-		}
 		return prefix + s[idx+1:]
 	}
-	return s
+	return prefix + s
 }
 
 // ifaceMethodKey builds the canonical string key ifaceMethodToImpls is

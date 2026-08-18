@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/justinstimatze/defn/internal/astutil"
 	"github.com/justinstimatze/defn/internal/store"
 )
 
@@ -256,22 +257,9 @@ func extractSignature(fset *token.FileSet, d *ast.FuncDecl) string {
 	return strings.TrimSpace(full)
 }
 
-// receiverExprName mirrors internal/ingest's receiverTypeName and
-// internal/emit's recvTypeName: strips pointer and generic type-param
-// syntax down to the bare receiver type name. The previous inline
-// switch here only matched *ast.Ident directly under *ast.StarExpr, so
-// a generic receiver like *Stack[T] (an *ast.IndexExpr, not *ast.Ident,
-// under the StarExpr) silently produced an empty receiver.
+// receiverExprName extracts a method receiver's bare type name.
+// Delegates to astutil.BareReceiverName -- see its doc comment for why
+// this used to be an independently-maintained copy.
 func receiverExprName(e ast.Expr) string {
-	switch t := e.(type) {
-	case *ast.Ident:
-		return t.Name
-	case *ast.StarExpr:
-		return "*" + receiverExprName(t.X)
-	case *ast.IndexExpr:
-		return receiverExprName(t.X)
-	case *ast.IndexListExpr:
-		return receiverExprName(t.X)
-	}
-	return ""
+	return astutil.BareReceiverName(e)
 }

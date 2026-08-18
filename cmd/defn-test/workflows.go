@@ -29,14 +29,23 @@ type workflowResult struct {
 	message string
 }
 
-func runWorkflowTests() {
+// runWorkflowTests returns (failed, skipped): failed is the count of
+// genuinely failed sub-tests (0 if the whole suite never ran due to an
+// infrastructure problem or a skip); skipped is true when the whole
+// suite didn't run at all -- clone failure (no network) or a setup
+// error (temp dir, DB open, ingest, resolve). Previously this returned
+// void and every early-return path (including genuine infrastructure
+// failures, not just clone skip) was invisible to main() -- a
+// FAIL/SKIP line printed to stdout, but nothing in the exit code or
+// aggregate counters reflected it.
+func runWorkflowTests() (failed int, skipped bool) {
 	fmt.Println("=== Workflow Tests (SWE-bench patterns) ===")
 
 	// Clone chi for workflow tests (small, clean, fast).
 	dir, err := os.MkdirTemp("", "defn-workflow-*")
 	if err != nil {
 		fmt.Println("FAIL: could not create temp dir")
-		return
+		return 1, false
 	}
 	defer os.RemoveAll(dir)
 
@@ -44,25 +53,25 @@ func runWorkflowTests() {
 	cmd := exec.Command("git", "clone", "--depth", "1", "https://github.com/go-chi/chi.git", cloneDir)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		fmt.Printf("SKIP: clone failed: %s\n", out)
-		return
+		return 0, true
 	}
 
 	dbDir := filepath.Join(dir, "db")
 	db, err := store.OpenBackend(dbDir)
 	if err != nil {
 		fmt.Printf("FAIL: open db: %v\n", err)
-		return
+		return 1, false
 	}
 	defer db.Close()
 
 	// Ingest + resolve.
 	if err := ingest.Ingest(db, cloneDir); err != nil {
 		fmt.Printf("FAIL: ingest: %v\n", err)
-		return
+		return 1, false
 	}
 	if err := resolve.Resolve(db, cloneDir); err != nil {
 		fmt.Printf("FAIL: resolve: %v\n", err)
-		return
+		return 1, false
 	}
 
 	var results []workflowResult
@@ -93,7 +102,6 @@ func runWorkflowTests() {
 
 	// Summary.
 	passed := 0
-	failed := 0
 	for _, r := range results {
 		status := "PASS"
 		if !r.passed {
@@ -105,6 +113,7 @@ func runWorkflowTests() {
 		fmt.Printf("  %s: %s — %s\n", status, r.name, r.message)
 	}
 	fmt.Printf("\n=== Workflow Results: %d passed, %d failed ===\n", passed, failed)
+	return failed, false
 }
 
 func testNavigate(db store.Backend) workflowResult {

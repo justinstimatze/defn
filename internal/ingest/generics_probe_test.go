@@ -3,6 +3,7 @@ package ingest
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -75,3 +76,43 @@ func main() {}
 	}
 }
 
+// TestValueSpecType_MultiTypeParamGenericVarDecl is the regression for
+// typeString's missing *ast.IndexListExpr case: a var decl's EXPLICIT
+// type (no initializer to fall back to for inference) with 2+ generic
+// type args, e.g. "var p Pair[int, string]", used to render as the
+// literal string "<unknown>" via typeString's default branch -- silently
+// dropping the type from the def's stored signature. Single-type-param
+// generics (Stack[T]) were already handled by the pre-existing
+// *ast.IndexExpr case; only the 2+ param shape (*ast.IndexListExpr) was
+// missing.
+func TestValueSpecType_MultiTypeParamGenericVarDecl(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module proj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(dir, "main.go"), []byte(`package main
+
+type Pair[K comparable, V any] struct {
+	Key   K
+	Value V
+}
+
+var GlobalPair Pair[int, string]
+
+func main() {}
+`), 0644)
+
+	db := testDB(t)
+	if err := Ingest(db, dir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+
+	v, err := db.GetDefinitionByName("GlobalPair", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(v.Signature, "<unknown>") || strings.Contains(v.Body, "<unknown>") {
+		t.Errorf("GlobalPair's type was dropped to <unknown>: signature=%q body=%q", v.Signature, v.Body)
+	}
+	if !strings.Contains(v.Signature, "Pair[int, string]") {
+		t.Errorf("expected GlobalPair's signature to contain the full generic type, got %q", v.Signature)
+	}
+}
