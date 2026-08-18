@@ -10611,3 +10611,92 @@ func TestHandleCode_VersionReportsBuildIdentity(t *testing.T) {
 		t.Errorf("expected pid in response, got: %s", text)
 	}
 }
+
+// TestHandleRename_StructFieldWithSameNameOnAnotherTypeInSameFileResolvesCorrectly
+// is the collision case TestHandleRename_StructFieldRenamesDeclarationAndCallers
+// doesn't cover: two DIFFERENT types in the SAME file each have a field
+// named "Count". Real-world shape (etcd, mvcc/kv.go): RangeOptions.Count
+// and RangeResult.Count sit side by side; a rename targeting
+// RangeOptions.Count via receiver:"RangeOptions" must resolve to that
+// field specifically, update only ITS declaration and ITS own caller,
+// and leave the other type's same-named field and caller completely
+// untouched. If receiver-scoped resolution for a field target is
+// broken, this either targets the wrong field (renaming Wrong's Count
+// instead, leaving Target.Count and its real caller stale) or reports
+// success with zero callers updated despite a real caller existing.
+func TestHandleRename_StructFieldWithSameNameOnAnotherTypeInSameFileResolvesCorrectly(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "collideproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module collideproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package collideproj
+
+type Target struct {
+	Count bool
+}
+
+type Wrong struct {
+	Count int
+}
+
+func useTarget(t Target) bool {
+	return t.Count
+}
+
+func useWrong(w Wrong) int {
+	return w.Count
+}
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleRename(context.Background(), nil, renameParam{
+		OldName:  "Count",
+		NewName:  "CountOnly",
+		Receiver: "Target",
+		File:     "main.go",
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "rolled back") || strings.Contains(text, "not supported") {
+		t.Fatalf("expected rename to succeed, got: %s", text)
+	}
+	if !strings.Contains(text, "struct declaration") {
+		t.Errorf("expected the response to confirm a struct declaration was updated (field-rename path taken), got: %s", text)
+	}
+	if strings.Contains(text, "Updated 0 callers") {
+		t.Errorf("expected Target's real caller (useTarget) to be counted, got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(raw)
+	if !strings.Contains(src, "CountOnly bool") {
+		t.Errorf("expected Target's field to be renamed to CountOnly, got:\n%s", src)
+	}
+	if !strings.Contains(src, "t.CountOnly") {
+		t.Errorf("expected useTarget's selector to be rewritten to t.CountOnly, got:\n%s", src)
+	}
+	if !strings.Contains(src, "Count int") {
+		t.Errorf("expected Wrong's field to be left completely untouched, got:\n%s", src)
+	}
+	if !strings.Contains(src, "w.Count") {
+		t.Errorf("expected useWrong's selector to be left completely untouched, got:\n%s", src)
+	}
+}
