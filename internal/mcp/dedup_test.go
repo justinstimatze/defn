@@ -594,3 +594,42 @@ func TestMaybeAppendStarterBundle_EmptyQuestionDoesNotConsumeOneShot(t *testing.
 		t.Fatal("a blank-question call should not have consumed the one-shot starterInjected flag")
 	}
 }
+
+// TestDedupOpKey_ReadKeyIncludesQuery is the regression for a real
+// trajectory finding (prometheus-18712, v4 mining round): dedupOpKey's
+// "read" case ignored args.Query, so a full-body read of a large
+// function followed by a query-scoped read of the SAME def collided on
+// one dedup key -- the query-scoped call got served the stale
+// full-body "already served, nothing new" stub instead of the
+// genuinely narrower, different output it asked for.
+func TestDedupOpKey_ReadKeyIncludesQuery(t *testing.T) {
+	_, key1, ok1 := dedupOpKey(codeParam{Op: "read", Name: "main", Full: true})
+	_, key2, ok2 := dedupOpKey(codeParam{Op: "read", Name: "main", Full: true, Query: "memlimit"})
+	if !ok1 || !ok2 {
+		t.Fatalf("expected both read calls to be cacheable, got ok1=%v ok2=%v", ok1, ok2)
+	}
+	if key1 == key2 {
+		t.Errorf("a plain full-body read and a query-scoped read of the same def collided on one dedup key: %q", key1)
+	}
+}
+
+// TestDedupOpKey_ReadKeyIncludesLineRange is the same collision class as
+// TestDedupOpKey_ReadKeyIncludesQuery, but for the line_range param added
+// alongside it: a full-body read of a large function followed by a
+// line-range-scoped read of the SAME def must not collide on one dedup
+// key, or the ranged call would get served the stale full-body stub
+// instead of the narrower range it actually asked for.
+func TestDedupOpKey_ReadKeyIncludesLineRange(t *testing.T) {
+	_, key1, ok1 := dedupOpKey(codeParam{Op: "read", Name: "main", Full: true})
+	_, key2, ok2 := dedupOpKey(codeParam{Op: "read", Name: "main", Full: true, LineRange: "700-820"})
+	_, key3, ok3 := dedupOpKey(codeParam{Op: "read", Name: "main", Full: true, LineRange: "900-950"})
+	if !ok1 || !ok2 || !ok3 {
+		t.Fatalf("expected all three read calls to be cacheable, got ok1=%v ok2=%v ok3=%v", ok1, ok2, ok3)
+	}
+	if key1 == key2 {
+		t.Errorf("a plain full-body read and a line_range-scoped read of the same def collided on one dedup key: %q", key1)
+	}
+	if key2 == key3 {
+		t.Errorf("two different line_range values on the same def collided on one dedup key: %q", key2)
+	}
+}

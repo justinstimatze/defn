@@ -93,10 +93,23 @@ func newRespCache() *respCache {
 func dedupOpKey(args codeParam) (string, string, bool) {
 	switch args.Op {
 	case "read":
+		// #274-mining finding: Query activates #153's query-adaptive
+		// narrowing (return only body statements matching a token) --
+		// a full-body read followed by a query-scoped read of the same
+		// def used to collide on one key, serving the stale full-body
+		// stub for what should have been genuinely different, smaller
+		// output. Confirmed live in a real trajectory (prometheus-18712).
+		key := args.Name
 		if args.Full {
-			return "read", args.Name + "|full", true
+			key += "|full"
 		}
-		return "read", args.Name, true
+		if args.Query != "" {
+			key += "|query:" + args.Query
+		}
+		if args.LineRange != "" {
+			key += "|range:" + args.LineRange
+		}
+		return "read", key, true
 	case "outline":
 		return "outline", args.Name, true
 	case "slice":

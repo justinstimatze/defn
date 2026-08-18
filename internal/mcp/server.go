@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.68"
+const Version = "0.26.69"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -381,7 +381,7 @@ For any "how does X work in this codebase" discovery question, reach for context
 
 Orient before you read: overview (project shape) → outline (def shape) → impact (when you know which def matters). Only read whole bodies when you're about to edit them; whole-file reads on files you won't touch are pure wire cost — use outline or search instead.
 
-Ops: overview (project-wide shape when called with no args — one line per module with def counts + first exported names; pass file:"pkg-path" or file:"pkg-path/file.go" to drill in; the right first-touch when you don't know which def matters yet), outline (compact projection of a def — sig + doc + caller/callee summary, no body; use when body isn't needed), search, impact (blast radius of a known def — pass format:"json" for structured output; callers, transitives, test coverage in one call), read (returns the def body + a compact "Related" footer with summary, top-3 callers, top-3 callees, and semantically-adjacent defs — one call gives you what would otherwise take 3-4 sequential impact/outline calls; auto-downgrades to outline when body > 1500 bytes, pass full:true or mode:"body" to force), read-and-verify (read a def AND run its covering tests in one call — use during bug triage so you see behavior alongside source and don't spiral into read-loops; pass name), read-file (all defs' bodies in one file — pass file:"path"; whole-file counterpart to read; prefer over N sequential read calls when scanning), expand (bundle a def's outline/body/callers in one call — pass name:"F", or names:["A","B",...] to batch several targets into ONE response instead of one expand per target; include:["outline","callers","body"] controls sections, defaults to outline+callers; prefer over read+impact+read chains AND over N sequential single-name expand calls — round-trip count within a turn is the dominant session cost driver, not per-call size), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), replace-hunk (replace a byte-exact occurrence of 'old' inside a def body with 'new' — byte-exact PUTGET, content-addressed inside the def; pass name+old+new, plus index=1..N if 'old' occurs more than once; empty 'new' deletes the hunk. Send zero anchor context when the hunk is def-unique — the name argument does the file-level disambiguation), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), explain (structural analysis of a def — pass name to get sig + callers + callees + test coverage; ALSO accepts question:"how does X handle Y" which routes to a Sonnet co-processor that returns a prose answer grounded in the def's source with provenance refs. Cheaper than reading + interpreting a large body yourself when the answer is prose, not code. names:["A","B"] for multi-def scope. Requires ANTHROPIC_API_KEY), plan (pass intent:"..." — the co-processor grounds your intent in real defs via context's own candidate search, emits a compact trajectory, and defn mechanically walks it server-side in one round-trip instead of you sequencing several read/outline/impact calls yourself. Requires ANTHROPIC_API_KEY; falls back to a clear error pointing at plan-dsl/plan-sexpr when unset), plan-dsl / plan-sexpr (mechanically walk a trajectory YOU already wrote — pass plan:"..." in the compact DSL "@Def.field[!test]" form (plan-dsl) or the S-expression "(op target [!test])" form (plan-sexpr), op one of read/outline/impact; no API key needed), similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create (single def from body; with file: set, body may hold multiple top-level decls to author a whole file in one call — the whole-file equivalent of files-mode Write), delete (safe by default — refuses when other defs still reference this def; pass force:true to delete anyway. Refusal message lists the callers so you can rewrite them first), retarget-field-value (rewrite a composite-literal field's string value across every def whose body matches — pass name:"<StructType>" field:"<Field>" old:"<oldStr>" new:"<newStr>"; AST-safe, so unrelated occurrences of the string won't match), rename, move, test (run ONLY tests that cover a given def — pass name; scoped subset, not the full suite; prefer over bash 'go test ./...' when you only need coverage for a specific change. Also accepts test:"TestX" to run one test by name — use this to REPRODUCE a bug from the issue BEFORE writing any code; a passing test means your hypothesis about which def is broken is wrong), apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 6 projection ops insert-precondition/replace-slice/replace-hunk/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (rarely needed — every edit op auto-syncs the DB; only use after external file changes outside the code tool), query (raw SQL escape hatch — for schema analytics only; NEVER use to look up a def by name, grep bodies, or list files/defs-in-file — use search/outline/read-file/file-defs/impact instead, which are far cheaper on the wire), patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), commit (snapshot current state), status (current branch + dirty state), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree)`,
+Ops: overview (project-wide shape when called with no args — one line per module with def counts + first exported names; pass file:"pkg-path" or file:"pkg-path/file.go" to drill in; the right first-touch when you don't know which def matters yet), outline (compact projection of a def — sig + doc + caller/callee summary, no body; use when body isn't needed), search, impact (blast radius of a known def — pass format:"json" for structured output; callers, transitives, test coverage in one call), read (returns the def body + a compact "Related" footer with summary, top-3 callers, top-3 callees, and semantically-adjacent defs — one call gives you what would otherwise take 3-4 sequential impact/outline calls; auto-downgrades to outline when body > 1500 bytes, pass full:true or mode:"body" to force; for a large body, pass line_range:"700-820" (1-indexed, file-relative, "-" or ":" both accepted) to get back just that span instead — also bypasses the auto-downgrade, and composes with query: to filter further within the returned range), read-and-verify (read a def AND run its covering tests in one call — use during bug triage so you see behavior alongside source and don't spiral into read-loops; pass name), read-file (all defs' bodies in one file — pass file:"path"; whole-file counterpart to read; prefer over N sequential read calls when scanning), expand (bundle a def's outline/body/callers in one call — pass name:"F", or names:["A","B",...] to batch several targets into ONE response instead of one expand per target; include:["outline","callers","body"] controls sections, defaults to outline+callers; prefer over read+impact+read chains AND over N sequential single-name expand calls — round-trip count within a turn is the dominant session cost driver, not per-call size), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), replace-hunk (replace a byte-exact occurrence of 'old' inside a def body with 'new' — byte-exact PUTGET, content-addressed inside the def; pass name+old+new, plus index=1..N if 'old' occurs more than once; empty 'new' deletes the hunk. Send zero anchor context when the hunk is def-unique — the name argument does the file-level disambiguation), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), explain (structural analysis of a def — pass name to get sig + callers + callees + test coverage; ALSO accepts question:"how does X handle Y" which routes to a Sonnet co-processor that returns a prose answer grounded in the def's source with provenance refs. Cheaper than reading + interpreting a large body yourself when the answer is prose, not code. names:["A","B"] for multi-def scope. Requires ANTHROPIC_API_KEY), plan (pass intent:"..." — the co-processor grounds your intent in real defs via context's own candidate search, emits a compact trajectory, and defn mechanically walks it server-side in one round-trip instead of you sequencing several read/outline/impact calls yourself. Requires ANTHROPIC_API_KEY; falls back to a clear error pointing at plan-dsl/plan-sexpr when unset), plan-dsl / plan-sexpr (mechanically walk a trajectory YOU already wrote — pass plan:"..." in the compact DSL "@Def.field[!test]" form (plan-dsl) or the S-expression "(op target [!test])" form (plan-sexpr), op one of read/outline/impact; no API key needed), similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create (single def from body; with file: set, body may hold multiple top-level decls to author a whole file in one call — the whole-file equivalent of files-mode Write), delete (safe by default — refuses when other defs still reference this def; pass force:true to delete anyway. Refusal message lists the callers so you can rewrite them first), retarget-field-value (rewrite a composite-literal field's string value across every def whose body matches — pass name:"<StructType>" field:"<Field>" old:"<oldStr>" new:"<newStr>"; AST-safe, so unrelated occurrences of the string won't match), rename, move, test (run ONLY tests that cover a given def — pass name; scoped subset, not the full suite; prefer over bash 'go test ./...' when you only need coverage for a specific change. Also accepts test:"TestX" to run one test by name — use this to REPRODUCE a bug from the issue BEFORE writing any code; a passing test means your hypothesis about which def is broken is wrong), apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 6 projection ops insert-precondition/replace-slice/replace-hunk/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (rarely needed — every edit op auto-syncs the DB; only use after external file changes outside the code tool), query (raw SQL escape hatch — for schema analytics only; NEVER use to look up a def by name, grep bodies, or list files/defs-in-file — use search/outline/read-file/file-defs/impact instead, which are far cheaper on the wire), patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), commit (snapshot current state), status (current branch + dirty state), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree)`,
 	}, s.handleCode)
 
 	return s, mcpServer
@@ -455,14 +455,15 @@ type codeParam struct {
 	StmtIndex   int              `json:"stmt_index,omitempty"`
 	DeferBody   string           `json:"defer_body,omitempty"`
 	Full        bool             `json:"full,omitempty"`
-	Include     []string         `json:"include,omitempty"`  // expand op: which graph hops to fold in
-	Test        string           `json:"test,omitempty"`     // L11: op:test named-test reproduction (`-run <regex>` verbatim)
-	Field       string           `json:"field,omitempty"`    // retarget-field-value: composite-literal field name
-	Query       string           `json:"query,omitempty"`    // #153: query-adaptive read — keep only body branches touching the query
-	Mode        string           `json:"mode,omitempty"`     // #160: "summary" returns model-generated one-line intent instead of body
-	Question    string           `json:"question,omitempty"` // #186: natural-language question for op:"explain" co-processor
-	Plan        string           `json:"plan,omitempty"`     // #187/#188/#189: trajectory plan text for op:"plan-dsl" / op:"plan-sexpr"
-	Intent      string           `json:"intent,omitempty"`   // #186: natural-language exploration goal for op:"plan" (co-processor-generated trajectory)
+	Include     []string         `json:"include,omitempty"`    // expand op: which graph hops to fold in
+	Test        string           `json:"test,omitempty"`       // L11: op:test named-test reproduction (`-run <regex>` verbatim)
+	Field       string           `json:"field,omitempty"`      // retarget-field-value: composite-literal field name
+	Query       string           `json:"query,omitempty"`      // #153: query-adaptive read — keep only body branches touching the query
+	Mode        string           `json:"mode,omitempty"`       // #160: "summary" returns model-generated one-line intent instead of body
+	Question    string           `json:"question,omitempty"`   // #186: natural-language question for op:"explain" co-processor
+	Plan        string           `json:"plan,omitempty"`       // #187/#188/#189: trajectory plan text for op:"plan-dsl" / op:"plan-sexpr"
+	Intent      string           `json:"intent,omitempty"`     // #186: natural-language exploration goal for op:"plan" (co-processor-generated trajectory)
+	LineRange   string           `json:"line_range,omitempty"` // read: file-relative 1-indexed inclusive range, "700-820" or "700:820" -- narrows the returned body to just those lines, bypassing summary-mode/outline-downgrade the same way full:true does
 }
 
 // applyOp is one operation inside an apply batch. Only Op is
@@ -547,6 +548,12 @@ type nameParam struct {
 	// wins when both are set, mirroring resolveEditTarget's precedence.
 	Module string `json:"module,omitempty"`
 	File   string `json:"file,omitempty"`
+	// LineRange, when non-empty, narrows a read's returned body to a
+	// file-relative 1-indexed inclusive line range ("700-820" or
+	// "700:820"). Bypasses summary-mode-by-default and the #184
+	// auto-outline-downgrade the same way Full does -- an explicit
+	// range request means the caller wants body text, not a projection.
+	LineRange string `json:"line_range,omitempty"`
 }
 
 type editParam struct {
@@ -1179,7 +1186,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		// or a downgraded subset -- never more. Bypassed when full:true or
 		// a query is set: those aren't redundant with a prior plain-args
 		// full-body serve check the same way outline's bypass works.
-		if !args.Full && req != nil && s.respCache != nil && strings.TrimSpace(args.Query) == "" && args.Module == "" && args.File == "" {
+		if !args.Full && req != nil && s.respCache != nil && strings.TrimSpace(args.Query) == "" && strings.TrimSpace(args.LineRange) == "" && args.Module == "" && args.File == "" {
 			if epochsAgo, ok := s.respCache.bodyServedEpochsAgo(req.Session, args.Name); ok {
 				if epochsAgo <= staleEpochThreshold {
 					stub := fmt.Sprintf(
@@ -1196,7 +1203,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 				return wrapStale(s.handleExpand(ctx, req, codeParam{Name: args.Name, Include: []string{"outline", "callers", "body"}, Module: args.Module, File: args.File}))
 			}
 		}
-		r, o, e := wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name, Full: args.Full, Query: args.Query, Mode: args.Mode, Receiver: args.Receiver, Module: args.Module, File: args.File}))
+		r, o, e := wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name, Full: args.Full, Query: args.Query, Mode: args.Mode, Receiver: args.Receiver, Module: args.Module, File: args.File, LineRange: args.LineRange}))
 		if note := s.ambiguityNote(args.Name, args.Receiver, args.Module, args.File); note != "" {
 			r = prependNote(r, note)
 		}
@@ -1831,7 +1838,13 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 	// since args.Mode == "" is now no longer a reliable signal that
 	// the caller wants the body.
 	justMutated := req != nil && s.respCache != nil && s.respCache.takeMutated(req.Session, args.Name)
-	if args.Mode == "" && !args.Full && !justMutated && os.Getenv("DEFN_SUMMARY_READ_DEFAULT") != "0" {
+	// wantsBody mirrors what args.Full already means to every gate below:
+	// an explicit line_range request is just as unambiguous an "I want
+	// body text" signal as full:true -- both should bypass summary-mode-
+	// by-default, the upstream-match/diverged-from-upstream projections,
+	// and the #184 auto-outline-downgrade the same way.
+	wantsBody := args.Full || strings.TrimSpace(args.LineRange) != ""
+	if args.Mode == "" && !wantsBody && !justMutated && os.Getenv("DEFN_SUMMARY_READ_DEFAULT") != "0" {
 		args.Mode = "summary"
 	}
 	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
@@ -1874,7 +1887,7 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 	// Delta-from-prior: if this def belongs to a module we have upstream
 	// fingerprints for AND the caller hasn't asked for the full body,
 	// try the compact provenance form. See project_d_delta_from_prior.
-	if !args.Full && modulePath != "" {
+	if !wantsBody && modulePath != "" {
 		upstreamName := upstreamDefName(d)
 		hash := store.HashBodyStructural(d.Body)
 		if match, _ := s.backend.FindUpstreamMatch(modulePath, upstreamName, d.Kind, d.Receiver, hash); match != nil {
@@ -1896,7 +1909,7 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 	// tells the model how to get the body if it actually needs it.
 	// Rationale: #174 receipt showed CLAUDE.md-level outline-first
 	// nudges failed. Taking the choice away is the recommended lever.
-	if !args.Full &&
+	if !wantsBody &&
 		args.Mode != "body" &&
 		strings.TrimSpace(args.Query) == "" &&
 		len(d.Body) > readAutoOutlineThreshold {
@@ -1928,8 +1941,28 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 	// or the hint header would exceed the byte savings.
 	body := d.Body
 	var queryHint string
+	var rangeHint string
+	if strings.TrimSpace(args.LineRange) != "" {
+		wantStart, wantEnd, rErr := projection.ParseLineRange(args.LineRange)
+		if rErr != nil {
+			return errResult(fmt.Errorf("read: %w", rErr))
+		}
+		bodyStartLine := projection.BodyStartLine(d.Body, d.StartLine, d.EndLine)
+		if narrowed, actualStart, actualEnd, ok := projection.ExtractLineRange(d.Body, bodyStartLine, wantStart, wantEnd); ok {
+			body = narrowed
+			rangeHint = fmt.Sprintf(
+				"[line_range read: showing file lines %d-%d (requested %d-%d) of %s's full range %d-%d. Pass line_range=\"\" for the full body.]\n\n",
+				actualStart, actualEnd, wantStart, wantEnd, args.Name, d.StartLine, d.EndLine,
+			)
+		} else {
+			rangeHint = fmt.Sprintf(
+				"[line_range read: requested %d-%d does not overlap %s's actual range %d-%d — showing the full body instead. Pass line_range=\"\" to skip this check next time.]\n\n",
+				wantStart, wantEnd, args.Name, d.StartLine, d.EndLine,
+			)
+		}
+	}
 	if strings.TrimSpace(args.Query) != "" {
-		filtered, kept, elided := projection.FilterBodyByQuery(d.Body, args.Query)
+		filtered, kept, elided := projection.FilterBodyByQuery(body, args.Query)
 		if elided > 0 && kept > 0 {
 			candidateHint := fmt.Sprintf(
 				"[query-adaptive read: query=%q, %d/%d statements kept, %d elided. Pass query=\"\" for the full body.]\n\n",
@@ -1938,7 +1971,7 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 			// Only apply when the filter is a net win — the hint
 			// header costs ~140 bytes; on tiny bodies it can dwarf
 			// the elision savings.
-			if len(filtered)+len(candidateHint) < len(d.Body) {
+			if len(filtered)+len(candidateHint) < len(body) {
 				body = filtered
 				queryHint = candidateHint
 			}
@@ -1949,6 +1982,9 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 	recv := formatReceiver(d.Receiver)
 	sb.WriteString(fmt.Sprintf("## %s%s (%s)\n", recv, d.Name, d.Kind))
 	sb.WriteString(fmt.Sprintf("Module: %s\n\n", modulePath))
+	if rangeHint != "" {
+		sb.WriteString(rangeHint)
+	}
 	if queryHint != "" {
 		sb.WriteString(queryHint)
 	}
@@ -1973,7 +2009,7 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 	// not it asked, which collapses the read→impact→read-caller chain
 	// into one round-trip. Skipped only for query-adaptive filtered
 	// reads (query is set) since those are already narrower on purpose.
-	if strings.TrimSpace(args.Query) == "" && !stripped("related-footer") {
+	if strings.TrimSpace(args.Query) == "" && strings.TrimSpace(args.LineRange) == "" && !stripped("related-footer") {
 		sb.WriteString(s.renderReadNeighborhood(d))
 	}
 
