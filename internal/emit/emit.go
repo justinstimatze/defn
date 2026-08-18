@@ -477,12 +477,27 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 	}
 	sort.Strings(fileNames)
 
+	// Phase C: pre-fetch the raw sources for this module. When present,
+	// writeFile uses them as the authoritative merge base — that's the
+	// byte-faithful copy, unaffected by whatever's on disk (which might
+	// be stale or never have existed, e.g. fresh `defn emit /tmp/out`).
+	// Fetched here, before the scoped filter below (not after) -- the
+	// #276 def-less pass at the end of this function needs to influence
+	// whether the scoped filter's early-return actually fires. It used
+	// to be fetched after that early return, so a module whose ONLY
+	// relevant content for this emit was a def-less file_sources entry
+	// (a freshly scaffolded file, no defs yet) bailed out before ever
+	// reaching the code that would have written it.
+	rawMap, _ := db.ListFileSources(mod.ID)
+
 	// Scoped emit filter: keep only files whose canonical project-relative
 	// path is in touchedSet. Pick the canonical path from the bucket's
 	// first def with a non-empty SourceFile (same invariant as projectRelByFile
 	// below — buckets share a SourceFile). Files without any SourceFile
 	// (fresh defs) are always kept. If no file in this module matched,
-	// return early — nothing to emit here.
+	// return early -- unless a def-less file_sources entry is still
+	// relevant to this emit (#276), in which case fall through so the
+	// pass at the end of this function gets a chance to run.
 	if scoped {
 		kept := fileNames[:0]
 		for _, file := range fileNames {
@@ -507,15 +522,18 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 		}
 		fileNames = kept
 		if len(fileNames) == 0 {
-			return nil, nil, nil, nil
+			relevantDeflessFile := false
+			for sourceFile := range rawMap {
+				if touchedSet[filepath.ToSlash(filepath.Clean(sourceFile))] {
+					relevantDeflessFile = true
+					break
+				}
+			}
+			if !relevantDeflessFile {
+				return nil, nil, nil, nil
+			}
 		}
 	}
-
-	// Phase C: pre-fetch the raw sources for this module. When present,
-	// writeFile uses them as the authoritative merge base — that's the
-	// byte-faithful copy, unaffected by whatever's on disk (which might
-	// be stale or never have existed, e.g. fresh `defn emit /tmp/out`).
-	rawMap, _ := db.ListFileSources(mod.ID)
 
 	// Per-file rawFromDB lookup, cached once for reuse.
 	rawByFile := make(map[string][]byte, len(fileNames))
@@ -635,6 +653,58 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 			Path:       path,
 			ModuleID:   mod.ID,
 			SourceFile: projectRelByFile[file],
+		})
+	}
+
+	// #276: byFile/fileNames above are built exclusively from
+	// Definitions, so a file recorded in file_sources with ZERO
+	// matching defs -- most notably handleCreateScaffoldFile's whole
+	// reason to exist -- was invisible to every emit call in every
+	// scenario: a module with other defs never puts a def-less file
+	// into byFile at all, and a module with zero defs total hits the
+	// len(defs)==0 bailout above before byFile is even built. Confirmed
+	// live: a scaffolded file reported "Scaffolded ... N bytes" success
+	// and was never actually written to disk. Handle these separately
+	// from the def-driven path above -- there's nothing to AST-merge,
+	// just the raw file_sources content to place on disk (safeWriteGoFile's
+	// own data-loss check still applies if the target already has
+	// on-disk decls this content doesn't account for). Additive only:
+	// this can write a new file or refresh an existing one, never
+	// delete -- consistent with the len(defs)==0 module bailout's own
+	// "file_sources alone is not proof of ownership" reasoning, which
+	// only ever applied to DELETION, not to placing content a caller
+	// explicitly just asked to be written.
+	handledPaths := make(map[string]bool, len(projectRelByFile))
+	for _, pr := range projectRelByFile {
+		if pr != "" {
+			handledPaths[pr] = true
+		}
+	}
+	for sourceFile, raw := range rawMap {
+		clean := filepath.ToSlash(filepath.Clean(sourceFile))
+		if handledPaths[clean] {
+			continue
+		}
+		if scoped && !touchedSet[clean] {
+			continue
+		}
+		path := filepath.Join(outDir, clean)
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			return nil, nil, nil, err
+		}
+		wrote, lost, err := safeWriteGoFile(path, []byte(raw), allowedRemovals)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if !wrote {
+			warnings = append(warnings, fmt.Sprintf("%s: skipped writing a def-less file_sources entry -- would remove %d on-disk declaration(s) not in the database: %v", path, len(lost), lost))
+			continue
+		}
+		emitDebugf("  WROTE %s (module=%s sourceFile=%q scoped=%v, def-less file_sources entry)", path, mod.Path, clean, scoped)
+		written = append(written, writtenFile{
+			Path:       path,
+			ModuleID:   mod.ID,
+			SourceFile: clean,
 		})
 	}
 

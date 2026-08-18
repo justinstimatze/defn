@@ -10104,13 +10104,10 @@ func use(r Reader) string {
 // is the regression for wrapping handleCreateScaffoldFile's write in a
 // transaction (#12-class fix -- every sibling write handler already had
 // this): confirms the DB-side behavior is unaffected by the fix -- the
-// file_sources row is durably committed and reports success. See #276
-// for a separate, pre-existing, deeper issue this test does NOT cover:
-// emitModule builds its write set exclusively from Definitions, so a
-// zero-def scaffold file may never actually be written to disk in any
-// scenario -- that's unrelated to (and unfixed by) the transaction wrap
-// here, which only protects DB-vs-disk consistency for whatever emit
-// actually does end up doing.
+// file_sources row is durably committed and reports success. See
+// TestHandleCreateScaffoldFile_ActuallyWritesFileToDisk for the
+// separate #276 fix (now shipped) confirming the content actually
+// lands on disk, not just in file_sources.
 func TestHandleCreateScaffoldFile_RoutesThroughTransactionAndStillSucceeds(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, ".defn")
@@ -10135,10 +10132,13 @@ func TestHandleCreateScaffoldFile_RoutesThroughTransactionAndStillSucceeds(t *te
 	s := &server{backend: db, projectDir: projDir}
 	s.ready.Store(true)
 
+	// Blank import: goimports (which now actually runs against this
+	// file post-#276) legitimately strips a genuinely unused named
+	// import, but keeps a blank one.
 	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
 		Op:   "create",
 		File: "pkg/newfile.go",
-		Body: "import \"fmt\"\n",
+		Body: "import _ \"fmt\"\n",
 	})
 	text := resultText(t, result)
 	if !strings.Contains(text, "Scaffolded") {
@@ -10162,7 +10162,7 @@ func TestHandleCreateScaffoldFile_RoutesThroughTransactionAndStillSucceeds(t *te
 	if err != nil || src == "" {
 		t.Fatalf("scaffold content not committed to file_sources: err=%v src=%q", err, src)
 	}
-	if !strings.Contains(src, "import \"fmt\"") {
+	if !strings.Contains(src, "_ \"fmt\"") {
 		t.Errorf("committed file_sources missing expected content: %q", src)
 	}
 
@@ -10368,5 +10368,132 @@ func TestExtractQueryTokensLower_MatchesProjectionMirrorOnNonASCII(t *testing.T)
 	want := []string{"café", "über", "λambda"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("extractQueryTokensLower(%q) = %v, want %v", "café über λambda", got, want)
+	}
+}
+
+// TestHandleEdit_DiskIOFailureRollsBackNotSilentSuccess is the
+// verification for #275: does a genuine OS-level write failure (not
+// just a data-loss safety-net refusal) actually propagate as a
+// rollback, or can it be silently swallowed? Simulates external
+// interference by replacing the target file with a directory on disk
+// after ingest -- writeFile/safeWriteGoFile's os.ReadFile hits a real
+// "is a directory" error, not os.IsNotExist, so it must propagate as
+// writeFile's own error return (not just the softer data-loss warning
+// string), all the way up through emitModule/emitWithOpts/
+// emitAndBuildAgainst to a rolled-back commitOrRollbackOnBuild.
+func TestHandleEdit_DiskIOFailureRollsBackNotSilentSuccess(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "proj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module proj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc F() int {\n\treturn 1\n}\n\nfunc main() {}\n"), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	// Simulate external interference: the target file is now a
+	// directory, not a regular file. os.ReadFile inside
+	// safeWriteGoFile will get a real I/O error here, not ENOENT.
+	os.Remove(filepath.Join(projDir, "main.go"))
+	os.MkdirAll(filepath.Join(projDir, "main.go"), 0755)
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op:      "edit",
+		Name:    "F",
+		NewBody: "func F() int {\n\treturn 2\n}",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "rolled back") {
+		t.Fatalf("expected the edit to be refused/rolled back when the target path is a directory, got: %s", text)
+	}
+
+	// The DB must not durably believe F's body changed either.
+	f, err := db.GetDefinitionByName("F", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(f.Body, "return 2") {
+		t.Errorf("DB durably committed the edit despite the disk write failing: %s", f.Body)
+	}
+}
+
+// TestHandleCreateScaffoldFile_ActuallyWritesFileToDisk is the
+// regression for #276: emitModule built its write set exclusively from
+// Definitions, so a scaffold-only file (zero defs, just a raw
+// file_sources row) was invisible to it in EVERY scenario -- a module
+// with other defs never put a def-less file in byFile at all, and a
+// module with zero defs total hit the len(defs)==0 bailout before
+// byFile was even built. handleCreateScaffoldFile reported "Scaffolded
+// ... N bytes" success while the file was never actually created on
+// disk. This confirms the file now genuinely lands, in a module that
+// also has an existing real definition (the shape that hit the bug --
+// a module with SOME defs, just not for this specific new file).
+func TestHandleCreateScaffoldFile_ActuallyWritesFileToDisk(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "proj")
+	os.MkdirAll(filepath.Join(projDir, "pkg"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module proj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "pkg", "existing.go"), []byte("package pkg\n\nfunc Real() int {\n\treturn 1\n}\n"), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	// Blank import: goimports legitimately strips a genuinely unused
+	// named import ("fmt" referenced nowhere), but a blank import is
+	// kept -- it's the realistic shape a real scaffold body would use.
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op:   "create",
+		File: "pkg/newfile.go",
+		Body: "import _ \"fmt\"\n",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Scaffolded") {
+		t.Fatalf("expected a successful scaffold, got: %s", text)
+	}
+
+	src, err := os.ReadFile(filepath.Join(projDir, "pkg", "newfile.go"))
+	if err != nil {
+		t.Fatalf("scaffolded file was NOT written to disk despite reporting success: %v", err)
+	}
+	if !strings.Contains(string(src), "package pkg") || !strings.Contains(string(src), "_ \"fmt\"") {
+		t.Errorf("scaffolded file on disk missing expected content:\n%s", src)
+	}
+
+	// Real() must still be intact -- this write must be purely
+	// additive, not disturb the sibling file.
+	realSrc, err := os.ReadFile(filepath.Join(projDir, "pkg", "existing.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(realSrc), "func Real()") {
+		t.Errorf("existing.go lost Real() as a side effect of scaffolding a sibling file:\n%s", realSrc)
 	}
 }
