@@ -1264,14 +1264,24 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 					}
 					delete(wantTypes, s.Name.Name)
 				case *ast.ValueSpec:
-					// Multi-name specs (var a, b = 1, 2) share a single
-					// DB def under the first name; partial patching
-					// would leak the wrong value into siblings. Fall
-					// through to regeneration.
-					if len(s.Names) != 1 {
+					// Multi-name specs (var a, b = 1, 2; or var x, y T) share
+					// a single DB def under the first non-blank name
+					// (ingestValueSpec's own storage convention -- Body
+					// already holds the WHOLE spec's rendered text, not just
+					// one name's value). The splice below always replaces the
+					// entire spec's byte range regardless of name count, so
+					// there was never a real "partial patching leaks into
+					// siblings" risk here -- bailing on len(s.Names)!=1 just
+					// silently left the def unmatched forever (no "fall
+					// through to regeneration" ever actually happened), which
+					// is exactly the prometheus-16766 bug: a multi-name var
+					// spec (agentOnlyFlags, serverOnlyFlags []string) blocked
+					// every subsequent edit to ANY OTHER decl in the same
+					// file, forever, even after a fresh sync.
+					name := firstNonBlankValueSpecName(s.Names)
+					if name == "" {
 						continue
 					}
-					name := s.Names[0].Name
 					// Per-spec removal -- same rationale as the TypeSpec case
 					// above.
 					if remove[name] {
@@ -1683,4 +1693,18 @@ func emitDebugf(format string, args ...any) {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "[emit-debug] "+format+"\n", args...)
+}
+
+// firstNonBlankValueSpecName returns the first non-"_" name in a
+// ValueSpec's Names list, or "" if all are blank. Mirrors
+// ingestValueSpec's own "first non-blank name owns the spec"
+// convention (internal/ingest/ingest.go) -- a multi-name spec is
+// matched and replaced as a whole under this same key.
+func firstNonBlankValueSpecName(names []*ast.Ident) string {
+	for _, n := range names {
+		if n.Name != "_" {
+			return n.Name
+		}
+	}
+	return ""
 }

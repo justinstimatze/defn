@@ -11009,3 +11009,92 @@ func TestHandleCode_DeleteValidationRequiresNameOrFile(t *testing.T) {
 		t.Errorf("expected \"name or file is required\", got: %s", text)
 	}
 }
+
+func TestHandleEdit_MultiNameVarSpecInGroupedBlockDoesNotFalselyBlockUnrelatedEdit(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/proj\n\ngo 1.26\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	src := `package proj
+
+import "fmt"
+
+var (
+	agentOnlyFlags, serverOnlyFlags []string
+)
+
+func agentOnlyFlag(name string) {
+	agentOnlyFlags = append(agentOnlyFlags, "--"+name)
+}
+
+func serverOnlyFlag(name string) {
+	serverOnlyFlags = append(serverOnlyFlags, "--"+name)
+}
+
+func reloadConfig(start int) {
+	fmt.Println("duration", start)
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, dir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, dir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: dir}
+	s.ready.Store(true)
+
+	// #284-adjacent finding: multi-name specs (var x, y int) are stored
+	// once under the first name by design (ingestValueSpec's own doc
+	// comment) -- serverOnlyFlags is NOT independently queryable, its
+	// text lives inside agentOnlyFlags' Body. Confirm that's still true
+	// here rather than assuming it, then focus on the real question:
+	// does an unrelated edit round-trip cleanly against this shape?
+	if _, err := db.GetDefinitionByName("agentOnlyFlags", "example.com/proj"); err != nil {
+		t.Fatalf("expected agentOnlyFlags to be ingested: %v", err)
+	}
+	if _, err := db.GetDefinitionByName("serverOnlyFlags", "example.com/proj"); err == nil {
+		t.Fatalf("serverOnlyFlags unexpectedly has its own def row -- multi-name spec storage changed, update this test's assumptions")
+	}
+
+	// Same remedy the real trajectory called after its first failure.
+	if _, _, err := s.handleCode(context.Background(), nil, codeParam{Op: "sync", File: "main.go"}); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	// Now edit reloadConfig -- a function that has nothing to do with
+	// either flags var -- in the SAME file. Before a fix, this would
+	// roll back with "could not be matched to an on-disk declaration...
+	// [agentOnlyFlags]" despite the edit never touching that name.
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op: "edit", Name: "reloadConfig",
+		NewBody: `func reloadConfig(start int) {
+	fmt.Println("duration", start, "seconds")
+}`,
+	})
+	if err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "could not be matched") || strings.Contains(text, "rolled back") {
+		t.Errorf("expected the edit to land cleanly, got: %s", text)
+	}
+	if !strings.Contains(text, "Updated") {
+		t.Errorf("expected a normal success response, got: %s", text)
+	}
+
+	// agentOnlyFlags' spec must still resolve correctly after the round trip.
+	if _, err := db.GetDefinitionByName("agentOnlyFlags", "example.com/proj"); err != nil {
+		t.Errorf("agentOnlyFlags should still exist after the edit: %v", err)
+	}
+}

@@ -2211,3 +2211,77 @@ type (
 		t.Errorf("A was incorrectly removed alongside B:\n%s", got)
 	}
 }
+
+// TestMergeDeclsIntoSource_DeletingMultiNameValueSpecRemovesItFromDisk
+// covers the sibling half of the same root cause: since the old code
+// never resolved a name for a multi-name spec, code(op:"delete") on one
+// used to report success (DB row removed) while silently leaving the
+// spec's text on disk forever.
+func TestMergeDeclsIntoSource_DeletingMultiNameValueSpecRemovesItFromDisk(t *testing.T) {
+	existing := []byte(`package p
+
+var (
+	agentOnlyFlags, serverOnlyFlags []string
+)
+
+func reloadConfig() {}
+`)
+	// Deleted def is no longer in defs; caller declares it via allowedRemovals.
+	defs := []store.Definition{
+		{Name: "reloadConfig", Kind: "function", Body: "func reloadConfig() {}"},
+	}
+	merged, ok, unmatched := mergeDeclsIntoSource(existing, defs, []string{"agentOnlyFlags"}, nil)
+	if !ok {
+		t.Fatalf("mergeDeclsIntoSource returned ok=false")
+	}
+	if len(unmatched) != 0 {
+		t.Fatalf("expected no unmatched defs, got %v", unmatched)
+	}
+	got := string(merged)
+	if strings.Contains(got, "agentOnlyFlags") {
+		t.Errorf("multi-name var spec should have been removed from disk, still present:\n%s", got)
+	}
+}
+
+// TestMergeDeclsIntoSource_MultiNameValueSpecMatchesUnderFirstName is the
+// direct unit-level regression for the prometheus-16766 bug: a var/const
+// spec declaring more than one name (var a, b []string) used to bail out
+// of the match loop unconditionally, leaving its DB def permanently
+// unmatched -- which blocked every subsequent edit to any OTHER decl in
+// the same file with a false "could not be matched to an on-disk
+// declaration" warning, since the def stayed in mergeDeclsIntoSource's
+// unmatched set forever regardless of how many times the file was
+// re-synced. ingestValueSpec already stores exactly one def for a
+// multi-name spec, keyed by the first non-blank name, with Body holding
+// the WHOLE spec's rendered text -- this confirms mergeDeclsIntoSource
+// now matches and replaces under that same key.
+func TestMergeDeclsIntoSource_MultiNameValueSpecMatchesUnderFirstName(t *testing.T) {
+	existing := []byte(`package p
+
+var (
+	agentOnlyFlags, serverOnlyFlags []string
+)
+
+func reloadConfig(start int) {
+	_ = start
+}
+`)
+	defs := []store.Definition{
+		{Name: "agentOnlyFlags", Kind: "var", Body: "agentOnlyFlags, serverOnlyFlags []string"},
+		{Name: "reloadConfig", Kind: "function", Body: "func reloadConfig(start int) {\n\t_ = start\n\t_ = 1\n}"},
+	}
+	merged, ok, unmatched := mergeDeclsIntoSource(existing, defs, nil, nil)
+	if !ok {
+		t.Fatalf("mergeDeclsIntoSource returned ok=false")
+	}
+	if len(unmatched) != 0 {
+		t.Fatalf("expected no unmatched defs, got %v -- the multi-name var spec should match under its first name", unmatched)
+	}
+	got := string(merged)
+	if !strings.Contains(got, "agentOnlyFlags, serverOnlyFlags []string") {
+		t.Errorf("multi-name var spec text lost from merged output:\n%s", got)
+	}
+	if !strings.Contains(got, "_ = 1") {
+		t.Errorf("unrelated func edit didn't land:\n%s", got)
+	}
+}
