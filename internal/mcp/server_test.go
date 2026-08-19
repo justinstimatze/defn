@@ -11605,3 +11605,181 @@ func TestHandleCode_CircuitBreakerAutoBatchBodyOnlyForNamesActuallyRead(t *testi
 		t.Errorf("Greet should still appear via outline (name/signature), got: %s", text)
 	}
 }
+
+// TestHandleApply_InsertHeaderCombinedWithEditDoesNotRollBackBatch guards
+// the #296 bug found reviewing e65af5d: insert-header was wired into
+// writeTargets/isWriteOp but never into handleApply's own op-dispatch
+// switches, so any apply batch containing insert-header hit "unknown op:
+// insert-header" and rolled back the ENTIRE batch -- including other
+// valid ops bundled alongside it. This reproduces exactly that shape: an
+// edit + an insert-header in one batch, both must land.
+func TestHandleApply_InsertHeaderCombinedWithEditDoesNotRollBackBatch(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "edit", Name: "Greet", NewBody: `func Greet(name string) string {
+	return "Hi, " + name
+}`},
+			{Op: "insert-header", File: "main.go", Body: "// Copyright 2026 Example Authors"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleApply: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "rolled back") || strings.Contains(text, "unknown op") {
+		t.Fatalf("batch should not have rolled back, got: %s", text)
+	}
+
+	final, ferr := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if ferr != nil {
+		t.Fatalf("read main.go: %v", ferr)
+	}
+	if !strings.HasPrefix(string(final), "// Copyright 2026 Example Authors") {
+		t.Errorf("expected header to land on disk, got:\n%s", final)
+	}
+	if !strings.Contains(string(final), `"Hi, " + name`) {
+		t.Errorf("expected edit to also land on disk, got:\n%s", final)
+	}
+}
+
+// TestHandleApply_InsertHeaderDryRunPreviewsWithoutWriting guards the
+// apply-batch dry-run path for insert-header (#296).
+func TestHandleApply_InsertHeaderDryRunPreviewsWithoutWriting(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	before, berr := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if berr != nil {
+		t.Fatalf("read main.go before: %v", berr)
+	}
+
+	result, _, err := s.handleApply(context.Background(), nil, applyParam{
+		DryRun: true,
+		Operations: []applyOp{
+			{Op: "insert-header", File: "main.go", Body: "// Copyright 2026 Example Authors"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleApply dry_run: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "would prepend header") {
+		t.Errorf("expected dry-run preview, got: %s", text)
+	}
+
+	after, aerr := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if aerr != nil {
+		t.Fatalf("read main.go after: %v", aerr)
+	}
+	if string(after) != string(before) {
+		t.Errorf("dry_run modified the file on disk")
+	}
+}
+
+// TestHandleInsertHeader_IdempotencyDoesNotFalsePositiveOnPrefixCollision
+// guards the #297 bug found reviewing e65af5d: the idempotency check used
+// a bare strings.HasPrefix, so a header that's merely a PREFIX of
+// unrelated existing content (not the header itself) was wrongly treated
+// as "already present" and silently skipped -- reported success with no
+// actual insertion.
+func TestHandleInsertHeader_IdempotencyDoesNotFalsePositiveOnPrefixCollision(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	// Seed main.go with content that STARTS WITH the header text as a
+	// substring, but isn't actually the header (continues on the same
+	// line instead of breaking).
+	original, rerr := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if rerr != nil {
+		t.Fatalf("read main.go: %v", rerr)
+	}
+	seeded := "// Copyright 2026-2027 Foo Corp, all rights reserved\n\n" + string(original)
+	if err := os.WriteFile(filepath.Join(projDir, "main.go"), []byte(seeded), 0644); err != nil {
+		t.Fatalf("seed main.go: %v", err)
+	}
+
+	result, _, err := s.handleInsertHeader(context.Background(), nil, codeParam{
+		File: "main.go",
+		Body: "// Copyright 2026",
+	})
+	if err != nil {
+		t.Fatalf("handleInsertHeader: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "no-op") {
+		t.Fatalf("expected the header to actually be inserted (prefix collision, not a real match), got no-op: %s", text)
+	}
+
+	final, ferr := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if ferr != nil {
+		t.Fatalf("read main.go after: %v", ferr)
+	}
+	if !strings.HasPrefix(string(final), "// Copyright 2026\n\n// Copyright 2026-2027 Foo Corp") {
+		t.Errorf("expected the new header prepended above the existing similar-looking comment, got:\n%s", final)
+	}
+}
+
+// TestHandleTestByName_AlternationPatternScopesEmitToBothResolvedFiles
+// guards the #298 bug found root-causing prometheus-12024/18972's fresh
+// F1 losses: test:"TestFoo|TestBar" (no file:/module: hint -- the shape
+// produced whenever a model verifies several just-created tests
+// together) isn't a literal test name, so it fell through to the
+// "hint == \"\"" branch and testScopeTarget("") returned "./..." for the
+// pre-test emit gate, triggering a FULLY UNSCOPED emit.Emit() that
+// re-normalized every file in the whole project -- including files
+// nothing about the test ever touched. Confirmed live: both fresh
+// trajectories show promql/parser/generated_parser.y.go's import block
+// silently reordered by exactly this kind of call. Each alternated name
+// is now resolved independently to scope the emit to the union of their
+// actual files, even though the go test invocation itself still uses
+// "./..." when they span different packages (unchanged, safe).
+func TestHandleTestByName_AlternationPatternScopesEmitToBothResolvedFiles(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	// A third, unrelated file that must NOT be touched by this test run.
+	unrelatedDir := filepath.Join(projDir, "unrelated")
+	if err := os.MkdirAll(unrelatedDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	unrelatedSrc := "package unrelated\n\nimport (\n\t\"fmt\"\n\n\t\"strings\"\n)\n\nfunc F() string { return fmt.Sprint(strings.ToUpper(\"x\")) }\n"
+	if err := os.WriteFile(filepath.Join(unrelatedDir, "unrelated.go"), []byte(unrelatedSrc), 0644); err != nil {
+		t.Fatal(err)
+	}
+	before, berr := os.ReadFile(filepath.Join(unrelatedDir, "unrelated.go"))
+	if berr != nil {
+		t.Fatal(berr)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+	if err := s.ingestAndResolve(); err != nil {
+		t.Fatalf("ingest unrelated.go: %v", err)
+	}
+
+	result, _, err := s.handleTestByName(context.Background(), nil, "TestGreet|TestFarewell", "", "")
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "emit:") {
+		t.Fatalf("emit failed: %s", text)
+	}
+
+	after, aerr := os.ReadFile(filepath.Join(unrelatedDir, "unrelated.go"))
+	if aerr != nil {
+		t.Fatal(aerr)
+	}
+	if string(after) != string(before) {
+		t.Errorf("unrelated.go was rewritten by an alternation-pattern test run that never referenced it:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}

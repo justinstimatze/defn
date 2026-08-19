@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.77"
+const Version = "0.26.78"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -3972,6 +3972,12 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				} else {
 					sb.WriteString(fmt.Sprintf("+ would add import %q\n", op.ImportPath))
 				}
+			case "insert-header":
+				if op.File == "" || strings.TrimSpace(op.Body) == "" {
+					errors = append(errors, "insert-header: file and body are required")
+				} else {
+					sb.WriteString(fmt.Sprintf("+ would prepend header to %s\n", op.File))
+				}
 			default:
 				errors = append(errors, fmt.Sprintf("unknown op: %s", op.Op))
 			}
@@ -4026,6 +4032,14 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		file, importPath, alias string
 	}
 	var pendingImports []pendingImport
+	// #296: insert-header shares add-import's deferred-write shape --
+	// it's a raw disk write, not a DB definition write, so it can't
+	// happen until after tx commits either.
+	type pendingHeader struct {
+		moduleID   int64
+		file, body string
+	}
+	var pendingHeaders []pendingHeader
 	addTouched := func(f string) {
 		if f != "" {
 			touchedFiles[f] = true
@@ -4587,6 +4601,28 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			// already covers it independently.
 			pendingImports = append(pendingImports, pendingImport{moduleID: moduleID, file: file, importPath: op.ImportPath, alias: op.Alias})
 
+		case "insert-header":
+			if op.File == "" || strings.TrimSpace(op.Body) == "" {
+				errors = append(errors, "insert-header: file and body are required")
+				continue
+			}
+			// Best-effort module resolution, same as the singleton
+			// handleInsertHeader -- a file with zero DB definitions yet
+			// (a fresh scaffold file) still gets its header written;
+			// only the file_sources cache sync is skipped. Unlike
+			// add-import, insert-header doesn't need moduleID for
+			// anything but that cache sync, so this doesn't error out
+			// on a miss.
+			hdir := ""
+			if idx := strings.LastIndex(op.File, "/"); idx >= 0 {
+				hdir = op.File[:idx]
+			}
+			var headerModuleID int64
+			if defs, derr := tx.FindDefinitionsByFile(hdir, op.File, 0); derr == nil && len(defs) > 0 {
+				headerModuleID = defs[0].ModuleID
+			}
+			pendingHeaders = append(pendingHeaders, pendingHeader{moduleID: headerModuleID, file: op.File, body: op.Body})
+
 		default:
 			errors = append(errors, fmt.Sprintf("unknown op: %s", op.Op))
 		}
@@ -4623,7 +4659,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	var buildResult string
 	rolledBack := false
 	switch {
-	case len(pendingImports) == 0 && (len(touchedFiles) > 0 || len(allowedRemovals) > 0 || len(allowedAdds) > 0):
+	case len(pendingImports) == 0 && len(pendingHeaders) == 0 && (len(touchedFiles) > 0 || len(allowedRemovals) > 0 || len(allowedAdds) > 0):
 		goimportsFiles := make([]string, 0, len(touchedFiles))
 		for f := range touchedFiles {
 			goimportsFiles = append(goimportsFiles, f)
@@ -4650,7 +4686,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			rolledBack = true
 		}
 
-	case len(pendingImports) == 0:
+	case len(pendingImports) == 0 && len(pendingHeaders) == 0:
 		// Nothing tracked at all (every op had empty SourceFile) — no
 		// per-file snapshot is possible, so commit unconditionally and
 		// fall back to the full-project emit+build, same as before #12.
@@ -4678,6 +4714,17 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				sb.WriteString(fmt.Sprintf("+ added import %q to %s\n", pi.importPath, pi.file))
 			default:
 				sb.WriteString(fmt.Sprintf("= import %q already present in %s\n", pi.importPath, pi.file))
+			}
+		}
+		for _, ph := range pendingHeaders {
+			changed, err := s.patchInsertHeaderOnDisk(ph.moduleID, ph.file, ph.body)
+			switch {
+			case err != nil:
+				sb.WriteString(fmt.Sprintf("WARNING: insert-header on %s: %v\n", ph.file, err))
+			case changed:
+				sb.WriteString(fmt.Sprintf("+ inserted header into %s\n", ph.file))
+			default:
+				sb.WriteString(fmt.Sprintf("= header already present in %s\n", ph.file))
 			}
 		}
 		if len(touchedFiles) > 0 || len(allowedRemovals) > 0 || len(allowedAdds) > 0 {
@@ -5284,6 +5331,15 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 		hint = module
 	}
 	ambiguityMsg := ""
+	// #298: emitHints independently collects every resolvable file this
+	// pattern touches, for scoping the pre-test emit below -- broader
+	// than what a single `hint`/`target` string can express. An
+	// alternation like "TestFoo|TestBar" may span multiple packages, so
+	// testScopeTarget(hint="") falls back to "./..." for the actual go
+	// test invocation (unchanged, still safe) -- but the emit doesn't
+	// need one target string, it just needs the union of files that
+	// might be stale, so it can stay scoped even when target can't.
+	var emitHints []string
 	if hint == "" && testNamePattern.MatchString(pattern) {
 		// No explicit scope, but pattern is very often the literal test
 		// name being targeted (the documented, common case: reproduce an
@@ -5321,6 +5377,38 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 				pattern,
 			)), nil, nil
 		}
+	} else if hint == "" {
+		// No explicit scope, and the pattern isn't a single literal name
+		// -- a "./..." target used to always mean the pre-test emit
+		// below ran fully unscoped too, re-normalizing every file in the
+		// whole project (import grouping, goimports) regardless of
+		// whether this test touches it. Confirmed live: fresh
+		// prometheus-12024 and prometheus-18972 runs both show
+		// promql/parser/generated_parser.y.go's import block silently
+		// reordered by a code(op:"test", test:"A|B") call that never
+		// referenced that file -- neither trajectory's own edits ever
+		// named or touched promql/parser at all. If the pattern is a
+		// pure alternation of literal names (the common real shape:
+		// verifying several just-created tests together in one call),
+		// resolve each independently so the pre-test emit can still be
+		// scoped to their actual files.
+		allResolved := true
+		for _, seg := range strings.Split(pattern, "|") {
+			seg = strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(seg), "^"), "$")
+			if !testNamePattern.MatchString(seg) {
+				allResolved = false
+				break
+			}
+			d, err := s.backend.GetDefinitionByName(seg, "")
+			if err != nil || d == nil || d.SourceFile == "" {
+				allResolved = false
+				break
+			}
+			emitHints = append(emitHints, d.SourceFile)
+		}
+		if !allResolved {
+			emitHints = nil
+		}
 	}
 	target := s.testScopeTarget(hint)
 
@@ -5329,37 +5417,42 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 	// on success (commitOrRollbackOnBuild/autoEmitAndBuild) -- this is a
 	// defensive catch-all for the rare case a DB write landed without
 	// going through that path, not a routine "the project has pending
-	// edits" step. A full unscoped emit.Emit here used to re-serialize
-	// and goimports-normalize EVERY file in the whole project on every
-	// single test run, silently rewriting the import grouping of files
-	// nothing about this task ever touched (confirmed via a real etcd
-	// bench trajectory: unrelated generated .pb.gw.go files in
-	// completely different modules got their imports reordered by a
-	// test call, tanking that run's precision even though the actual
-	// edit was exact). Scope to whatever directory testScopeTarget
-	// already resolved -- same scope the go test invocation itself
-	// uses below, so this can never under-cover what's about to run.
-	// Only the genuinely-unscoped "./..." case (no hint resolved at
-	// all) still pays the full emit, same as before.
-	if target == "./..." {
+	// edits" step. Union the scope dirs from `target` (if resolved) and
+	// every entry in emitHints; only fall back to the fully-unscoped
+	// emit when NEITHER produced any concrete scope at all.
+	scopeDirs := map[string]bool{}
+	if target != "./..." {
+		scopeDirs[strings.TrimSuffix(strings.TrimPrefix(target, "./"), "/...")] = true
+	}
+	for _, h := range emitHints {
+		if t := s.testScopeTarget(h); t != "./..." {
+			scopeDirs[strings.TrimSuffix(strings.TrimPrefix(t, "./"), "/...")] = true
+		}
+	}
+	if len(scopeDirs) == 0 {
 		if err := emit.Emit(s.backend, s.projectDir); err != nil {
 			return errResult(fmt.Errorf("emit: %w", err))
 		}
 	} else {
-		scopeDir := strings.TrimSuffix(strings.TrimPrefix(target, "./"), "/...")
 		var scopedFiles []string
 		if all, err := s.backend.DistinctSourceFiles(); err == nil {
+			seen := map[string]bool{}
 			for _, f := range all {
-				switch {
-				case scopeDir == ".":
-					// testScopeTarget's "." means the root package ONLY
-					// (distinct from "./..." recursive-everything) --
-					// match root-level files alone, not every file.
-					if !strings.Contains(f, "/") {
+				for scopeDir := range scopeDirs {
+					var matched bool
+					if scopeDir == "." {
+						// testScopeTarget's "." means the root package
+						// ONLY (distinct from "./..." recursive-
+						// everything) -- match root-level files alone,
+						// not every file.
+						matched = !strings.Contains(f, "/")
+					} else {
+						matched = f == scopeDir || strings.HasPrefix(f, scopeDir+"/")
+					}
+					if matched && !seen[f] {
+						seen[f] = true
 						scopedFiles = append(scopedFiles, f)
 					}
-				case f == scopeDir || strings.HasPrefix(f, scopeDir+"/"):
-					scopedFiles = append(scopedFiles, f)
 				}
 			}
 		}
@@ -10304,36 +10397,86 @@ func splitReceiverQualifiedName(name string) (methName, recv string, ok bool) {
 // 15-25 tool calls across replace-hunk/move/patch/raw-query attempts
 // before giving up with no header added.
 //
-// Pure byte-level prepend, not an AST rewrite: the rest of the file
-// (including anything already there -- an existing package doc comment
-// directly above `package X`, for instance -- stays directly attached,
-// since the new header sits above it separated by its own blank line)
-// is untouched byte-for-byte, same guarantee as the other projection
-// ops. Validated by re-parsing the result: rejects if the insertion
-// breaks parsing or changes the parsed package name (a sign args.Body
-// wasn't pure comment text).
-//
-// Idempotent: a file that already starts with the trimmed body is a
-// no-op, not a duplicate.
+// Actual read/validate/write logic lives in patchInsertHeaderOnDisk,
+// shared with handleApply's batch "insert-header" case (#296).
 func (s *server) handleInsertHeader(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	file := strings.TrimSpace(args.File)
 	if s.projectDir == "" {
 		return errResult(fmt.Errorf("insert-header: no project directory configured"))
 	}
-	diskPath := filepath.Join(s.projectDir, file)
-	orig, err := os.ReadFile(diskPath)
-	if err != nil {
-		return errResult(fmt.Errorf("insert-header: read %s: %w", file, err))
-	}
-
-	header := strings.TrimRight(args.Body, "\n")
-	if strings.TrimSpace(header) == "" {
+	if strings.TrimSpace(args.Body) == "" {
 		return errResult(fmt.Errorf("insert-header: body is empty after trimming"))
 	}
 
-	trimmedOrig := strings.TrimLeft(string(orig), "\n")
-	if strings.HasPrefix(trimmedOrig, strings.TrimSpace(header)) {
+	header := strings.TrimRight(args.Body, "\n")
+	if args.DryRun {
+		return dryRunResult(fmt.Sprintf("%s: would prepend %d bytes before existing content", file, len(header)+2))
+	}
+
+	// Best-effort module resolution for the file_sources cache sync --
+	// see patchInsertHeaderOnDisk's doc comment. A file with zero DB
+	// definitions yet (a fresh scaffold file) still gets its header
+	// written; only the cache sync is skipped.
+	dir := ""
+	if idx := strings.LastIndex(file, "/"); idx >= 0 {
+		dir = file[:idx]
+	}
+	var moduleID int64
+	if defs, ferr := s.backend.FindDefinitionsByFile(dir, file, 0); ferr == nil && len(defs) > 0 {
+		moduleID = defs[0].ModuleID
+	}
+
+	changed, err := s.patchInsertHeaderOnDisk(moduleID, file, args.Body)
+	if err != nil {
+		return errResult(fmt.Errorf("insert-header: %w", err))
+	}
+	if !changed {
 		return textResult(fmt.Sprintf("%s: already starts with this header (no-op)\n", file)), nil, nil
+	}
+
+	return textResult(fmt.Sprintf("%s: inserted %d-byte header before existing content\n", file, len(header)+2)), nil, nil
+}
+
+// patchInsertHeaderOnDisk is the shared disk-write path for op:
+// "insert-header", used by both the singleton handleInsertHeader and
+// handleApply's batch "insert-header" case (which must defer disk writes
+// until after its transaction commits, same reason add-import defers via
+// patchImportOnDisk -- see #233's comment there for the full rationale).
+//
+// moduleID may be 0 (file has no DB definitions yet, e.g. a fresh scaffold
+// file) -- the write still proceeds; only the best-effort file_sources
+// cache sync is skipped.
+//
+// Idempotent: changed=false and no write when the file already starts
+// with this exact header. #297: boundary-checked, not a bare
+// strings.HasPrefix -- a prefix match alone false-positives when existing
+// content merely STARTS WITH the header text as a substring (e.g. header
+// "// Copyright 2026" against existing "// Copyright 2026-2027 Foo
+// Corp"), silently skipping insertion. The character right after the
+// matched prefix must be a line break (or EOF), not a continuation of
+// the same line.
+func (s *server) patchInsertHeaderOnDisk(moduleID int64, file, body string) (changed bool, err error) {
+	if s.projectDir == "" {
+		return false, fmt.Errorf("insert-header: no project directory configured")
+	}
+	diskPath := filepath.Join(s.projectDir, file)
+	orig, rerr := os.ReadFile(diskPath)
+	if rerr != nil {
+		return false, fmt.Errorf("read %s: %w", file, rerr)
+	}
+
+	header := strings.TrimRight(body, "\n")
+	trimmedHeader := strings.TrimSpace(header)
+	if trimmedHeader == "" {
+		return false, fmt.Errorf("insert-header: body is empty after trimming")
+	}
+
+	trimmedOrig := strings.TrimLeft(string(orig), "\n")
+	if strings.HasPrefix(trimmedOrig, trimmedHeader) {
+		rest := trimmedOrig[len(trimmedHeader):]
+		if rest == "" || rest[0] == '\n' || rest[0] == '\r' {
+			return false, nil
+		}
 	}
 
 	updated := header + "\n\n" + string(orig)
@@ -10345,32 +10488,24 @@ func (s *server) handleInsertHeader(_ context.Context, _ *sdkmcp.CallToolRequest
 	origAST, oerr := parser.ParseFile(fset, "", orig, parser.PackageClauseOnly)
 	newAST, nerr := parser.ParseFile(fset, "", updated, parser.PackageClauseOnly)
 	if nerr != nil {
-		return errResult(fmt.Errorf("insert-header: inserting this body would break parsing (body must be comment lines only) -- %w", nerr))
+		return false, fmt.Errorf("inserting this body would break parsing (body must be comment lines only) -- %w", nerr)
 	}
 	if oerr == nil && origAST.Name != nil && newAST.Name != nil && origAST.Name.Name != newAST.Name.Name {
-		return errResult(fmt.Errorf("insert-header: inserting this body would change the parsed package name from %q to %q -- body must be comment lines only", origAST.Name.Name, newAST.Name.Name))
-	}
-
-	if args.DryRun {
-		return dryRunResult(fmt.Sprintf("%s: would prepend %d bytes before existing content", file, len(header)+2))
+		return false, fmt.Errorf("inserting this body would change the parsed package name from %q to %q -- body must be comment lines only", origAST.Name.Name, newAST.Name.Name)
 	}
 
 	if err := os.WriteFile(diskPath, []byte(updated), 0644); err != nil {
-		return errResult(fmt.Errorf("insert-header: write %s: %w", file, err))
+		return false, fmt.Errorf("write %s: %w", file, err)
 	}
 
 	// Keep the DB's file_sources cache in sync, same discipline as
 	// patchImportOnDisk -- disk is authoritative (already written above),
 	// so a cache-update failure here is logged, not fatal.
-	dir := ""
-	if idx := strings.LastIndex(file, "/"); idx >= 0 {
-		dir = file[:idx]
-	}
-	if defs, ferr := s.backend.FindDefinitionsByFile(dir, file, 0); ferr == nil && len(defs) > 0 {
-		if err := s.backend.SetFileSource(defs[0].ModuleID, file, updated); err != nil {
+	if moduleID != 0 {
+		if err := s.backend.SetFileSource(moduleID, file, updated); err != nil {
 			fmt.Fprintf(os.Stderr, "defn: file_sources update failed after insert-header to %s: %v\n", file, err)
 		}
 	}
 
-	return textResult(fmt.Sprintf("%s: inserted %d-byte header before existing content\n", file, len(header)+2)), nil, nil
+	return true, nil
 }
