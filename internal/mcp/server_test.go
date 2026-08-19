@@ -11783,3 +11783,206 @@ func TestHandleTestByName_AlternationPatternScopesEmitToBothResolvedFiles(t *tes
 		t.Errorf("unrelated.go was rewritten by an alternation-pattern test run that never referenced it:\nbefore:\n%s\nafter:\n%s", before, after)
 	}
 }
+
+// TestHandleDeleteFile_RemoveFileActuallyRemovesFileFromDisk guards the
+// #301 fix: op:"delete", file:"x.go", remove_file:true now purges every
+// def in the file AND removes the file itself. Confirmed on two real
+// trajectories (prometheus-12024, prometheus-19017) that the pre-fix
+// behavior (defs purged, file left behind as an empty stub) left a
+// model with no way to actually get rid of a throwaway file it created
+// -- burning 40-90 tool calls across delete/move/patch/emit/gc before
+// giving up, since none of those ops remove a file either.
+func TestHandleDeleteFile_RemoveFileActuallyRemovesFileFromDisk(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	// main_test.go has no callers from outside itself (TestGreet/TestFarewell
+	// aren't called by anything), so this is a clean bulk-delete case.
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op: "delete", File: "main_test.go", RemoveFile: true,
+	})
+	if err != nil {
+		t.Fatalf("handleCode delete: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Also removed main_test.go from disk") {
+		t.Errorf("expected confirmation the file was removed, got: %s", text)
+	}
+
+	if _, statErr := os.Stat(filepath.Join(projDir, "main_test.go")); !os.IsNotExist(statErr) {
+		t.Errorf("expected main_test.go to be removed from disk, stat err: %v", statErr)
+	}
+}
+
+// TestHandleDeleteFile_RemoveFileDryRunDoesNotRemove guards dry_run
+// composing correctly with remove_file:true -- preview only, no actual
+// deletion of defs or the file.
+func TestHandleDeleteFile_RemoveFileDryRunDoesNotRemove(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op: "delete", File: "main_test.go", RemoveFile: true, DryRun: true,
+	})
+	if err != nil {
+		t.Fatalf("handleCode delete dry_run: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "remove main_test.go itself") {
+		t.Errorf("expected dry-run preview to mention removing the file, got: %s", text)
+	}
+
+	if _, statErr := os.Stat(filepath.Join(projDir, "main_test.go")); statErr != nil {
+		t.Errorf("dry_run must not have actually removed the file, stat err: %v", statErr)
+	}
+}
+
+// TestHandleDeleteFile_RemoveFileOnAlreadyEmptyFileStillRemoves guards
+// the #301 case where every def in a file was already purged by a
+// prior delete call without remove_file -- a second delete(file:,
+// remove_file:true) call on the now-empty stub must still remove the
+// leftover file, not error "no definitions found".
+func TestHandleDeleteFile_RemoveFileOnAlreadyEmptyFileStillRemoves(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	if _, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op: "delete", File: "main_test.go",
+	}); err != nil {
+		t.Fatalf("first delete (purge defs): %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(projDir, "main_test.go")); statErr != nil {
+		t.Fatalf("expected the empty stub to still exist after first delete: %v", statErr)
+	}
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op: "delete", File: "main_test.go", RemoveFile: true,
+	})
+	if err != nil {
+		t.Fatalf("second delete (remove empty stub): %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "removed the leftover file") {
+		t.Errorf("expected confirmation the leftover stub was removed, got: %s", text)
+	}
+	if _, statErr := os.Stat(filepath.Join(projDir, "main_test.go")); !os.IsNotExist(statErr) {
+		t.Errorf("expected main_test.go to be gone, stat err: %v", statErr)
+	}
+}
+
+// TestHandleDeleteFile_WithoutRemoveFileKeepsFileOnDisk is the default-
+// behavior regression guard for #301: omitting remove_file must keep
+// the pre-existing #284 behavior unchanged (file survives with its defs
+// purged).
+func TestHandleDeleteFile_WithoutRemoveFileKeepsFileOnDisk(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op: "delete", File: "main_test.go",
+	})
+	if err != nil {
+		t.Fatalf("handleCode delete: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "not removed") {
+		t.Errorf("expected the default no-remove message, got: %s", text)
+	}
+
+	if _, statErr := os.Stat(filepath.Join(projDir, "main_test.go")); statErr != nil {
+		t.Errorf("expected main_test.go to still exist on disk (remove_file not set), stat err: %v", statErr)
+	}
+}
+
+// TestHandleApply_ReplaceHunkReplaceAllAcrossBatch reproduces the exact
+// #302 failure shape from a real trajectory (prometheus-19338): the OLD
+// approach of batching several replace-hunk ops with sequential
+// index=1..N against the same repeated pattern breaks because indices
+// shift as earlier matches are consumed within the same apply
+// transaction. A single replace-hunk op with replace_all:true replaces
+// every occurrence in one shot instead.
+func TestHandleApply_ReplaceHunkReplaceAllAcrossBatch(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	seed, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op: "edit", Name: "Farewell",
+		NewBody: `func Farewell(name string) string {
+	return Greet(name) + Greet(name) + Greet(name)
+}`,
+	})
+	if err != nil || seed.IsError {
+		t.Fatalf("seed edit: %v / %s", err, resultText(t, seed))
+	}
+
+	result, _, err := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "replace-hunk", Name: "Farewell", Old: "Greet(name)", New: `Greet(name + "!")`, ReplaceAll: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleApply: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "rolled back") || strings.Contains(text, "exceeds") {
+		t.Fatalf("expected replace_all to succeed in one op, got: %s", text)
+	}
+
+	final, ferr := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if ferr != nil {
+		t.Fatalf("read main.go: %v", ferr)
+	}
+	if strings.Count(string(final), `Greet(name+"!")`) != 3 {
+		t.Errorf("expected all 3 occurrences replaced, got:\n%s", final)
+	}
+	if strings.Contains(string(final), "Greet(name) + Greet") {
+		t.Errorf("expected no remaining unreplaced Greet(name) occurrences in Farewell, got:\n%s", final)
+	}
+}
+
+// TestHandleReplaceHunk_ReplaceAllHandlesMultipleIdenticalOccurrences
+// guards the #302 fix: replace_all:true replaces every occurrence of
+// old in one call, sidestepping the index-shifting problem entirely for
+// the common real shape (several identical sites all needing the same
+// replacement).
+func TestHandleReplaceHunk_ReplaceAllHandlesMultipleIdenticalOccurrences(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op: "edit", Name: "Farewell",
+		NewBody: `func Farewell(name string) string {
+	return Greet(name) + Greet(name) + Greet(name)
+}`,
+	})
+	if err != nil {
+		t.Fatalf("seed edit: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("seed edit failed: %s", resultText(t, result))
+	}
+
+	result, _, err = s.handleCode(context.Background(), nil, codeParam{
+		Op: "replace-hunk", Name: "Farewell",
+		Old: "Greet(name)", New: "Hello(name)", ReplaceAll: true,
+	})
+	if err != nil {
+		t.Fatalf("replace-hunk replace_all: %v", err)
+	}
+	text := resultText(t, result)
+	if result.IsError {
+		t.Fatalf("replace-hunk replace_all failed: %s", text)
+	}
+}
