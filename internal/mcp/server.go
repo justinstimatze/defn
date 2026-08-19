@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.73"
+const Version = "0.26.74"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -381,7 +381,7 @@ For any "how does X work in this codebase" discovery question, reach for context
 
 Orient before you read: overview (project shape) → outline (def shape) → impact (when you know which def matters). Only read whole bodies when you're about to edit them; whole-file reads on files you won't touch are pure wire cost — use outline or search instead.
 
-Ops: overview (project-wide shape when called with no args — one line per module with def counts + first exported names; pass file:"pkg-path" or file:"pkg-path/file.go" to drill in; the right first-touch when you don't know which def matters yet), outline (compact projection of a def — sig + doc + caller/callee summary, no body; use when body isn't needed), search, impact (blast radius of a known def — pass format:"json" for structured output; callers, transitives, test coverage in one call), read (returns the def body + a compact "Related" footer with summary, top-3 callers, top-3 callees, and semantically-adjacent defs — one call gives you what would otherwise take 3-4 sequential impact/outline calls; auto-downgrades to outline when body > 1500 bytes, pass full:true or mode:"body" to force; for a large body, pass line_range:"700-820" (1-indexed, file-relative, "-" or ":" both accepted) to get back just that span instead — also bypasses the auto-downgrade, and composes with query: to filter further within the returned range), read-and-verify (read a def AND run its covering tests in one call — use during bug triage so you see behavior alongside source and don't spiral into read-loops; pass name), read-file (all defs' bodies in one file — pass file:"path"; whole-file counterpart to read; prefer over N sequential read calls when scanning; for a large file, pass line_range:"700-820" the same as read to keep only the definitions overlapping that file-relative range, each narrowed to its own overlapping span), expand (bundle a def's outline/body/callers in one call — pass name:"F", or names:["A","B",...] to batch several targets into ONE response instead of one expand per target; include:["outline","callers","body"] controls sections, defaults to outline+callers; prefer over read+impact+read chains AND over N sequential single-name expand calls — round-trip count within a turn is the dominant session cost driver, not per-call size), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), replace-hunk (replace a byte-exact occurrence of 'old' inside a def body with 'new' — byte-exact PUTGET, content-addressed inside the def; pass name+old+new, plus index=1..N if 'old' occurs more than once; empty 'new' deletes the hunk. Send zero anchor context when the hunk is def-unique — the name argument does the file-level disambiguation), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), explain (structural analysis of a def — pass name to get sig + callers + callees + test coverage; ALSO accepts question:"how does X handle Y" which routes to a Sonnet co-processor that returns a prose answer grounded in the def's source with provenance refs. Cheaper than reading + interpreting a large body yourself when the answer is prose, not code. names:["A","B"] for multi-def scope. Requires ANTHROPIC_API_KEY), plan (pass intent:"..." — the co-processor grounds your intent in real defs via context's own candidate search, emits a compact trajectory, and defn mechanically walks it server-side in one round-trip instead of you sequencing several read/outline/impact calls yourself. Requires ANTHROPIC_API_KEY; falls back to a clear error pointing at plan-dsl/plan-sexpr when unset), plan-dsl / plan-sexpr (mechanically walk a trajectory YOU already wrote — pass plan:"..." in the compact DSL "@Def.field[!test]" form (plan-dsl) or the S-expression "(op target [!test])" form (plan-sexpr), op one of read/outline/impact; no API key needed), similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create (single def from body; with file: set, body may hold multiple top-level decls to author a whole file in one call — the whole-file equivalent of files-mode Write), delete (safe by default — refuses when other defs still reference this def; pass force:true to delete anyway. Refusal message lists the callers so you can rewrite them first), retarget-field-value (rewrite a composite-literal field's string value across every def whose body matches — pass name:"<StructType>" field:"<Field>" old:"<oldStr>" new:"<newStr>"; AST-safe, so unrelated occurrences of the string won't match), rename, move, test (run ONLY tests that cover a given def — pass name; scoped subset, not the full suite; prefer over bash 'go test ./...' when you only need coverage for a specific change. Also accepts test:"TestX" to run one test by name — use this to REPRODUCE a bug from the issue BEFORE writing any code; a passing test means your hypothesis about which def is broken is wrong. An identical test call repeated with no write in between this session returns the cached result instead of rerunning the real subprocess — pass force:true to force a genuine rerun anyway), apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 6 projection ops insert-precondition/replace-slice/replace-hunk/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (rarely needed — every edit op auto-syncs the DB; only use after external file changes outside the code tool), query (raw SQL escape hatch — for schema analytics only; NEVER use to look up a def by name, grep bodies, or list files/defs-in-file — use search/outline/read-file/file-defs/impact instead, which are far cheaper on the wire), patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), commit (snapshot current state), status (current branch + dirty state), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), version (no params — running build's version string + on-disk binary path/mtime; call this after a rebuild+reconnect to confirm you're actually talking to fresh code, not a stale already-running serve process)`,
+Ops: overview (project-wide shape when called with no args — one line per module with def counts + first exported names; pass file:"pkg-path" or file:"pkg-path/file.go" to drill in; the right first-touch when you don't know which def matters yet), outline (compact projection of a def — sig + doc + caller/callee summary, no body; use when body isn't needed), search, impact (blast radius of a known def — pass format:"json" for structured output; callers, transitives, test coverage in one call), read (returns the def body + a compact "Related" footer with summary, top-3 callers, top-3 callees, and semantically-adjacent defs — one call gives you what would otherwise take 3-4 sequential impact/outline calls; auto-downgrades to outline when body > 1500 bytes, pass full:true or mode:"body" to force; for a large body, pass line_range:"700-820" (1-indexed, file-relative, "-" or ":" both accepted) to get back just that span instead — also bypasses the auto-downgrade, and composes with query: to filter further within the returned range), read-and-verify (read a def AND run its covering tests in one call — use during bug triage so you see behavior alongside source and don't spiral into read-loops; pass name), read-file (all defs' bodies in one file — pass file:"path"; whole-file counterpart to read; prefer over N sequential read calls when scanning; for a large file, pass line_range:"700-820" the same as read to keep only the definitions overlapping that file-relative range, each narrowed to its own overlapping span), expand (bundle a def's outline/body/callers in one call — pass name:"F", or names:["A","B",...] to batch several targets into ONE response instead of one expand per target; include:["outline","callers","body"] controls sections, defaults to outline+callers; prefer over read+impact+read chains AND over N sequential single-name expand calls — round-trip count within a turn is the dominant session cost driver, not per-call size), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), replace-hunk (replace a byte-exact occurrence of 'old' inside a def body with 'new' — byte-exact PUTGET, content-addressed inside the def; pass name+old+new, plus index=1..N if 'old' occurs more than once; empty 'new' deletes the hunk. Send zero anchor context when the hunk is def-unique — the name argument does the file-level disambiguation), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), explain (structural analysis of a def — pass name to get sig + callers + callees + test coverage; ALSO accepts question:"how does X handle Y" which routes to a Sonnet co-processor that returns a prose answer grounded in the def's source with provenance refs. Cheaper than reading + interpreting a large body yourself when the answer is prose, not code. names:["A","B"] for multi-def scope. Requires ANTHROPIC_API_KEY), plan (pass intent:"..." — the co-processor grounds your intent in real defs via context's own candidate search, emits a compact trajectory, and defn mechanically walks it server-side in one round-trip instead of you sequencing several read/outline/impact calls yourself. Requires ANTHROPIC_API_KEY; falls back to a clear error pointing at plan-dsl/plan-sexpr when unset), plan-dsl / plan-sexpr (mechanically walk a trajectory YOU already wrote — pass plan:"..." in the compact DSL "@Def.field[!test]" form (plan-dsl) or the S-expression "(op target [!test])" form (plan-sexpr), op one of read/outline/impact; no API key needed), similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create (single def from body; with file: set, body may hold multiple top-level decls to author a whole file in one call — the whole-file equivalent of files-mode Write), delete (safe by default — refuses when other defs still reference this def; pass force:true to delete anyway. Refusal message lists the callers so you can rewrite them first. Pass file:"path/to/x.go" with no name: to bulk-delete every definition in that file in one call — same safety check, scoped to callers outside the file; the file itself is NOT removed from disk, only its defs — rm it yourself if you want it gone too), retarget-field-value (rewrite a composite-literal field's string value across every def whose body matches — pass name:"<StructType>" field:"<Field>" old:"<oldStr>" new:"<newStr>"; AST-safe, so unrelated occurrences of the string won't match), rename, move, test (run ONLY tests that cover a given def — pass name; scoped subset, not the full suite; prefer over bash 'go test ./...' when you only need coverage for a specific change. Also accepts test:"TestX" to run one test by name — use this to REPRODUCE a bug from the issue BEFORE writing any code; a passing test means your hypothesis about which def is broken is wrong. An identical test call repeated with no write in between this session returns the cached result instead of rerunning the real subprocess — pass force:true to force a genuine rerun anyway), apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 6 projection ops insert-precondition/replace-slice/replace-hunk/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (rarely needed — every edit op auto-syncs the DB; only use after external file changes outside the code tool), query (raw SQL escape hatch — for schema analytics only; NEVER use to look up a def by name, grep bodies, or list files/defs-in-file — use search/outline/read-file/file-defs/impact instead, which are far cheaper on the wire), patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), commit (snapshot current state), status (current branch + dirty state), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), version (no params — running build's version string + on-disk binary path/mtime; call this after a rebuild+reconnect to confirm you're actually talking to fresh code, not a stale already-running serve process)`,
 	}, s.handleCode)
 
 	return s, mcpServer
@@ -911,12 +911,23 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	}
 
 	switch args.Op {
-	case "read", "outline", "impact", "delete", "similar":
+	case "read", "outline", "impact", "similar":
 		if strings.TrimSpace(args.Name) == "" {
 			if strings.TrimSpace(args.File) != "" {
 				return errResult(fmt.Errorf("%s: name is required — pass name:\"<def>\" for one definition, or use op:\"overview\", file:%q to see every def in that file", args.Op, args.File))
 			}
 			return errResult(fmt.Errorf("%s: name is required", args.Op))
+		}
+	case "delete":
+		// #284: file:-only delete is a bulk op -- "remove every def in this
+		// throwaway file" -- distinct from read/outline/impact/similar
+		// above, where a bare file: is very likely a mistake (those ops
+		// return exactly one def's content and file: alone can't
+		// disambiguate which). A real trajectory (prometheus-18765) wanted
+		// exactly this and had no way to say it, burning ~20 calls across
+		// delete/move/emit/patch before giving up.
+		if strings.TrimSpace(args.Name) == "" && strings.TrimSpace(args.File) == "" {
+			return errResult(fmt.Errorf("delete: name or file is required — pass name:\"<def>\" to delete one definition, or file:\"path/to/x.go\" to delete every definition in that file"))
 		}
 	case "test":
 		// #241: test:"TestX" (named-test reproduction -- e.g. replicate a
@@ -1332,6 +1343,9 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "create":
 		return s.handleCreate(ctx, req, createParam{Body: args.Body, Module: args.Module, File: args.File, DryRun: args.DryRun})
 	case "delete":
+		if strings.TrimSpace(args.Name) == "" && strings.TrimSpace(args.File) != "" {
+			return s.handleDeleteFile(ctx, req, args)
+		}
 		return s.handleDelete(ctx, req, nameParam{Name: args.Name, Force: args.Force, DryRun: args.DryRun, Receiver: args.Receiver, Module: args.Module, File: args.File})
 	case "rename":
 		return s.handleRename(ctx, req, renameParam{OldName: args.OldName, NewName: args.NewName, Receiver: args.Receiver, Module: args.Module, File: args.File})
@@ -10055,5 +10069,129 @@ func (s *server) handleVersion(_ context.Context, _ *sdkmcp.CallToolRequest, _ c
 		}
 	}
 	sb.WriteString(fmt.Sprintf("pid: %d\n", os.Getpid()))
+	return textResult(sb.String()), nil, nil
+}
+
+// handleDeleteFile bulk-deletes every definition in a file in one
+// transaction -- op:"delete", file:"x.go" with no name:. #284: a real
+// trajectory (prometheus-18765) wanted to remove one throwaway helper
+// file and had no way to say so -- delete unconditionally required a
+// single name, so the model burned ~20 calls across delete/move/emit/
+// patch trying to express "get rid of this whole file" before giving
+// up. Shares handleDelete's safe-delete caller check, scoped so defs in
+// this file calling each other don't block the bulk delete -- only
+// callers OUTSIDE the file's own def set do. Does NOT remove the file
+// from disk once its last def is gone: emit's zero-def policy is
+// never-delete (see TestEmitZeroDefModuleNeverDeletesEvenWithFileSources
+// in internal/emit), so the response says so explicitly instead of
+// letting the caller assume the file vanished too.
+func (s *server) handleDeleteFile(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	dir := ""
+	if idx := strings.LastIndex(args.File, "/"); idx >= 0 {
+		dir = args.File[:idx]
+	}
+	defs, err := s.backend.FindDefinitionsByFile(dir, args.File, 0)
+	if err != nil {
+		return errResult(err)
+	}
+	if len(defs) == 0 {
+		return errResult(fmt.Errorf("delete: no definitions found in file %q — check the path (relative to a module root), or run code(op:\"sync\", file:%q) if it was just added", args.File, args.File))
+	}
+
+	inFile := make(map[int64]bool, len(defs))
+	for _, d := range defs {
+		inFile[d.ID] = true
+	}
+
+	if !args.Force {
+		var blockers []string
+		for _, d := range defs {
+			if d.Kind == "field" {
+				// Fields have no independent on-disk declaration (#11) --
+				// they're just text inside their declaring type's body, so
+				// they're removed automatically once that type is deleted.
+				// Since this deletes every def in the file, the declaring
+				// type is always in the same batch -- no separate
+				// caller-safety check applies to a field by itself.
+				continue
+			}
+			callers, cerr := s.backend.GetCallers(d.ID)
+			if cerr != nil || len(callers) == 0 {
+				continue
+			}
+			var external int
+			for _, c := range callers {
+				if !inFile[c.ID] {
+					external++
+				}
+			}
+			if external > 0 {
+				blockers = append(blockers, fmt.Sprintf("%s%s (%d external caller(s))", formatReceiver(d.Receiver), d.Name, external))
+			}
+		}
+		if len(blockers) > 0 {
+			return errResult(fmt.Errorf(
+				"delete %q refused — %d of %d definition(s) still referenced from outside this file: %s. Rewrite or delete callers first, or pass force:true to delete anyway",
+				args.File, len(blockers), len(defs), strings.Join(blockers, ", ")))
+		}
+	}
+
+	if args.DryRun {
+		names := make([]string, 0, len(defs))
+		for _, d := range defs {
+			names = append(names, formatReceiver(d.Receiver)+d.Name)
+		}
+		return dryRunResult(fmt.Sprintf("- would delete %d definition(s) from %s: %s", len(defs), args.File, strings.Join(names, ", ")))
+	}
+
+	tx, commit, rollback, txErr := s.backend.Begin()
+	if txErr != nil {
+		return errResult(txErr)
+	}
+	defer rollback()
+
+	qualified := make([]string, 0, len(defs))
+	for _, d := range defs {
+		if err := tx.DeleteDefinition(d.ID); err != nil {
+			return errResult(err)
+		}
+		if d.Kind == "field" {
+			// Not a top-level FuncDecl -- nothing for emit's
+			// AllowedRemovals matching to do here; the field's text
+			// disappears along with its declaring type's body.
+			continue
+		}
+		qualified = append(qualified, emit.FuncIdentity(d.Name, d.Receiver))
+	}
+
+	deleteOpts := emit.Opts{
+		AllowedRemovals: qualified,
+		GoimportsFiles:  []string{args.File},
+		TouchedFiles:    []string{args.File},
+	}
+	var buildResult string
+	if args.Force {
+		if err := commit(); err != nil {
+			return errResult(fmt.Errorf("commit: %w", err))
+		}
+		buildResult = s.emitAndBuildAgainst(s.backend, deleteOpts)
+	} else {
+		buildResult = s.commitOrRollbackOnBuild(tx, commit, rollback, deleteOpts)
+	}
+	if buildResult == "" || args.Force {
+		if err := s.autoCommit(); err != nil {
+			fmt.Fprintf(os.Stderr, "defn: auto-commit failed (post-delete-file): %v\n", err)
+		}
+		if s.idf != nil {
+			s.idf.Invalidate()
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Deleted %d definition(s) from %s\n", len(defs), args.File))
+	sb.WriteString(fmt.Sprintf("The file itself was not removed — defn never deletes a file on zero defs (only rm does). If you want it gone, remove it yourself and run code(op:\"sync\", file:%q) to drop it from the index.\n", args.File))
+	if buildResult != "" {
+		sb.WriteString("\n" + buildResult)
+	}
 	return textResult(sb.String()), nil, nil
 }

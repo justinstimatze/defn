@@ -10886,3 +10886,126 @@ func TestHandleSync_PrunesStaleDefSoSubsequentWritesToSameFileSucceed(t *testing
 		t.Errorf("expected a normal success response, got: %s", text)
 	}
 }
+
+func TestHandleCode_DeleteFileOnlyBulkDeletesAllDefsInFileWhenReferencesAreInternal(t *testing.T) {
+	// main_test.go's TestGreet/TestFarewell call Greet/Farewell in main.go
+	// (internal to their own def, not to main_test.go), and nothing calls
+	// INTO either test function -- a clean "delete this whole file" case
+	// that shouldn't need force:true, and doesn't touch main.go's func
+	// main so the project still builds afterward.
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "delete", File: "main_test.go"})
+	text := resultText(t, result)
+	if result.IsError || strings.Contains(text, "BUILD FAILED") {
+		t.Fatalf("bulk delete of main_test.go should succeed cleanly: %s", text)
+	}
+	if !strings.Contains(text, "Deleted 2 definition(s)") {
+		t.Errorf("expected both defs reported deleted, got: %s", text)
+	}
+
+	remaining, err := db.FindDefinitionsByFile("", "main_test.go", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 0 {
+		t.Errorf("expected 0 defs remaining in main_test.go, got %d", len(remaining))
+	}
+}
+
+func TestHandleCode_DeleteFileOnlyDryRunDoesNotDelete(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "delete", File: "main_test.go", DryRun: true})
+	text := resultText(t, result)
+	if result.IsError {
+		t.Fatalf("dry run should not error: %s", text)
+	}
+	if !strings.Contains(text, "would delete 2 definition(s)") {
+		t.Errorf("expected dry-run preview naming the count, got: %s", text)
+	}
+
+	remaining, err := db.FindDefinitionsByFile("", "main_test.go", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 2 {
+		t.Errorf("dry run must not delete anything -- expected 2 defs still in main_test.go, got %d", len(remaining))
+	}
+}
+
+func TestHandleCode_DeleteFileOnlyForceBypassesExternalCallerCheck(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "delete", File: "main.go", Force: true})
+	text := resultText(t, result)
+	if result.IsError {
+		t.Fatalf("force:true should bypass the external-caller refusal: %s", text)
+	}
+
+	remaining, err := db.FindDefinitionsByFile("", "main.go", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 0 {
+		t.Errorf("expected 0 defs remaining in main.go after forced bulk delete, got %d", len(remaining))
+	}
+}
+
+func TestHandleCode_DeleteFileOnlyNoDefsFoundGivesHelpfulError(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "delete", File: "nonexistent.go"})
+	text := resultText(t, result)
+	if !result.IsError {
+		t.Fatalf("expected error for a file with no definitions, got: %s", text)
+	}
+	if !strings.Contains(text, "no definitions found") {
+		t.Errorf("expected a helpful message, got: %s", text)
+	}
+}
+
+func TestHandleCode_DeleteFileOnlyRefusedWhenExternalCallersExist(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "delete", File: "main.go"})
+	text := resultText(t, result)
+	if !result.IsError {
+		t.Fatalf("expected refusal -- main.go's Greet/Farewell are called from main_test.go, got: %s", text)
+	}
+	if !strings.Contains(text, "external caller") {
+		t.Errorf("expected external-caller refusal message, got: %s", text)
+	}
+
+	remaining, err := db.FindDefinitionsByFile("", "main.go", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 3 {
+		t.Errorf("refused delete should not touch the DB -- expected 3 defs still in main.go, got %d", len(remaining))
+	}
+}
+
+func TestHandleCode_DeleteValidationRequiresNameOrFile(t *testing.T) {
+	s := &server{backend: nil}
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "delete"})
+	text := resultText(t, result)
+	if !strings.Contains(text, "name or file is required") {
+		t.Errorf("expected \"name or file is required\", got: %s", text)
+	}
+}

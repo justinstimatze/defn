@@ -350,6 +350,18 @@ func TestWriteTargets(t *testing.T) {
 			wantOK:    true,
 		},
 		{
+			name:      "delete_scopes_to_name",
+			args:      codeParam{Op: "delete", Name: "Foo"},
+			wantNames: []string{"Foo"},
+			wantOK:    true,
+		},
+		{
+			name:      "delete_file_only_scopes_to_file",
+			args:      codeParam{Op: "delete", File: "pkg/x.go"},
+			wantFiles: []string{"pkg/x.go"},
+			wantOK:    true,
+		},
+		{
 			name:   "sync_is_not_determinable",
 			args:   codeParam{Op: "sync"},
 			wantOK: false,

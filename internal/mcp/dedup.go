@@ -449,12 +449,24 @@ var readOpsWithNameKey = []string{"read", "outline", "slice", "impact", "expand"
 func writeTargets(args codeParam) (names, files []string, ok bool) {
 	switch args.Op {
 	case "edit", "insert", "insert-precondition", "replace-slice",
-		"replace-hunk", "wrap-in-defer", "rename-param", "delete",
+		"replace-hunk", "wrap-in-defer", "rename-param",
 		"retarget-field-value", "patch":
 		if args.Name == "" {
 			return nil, nil, false
 		}
 		return []string{args.Name}, nil, true
+	case "delete":
+		// #284: file:-only delete (no name) is the bulk "delete every def
+		// in this file" path -- unlike the other name-scoped write ops
+		// above, its blast radius is knowable from File alone even
+		// without Name.
+		if args.Name != "" {
+			return []string{args.Name}, nil, true
+		}
+		if args.File == "" {
+			return nil, nil, false
+		}
+		return nil, []string{args.File}, true
 	case "rename":
 		// Unlike the other name-scoped ops above, a rename's real blast
 		// radius isn't just OldName/NewName -- handleRename also rewrites
