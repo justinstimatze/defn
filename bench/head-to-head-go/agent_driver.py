@@ -593,6 +593,9 @@ def apply_edits_via_defn(workdir):
         print(f"[emit] defn emit failed: {e}", file=sys.stderr)
 
 
+DISK_SPACE_LOCK_PATH = "/tmp/defn-h2h-disk-space.lock"
+
+
 def _ensure_disk_space(min_gb=DISK_FREE_MIN_GB):
     """Bail loudly instead of silently losing a task to "no space left
     on device" -- found 2026-08-11: a 15-task prometheus rerun lost 2
@@ -602,24 +605,50 @@ def _ensure_disk_space(min_gb=DISK_FREE_MIN_GB):
     failure instead of the infra problem it actually was. Cleans go's
     build cache and orphaned go-build temp dirs (the actual repeat
     offender -- crashed/killed `go test`/`go vet` runs leave these
-    behind) before giving up."""
+    behind) before giving up.
+
+    2026-08-19: wrapped in a flock. This function is check-then-act
+    (measure free space, clean if low, measure again) with no
+    synchronization -- fine for the strictly-sequential --all loop this
+    was written for, but a real TOCTOU race once tasks run concurrently
+    (e.g. via `xargs -P<N>` over single-instance invocations, which
+    needs no other harness changes to work). Without the lock, N
+    concurrent tasks all observe "below threshold" at once, all run
+    `go clean -cache` redundantly at the same time, and the post-clean
+    free-space number any one of them sees no longer reflects what's
+    actually free by the time IT starts consuming disk -- the other
+    N-1 processes are consuming concurrently too. The lock only
+    serializes this check-and-clean step itself (a few seconds), not
+    each task's full disk usage for its whole lifetime -- it does not
+    by itself guarantee peak concurrent usage stays under the limit,
+    just removes the redundant-cleanup race and gives every caller an
+    honest, un-raced measurement to decide against.
+    """
+    import fcntl
     import glob
     import shutil
 
-    free_gb = shutil.disk_usage(WORKDIR_ROOT).free / 1e9
-    if free_gb >= min_gb:
-        return
-    print(
-        f"[disk] {free_gb:.1f}GB free, below {min_gb}GB -- cleaning caches",
-        file=sys.stderr,
-    )
-    subprocess.run(
-        ["go", "clean", "-cache"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-    for entry in glob.glob("/tmp/go-build*"):
-        shutil.rmtree(entry, ignore_errors=True)
-    free_gb = shutil.disk_usage(WORKDIR_ROOT).free / 1e9
-    print(f"[disk] {free_gb:.1f}GB free after cleanup", file=sys.stderr)
+    with open(DISK_SPACE_LOCK_PATH, "w") as lock_f:
+        fcntl.flock(lock_f, fcntl.LOCK_EX)
+        try:
+            free_gb = shutil.disk_usage(WORKDIR_ROOT).free / 1e9
+            if free_gb >= min_gb:
+                return
+            print(
+                f"[disk] {free_gb:.1f}GB free, below {min_gb}GB -- cleaning caches",
+                file=sys.stderr,
+            )
+            subprocess.run(
+                ["go", "clean", "-cache"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            for entry in glob.glob("/tmp/go-build*"):
+                shutil.rmtree(entry, ignore_errors=True)
+            free_gb = shutil.disk_usage(WORKDIR_ROOT).free / 1e9
+            print(f"[disk] {free_gb:.1f}GB free after cleanup", file=sys.stderr)
+        finally:
+            fcntl.flock(lock_f, fcntl.LOCK_UN)
     if free_gb < min_gb:
         raise RuntimeError(
             f"only {free_gb:.1f}GB free on {WORKDIR_ROOT}'s filesystem after "
