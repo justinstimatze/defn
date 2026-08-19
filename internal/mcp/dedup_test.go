@@ -2,10 +2,16 @@ package mcp
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/justinstimatze/defn/internal/ingest"
+	"github.com/justinstimatze/defn/internal/resolve"
+	"github.com/justinstimatze/defn/internal/store"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -755,5 +761,66 @@ func TestHandleCode_TestDedup_ForceBypassesCache(t *testing.T) {
 	text := resultText(t, result)
 	if strings.Contains(text, "test dedup") {
 		t.Errorf("force:true must bypass the dedup cache and force a real rerun, got a dedup hit: %s", text)
+	}
+}
+
+// TestHandleCode_TestDedup_DoesNotCacheATimedOutResult is the #304
+// regression: a TIMED OUT result used to be cached exactly like a
+// genuine pass/fail, so a repeated call (even the correctly-triggered
+// force:true retry) served the stale "TIMED OUT" text back verbatim
+// instead of actually re-running -- a timeout is not a stable,
+// reproducible outcome (it may be transient load/flakiness, not a
+// real hang), so it must never short-circuit a later call the way a
+// real pass/fail legitimately does.
+func TestHandleCode_TestDedup_DoesNotCacheATimedOutResult(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main_test.go"), []byte("package main\n\nimport (\n\t\"testing\"\n\t\"time\"\n)\n\nfunc TestSlowHang(t *testing.T) {\n\ttime.Sleep(2 * time.Second)\n}\n"), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+
+	orig := testTimeout
+	testTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { testTimeout = orig })
+
+	sess := &sdkmcp.ServerSession{}
+	req := &sdkmcp.CallToolRequest{Session: sess}
+
+	result1, _, err := s.handleCode(context.Background(), req, codeParam{Op: "test", Test: "TestSlowHang"})
+	if err != nil {
+		t.Fatalf("first test call: %v", err)
+	}
+	text1 := resultText(t, result1)
+	if !strings.Contains(text1, "TIMED OUT") {
+		t.Fatalf("expected the first call to time out, got: %s", text1)
+	}
+
+	result2, _, err := s.handleCode(context.Background(), req, codeParam{Op: "test", Test: "TestSlowHang"})
+	if err != nil {
+		t.Fatalf("second test call: %v", err)
+	}
+	text2 := resultText(t, result2)
+	if strings.Contains(text2, "test dedup") {
+		t.Errorf("a TIMED OUT result must never be served from the dedup cache -- it is not a stable outcome, got: %s", text2)
+	}
+	if !strings.Contains(text2, "TIMED OUT") {
+		t.Errorf("expected the second call to genuinely re-run and time out again, got: %s", text2)
 	}
 }

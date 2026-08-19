@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.80"
+const Version = "0.26.81"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -1395,7 +1395,14 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 			}
 		}
 		if e == nil && r != nil && !r.IsError && req != nil && s.respCache != nil {
-			s.respCache.recordTestRun(req.Session, testKey, resultTextRaw(r))
+			// A timeout is not a stable, reproducible outcome -- it may be
+			// transient load/flakiness, not a real hang. Caching it means a
+			// retry (even a legitimate one under force:true) can never
+			// prove the test actually passes; it just re-serves the same
+			// non-answer. Only cache genuine pass/fail outcomes.
+			if txt := resultTextRaw(r); !strings.Contains(txt, "TIMED OUT") {
+				s.respCache.recordTestRun(req.Session, testKey, txt)
+			}
 		}
 		return r, o, e
 	case "similar":
@@ -5482,7 +5489,7 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 		sb.WriteString("\nBUILD FAILED -- the package did not compile; zero tests ran. This is NOT a test-failure signal, fix the compile error shown above first")
 	case err != nil && testPanicked(outStr):
 		sb.WriteString("\nTEST BINARY PANICKED -- not a normal assertion failure; likely caused by state unrelated to your edit (e.g. duplicate flag/command registration shared across tests in one binary). Investigate the panic trace above before assuming your edit is wrong")
-	case ctx.Err() == context.DeadlineExceeded:
+	case err != nil && ctx.Err() == context.DeadlineExceeded:
 		sb.WriteString(fmt.Sprintf("\nTIMED OUT after %s -- this is NOT a pass; the run was killed before finishing. This may be a hang from your edit, or simply a large/slow test package -- set DEFN_TEST_TIMEOUT=<duration> (e.g. \"5m\") to allow more time before assuming a hang", testTimeout))
 	case err != nil:
 		sb.WriteString("\nSOME TESTS FAILED")
@@ -5569,7 +5576,7 @@ func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args n
 		sb.WriteString("\nBUILD FAILED -- the package did not compile; zero tests ran. This is NOT a test-failure signal, fix the compile error shown above first")
 	case err != nil && testPanicked(outStr):
 		sb.WriteString("\nTEST BINARY PANICKED -- not a normal assertion failure; likely caused by state unrelated to your edit (e.g. duplicate flag/command registration shared across tests in one binary). Investigate the panic trace above before assuming your edit is wrong")
-	case ctx.Err() == context.DeadlineExceeded:
+	case err != nil && ctx.Err() == context.DeadlineExceeded:
 		sb.WriteString(fmt.Sprintf("\nTIMED OUT after %s -- this is NOT a pass; the run was killed before finishing. This may be a hang from your edit, or simply a large/slow test package -- set DEFN_TEST_TIMEOUT=<duration> (e.g. \"5m\") to allow more time before assuming a hang", testTimeout))
 	case err != nil:
 		sb.WriteString("\nSOME TESTS FAILED")

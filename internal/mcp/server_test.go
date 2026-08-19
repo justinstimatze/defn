@@ -11986,3 +11986,53 @@ func TestHandleReplaceHunk_ReplaceAllHandlesMultipleIdenticalOccurrences(t *test
 		t.Fatalf("replace-hunk replace_all failed: %s", text)
 	}
 }
+
+// TestHandleTestByName_GenuineTimeoutStillReportsTimedOut is the
+// regression test for the #304 fix: the TIMED OUT case switched from
+// `ctx.Err() == context.DeadlineExceeded` to `err != nil &&
+// ctx.Err() == context.DeadlineExceeded`, to stop a genuinely-passing
+// run (finishing right at the deadline) from getting a spurious TIMED
+// OUT banner appended after real PASS output (confirmed live on
+// prometheus-19017: a force:true rerun printed a clean PASS block,
+// then still appended "TIMED OUT after 1m0s"). This test proves the
+// straightforward, non-racy case -- a test that genuinely hangs past
+// the deadline -- still reports TIMED OUT after that change; a real
+// process-kill race at the exact deadline boundary isn't practical to
+// force deterministically in a unit test.
+func TestHandleTestByName_GenuineTimeoutStillReportsTimedOut(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main_test.go"), []byte("package main\n\nimport (\n\t\"testing\"\n\t\"time\"\n)\n\nfunc TestSlowHang(t *testing.T) {\n\ttime.Sleep(2 * time.Second)\n}\n"), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	orig := testTimeout
+	testTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { testTimeout = orig })
+
+	result, _, err := s.handleTestByName(context.Background(), nil, "TestSlowHang", "", "")
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "TIMED OUT") {
+		t.Errorf("expected a genuine hang past the deadline to still report TIMED OUT, got:\n%s", text)
+	}
+}
