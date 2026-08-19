@@ -5,14 +5,13 @@ import (
 	"testing"
 )
 
-// replaceHunkFixture is a byte-exact PUTGET golden for the replace-hunk
-// operator. Content-addressed hunk replacement inside a def body.
 type replaceHunkFixture struct {
 	name        string
 	body        string
 	old         string
 	replacement string
 	index       int
+	replaceAll  bool
 	after       string
 }
 
@@ -217,12 +216,37 @@ var replaceHunkFixtures = []replaceHunkFixture{
 	x += 4
 }`,
 	},
+	{
+		// #302: mirrors a real trajectory (prometheus-19338) that needed
+		// the identical replacement at every one of several repeated
+		// occurrences and had to fall back to indexed calls, which broke
+		// under batching because indices shift as earlier matches are
+		// consumed within the same apply transaction.
+		name: "replace_all_multiple_occurrences",
+		body: `func F() {
+	errs = errors.Join(errs, e1)
+	do()
+	errs = errors.Join(errs, e2)
+	do()
+	errs = errors.Join(errs, e3)
+}`,
+		old:         "errors.Join(errs, ",
+		replacement: "annots.Add(newCategorizedWarningf(",
+		replaceAll:  true,
+		after: `func F() {
+	errs = annots.Add(newCategorizedWarningf(e1)
+	do()
+	errs = annots.Add(newCategorizedWarningf(e2)
+	do()
+	errs = annots.Add(newCategorizedWarningf(e3)
+}`,
+	},
 }
 
 func TestReplaceHunk_ByteExactPUTGET(t *testing.T) {
 	for _, tc := range replaceHunkFixtures {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := ReplaceHunk(tc.body, tc.old, tc.replacement, tc.index)
+			got, err := ReplaceHunk(tc.body, tc.old, tc.replacement, tc.index, tc.replaceAll)
 			if err != nil {
 				t.Fatalf("ReplaceHunk: unexpected error: %v", err)
 			}
@@ -264,7 +288,7 @@ func TestReplaceHunk_ErrorCases(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := ReplaceHunk(tc.body, tc.old, tc.replacement, tc.index)
+			_, err := ReplaceHunk(tc.body, tc.old, tc.replacement, tc.index, false)
 			if err == nil {
 				t.Fatalf("expected error containing %q, got nil", tc.want)
 			}
