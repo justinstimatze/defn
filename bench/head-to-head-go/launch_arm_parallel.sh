@@ -15,16 +15,28 @@
 # invocations don't race on cache cleanup, but that lock only serializes
 # the check-and-clean step itself -- it does NOT guarantee peak
 # concurrent disk usage stays under any limit across N simultaneous
-# tasks' full lifetimes. Start conservative (N=3 on a 4-vCPU box) and
-# watch `df -h`/`free -h`/load average before pushing higher; purge
-# stale workdirs from old/completed corpora first for headroom.
+# tasks' full lifetimes.
+#
+# GOMAXPROCS: each task's own `go build`/`defn init`/`defn ingest` step
+# defaults to using ALL cores (Go's runtime sets GOMAXPROCS=NumCPU per
+# process, with no awareness of sibling concurrent processes). The
+# first live run of this script (2026-08-19) hit this directly: N=3 per
+# arm x 2 arms = 6 concurrent tasks, each independently spawning its own
+# multi-threaded go toolchain, drove load average to 40+ on a 4-vCPU
+# box before it was killed. Pinning GOMAXPROCS=1 here bounds each task
+# to one core's worth of Go-toolchain parallelism, so PARALLELISM
+# concurrent tasks cost at most ~PARALLELISM cores, not
+# PARALLELISM*NumCPU. Still start conservative (PARALLELISM=2 on a
+# 4-vCPU box running both arms at once, i.e. 4 total workers) and watch
+# `uptime`/`df -h`/`free -h` before pushing higher; purge stale workdirs
+# from old/completed corpora first for headroom.
 #
 # Usage:
 #   launch_arm_parallel.sh <corpus-dir> <arm: defn|files> <model> <budget-usd> <max-turns> <parallelism> <log-dir>
 #
 # Example:
 #   ssh box 'bash ~/defn/bench/head-to-head-go/launch_arm_parallel.sh \
-#     ~/defn/bench/prometheus-repo-opus defn opus 8.0 100 3 ~/logs/prom-opus-defn'
+#     ~/defn/bench/prometheus-repo-opus defn opus 8.0 100 2 ~/logs/prom-opus-defn'
 #
 # Per-task output still lands at <corpus-dir>/arm_<arm>/<instance_id>.json
 # same as --all; this script only changes HOW MANY run at once, not
@@ -56,7 +68,7 @@ mkdir -p "$LOG_DIR"
 
 run_task() {
 	local iid="$1"
-	python3 "$SCRIPT_DIR/agent_driver.py" "$iid" \
+	GOMAXPROCS=1 python3 "$SCRIPT_DIR/agent_driver.py" "$iid" \
 		--arm "$ARM" --model "$MODEL" \
 		--budget-usd "$BUDGET" --max-turns "$MAX_TURNS" \
 		--corpus-dir "$CORPUS_DIR" \
