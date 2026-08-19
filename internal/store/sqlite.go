@@ -2830,3 +2830,18 @@ func (s *SQLiteDB) GetExternalInterfaces(defID int64) ([]string, error) {
 	}
 	return out, rows.Err()
 }
+
+// CountDefinitionsByNameAndReceiver returns how many definitions share
+// both name and receiver, regardless of module/package -- the
+// receiver-qualified sibling of CountDefinitionsByName, used to detect
+// ambiguity for the "(*Recv).Method" name convention (see its own doc
+// comment on the Backend interface for why the plain name-only count
+// can't see this).
+func (s *SQLiteDB) CountDefinitionsByNameAndReceiver(name, receiver string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(s.Ctx(), "SELECT COUNT(*) FROM definitions WHERE name = ? AND COALESCE(receiver,'') = ?", name, receiver).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}

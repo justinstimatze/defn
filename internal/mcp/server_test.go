@@ -11098,3 +11098,158 @@ func reloadConfig(start int) {
 		t.Errorf("agentOnlyFlags should still exist after the edit: %v", err)
 	}
 }
+
+// TestHandleCode_EditRefusesAmbiguousReceiverQualifiedName is the
+// write-path counterpart, and the more severe half of #287: without
+// the fix, code(op:"edit", name:"(*Config).UnmarshalYAML", ...) with
+// no receiver:/module:/file: would silently resolve via the same
+// blast-radius tiebreak and overwrite whichever package's Config
+// happened to win it -- exactly the class of destructive-write
+// corruption #248 (resolveWriteTarget) was built to prevent for the
+// bare-name case, just reached through a syntax #248 never covered.
+func TestHandleCode_EditRefusesAmbiguousReceiverQualifiedName(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	if err := os.MkdirAll(filepath.Join(projDir, "pkga"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(projDir, "pkgb"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "pkga", "config.go"), []byte(`package pkga
+
+type Config struct{ A string }
+
+func (c *Config) UnmarshalYAML(unmarshal func(any) error) error { return nil }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "pkgb", "config.go"), []byte(`package pkgb
+
+type Config struct{ B string }
+
+func (c *Config) UnmarshalYAML(unmarshal func(any) error) error { return nil }
+func UseA(c *Config) string { return c.B }
+func UseB(c *Config) string { return c.B }
+func UseC(c *Config) string { return c.B }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op:      "edit",
+		Name:    "(*Config).UnmarshalYAML",
+		NewBody: `func (c *Config) UnmarshalYAML(unmarshal func(any) error) error { return errors.New("nope") }`,
+	})
+	if err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected a refusal for the ambiguous receiver-qualified name, got success: %s", resultText(t, result))
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "ambiguous") {
+		t.Errorf("expected an ambiguity refusal message, got: %s", text)
+	}
+
+	// Neither Config's UnmarshalYAML should have been touched.
+	pkgaDef, err := db.GetDefinitionByNameAndReceiver("UnmarshalYAML", "testproj/pkga", "*Config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(pkgaDef.Body, "nope") {
+		t.Errorf("pkga's Config.UnmarshalYAML was overwritten despite the refusal")
+	}
+	pkgbDef, err := db.GetDefinitionByNameAndReceiver("UnmarshalYAML", "testproj/pkgb", "*Config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(pkgbDef.Body, "nope") {
+		t.Errorf("pkgb's Config.UnmarshalYAML was overwritten despite the refusal")
+	}
+}
+
+// TestHandleExpand_AmbiguityNoteFiresForReceiverQualifiedName is the
+// direct regression for the prometheus-18652 bug: a caller can embed
+// the receiver directly in a name using Go's own "(*Recv).Method"
+// convention (e.g. via expand's names:[] field, which has no separate
+// receiver param) instead of the dedicated receiver: param. Before
+// #287, ambiguityNote's CountDefinitionsByName(name) checked the
+// literal, unparsed string ("(*Config).UnmarshalYAML"), which never
+// matches a stored def's Name column -- so this exact cross-package
+// ambiguity class produced no warning at all, even though the
+// underlying resolution silently picked one of several candidates via
+// the same blast-radius tiebreak a bare name uses.
+func TestHandleExpand_AmbiguityNoteFiresForReceiverQualifiedName(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	if err := os.MkdirAll(filepath.Join(projDir, "pkga"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(projDir, "pkgb"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "pkga", "config.go"), []byte(`package pkga
+
+type Config struct{ A string }
+
+func (c *Config) UnmarshalYAML(unmarshal func(any) error) error { return nil }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "pkgb", "config.go"), []byte(`package pkgb
+
+type Config struct{ B string }
+
+func (c *Config) UnmarshalYAML(unmarshal func(any) error) error { return nil }
+func UseA(c *Config) string { return c.B }
+func UseB(c *Config) string { return c.B }
+func UseC(c *Config) string { return c.B }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op:      "expand",
+		Names:   []string{"(*Config).UnmarshalYAML"},
+		Include: []string{"body"},
+	})
+	if err != nil {
+		t.Fatalf("expand: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "note:") || !strings.Contains(text, "ambiguous") && !strings.Contains(text, "best-effort tiebreak") {
+		t.Errorf("expected an ambiguity note for the receiver-qualified name, got:\n%s", text)
+	}
+	if !strings.Contains(text, "UnmarshalYAML") {
+		t.Errorf("expected the resolved def's body to still be returned, got:\n%s", text)
+	}
+}

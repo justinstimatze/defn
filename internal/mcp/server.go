@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.75"
+const Version = "0.26.76"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -9384,23 +9384,25 @@ func (s *server) testScopeTarget(hint string) string {
 // Matches fileDefsCap's cap value for the sibling file-scoped op.
 const overviewDefsCap = fileDefsCap
 
-// resolveWriteTarget wraps resolveEditTarget for MUTATING ops. #248:
-// a bare (no receiver/module/file) name lookup uses
-// GetDefinitionByName's best-effort blast-radius tiebreak, which is
-// fine for a read (worst case: stale info) but not for a write --
-// live-reproduced this session when code(op:"edit", name:"Backend")
-// with no module qualifier silently targeted the wrong one of two
-// same-named "Backend" interfaces across different packages and
-// overwrote it with the other's body, corrupting a file that was
-// never meant to be touched. Refuse instead of guessing whenever the
-// name is ambiguous and the caller gave no disambiguating qualifier.
 func (s *server) resolveWriteTarget(name, receiver, module, file string) (*store.Definition, error) {
 	d, err := s.resolveEditTarget(name, receiver, module, file)
 	if err != nil {
 		return d, err
 	}
 	if receiver == "" && module == "" && file == "" {
-		if n, cErr := s.backend.CountDefinitionsByName(name); cErr == nil && n > 1 {
+		// #287: same receiver-embedded-in-name gap as ambiguityNote -- see
+		// its comment. A write is the more severe half of this: an
+		// unrefused ambiguous write can silently overwrite the wrong
+		// package's method, exactly the corruption #248 was written to
+		// prevent for the bare-name case.
+		if methName, recv, ok := splitReceiverQualifiedName(name); ok {
+			if n, cErr := s.backend.CountDefinitionsByNameAndReceiver(methName, recv); cErr == nil && n > 1 {
+				return nil, fmt.Errorf(
+					"%q is ambiguous: %d definitions named %q on receiver %q share this signature across different packages -- refusing to guess which one to write. Pass module: or file: to disambiguate, or use search(pattern:%q) to see every candidate",
+					name, n, methName, recv, methName,
+				)
+			}
+		} else if n, cErr := s.backend.CountDefinitionsByName(name); cErr == nil && n > 1 {
 			return nil, fmt.Errorf(
 				"%q is ambiguous: %d definitions share this name across different packages -- refusing to guess which one to write. Pass receiver:, module:, or file: to disambiguate, or use search(pattern:%q) to see every candidate",
 				name, n, name,
@@ -9410,15 +9412,30 @@ func (s *server) resolveWriteTarget(name, receiver, module, file string) (*store
 	return d, nil
 }
 
-// ambiguityNote warns when a bare-name lookup (no receiver/module/file
-// qualifier) resolved via GetDefinitionByName's best-effort tiebreak
-// while other same-named definitions exist -- #248: outline/read gave
-// no indication another candidate existed, unlike search which lists
-// every match. Empty qualifiers only: an explicit receiver/module/file
-// is a deliberate disambiguation, not something to second-guess.
 func (s *server) ambiguityNote(name, receiver, module, file string) string {
 	if receiver != "" || module != "" || file != "" || strings.TrimSpace(name) == "" {
 		return ""
+	}
+	// #287: a caller can embed the receiver directly in name using Go's
+	// own "(*Recv).Method"/"Recv.Method" convention instead of the
+	// separate receiver: param -- GetDefinitionByName already parses and
+	// resolves that shape (silently picking one via the same blast-radius
+	// tiebreak as a bare name), but CountDefinitionsByName only ever
+	// matched the literal, unparsed string, which never equals a stored
+	// def's Name column -- so this exact ambiguity class was invisible no
+	// matter how many packages shared it. Real trajectory
+	// (prometheus-18652): expand(names:["(*Config).UnmarshalYAML"]) with
+	// two same-named-same-receiver types across different packages
+	// silently resolved to the wrong one, with no note at all.
+	if methName, recv, ok := splitReceiverQualifiedName(name); ok {
+		n, err := s.backend.CountDefinitionsByNameAndReceiver(methName, recv)
+		if err != nil || n <= 1 {
+			return ""
+		}
+		return fmt.Sprintf(
+			"[note: %d definitions named %q on receiver %q share this signature across different packages; this resolved to one via a best-effort tiebreak (most production callers). Pass module:/file: to target a specific one, or search(pattern:%q) to see every candidate.]\n\n",
+			n, methName, recv, methName,
+		)
 	}
 	n, err := s.backend.CountDefinitionsByName(name)
 	if err != nil || n <= 1 {
@@ -10194,4 +10211,28 @@ func (s *server) handleDeleteFile(_ context.Context, _ *sdkmcp.CallToolRequest, 
 		sb.WriteString("\n" + buildResult)
 	}
 	return textResult(sb.String()), nil, nil
+}
+
+// splitReceiverQualifiedName parses Go's own "(*Recv).Method"/
+// "Recv.Method" convention out of name, mirroring the exact parsing
+// GetDefinitionByName does internally (internal/store/sqlite.go) so
+// ambiguity detection sees the same (method, receiver) pair the
+// underlying resolution actually used. ok=false when name doesn't look
+// like this shape (no dot, or contains a "/" -- a package-path-
+// qualified name like "pkg/path.Symbol" is a different convention,
+// handled by resolveDottedQualifiedName instead) or either half is
+// empty after stripping parens.
+func splitReceiverQualifiedName(name string) (methName, recv string, ok bool) {
+	if !strings.Contains(name, ".") || strings.Contains(name, "/") {
+		return "", "", false
+	}
+	dotIdx := strings.LastIndex(name, ".")
+	recv = strings.TrimSpace(name[:dotIdx])
+	methName = strings.TrimSpace(name[dotIdx+1:])
+	recv = strings.TrimPrefix(recv, "(")
+	recv = strings.TrimSuffix(recv, ")")
+	if methName == "" || recv == "" {
+		return "", "", false
+	}
+	return methName, recv, true
 }

@@ -40,6 +40,14 @@ type Backend interface {
 	// lookup's best-effort tiebreak (GetDefinitionByName's blast-radius
 	// ORDER BY) silently picked one of several candidates.
 	CountDefinitionsByName(name string) (int, error)
+	// CountDefinitionsByNameAndReceiver mirrors CountDefinitionsByName
+	// for the "(*Recv).Method" name convention -- a plain
+	// CountDefinitionsByName(name) never matches anything for that shape
+	// (the literal string "(*Recv).Method" is never a stored Name column
+	// value), which made the exact same cross-package ambiguity invisible
+	// whenever a caller embedded the receiver in the name string instead
+	// of using a separate receiver: param.
+	CountDefinitionsByNameAndReceiver(name, receiver string) (int, error)
 	GetDefinitionByNameAndReceiver(name, modulePath, receiver string) (*Definition, error)
 	FilterDefinitions(name, kind, file string, limit int) ([]Definition, error)
 	FindDefinitions(namePattern string) ([]Definition, error)
