@@ -10,6 +10,7 @@ import (
 	"go/format"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path"
@@ -275,7 +276,30 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, []
 				}
 			}
 		} else {
-			args = append(args, outDir)
+			// Don't blindly sweep the whole tree: a full/unscoped emit
+			// (e.g. handleTestByName's scope-resolution-failed fallback)
+			// would otherwise run goimports over every .go file under
+			// outDir, including generated files (protobuf, goyacc,
+			// stringer output) nothing in this pass actually touched.
+			// goimports is happy to "fix" a generated file's own
+			// non-canonical import grouping -- that shows up as a
+			// spurious diff on a file nobody edited. Skip generated
+			// files here unless the caller explicitly named them as
+			// touched this pass.
+			_ = filepath.WalkDir(outDir, func(p string, d fs.DirEntry, err error) error {
+				if err != nil || d.IsDir() || !strings.HasSuffix(p, ".go") {
+					return nil
+				}
+				if rel, relErr := filepath.Rel(outDir, p); relErr == nil && touchedSet[filepath.ToSlash(rel)] {
+					args = append(args, p)
+					return nil
+				}
+				if isGeneratedFile(p) {
+					return nil
+				}
+				args = append(args, p)
+				return nil
+			})
 		}
 		emitDebugf("goimports args: %v", args)
 		if out, err := exec.Command(goimports, args...).CombinedOutput(); err != nil {

@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.79"
+const Version = "0.26.80"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -8927,13 +8927,6 @@ func (s *server) suggestMissingImportFixes(buildOutput string) string {
 // path/to/file.go:line:col: undefined: X
 var undefinedRe = regexp.MustCompile(`^(\S+\.go):(\d+):(\d+): undefined: (\w+)$`)
 
-// generatedCodeMarker matches Go's own generated-code convention
-// (https://go.dev/s/generatedcode): a line matching this pattern exactly
-// marks a file as machine-generated. Recognized by goimports, golint,
-// and most other Go tooling -- reusing it here rather than inventing a
-// new convention.
-var generatedCodeMarker = regexp.MustCompile(`^// Code generated .* DO NOT EDIT\.$`)
-
 // isGeneratedSource reports whether raw's first few lines carry Go's
 // standard generated-code marker. Checked against only the first 10
 // lines -- the convention requires it near the top of the file, and
@@ -10563,3 +10556,10 @@ func (s *server) patchInsertHeaderOnDisk(moduleID int64, file, body string) (cha
 
 	return true, nil
 }
+
+// generatedCodeMarker matches Go's own generated-code convention
+// (https://go.dev/s/generatedcode): a line matching this pattern exactly
+// marks a file as machine-generated. Recognized by goimports, golint,
+// and most other Go tooling -- reusing it here rather than inventing a
+// new convention.
+var generatedCodeMarker = regexp.MustCompile(`^// Code generated .* DO NOT EDIT\.$`)

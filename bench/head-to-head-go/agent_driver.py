@@ -106,8 +106,9 @@ EMPTY_MCP_CONFIG = {"mcpServers": {}}
 # not of defn itself. Real-world defn usage always pairs `code` for Go
 # with Edit/Write for everything else (CLAUDE.md's own documented
 # convention) -- this restores that pairing for the bench too, while
-# keeping Grep/Bash/MultiEdit closed to preserve the original "no escape
-# hatch dilutes the Go-side measurement" protection below.
+# keeping Bash/MultiEdit closed to preserve the original "no escape
+# hatch dilutes the Go-side measurement" protection below. (Grep
+# reopened non-Go-only on 2026-08-19, see below.)
 #
 # 2026-08-19: Glob added back too, same non-Go-only carve-out as
 # Read/Write/Edit above (enforced the same way: a SYSTEM_APPEND
@@ -117,17 +118,26 @@ EMPTY_MCP_CONFIG = {"mcpServers": {}}
 # promql/promqltest/testdata/*.test golden fixture and had no way to
 # discover its path -- code's search op is Go-definitions-only by
 # design, so there was structurally no way to enumerate non-Go files by
-# pattern. Grep stays closed: unlike file discovery, content search
-# inside .go files is squarely code(op:"search")'s job and reopening it
-# would reintroduce the measured dilution below for no comparable gain.
-ALLOWED_TOOLS = "mcp__defn__code TodoWrite Read Write Edit Glob"
-# Escape hatches close: Grep lets the model bypass defn's `search` op;
-# Agent/Task* let it spawn subagents that use full tool set; dispatch is
-# cross-session messaging. n=10 measurement 2026-07-20 found 170k / 481k
-# (35%) of measured wire went to these off-tool paths, invisibly diluting
-# every defn-side lever we measured. Closing them here so the "defn arm"
-# actually is defn-only for its GO-side measurement (see the Read/Write/
-# Edit/Glob carve-out above for non-Go files).
+# pattern.
+#
+# 2026-08-19 (later same day): Grep added back too, same non-Go-only
+# carve-out. A real trajectory (prometheus-19184) needed to check
+# docs/configuration/configuration.md for stale label documentation
+# after fixing the underlying code panic -- files-mode found it via a
+# quick `grep -n "jmx_exporter_enabled|..."` and fixed it (recall 1.00);
+# defn-mode had no way to text-search non-Go files at all and never
+# thought to check docs, losing recall on a task both arms otherwise
+# solved identically. Grep on .go files is still squarely
+# code(op:"search")'s job -- the SYSTEM_APPEND instruction below draws
+# that line the same way it already does for Glob.
+ALLOWED_TOOLS = "mcp__defn__code TodoWrite Read Write Edit Glob Grep"
+# Escape hatches close: Agent/Task* let it spawn subagents that use full
+# tool set; dispatch is cross-session messaging. n=10 measurement
+# 2026-07-20 found 170k / 481k (35%) of measured wire went to these
+# off-tool paths, invisibly diluting every defn-side lever we measured.
+# Closing them here so the "defn arm" actually is defn-only for its
+# GO-side measurement (see the Read/Write/Edit/Glob/Grep carve-out above
+# for non-Go files).
 #
 # 2026-08-07: found the hard way that this list goes stale every time
 # Claude Code ships a new tool -- Monitor didn't exist when this list was
@@ -145,7 +155,6 @@ ALLOWED_TOOLS = "mcp__defn__code TodoWrite Read Write Edit Glob"
 # run's arm isolation.
 DISALLOWED_TOOLS = (
     "MultiEdit NotebookEdit Bash "
-    "Grep "
     "Agent Task TaskCreate TaskUpdate TaskGet TaskList TaskOutput TaskStop "
     "mcp__dispatch__dispatch mcp__dispatch__peek mcp__dispatch__ack "
     "mcp__dispatch__who mcp__dispatch__subscribe mcp__dispatch__unsubscribe "
@@ -160,12 +169,13 @@ IMPORTANT — this session measures `mcp__defn__code` against files-mode on Go
 source specifically. Use `mcp__defn__code` for ALL Go (.go) source access and
 edits: op:overview for project shape, op:outline for a def's shape, op:search
 for symbol/text search, op:read for a def body, op:edit / op:replace-hunk /
-op:create for writes. Never call Read/Write/Edit/Glob on .go files — use `code`
-for every one of those, no exceptions. Read/Write/Edit/Glob ARE available, but
-ONLY for non-Go files (docs/*.md, testdata, config, etc.) that the fix may also
-need to touch — `code`'s scope is Go source only, by design, so use Glob only
-to find the PATH of a non-Go file you already know you need (e.g. a testdata
-fixture), never to search or browse .go files. For running tests, use code
+op:create for writes. Never call Read/Write/Edit/Glob/Grep on .go files — use
+`code` for every one of those, no exceptions. Read/Write/Edit/Glob/Grep ARE
+available, but ONLY for non-Go files (docs/*.md, testdata, config, etc.) that
+the fix may also need to touch — `code`'s scope is Go source only, by design,
+so use Glob/Grep only to find or search the PATH/CONTENT of a non-Go file
+(e.g. a testdata fixture, or checking docs for stale references after a code
+fix), never to search or browse .go files. For running tests, use code
 op:test (scoped to defs) — direct shell is not available. Complete the task
 and stop.
 
