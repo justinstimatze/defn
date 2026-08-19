@@ -8237,7 +8237,7 @@ func TestHandleImpact_JSONCapsLargeTestList(t *testing.T) {
 	target.Hash = store.HashBody(target.Body)
 	targetID, _ := db.UpsertDefinition(target)
 
-	const n = impactJSONCap + 5
+	const n = impactJSONTestsCap + 5
 	for i := 0; i < n; i++ {
 		name := fmt.Sprintf("TestT_%d", i)
 		c := &store.Definition{
@@ -8264,8 +8264,8 @@ func TestHandleImpact_JSONCapsLargeTestList(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected \"tests\" array in JSON, got: %v", parsed["tests"])
 	}
-	if len(tests) != impactJSONCap {
-		t.Errorf("expected tests capped at %d, got %d", impactJSONCap, len(tests))
+	if len(tests) != impactJSONTestsCap {
+		t.Errorf("expected tests capped at %d, got %d", impactJSONTestsCap, len(tests))
 	}
 	testsTotal, _ := parsed["tests_total"].(float64)
 	if int(testsTotal) != n {
@@ -11317,5 +11317,291 @@ func TestHandleReadFile_LineRangeWithFullTrueStaysNarrowOnLargeFile(t *testing.T
 	}
 	if strings.Contains(narrowText, "Func0()") {
 		t.Errorf("expected Func0 (far outside the requested range) to be excluded, got it in:\n%s", narrowText)
+	}
+}
+
+// TestHandleImpact_JSONTestsCapIndependentOfCallerCap guards #279
+// (etcd-21620, 2026-08-19): impactJSON used a single impactJSONCap (200)
+// for callers, interface-dispatch callers, AND tests alike. A
+// high-blast-radius def with many callers but far more covering tests
+// (the common shape for a widely-used, widely-tested type) still
+// returned all 200 test names in one call -- 45,410 bytes in the real
+// trajectory, 55% of that task's entire defn tool-result byte total,
+// for a list the agent only needed as a coverage sanity check. Tests now
+// cap at the much smaller impactJSONTestsCap independent of the caller
+// lists, with a truncation note pointing at op:"test-coverage" (the
+// dedicated deep-dive) instead of op:"query".
+func TestHandleImpact_JSONTestsCapIndependentOfCallerCap(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := &server{backend: db}
+
+	m, _ := db.EnsureModule("example.com/lib", "lib", "")
+	target := &store.Definition{
+		ModuleID: m.ID, Name: "T", Kind: "function", Exported: true,
+		Body: "func T() {}", Signature: "func T()",
+	}
+	target.Hash = store.HashBody(target.Body)
+	targetID, _ := db.UpsertDefinition(target)
+
+	// Well under impactJSONCap -- callers should NOT be truncated.
+	const callerCount = 10
+	for i := 0; i < callerCount; i++ {
+		name := fmt.Sprintf("Caller_%d", i)
+		c := &store.Definition{
+			ModuleID: m.ID, Name: name, Kind: "function",
+			Body: fmt.Sprintf("func %s() { T() }", name),
+		}
+		c.Hash = store.HashBody(c.Body)
+		id, _ := db.UpsertDefinition(c)
+		_ = db.SetReferences(id, []store.Reference{{FromDef: id, ToDef: targetID, Kind: "call"}})
+	}
+
+	// Well over impactJSONTestsCap but under impactJSONCap.
+	const testCount = impactJSONTestsCap + 30
+	for i := 0; i < testCount; i++ {
+		name := fmt.Sprintf("TestT_%d", i)
+		c := &store.Definition{
+			ModuleID: m.ID, Name: name, Kind: "function", Test: true,
+			Body: fmt.Sprintf("func %s(t *testing.T) { T() }", name),
+		}
+		c.Hash = store.HashBody(c.Body)
+		id, _ := db.UpsertDefinition(c)
+		_ = db.SetReferences(id, []store.Reference{{FromDef: id, ToDef: targetID, Kind: "call"}})
+	}
+
+	result, _, err := s.handleImpact(context.Background(), nil, codeParam{Name: "T", Format: "json"})
+	if err != nil {
+		t.Fatalf("handleImpact: %v", err)
+	}
+	text := resultText(t, result)
+
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(text), &parsed); err != nil {
+		t.Fatalf("impactJSON output is not valid JSON: %v\n%s", err, text)
+	}
+
+	// direct_callers includes every caller regardless of test-ness (tests
+	// that call T() are callers too, just also separately surfaced in the
+	// "tests" list) -- callerCount+testCount total, still well under
+	// impactJSONCap.
+	callers, _ := parsed["direct_callers"].([]any)
+	wantCallers := callerCount + testCount
+	if len(callers) != wantCallers {
+		t.Errorf("expected all %d callers (under impactJSONCap), got %d", wantCallers, len(callers))
+	}
+
+	tests, _ := parsed["tests"].([]any)
+	if len(tests) != impactJSONTestsCap {
+		t.Errorf("expected tests capped at impactJSONTestsCap=%d, got %d", impactJSONTestsCap, len(tests))
+	}
+	testsTotal, _ := parsed["tests_total"].(float64)
+	if int(testsTotal) != testCount {
+		t.Errorf("expected tests_total=%d (uncapped true count), got %v", testCount, parsed["tests_total"])
+	}
+
+	truncated, ok := parsed["truncated"].(string)
+	if !ok {
+		t.Fatalf("expected a \"truncated\" field since the tests cap was hit, got none. Full response:\n%s", text)
+	}
+	if !strings.Contains(truncated, "test-coverage") {
+		t.Errorf("expected truncation note to point at op:\"test-coverage\" for the full test list, got: %s", truncated)
+	}
+	if strings.Contains(truncated, "caller lists capped") {
+		t.Errorf("callers were NOT truncated (%d, under the cap) -- truncation note shouldn't claim they were: %s", callerCount, truncated)
+	}
+}
+
+// TestHandleInsertHeader_DryRunDoesNotWrite guards the same
+// silently-dropped dry_run gap fixed repeatedly elsewhere in this file
+// (create, add-import, delete) -- dry_run:true must preview without
+// touching disk.
+func TestHandleInsertHeader_DryRunDoesNotWrite(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	before, berr := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if berr != nil {
+		t.Fatalf("read main.go before: %v", berr)
+	}
+
+	result, _, err := s.handleInsertHeader(context.Background(), nil, codeParam{
+		File:   "main.go",
+		Body:   "// Copyright 2026 Example Authors",
+		DryRun: true,
+	})
+	if err != nil {
+		t.Fatalf("handleInsertHeader dry_run: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "would prepend") {
+		t.Errorf("expected a dry-run preview mentioning 'would prepend', got: %s", text)
+	}
+
+	after, aerr := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if aerr != nil {
+		t.Fatalf("read main.go after: %v", aerr)
+	}
+	if string(after) != string(before) {
+		t.Errorf("dry_run modified the file on disk")
+	}
+}
+
+// TestHandleInsertHeader_IdempotentOnRepeat guards against a second
+// insert-header call (e.g. a retried tool call) duplicating the header
+// instead of recognizing it's already present.
+func TestHandleInsertHeader_IdempotentOnRepeat(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	header := "// Copyright 2026 Example Authors"
+	args := codeParam{File: "main.go", Body: header}
+	if _, _, err := s.handleInsertHeader(context.Background(), nil, args); err != nil {
+		t.Fatalf("first insertHeader: %v", err)
+	}
+	result, _, err := s.handleInsertHeader(context.Background(), nil, args)
+	if err != nil {
+		t.Fatalf("second insertHeader: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "no-op") {
+		t.Errorf("expected 'no-op' on repeat call, got: %s", text)
+	}
+
+	final, ferr := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if ferr != nil {
+		t.Fatalf("read main.go: %v", ferr)
+	}
+	if strings.Count(string(final), header) != 1 {
+		t.Errorf("expected header to appear exactly once, got %d times:\n%s", strings.Count(string(final), header), final)
+	}
+}
+
+// TestHandleInsertHeader_PrependsToFile is the #292 feature test: op:
+// "insert-header" is the first defn write op that can touch content
+// outside any definition's tracked byte range (a license/copyright
+// header before `package`). Guards the real gap found in
+// prometheus-19236/17395 (2026-08-19): no existing op could do this at
+// all.
+func TestHandleInsertHeader_PrependsToFile(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	before, berr := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if berr != nil {
+		t.Fatalf("read main.go before: %v", berr)
+	}
+
+	header := "// Copyright 2026 Example Authors\n// Licensed under the Apache License, Version 2.0."
+	result, _, err := s.handleInsertHeader(context.Background(), nil, codeParam{
+		File: "main.go",
+		Body: header,
+	})
+	if err != nil {
+		t.Fatalf("handleInsertHeader: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "inserted") {
+		t.Errorf("expected 'inserted' in response, got: %s", text)
+	}
+
+	final, ferr := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if ferr != nil {
+		t.Fatalf("read main.go after: %v", ferr)
+	}
+	if !strings.HasPrefix(string(final), header) {
+		t.Errorf("expected file to start with the header, got:\n%s", final)
+	}
+	if !strings.HasSuffix(string(final), string(before)) {
+		t.Errorf("expected original content preserved byte-for-byte after the header, got:\n%s", final)
+	}
+}
+
+// TestHandleInsertHeader_RejectsBodyThatBreaksParsing guards against a
+// body that isn't pure comment text (e.g. accidentally includes real
+// code) silently corrupting the file -- the insertion must be rejected
+// before anything is written to disk.
+func TestHandleInsertHeader_RejectsBodyThatBreaksParsing(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	before, berr := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if berr != nil {
+		t.Fatalf("read main.go before: %v", berr)
+	}
+
+	result, _, err := s.handleInsertHeader(context.Background(), nil, codeParam{
+		File: "main.go",
+		Body: "var oops = 1", // not a comment -- would land before `package`
+	})
+	if err == nil && (result == nil || !result.IsError) {
+		t.Fatalf("expected an error rejecting a non-comment body, got success: %v", resultText(t, result))
+	}
+
+	after, aerr := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if aerr != nil {
+		t.Fatalf("read main.go after: %v", aerr)
+	}
+	if string(after) != string(before) {
+		t.Errorf("file was modified despite the rejected insertion:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+// TestHandleCode_CircuitBreakerAutoBatchBodyOnlyForNamesActuallyRead
+// guards the #279/#290 fix: the circuit-breaker auto-batch redirect used
+// to key "include body" off a single session-wide bool -- ANY op:"read"
+// call this turn meant EVERY name folded into the auto-batch got its
+// full source dumped, even names the model only ever outlined or
+// searched. Confirmed on a real etcd-21620 trajectory: 2 auto-batch
+// calls added 19KB of unrequested bodies this way. Body inclusion is now
+// tracked per name, not per turn.
+func TestHandleCode_CircuitBreakerAutoBatchBodyOnlyForNamesActuallyRead(t *testing.T) {
+	t.Setenv("DEFN_CIRCUIT_BREAKER", "2")
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
+
+	// Greet is only ever outlined -- should get outline+callers, no body.
+	if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "outline", Name: "Greet"}); err != nil {
+		t.Fatalf("outline Greet: %v", err)
+	}
+	// Farewell and main are read -- should get body in the auto-batch.
+	if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "Farewell"}); err != nil {
+		t.Fatalf("read Farewell: %v", err)
+	}
+	third, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "main"})
+	if err != nil {
+		t.Fatalf("third read: %v", err)
+	}
+	text := resultText(t, third)
+	if !strings.Contains(text, "auto-batched") {
+		t.Fatalf("expected an auto-batch note, got: %s", text)
+	}
+
+	if !strings.Contains(text, `Greet(name) + " and goodbye"`) {
+		t.Errorf("Farewell was read -- expected its body in the auto-batch, got: %s", text)
+	}
+	if !strings.Contains(text, `Farewell("world")`) {
+		t.Errorf("main was read -- expected its body in the auto-batch, got: %s", text)
+	}
+	if strings.Contains(text, `"Hello, " + name`) {
+		t.Errorf("Greet was only outlined, not read -- its body must NOT appear in the auto-batch, got: %s", text)
+	}
+	if !strings.Contains(text, "Greet") {
+		t.Errorf("Greet should still appear via outline (name/signature), got: %s", text)
 	}
 }

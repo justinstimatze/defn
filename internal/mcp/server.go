@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.76"
+const Version = "0.26.77"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -398,6 +398,7 @@ Ops: overview (project-wide shape when called with no args — one line per modu
 //	         hold multiple top-level decls to author a whole file in one call.
 //	rename: old_name + new_name
 //	move: name + module
+//	insert-header: file + body (prepends body before any existing content -- e.g. a license header)
 //	find: file (+ optional line)
 //	query: sql
 //	apply: operations
@@ -456,6 +457,7 @@ type codeParam struct {
 	DeferBody   string           `json:"defer_body,omitempty"`
 	Full        bool             `json:"full,omitempty"`
 	Include     []string         `json:"include,omitempty"`    // expand op: which graph hops to fold in
+	BodyNames   []string         `json:"body_names,omitempty"` // expand op, internal circuit-breaker redirect only: restrict "body" inclusion to these specific names within Names, instead of applying Include's body flag to every name uniformly (see #279)
 	Test        string           `json:"test,omitempty"`       // L11: op:test named-test reproduction (`-run <regex>` verbatim)
 	Field       string           `json:"field,omitempty"`      // retarget-field-value: composite-literal field name
 	Query       string           `json:"query,omitempty"`      // #153: query-adaptive read — keep only body branches touching the query
@@ -1020,6 +1022,13 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if r, o, e := need(args.ImportPath, "import_path"); r != nil {
 			return r, o, e
 		}
+	case "insert-header":
+		if r, o, e := need(args.File, "file"); r != nil {
+			return r, o, e
+		}
+		if r, o, e := need(args.Body, "body"); r != nil {
+			return r, o, e
+		}
 	case "edit":
 		if r, o, e := need(args.Name, "name"); r != nil {
 			return r, o, e
@@ -1161,26 +1170,27 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		// makes the server robust to that instead of depending on the
 		// model's compliance.
 		var autoNames []string
-		var autoWantsBody bool
+		var autoBodyNames []string
 		if breakerMsg != "" && nameableReadOps[args.Op] && len(sc.pendingReadNames) > 0 {
 			autoNames = append([]string(nil), sc.pendingReadNames...)
-			autoWantsBody = sc.pendingWantsBody
+			autoBodyNames = append([]string(nil), sc.pendingBodyNames...)
 			sc.pendingReadNames = nil
-			sc.pendingWantsBody = false
+			sc.pendingBodyNames = nil
 			sc.readShapedCount = 0
 		}
 		s.respCache.mu.Unlock()
 		if len(autoNames) > 0 {
-			include := []string{"outline", "callers"}
-			if autoWantsBody {
-				// #250: a blocked op:"read" mid-batch wants source, not just
-				// outline+callers -- dropping the body silently downgraded the
-				// response below what was actually asked for (a real
-				// grpc-go-3351 trajectory burned 2 extra round-trips
-				// re-requesting the body this should have returned).
-				include = append(include, "body")
-			}
-			r, o, e := wrapStale(s.handleExpand(ctx, req, codeParam{Names: autoNames, Include: include}))
+			// #250: a blocked op:"read" mid-batch wants source, not just
+			// outline+callers -- dropping the body silently downgraded the
+			// response below what was actually asked for (a real
+			// grpc-go-3351 trajectory burned 2 extra round-trips
+			// re-requesting the body this should have returned). #279: but
+			// that body want is per-NAME, not per-batch -- applying it to
+			// every name folded into the batch dumped full source for defs
+			// only ever outlined/searched (etcd-21620: 19KB of unrequested
+			// bodies across 2 auto-batch calls). BodyNames restricts "body"
+			// to exactly the names actually read.
+			r, o, e := wrapStale(s.handleExpand(ctx, req, codeParam{Names: autoNames, Include: []string{"outline", "callers"}, BodyNames: autoBodyNames}))
 			note := fmt.Sprintf("[circuit breaker: auto-batched %d individual lookups this turn (%s) into one expand call instead of refusing -- call code(op:\"context\"/op:\"expand\", names:[...]) yourself next time to skip this extra round-trip.]\n\n", len(autoNames), strings.Join(autoNames, ", "))
 			return prependNote(r, note), o, e
 		}
@@ -1283,6 +1293,8 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return s.handleRenameParam(ctx, req, args)
 	case "add-import":
 		return s.handleAddImport(ctx, req, args)
+	case "insert-header":
+		return s.handleInsertHeader(ctx, req, args)
 	case "search":
 		if args.Pattern == "" {
 			args.Pattern = args.Name
@@ -1449,7 +1461,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "gc":
 		return s.handleGC(ctx, req, args)
 	default:
-		return errResult(fmt.Errorf("unknown op %q — valid: read, read-and-verify, outline, slice, insert-precondition, replace-slice, replace-hunk, wrap-in-defer, rename-param, add-import, search, impact, explain, context, similar, untested, edit, insert, create, delete, retarget-field-value, rename, move, test, apply, query, find, sync, test-coverage, batch-impact, simulate, file-defs, validate-plan, pragmas, literals, traverse, emit, gc, resummarize, plan-dsl, plan-sexpr, plan, overview, methods, patch, expand, read-file, version", args.Op))
+		return errResult(fmt.Errorf("unknown op %q — valid: read, read-and-verify, outline, slice, insert-precondition, replace-slice, replace-hunk, wrap-in-defer, rename-param, add-import, insert-header, search, impact, explain, context, similar, untested, edit, insert, create, delete, retarget-field-value, rename, move, test, apply, query, find, sync, test-coverage, batch-impact, simulate, file-defs, validate-plan, pragmas, literals, traverse, emit, gc, resummarize, plan-dsl, plan-sexpr, plan, overview, methods, patch, expand, read-file, version", args.Op))
 	}
 }
 
@@ -1791,14 +1803,13 @@ func (s *server) impactJSON(impact *store.Impact) (*sdkmcp.CallToolResult, any, 
 		ifaceDispatch = append(ifaceDispatch, toRef(c))
 	}
 	testsTotal := len(impact.Tests)
-	tests := make([]impactDefRef, 0, min(testsTotal, impactJSONCap))
+	tests := make([]impactDefRef, 0, min(testsTotal, impactJSONTestsCap))
 	for i, t := range impact.Tests {
-		if i >= impactJSONCap {
+		if i >= impactJSONTestsCap {
 			break
 		}
 		tests = append(tests, toRef(t))
 	}
-	truncated := callersTotal > impactJSONCap || ifaceTotal > impactJSONCap || testsTotal > impactJSONCap
 
 	result := map[string]any{
 		"definition": impactDefRef{
@@ -1819,8 +1830,15 @@ func (s *server) impactJSON(impact *store.Impact) (*sdkmcp.CallToolResult, any, 
 		"uncovered_by":               impact.UncoveredBy,
 		"blast_radius":               blastRadius,
 	}
-	if truncated {
-		result["truncated"] = fmt.Sprintf("each list capped at %d entries -- use op:\"query\" or narrow with op:\"impact\", query:\"<term>\" to see more of a specific list", impactJSONCap)
+	var truncNotes []string
+	if callersTotal > impactJSONCap || ifaceTotal > impactJSONCap {
+		truncNotes = append(truncNotes, fmt.Sprintf("caller lists capped at %d entries -- use op:\"query\" or narrow with op:\"impact\", query:\"<term>\" to see more", impactJSONCap))
+	}
+	if testsTotal > impactJSONTestsCap {
+		truncNotes = append(truncNotes, fmt.Sprintf("tests capped at %d of %d entries -- use op:\"test-coverage\", name:%q for the full covering-test list", impactJSONTestsCap, testsTotal, impact.Definition.Name))
+	}
+	if len(truncNotes) > 0 {
+		result["truncated"] = strings.Join(truncNotes, "; ")
 	}
 	text, err := toJSON(result)
 	if err != nil {
@@ -6463,6 +6481,22 @@ func (s *server) handleExpand(_ context.Context, req *sdkmcp.CallToolRequest, ar
 		want[strings.ToLower(strings.TrimSpace(k))] = true
 	}
 
+	// #279: BodyNames restricts "body" to a specific subset of names,
+	// overriding want["body"] per-name. Used by the circuit-breaker
+	// auto-batch redirect in handleCode, which used to apply want["body"]
+	// uniformly to every name folded into a batch whenever ANY of them was
+	// fetched via op:"read" -- dumping full source for defs only ever
+	// outlined/searched (etcd-21620: 19KB of unrequested bodies across 2
+	// auto-batch calls). nil means "no override" -- ordinary direct
+	// expand(include:[...]) calls are unaffected.
+	var bodyOverride map[string]bool
+	if len(args.BodyNames) > 0 {
+		bodyOverride = make(map[string]bool, len(args.BodyNames))
+		for _, n := range args.BodyNames {
+			bodyOverride[n] = true
+		}
+	}
+
 	mods, _ := s.backend.ListModules()
 	modulePathByID := make(map[int64]string, len(mods))
 	for _, m := range mods {
@@ -6494,11 +6528,18 @@ func (s *server) handleExpand(_ context.Context, req *sdkmcp.CallToolRequest, ar
 		if note := s.ambiguityNote(name, "", args.Module, args.File); note != "" {
 			sb.WriteString(note)
 		}
-		// This name's own want-map: a per-name copy only when body needs to
-		// be suppressed below, so other names in the same batch still get
-		// whatever the caller asked for.
+		// This name's own want-map: a per-name copy whenever body needs to
+		// be suppressed below or restricted by bodyOverride.
 		sectionWant := want
-		if want["body"] && req != nil && s.respCache != nil {
+		if bodyOverride != nil {
+			clone := make(map[string]bool, len(want))
+			for k, v := range want {
+				clone[k] = v
+			}
+			clone["body"] = bodyOverride[name]
+			sectionWant = clone
+		}
+		if sectionWant["body"] && req != nil && s.respCache != nil {
 			// The direct read/outline/slice dispatch cases in handleCode all
 			// check bodyServedEpochsAgo before re-serving a body, but this
 			// batched path -- including the circuit breaker's own auto-batch
@@ -6510,11 +6551,12 @@ func (s *server) handleExpand(_ context.Context, req *sdkmcp.CallToolRequest, ar
 			// calls later purely because it was caught in an unrelated
 			// circuit-breaker batch.
 			if epochsAgo, ok := s.respCache.bodyServedEpochsAgo(req.Session, name); ok && epochsAgo <= staleEpochThreshold {
-				sectionWant = map[string]bool{}
-				for k, v := range want {
-					sectionWant[k] = v
+				clone := make(map[string]bool, len(sectionWant))
+				for k, v := range sectionWant {
+					clone[k] = v
 				}
-				sectionWant["body"] = false
+				clone["body"] = false
+				sectionWant = clone
 				sb.WriteString(fmt.Sprintf("_(%s's full body was already read in this session via read(full:true) -- omitted here, nothing new. If it may have changed since, call code(op:\"sync\") first.)_\n", name))
 			}
 		}
@@ -9537,6 +9579,21 @@ var removedDoltOps = map[string]bool{
 // still bounded.
 const impactJSONCap = 200
 
+// impactJSONTestsCap separately bounds impactJSON's "tests" list, well
+// below impactJSONCap. #279 (etcd-21620, 2026-08-19): a call on a
+// high-blast-radius type (34 direct callers, 1,172 covering tests) still
+// returned 45,410 bytes in one call even with the 200-entry cap in
+// place -- 55% of that whole task's defn tool-result byte total, almost
+// entirely the 200 enumerated test names. The agent's actual need in
+// that trajectory was a coverage sanity check (some tests exist), not
+// 200 individual names -- op:"test-coverage" already exists as the
+// dedicated deep-dive for "give me the full covering-test list" and
+// isn't similarly bounded, so it's the right escape hatch. Callers and
+// interface-dispatch callers stay at impactJSONCap: unlike tests, which
+// are rarely read individually, seeing many production callers is
+// often the actual point of a blast-radius check.
+const impactJSONTestsCap = 20
+
 // opAliases maps common near-miss op-name guesses to the one real op
 // they unambiguously mean, so handleCode accepts them instead of
 // round-tripping an "unknown op" error. Confirmed hitting real
@@ -10235,4 +10292,85 @@ func splitReceiverQualifiedName(name string) (methName, recv string, ok bool) {
 		return "", "", false
 	}
 	return methName, recv, true
+}
+
+// handleInsertHeader prepends args.Body (typically a license/copyright
+// comment block) to the very top of args.File, before any existing
+// content -- the one place defn's def-scoped write ops (edit/insert/
+// create) can't reach, since it isn't part of any definition's tracked
+// byte range. #279/#292 (2026-08-19): a real prometheus-19236/17395
+// trajectory needed exactly this (prometheus requires a copyright
+// header on every new .go file) and had no way to say it, burning
+// 15-25 tool calls across replace-hunk/move/patch/raw-query attempts
+// before giving up with no header added.
+//
+// Pure byte-level prepend, not an AST rewrite: the rest of the file
+// (including anything already there -- an existing package doc comment
+// directly above `package X`, for instance -- stays directly attached,
+// since the new header sits above it separated by its own blank line)
+// is untouched byte-for-byte, same guarantee as the other projection
+// ops. Validated by re-parsing the result: rejects if the insertion
+// breaks parsing or changes the parsed package name (a sign args.Body
+// wasn't pure comment text).
+//
+// Idempotent: a file that already starts with the trimmed body is a
+// no-op, not a duplicate.
+func (s *server) handleInsertHeader(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+	file := strings.TrimSpace(args.File)
+	if s.projectDir == "" {
+		return errResult(fmt.Errorf("insert-header: no project directory configured"))
+	}
+	diskPath := filepath.Join(s.projectDir, file)
+	orig, err := os.ReadFile(diskPath)
+	if err != nil {
+		return errResult(fmt.Errorf("insert-header: read %s: %w", file, err))
+	}
+
+	header := strings.TrimRight(args.Body, "\n")
+	if strings.TrimSpace(header) == "" {
+		return errResult(fmt.Errorf("insert-header: body is empty after trimming"))
+	}
+
+	trimmedOrig := strings.TrimLeft(string(orig), "\n")
+	if strings.HasPrefix(trimmedOrig, strings.TrimSpace(header)) {
+		return textResult(fmt.Sprintf("%s: already starts with this header (no-op)\n", file)), nil, nil
+	}
+
+	updated := header + "\n\n" + string(orig)
+
+	// Validate: must still parse, and the package name must be unchanged
+	// -- catches body text that isn't pure comment (stray code, or a
+	// malformed // that breaks the following line).
+	fset := token.NewFileSet()
+	origAST, oerr := parser.ParseFile(fset, "", orig, parser.PackageClauseOnly)
+	newAST, nerr := parser.ParseFile(fset, "", updated, parser.PackageClauseOnly)
+	if nerr != nil {
+		return errResult(fmt.Errorf("insert-header: inserting this body would break parsing (body must be comment lines only) -- %w", nerr))
+	}
+	if oerr == nil && origAST.Name != nil && newAST.Name != nil && origAST.Name.Name != newAST.Name.Name {
+		return errResult(fmt.Errorf("insert-header: inserting this body would change the parsed package name from %q to %q -- body must be comment lines only", origAST.Name.Name, newAST.Name.Name))
+	}
+
+	if args.DryRun {
+		return dryRunResult(fmt.Sprintf("%s: would prepend %d bytes before existing content", file, len(header)+2))
+	}
+
+	if err := os.WriteFile(diskPath, []byte(updated), 0644); err != nil {
+		return errResult(fmt.Errorf("insert-header: write %s: %w", file, err))
+	}
+
+	// Keep the DB's file_sources cache in sync, same discipline as
+	// patchImportOnDisk -- disk is authoritative (already written above),
+	// so a cache-update failure here is logged, not fatal.
+	dir := ""
+	if idx := strings.LastIndex(file, "/"); idx >= 0 {
+		dir = file[:idx]
+	}
+	if defs, ferr := s.backend.FindDefinitionsByFile(dir, file, 0); ferr == nil && len(defs) > 0 {
+		if err := s.backend.SetFileSource(defs[0].ModuleID, file, updated); err != nil {
+			fmt.Fprintf(os.Stderr, "defn: file_sources update failed after insert-header to %s: %v\n", file, err)
+		}
+	}
+
+	return textResult(fmt.Sprintf("%s: inserted %d-byte header before existing content\n", file, len(header)+2)), nil, nil
 }

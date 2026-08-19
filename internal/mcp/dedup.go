@@ -58,12 +58,16 @@ type sessionCache struct {
 	// circuit-breaker block can auto-batch them via expand instead of
 	// just refusing. Reset alongside readShapedCount.
 	pendingReadNames []string
-	// pendingWantsBody is true when any call folded into pendingReadNames
-	// this turn was op:"read" (the one nameable op whose whole point is
-	// the source body) -- so an auto-batch redirect through expand can
-	// include "body" instead of silently downgrading a read into an
-	// outline+callers-only response. See #250.
-	pendingWantsBody bool
+	// pendingBodyNames holds the subset of pendingReadNames that were
+	// fetched via op:"read" (the one nameable op whose whole point is the
+	// source body) this turn, so an auto-batch redirect through expand can
+	// request "body" only for those specific names, not every name folded
+	// into the batch. Originally a single bool (any read this turn => body
+	// for ALL batched names); #279 found that silently dumped full source
+	// for defs the model only ever outlined/searched (etcd-21620: 19KB of
+	// unrequested bodies across 2 auto-batch calls). See #250 for the
+	// original body-inclusion motivation.
+	pendingBodyNames []string
 	// lastTestRun caches op:"test"'s own response text, keyed by
 	// testDedupKey (target-scoped, not response-content-scoped -- unlike
 	// entries/cacheEntry, which dedup by comparing response BYTES after
@@ -206,7 +210,7 @@ func isWriteOp(op string) bool {
 	switch op {
 	case "edit", "insert", "create", "delete", "rename", "move", "apply",
 		"insert-precondition", "replace-slice", "replace-hunk",
-		"wrap-in-defer", "rename-param", "add-import", "patch",
+		"wrap-in-defer", "rename-param", "add-import", "insert-header", "patch",
 		"sync", "resolve", "merge", "checkout", "commit", "merge-abort",
 		"retarget-field-value":
 		return true
@@ -487,7 +491,7 @@ func writeTargets(args codeParam) (names, files []string, ok bool) {
 			return nil, nil, false
 		}
 		return []string{args.Name}, nil, true
-	case "create", "add-import":
+	case "create", "add-import", "insert-header":
 		if args.File == "" {
 			return nil, nil, false
 		}
@@ -516,7 +520,7 @@ func writeTargets(args codeParam) (names, files []string, ok bool) {
 					return nil, nil, false
 				}
 				allNames = append(allNames, op.Name)
-			case "create", "add-import":
+			case "create", "add-import", "insert-header":
 				if op.File == "" {
 					return nil, nil, false
 				}

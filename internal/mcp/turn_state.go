@@ -181,17 +181,21 @@ var nameableReadOps = map[string]bool{
 	"read": true, "outline": true, "impact": true, "methods": true, "expand": true,
 }
 
-// trackReadShapedName records name for a possible circuit-breaker
-// auto-batch redirect. Called for every read-shaped call regardless of
-// whether it ends up blocked, so a later block can reconstruct the
-// whole turn's want-list. Cleared wherever readShapedCount resets
-// (batch call, new turn, or after a redirect consumes it).
 func (s *server) trackReadShapedName(sc *sessionCache, op, name string) {
 	if strings.TrimSpace(name) == "" || !nameableReadOps[op] {
 		return
 	}
 	if op == "read" {
-		sc.pendingWantsBody = true
+		already := false
+		for _, n := range sc.pendingBodyNames {
+			if n == name {
+				already = true
+				break
+			}
+		}
+		if !already {
+			sc.pendingBodyNames = append(sc.pendingBodyNames, name)
+		}
 	}
 	for _, n := range sc.pendingReadNames {
 		if n == name {
