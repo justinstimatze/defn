@@ -11253,3 +11253,69 @@ func UseC(c *Config) string { return c.B }
 		t.Errorf("expected the resolved def's body to still be returned, got:\n%s", text)
 	}
 }
+
+// TestHandleReadFile_LineRangeWithFullTrueStaysNarrowOnLargeFile is the
+// exact-args regression for the prometheus-18534 trajectory:
+// read-file(file:"promql/functions.go", line_range:"700:760",
+// full:true) returned 112,831 characters across 3,485 lines -- the
+// model had passed full:true specifically because a PRIOR capped
+// read-file response on this same file suggested it as the way to
+// bypass the signature-only cap, not realizing (before this fix)
+// line_range wasn't wired up at all, so full:true dumped the entire
+// file. TestHandleReadFile_LineRangeNarrowsToOverlappingDefs already
+// locks in line_range alone; this confirms full:true composes safely
+// with it instead of re-enabling the whole-file dump on a large file,
+// which is the exact combination the real trajectory used.
+func TestHandleReadFile_LineRangeWithFullTrueStaysNarrowOnLargeFile(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	if err := os.MkdirAll(projDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+
+	// A file with 60 small functions (~10 lines each, ~600 lines total)
+	// -- large enough that dumping every def's body would dwarf a
+	// narrowly-scoped few-def response, mirroring the real file's shape
+	// (81 definitions, 3,485 lines).
+	var src strings.Builder
+	src.WriteString("package big\n\n")
+	for i := 0; i < 60; i++ {
+		fmt.Fprintf(&src, "// Func%d does something.\nfunc Func%d() int {\n\tx := %d\n\ty := x * 2\n\tz := y + 1\n\treturn z\n}\n\n", i, i, i)
+	}
+	if err := os.WriteFile(filepath.Join(projDir, "big.go"), []byte(src.String()), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+
+	s := &server{backend: db}
+
+	// Full, uncapped whole-file baseline for comparison.
+	fullResult, _, err := s.handleReadFile(context.Background(), nil, codeParam{File: "big.go", Full: true})
+	if err != nil {
+		t.Fatalf("read-file (whole file): %v", err)
+	}
+	fullText := resultText(t, fullResult)
+
+	// Narrow window + full:true, same as the real trajectory's exact args.
+	narrowResult, _, err := s.handleReadFile(context.Background(), nil, codeParam{File: "big.go", LineRange: "50:65", Full: true})
+	if err != nil {
+		t.Fatalf("read-file (line_range+full): %v", err)
+	}
+	narrowText := resultText(t, narrowResult)
+
+	if len(narrowText) >= len(fullText)/2 {
+		t.Errorf("line_range:\"50:65\"+full:true returned %d bytes, not meaningfully narrower than the whole file's %d bytes -- full:true is bypassing line_range narrowing", len(narrowText), len(fullText))
+	}
+	if strings.Contains(narrowText, "Func0()") {
+		t.Errorf("expected Func0 (far outside the requested range) to be excluded, got it in:\n%s", narrowText)
+	}
+}
