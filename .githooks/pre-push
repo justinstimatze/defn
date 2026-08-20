@@ -1,0 +1,28 @@
+#!/bin/bash
+# Mirrors what .github/workflows/ci.yml actually checks (build, vet,
+# test, self-hosting round-trip), run once before code leaves the
+# machine rather than relying on GitHub Actions catching it after the
+# fact -- this repo's branch protection has enforce_admins=false, so a
+# direct push to main by the repo owner bypasses the "test" required
+# status check entirely.
+set -e
+
+echo "Running CI-equivalent checks before push..."
+
+echo "-> build"
+CGO_ENABLED=1 go build ./cmd/defn/
+
+echo "-> vet"
+go vet ./...
+
+echo "-> unit tests"
+CGO_ENABLED=1 go test ./... -count=1 -timeout 5m
+
+echo "-> self-hosting round-trip"
+EMIT_DIR=$(mktemp -d)
+DEFN_DB=.defn ./defn ingest .
+DEFN_DB=.defn ./defn emit "$EMIT_DIR"
+(cd "$EMIT_DIR" && go build ./cmd/defn/)
+rm -rf "$EMIT_DIR"
+
+echo "All CI-equivalent checks passed."

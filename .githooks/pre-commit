@@ -1,5 +1,28 @@
 #!/bin/bash
 
+# Fast, blocking checks (seconds, not minutes) -- the full CI-mirroring
+# checks (build/vet/test/self-hosting round-trip) live in pre-push
+# instead, so commit-time stays cheap while nothing leaves the machine
+# unverified. See pre-push's own comment for why: this repo's branch
+# protection has enforce_admins=false, so a direct push to main by the
+# repo owner bypasses the "test" required status check entirely --
+# CI failing after the fact doesn't block anything, it just leaves a
+# red X nobody is forced to look at.
+staged_go_files=$(git diff --cached --name-only --diff-filter=ACM -- \'*.go\')
+if [ -n "$staged_go_files" ]; then
+  unformatted=$(gofmt -l $staged_go_files)
+  if [ -n "$unformatted" ]; then
+    echo "\xe2\x9d\x8c gofmt would reformat:"
+    echo "$unformatted"
+    echo "Run: gofmt -w $unformatted"
+    exit 1
+  fi
+  if ! go vet ./...; then
+    echo "\xe2\x9d\x8c go vet failed"
+    exit 1
+  fi
+fi
+
 # Run CodeScene delta analysis on staged changes (non-blocking)
 if command -v cs &> /dev/null; then
   echo "Running CodeScene delta analysis..."
