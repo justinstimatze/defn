@@ -19,10 +19,22 @@ echo "-> unit tests"
 CGO_ENABLED=1 go test ./... -count=1 -timeout 5m
 
 echo "-> self-hosting round-trip"
+# Isolated tempdir DB, not the repo's own .defn -- that one is
+# routinely held open by a live `defn serve` during normal
+# development (e.g. an active MCP session), and this check has no
+# need to share it: a fresh ingest into scratch space is a truer
+# match for what CI's fresh-checkout run does anyway.
+#
+# --reindex skips the onboarding-file writes (CLAUDE.md, .mcp.json,
+# .gitignore, .codex config) that a plain `defn ingest` performs --
+# without it, every push would leave the real working tree's CLAUDE.md
+# etc. dirtied by this check's own side effect, confirmed live the
+# first time this hook ran for real.
 EMIT_DIR=$(mktemp -d)
-DEFN_DB=.defn ./defn ingest .
-DEFN_DB=.defn ./defn emit "$EMIT_DIR"
+ROUNDTRIP_DB=$(mktemp -d)
+DEFN_DB="$ROUNDTRIP_DB" ./defn ingest . --reindex
+DEFN_DB="$ROUNDTRIP_DB" ./defn emit "$EMIT_DIR"
 (cd "$EMIT_DIR" && go build ./cmd/defn/)
-rm -rf "$EMIT_DIR"
+rm -rf "$EMIT_DIR" "$ROUNDTRIP_DB"
 
 echo "All CI-equivalent checks passed."
