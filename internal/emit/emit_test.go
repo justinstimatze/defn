@@ -2340,3 +2340,36 @@ func TestEmitFullSweepSkipsGeneratedFilesButStillCleansOthers(t *testing.T) {
 		t.Fatalf("clean.go's unused import was NOT stripped -- the unscoped sweep should still clean non-generated files:\n%s", cleanData)
 	}
 }
+
+func TestMergeDeclsIntoSource_UngroupedThreeNameConstDoesNotBlockUnrelatedEdit(t *testing.T) {
+	existing := []byte(`package caddy
+
+const phOpen, phClose, phEscape = '{', '}', '\\'
+
+func readFileIntoBuffer(path string) (string, error) {
+	return path, nil
+}
+`)
+	// ingestValueSpec's own convention for an ungrouped (standalone) spec:
+	// Body renders the WHOLE GenDecl, keyword included -- unlike a
+	// grouped spec's Body, which is just the spec's own text.
+	constBody := `const phOpen, phClose, phEscape = '{', '}', '\\'`
+	defs := []store.Definition{
+		{Name: "phOpen", Kind: "const", Body: constBody},
+		{Name: "readFileIntoBuffer", Kind: "function", Body: "func readFileIntoBuffer(path string) (string, error) {\n\treturn path, io.EOF\n}"},
+	}
+	merged, ok, unmatched := mergeDeclsIntoSource(existing, defs, nil, nil)
+	if !ok {
+		t.Fatalf("mergeDeclsIntoSource returned ok=false")
+	}
+	if len(unmatched) != 0 {
+		t.Fatalf("expected no unmatched defs, got %v -- the ungrouped 3-name const spec should match under its first name (phOpen)", unmatched)
+	}
+	got := string(merged)
+	if !strings.Contains(got, "phOpen, phClose, phEscape") {
+		t.Errorf("ungrouped multi-name const text lost from merged output:\n%s", got)
+	}
+	if !strings.Contains(got, "io.EOF") {
+		t.Errorf("unrelated func edit didn't land:\n%s", got)
+	}
+}
