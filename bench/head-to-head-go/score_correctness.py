@@ -180,6 +180,33 @@ def arm_write_count(arm_data):
     return n
 
 
+def writes_need_name_resolution(arm_data):
+    """True if the arm made any write op that identifies its target by
+    name/receiver rather than an explicit file/path -- these can only be
+    scored correctly via resolve_defname_to_file, which requires a live
+    workdir with an intact .defn DB (see its own docstring)."""
+    for msg in arm_data.get("fncall_messages", []):
+        if msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls") or []:
+            fn = tc.get("function", {})
+            if not fn.get("name", "").endswith("__code"):
+                continue
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except Exception:
+                continue
+            op = args.get("op", "")
+            if op in WRITE_OPS and op != "apply":
+                if not (args.get("file") or args.get("path")):
+                    return True
+            elif op == "apply":
+                for sub in args.get("operations", []):
+                    if not (sub.get("file") or sub.get("path")):
+                        return True
+    return False
+
+
 def arm_touched_files(arm_data, workdir_hint):
     """Extract repo-relative paths the defn arm modified (via code tool ops
     or bash write commands). Best effort — normalize what we can."""
@@ -295,13 +322,37 @@ def main():
         arm = json.load(open(arm_path))
         workdir = arm.get("workdir") or os.path.join(WORKDIR_ROOT, inst_id)
         gold = gold_files(task.get("fix_patch") or "")
+        n_writes = arm_write_count(arm)
+        # Confirmed 2026-08-20 on the real head-to-head-go corpus: EVERY
+        # one of 28 completed tasks had an unresolvable workdir when
+        # rescored later (8 predate the /tmp->~/.cache fix and were wiped
+        # by an EC2 stop/start, 15 recorded a workdir on a totally
+        # different machine, 3 were evicted from ~/.cache by later runs'
+        # disk pressure). resolve_defname_to_file silently returns []
+        # when the workdir/.defn is gone, so any name-based write op
+        # (the common case -- defn's edit/apply take name, not file) was
+        # silently scored as touched=0, indistinguishable from "the arm
+        # edited the wrong file" in the aggregate. Surface this as an
+        # explicit unscoreable state instead of a misleading 0.0 F1.
+        if writes_need_name_resolution(arm) and not os.path.isdir(
+            os.path.join(workdir, ".defn")
+        ):
+            rows.append(
+                {
+                    "id": inst_id,
+                    "error": f"workdir unresolvable (not on this machine, or evicted): {workdir}",
+                    "n_writes": n_writes,
+                    "gold": sorted(gold),
+                    "cost": arm.get("cost_usd"),
+                }
+            )
+            continue
         # Parse arm tool calls first. git-status includes formatting churn
         # from `defn emit` and over-reports; only fall back to it when the
         # arm didn't make ANY write ops (informational-answer case), so an
         # informational-answer scores 0/0. If writes were attempted but
         # resolve failed (partial trajectory extraction), keep the partial
         # set rather than fall back to the noisy git snapshot.
-        n_writes = arm_write_count(arm)
         touched = arm_touched_files(arm, workdir)
         # No git-status fallback: `defn emit` re-formats every file in a
         # module after any DB mutation, so git status is not a reliable
@@ -334,28 +385,42 @@ def main():
     print(
         f"  {'instance':30s}  {'P':>5s} {'R':>5s} {'F1':>5s}  gold  touched  hit  wr  cost"
     )
-    for r in rows:
+    ok_rows = [r for r in rows if "error" not in r]
+    err_rows = [r for r in rows if "error" in r]
+    for r in ok_rows:
         cost = f"${r['cost']:.3f}" if r["cost"] else "-"
         print(
             f"  {r['id']:30s}  {r['precision']:>5.2f} {r['recall']:>5.2f} {r['f1']:>5.2f}  "
             f"{len(r['gold']):>4}  {len(r['touched']):>7}  {len(r['hit']):>3}  {r['n_writes']:>2}  {cost}"
         )
+    for r in err_rows:
+        print(f"  {r['id']:30s}  UNSCOREABLE: {r['error']}")
 
     import statistics
 
-    print(f"\n=== AGGREGATE ({len(rows)} tasks) ===")
-    print(f"  mean precision: {statistics.mean(r['precision'] for r in rows):.3f}")
-    print(f"  mean recall:    {statistics.mean(r['recall'] for r in rows):.3f}")
-    print(f"  mean F1:        {statistics.mean(r['f1'] for r in rows):.3f}")
-    hits = sum(1 for r in rows if r["f1"] >= 0.5)
-    print(f"  F1 >= 0.5: {hits}/{len(rows)}")
+    if not ok_rows:
+        print(
+            f"\n=== AGGREGATE: 0/{len(rows)} tasks scoreable, all workdirs unresolvable ==="
+        )
+        sys.exit(0)
+
+    print(f"\n=== AGGREGATE ({len(ok_rows)}/{len(rows)} tasks scoreable) ===")
+    if err_rows:
+        print(
+            f"  ({len(err_rows)} excluded as unscoreable, not counted as 0 -- see UNSCOREABLE rows above)"
+        )
+    print(f"  mean precision: {statistics.mean(r['precision'] for r in ok_rows):.3f}")
+    print(f"  mean recall:    {statistics.mean(r['recall'] for r in ok_rows):.3f}")
+    print(f"  mean F1:        {statistics.mean(r['f1'] for r in ok_rows):.3f}")
+    hits = sum(1 for r in ok_rows if r["f1"] >= 0.5)
+    print(f"  F1 >= 0.5: {hits}/{len(ok_rows)}")
 
     # Sub-aggregate: tasks where the arm actually attempted writes. This
     # separates the "gave up" cost from the "wrong edit" cost.
-    attempted = [r for r in rows if r["n_writes"] > 0]
-    if attempted and len(attempted) < len(rows):
+    attempted = [r for r in ok_rows if r["n_writes"] > 0]
+    if attempted and len(attempted) < len(ok_rows):
         print(
-            f"\n=== ATTEMPTED-ONLY ({len(attempted)}/{len(rows)} arms with writes>0) ==="
+            f"\n=== ATTEMPTED-ONLY ({len(attempted)}/{len(ok_rows)} arms with writes>0) ==="
         )
         print(
             f"  mean precision: {statistics.mean(r['precision'] for r in attempted):.3f}"
@@ -366,7 +431,7 @@ def main():
         print(f"  mean F1:        {statistics.mean(r['f1'] for r in attempted):.3f}")
         att_hits = sum(1 for r in attempted if r["f1"] >= 0.5)
         print(f"  F1 >= 0.5: {att_hits}/{len(attempted)}")
-        no_writes = [r["id"] for r in rows if r["n_writes"] == 0]
+        no_writes = [r["id"] for r in ok_rows if r["n_writes"] == 0]
         print(f"  no-write arms: {no_writes}")
     total_cost = sum(r["cost"] or 0 for r in rows)
     print(f"  total cost:  ${total_cost:.2f}")
