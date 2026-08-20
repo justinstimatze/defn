@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/justinstimatze/defn/internal/store"
 )
 
 // TestReadNeighborhoodAppendedByDefault locks in #202: a bare
@@ -48,5 +50,60 @@ func TestReadNeighborhoodSkippedForQuery(t *testing.T) {
 	text := resultText(t, result)
 	if strings.Contains(text, "Related (#202)") {
 		t.Errorf("query-scoped read must NOT emit #202 footer; got: %s", text)
+	}
+}
+
+// TestBodyReferencesIdent_RequiresWordBoundary confirms the
+// identifier-boundary check doesn't false-positive on a name that's
+// merely a substring of a longer identifier (e.g. "Add" inside
+// "AddAll"), while still matching plain calls and method calls.
+func TestBodyReferencesIdent_RequiresWordBoundary(t *testing.T) {
+	cases := []struct {
+		body string
+		name string
+		want bool
+	}{
+		{"x := AddAll(1)", "Add", false},
+		{"x := Add(1)", "Add", true},
+		{"x.Add(1)", "Add", true},
+		{"y := Address", "Add", false},
+	}
+	for _, c := range cases {
+		if got := bodyReferencesIdent(c.body, c.name); got != c.want {
+			t.Errorf("bodyReferencesIdent(%q, %q) = %v, want %v", c.body, c.name, got, c.want)
+		}
+	}
+}
+
+// TestPrioritizeByBodyReference_PromotesBodyReferencedCalleeAheadOfAlphabetical
+// locks in the #313 cost-gap fix: GetCallees orders purely
+// alphabetically, so a capped top-3 display on a high-fan-out
+// function can surface names unrelated to what the body just shown
+// actually calls, forcing an avoidable extra round-trip. Fabricates
+// callee defs directly (bypassing ingest) since reproducing the exact
+// real-world mechanism that creates a callee edge not literally named
+// in body text is out of scope -- this pins the reordering logic
+// itself, which is what changed.
+func TestPrioritizeByBodyReference_PromotesBodyReferencedCalleeAheadOfAlphabetical(t *testing.T) {
+	defs := []store.Definition{
+		{Name: "AlphaFirst"},
+		{Name: "AlphaSecond"},
+		{Name: "AlphaThird"},
+		{Name: "ZzzTarget"},
+	}
+	body := "func BigFunc() int {\n\treturn ZzzTarget()\n}"
+	got := prioritizeByBodyReference(defs, body)
+	names := make([]string, len(got))
+	for i, d := range got {
+		names[i] = d.Name
+	}
+	if len(got) != 4 || names[0] != "ZzzTarget" {
+		t.Fatalf("expected ZzzTarget promoted to front, got order: %v", names)
+	}
+	wantRest := []string{"AlphaFirst", "AlphaSecond", "AlphaThird"}
+	for i, name := range wantRest {
+		if names[i+1] != name {
+			t.Errorf("expected rest to preserve original relative order; position %d: want %s got %s", i+1, name, names[i+1])
+		}
 	}
 }

@@ -65,6 +65,7 @@ func (s *server) renderReadNeighborhood(d *store.Definition) string {
 
 	// 3. Top 3 callees
 	if callees, err := s.backend.GetCallees(d.ID); err == nil && len(callees) > 0 {
+		callees = prioritizeByBodyReference(callees, d.Body)
 		parts := make([]string, 0, 3)
 		for i, c := range callees {
 			if i >= 3 {
@@ -114,4 +115,65 @@ func (s *server) renderReadNeighborhood(d *store.Definition) string {
 	}
 
 	return sb.String()
+}
+
+// bodyReferencesIdent reports whether name appears in body as a
+// standalone identifier -- not as a substring of a longer identifier
+// (e.g. "Add" must not match inside "AddAll").
+func bodyReferencesIdent(body, name string) bool {
+	start := 0
+	for {
+		idx := strings.Index(body[start:], name)
+		if idx == -1 {
+			return false
+		}
+		idx += start
+		beforeOK := idx == 0 || !isIdentByte(body[idx-1])
+		afterPos := idx + len(name)
+		afterOK := afterPos >= len(body) || !isIdentByte(body[afterPos])
+		if beforeOK && afterOK {
+			return true
+		}
+		start = idx + 1
+	}
+}
+
+// isIdentByte reports whether b can appear inside a Go identifier
+// (ASCII letters, digits, underscore -- good enough for the
+// word-boundary check bodyReferencesIdent needs; Go identifiers can
+// contain Unicode letters too, but that's not a realistic case for
+// generated callee names in this codebase).
+func isIdentByte(b byte) bool {
+	return b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
+// prioritizeByBodyReference reorders callee defs so any whose name
+// appears as a literal identifier in body come first (in their
+// existing relative order), followed by the rest (also in their
+// existing relative order). GetCallees orders purely alphabetically
+// (ORDER BY d.name), so a capped top-N display on a high-fan-out
+// function often surfaces names having nothing to do with what body
+// actually calls -- confirmed via a real prometheus-19184 trajectory
+// where refresh's 42 callees showed (*FloatHistogram).Add first
+// (alphabetically early, unrelated) while nodeType -- literally
+// called in the body just shown -- sat behind "+39 more", forcing an
+// extra round-trip to look it up. Callees are exactly the
+// identifiers that appear as calls in body, so this reordering is
+// free (same data, no extra bytes) and directly targets that failure
+// mode. Not applied to callers -- a caller invokes this def, not the
+// other way around, so it wouldn't appear inside body.
+func prioritizeByBodyReference(defs []store.Definition, body string) []store.Definition {
+	if body == "" {
+		return defs
+	}
+	referenced := make([]store.Definition, 0, len(defs))
+	rest := make([]store.Definition, 0, len(defs))
+	for _, d := range defs {
+		if d.Name != "" && bodyReferencesIdent(body, d.Name) {
+			referenced = append(referenced, d)
+		} else {
+			rest = append(rest, d)
+		}
+	}
+	return append(referenced, rest...)
 }
