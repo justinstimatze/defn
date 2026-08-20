@@ -35,6 +35,25 @@ LOG_PATH="$6"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Guardrail (2026-08-20): refuse to launch against a stale/dirty defn
+# checkout -- see launch_arm_parallel.sh's identical check for the full
+# rationale (two full bench reruns burned on a binary missing
+# already-committed fixes, discovered only after the fact). Set
+# DEFN_BENCH_SKIP_SYNC_CHECK=1 to bypass for a deliberate exploratory
+# run against unpushed local changes.
+if [ -z "${DEFN_BENCH_SKIP_SYNC_CHECK:-}" ]; then
+	git -C "$SCRIPT_DIR" fetch origin main --quiet
+	if [ -n "$(git -C "$SCRIPT_DIR" status --porcelain --untracked-files=no)" ]; then
+		echo "[launch_arm] ABORT: $SCRIPT_DIR has uncommitted tracked changes -- commit or stash before launching a bench run whose result you intend to trust (or set DEFN_BENCH_SKIP_SYNC_CHECK=1 to override)." >&2
+		exit 1
+	fi
+	behind="$(git -C "$SCRIPT_DIR" rev-list --count HEAD..origin/main)"
+	if [ "$behind" -gt 0 ]; then
+		echo "[launch_arm] ABORT: $SCRIPT_DIR is $behind commit(s) behind origin/main -- pull before launching, or the binary under test won't match what you think it is (or set DEFN_BENCH_SKIP_SYNC_CHECK=1 to override)." >&2
+		exit 1
+	fi
+fi
+
 export PATH="/usr/local/go/bin:$HOME/go/bin:$PATH"
 if [ -f "$HOME/.anthropic_env" ]; then
 	set -a

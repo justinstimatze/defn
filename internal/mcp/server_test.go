@@ -10639,6 +10639,9 @@ func TestHandleCode_VersionReportsBuildIdentity(t *testing.T) {
 	if !strings.Contains(text, "pid:") {
 		t.Errorf("expected pid in response, got: %s", text)
 	}
+	if !strings.Contains(text, "commit:") {
+		t.Errorf("expected a commit: line (see CommitInfo) in response, got: %s", text)
+	}
 }
 
 // TestHandleRename_StructFieldWithSameNameOnAnotherTypeInSameFileResolvesCorrectly
@@ -12407,5 +12410,21 @@ func TestHandleDelete_RemoveFileStillRunsWhenForcedDeleteLeavesBuildWarning(t *t
 	}
 	if _, statErr := os.Stat(filepath.Join(projDir, "solo.go")); !os.IsNotExist(statErr) {
 		t.Errorf("expected solo.go to be removed from disk, stat err: %v", statErr)
+	}
+}
+
+// TestCommitInfo_ReturnsRevisionWhenBuiltInAGitCheckout locks in
+// CommitInfo's self-describing-binary contract: a test binary built by
+// `go test` inside this repo's git checkout gets VCS info stamped
+// automatically (no ldflags needed), so this should never fall back to
+// "unknown" in normal CI/dev runs -- only when built with
+// GOFLAGS=-buildvcs=false or outside a git repo entirely.
+func TestCommitInfo_ReturnsRevisionWhenBuiltInAGitCheckout(t *testing.T) {
+	got := CommitInfo()
+	if got == "" {
+		t.Fatal("CommitInfo returned an empty string, want a revision or \"unknown\"")
+	}
+	if got == "unknown" {
+		t.Skip("VCS info not stamped -- built with -buildvcs=false or outside a git checkout")
 	}
 }

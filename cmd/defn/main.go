@@ -22,7 +22,7 @@ func main() {
 			os.Exit(1)
 		}
 		if a == "-v" || a == "--version" {
-			fmt.Println(mcpserver.Version)
+			fmt.Printf("%s (%s)\n", mcpserver.Version, mcpserver.CommitInfo())
 			os.Exit(0)
 		}
 	}
@@ -163,7 +163,7 @@ func main() {
 	case "analyze-session":
 		cmdAnalyzeSession(os.Args[2:])
 	case "version":
-		fmt.Println(mcpserver.Version)
+		fmt.Printf("%s (%s)\n", mcpserver.Version, mcpserver.CommitInfo())
 	default:
 		usage()
 		os.Exit(1)

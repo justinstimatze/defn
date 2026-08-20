@@ -10385,6 +10385,7 @@ func dryRunResult(msg string) (*sdkmcp.CallToolResult, any, error) {
 func (s *server) handleVersion(_ context.Context, _ *sdkmcp.CallToolRequest, _ codeParam) (*sdkmcp.CallToolResult, any, error) {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("defn %s\n", Version))
+	sb.WriteString(fmt.Sprintf("commit: %s\n", CommitInfo()))
 	if exe, err := os.Executable(); err == nil {
 		sb.WriteString(fmt.Sprintf("binary: %s\n", exe))
 		if info, statErr := os.Stat(exe); statErr == nil {
@@ -10742,4 +10743,42 @@ func (s *server) newFileHint(file string, wasNew bool) string {
 		return ""
 	}
 	return fmt.Sprintf("_new file -- if this project requires a license/copyright header, add one with code(op:\"insert-header\", file:%q, body:\"...\") before this file is considered complete._\n", file)
+}
+
+// CommitInfo returns the git commit this binary was built from, read
+// from Go's automatic VCS stamping (populated by `go build` inside a
+// git checkout -- no ldflags required) rather than a manually-bumped
+// Version const that can drift out of sync with what actually got
+// built. Two divergent checkouts of this same repo (a local machine
+// and a bench box) once both reported Version "0.26.82" while running
+// genuinely different commits, which made reconciling which fixes were
+// actually deployed a forensic exercise -- this makes a binary
+// self-describing instead. Returns "unknown" if the toolchain didn't
+// stamp VCS info (e.g. built outside a git repo, or via `go install`
+// from a module cache/proxy).
+func CommitInfo() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	var revision string
+	var modified bool
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			revision = s.Value
+		case "vcs.modified":
+			modified = s.Value == "true"
+		}
+	}
+	if revision == "" {
+		return "unknown"
+	}
+	if len(revision) > 12 {
+		revision = revision[:12]
+	}
+	if modified {
+		revision += "-dirty"
+	}
+	return revision
 }
