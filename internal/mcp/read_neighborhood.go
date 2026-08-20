@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/justinstimatze/defn/internal/store"
@@ -117,25 +118,13 @@ func (s *server) renderReadNeighborhood(d *store.Definition) string {
 	return sb.String()
 }
 
-// bodyReferencesIdent reports whether name appears in body as a
-// standalone identifier -- not as a substring of a longer identifier
-// (e.g. "Add" must not match inside "AddAll").
+// bodyReferencesIdent reports whether name is called (call-shape:
+// name immediately followed by optional whitespace then "(") anywhere
+// in body. Delegates to firstCallPosition; kept as a bool-only helper
+// for callers that don't need the position.
 func bodyReferencesIdent(body, name string) bool {
-	start := 0
-	for {
-		idx := strings.Index(body[start:], name)
-		if idx == -1 {
-			return false
-		}
-		idx += start
-		beforeOK := idx == 0 || !isIdentByte(body[idx-1])
-		afterPos := idx + len(name)
-		afterOK := afterPos >= len(body) || !isIdentByte(body[afterPos])
-		if beforeOK && afterOK {
-			return true
-		}
-		start = idx + 1
-	}
+	_, ok := firstCallPosition(body, name)
+	return ok
 }
 
 // isIdentByte reports whether b can appear inside a Go identifier
@@ -147,33 +136,87 @@ func isIdentByte(b byte) bool {
 	return b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
 }
 
-// prioritizeByBodyReference reorders callee defs so any whose name
-// appears as a literal identifier in body come first (in their
-// existing relative order), followed by the rest (also in their
-// existing relative order). GetCallees orders purely alphabetically
-// (ORDER BY d.name), so a capped top-N display on a high-fan-out
-// function often surfaces names having nothing to do with what body
-// actually calls -- confirmed via a real prometheus-19184 trajectory
-// where refresh's 42 callees showed (*FloatHistogram).Add first
-// (alphabetically early, unrelated) while nodeType -- literally
-// called in the body just shown -- sat behind "+39 more", forcing an
-// extra round-trip to look it up. Callees are exactly the
-// identifiers that appear as calls in body, so this reordering is
-// free (same data, no extra bytes) and directly targets that failure
-// mode. Not applied to callers -- a caller invokes this def, not the
-// other way around, so it wouldn't appear inside body.
+// prioritizeByBodyReference reorders callee defs so any whose name is
+// called (name immediately followed by optional whitespace then "("
+// -- a call shape, not merely a type reference or field access)
+// somewhere in body come first, ordered by FIRST APPEARANCE POSITION
+// in body (mirroring the function's own control flow, so its
+// earliest/most substantive calls surface first) rather than
+// alphabetically. Falls back to the existing order for anything not
+// found as a call.
+//
+// Two refinements were needed beyond a naive "does the name appear in
+// body" check, both found by validating against a REAL prometheus
+// trajectory ((*MSKDiscovery).refresh, 44 callees, confirmed on the
+// v7 bench corpus):
+//  1. Call-shape only -- a naive identifier-occurrence check
+//     false-positived on every type reference (types.Cluster) and
+//     struct field access (tg.Targets, d.region), since Go
+//     identifiers get reused constantly across those unrelated roles
+//     -- all 44/44 callees matched under a bare-occurrence check,
+//     making the reordering a no-op.
+//  2. First-appearance-position ordering, not alphabetical-within-
+//     bucket -- common short method names (Add, Done, Lock) genuinely
+//     called via a DIFFERENT receiver (sync.WaitGroup, sync.Mutex)
+//     happen to share a bare name with an unrelated callee edge and
+//     sort alphabetically early, burying the function's own earliest
+//     substantive calls (initMskClient, describeClusters,
+//     listClusters) that a human reading top-to-bottom would meet
+//     first. Ordering by body position fixes this without needing
+//     receiver-level type resolution this render path doesn't have.
 func prioritizeByBodyReference(defs []store.Definition, body string) []store.Definition {
 	if body == "" {
 		return defs
 	}
-	referenced := make([]store.Definition, 0, len(defs))
+	type posDef struct {
+		pos int
+		def store.Definition
+	}
+	referenced := make([]posDef, 0, len(defs))
 	rest := make([]store.Definition, 0, len(defs))
 	for _, d := range defs {
-		if d.Name != "" && bodyReferencesIdent(body, d.Name) {
-			referenced = append(referenced, d)
+		if d.Name == "" {
+			rest = append(rest, d)
+			continue
+		}
+		if pos, ok := firstCallPosition(body, d.Name); ok {
+			referenced = append(referenced, posDef{pos, d})
 		} else {
 			rest = append(rest, d)
 		}
 	}
-	return append(referenced, rest...)
+	sort.SliceStable(referenced, func(i, j int) bool { return referenced[i].pos < referenced[j].pos })
+	out := make([]store.Definition, 0, len(defs))
+	for _, pd := range referenced {
+		out = append(out, pd.def)
+	}
+	return append(out, rest...)
+}
+
+// firstCallPosition returns the byte offset of the first call-shaped
+// occurrence of name in body (name as a standalone identifier,
+// immediately followed by optional whitespace then "("), and whether
+// one was found. Call-shape excludes type references (types.Cluster)
+// and field accesses (tg.Targets) that would otherwise false-positive
+// a plain identifier-occurrence check -- see prioritizeByBodyReference
+// for why this distinction matters.
+func firstCallPosition(body, name string) (int, bool) {
+	start := 0
+	for {
+		idx := strings.Index(body[start:], name)
+		if idx == -1 {
+			return 0, false
+		}
+		idx += start
+		beforeOK := idx == 0 || !isIdentByte(body[idx-1])
+		afterPos := idx + len(name)
+		afterOK := afterPos >= len(body) || !isIdentByte(body[afterPos])
+		if beforeOK && afterOK {
+			rest := strings.TrimLeft(body[afterPos:], " \t")
+			if strings.HasPrefix(rest, "(") {
+				return idx, true
+			}
+		}
+		start = idx + 1
+	}
 }

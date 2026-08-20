@@ -107,3 +107,48 @@ func TestPrioritizeByBodyReference_PromotesBodyReferencedCalleeAheadOfAlphabetic
 		}
 	}
 }
+
+// TestBodyReferencesIdent_RequiresCallShapeNotJustOccurrence locks in
+// the first refinement found validating against a real prometheus
+// trajectory ((*MSKDiscovery).refresh): a bare identifier-occurrence
+// check false-positived on every type reference and struct field
+// access sharing a name with an unrelated callee edge (all 44/44
+// callees matched, making the reordering a no-op). Requiring a
+// trailing "(" (call shape) excludes those non-call roles.
+func TestBodyReferencesIdent_RequiresCallShapeNotJustOccurrence(t *testing.T) {
+	cases := []struct {
+		body string
+		name string
+		want bool
+	}{
+		{"var x types.Cluster", "Cluster", false},                // type reference
+		{"tg.Targets = append(tg.Targets, x)", "Targets", false}, // field access (both occurrences)
+		{"x := Cluster()", "Cluster", true},                      // real call
+		{"y.Cluster()", "Cluster", true},                         // real method call
+	}
+	for _, c := range cases {
+		if got := bodyReferencesIdent(c.body, c.name); got != c.want {
+			t.Errorf("bodyReferencesIdent(%q, %q) = %v, want %v", c.body, c.name, got, c.want)
+		}
+	}
+}
+
+// TestPrioritizeByBodyReference_OrdersReferencedByBodyPositionNotAlphabetical
+// locks in the second refinement found validating against a real
+// prometheus trajectory: alphabetically-early common method names
+// (Add, Done, Lock) genuinely called via an unrelated receiver
+// (sync.WaitGroup, sync.Mutex) sorted ahead of a function's own
+// earliest, most substantive calls when the referenced bucket kept
+// its original (alphabetical) relative order. Ordering by first
+// body-appearance position instead fixes this.
+func TestPrioritizeByBodyReference_OrdersReferencedByBodyPositionNotAlphabetical(t *testing.T) {
+	defs := []store.Definition{
+		{Name: "AaaCalledLast"},
+		{Name: "ZzzCalledFirst"},
+	}
+	body := "func F() {\n\tZzzCalledFirst()\n\t// ...\n\tAaaCalledLast()\n}"
+	got := prioritizeByBodyReference(defs, body)
+	if got[0].Name != "ZzzCalledFirst" || got[1].Name != "AaaCalledLast" {
+		t.Fatalf("expected body-position order (ZzzCalledFirst, AaaCalledLast) despite reverse alphabetical order, got: %s, %s", got[0].Name, got[1].Name)
+	}
+}
