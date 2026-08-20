@@ -151,7 +151,38 @@ func (s *server) handleContext(ctx context.Context, _ *sdkmcp.CallToolRequest, a
 		return errResult(fmt.Errorf("context: %w", err))
 	}
 
-	const contextTopN = 5
+	// #250: Limit/Module/File were accepted params but silently ignored --
+	// context always searched/returned the whole repo capped at a fixed
+	// top-5, with zero error or note. Same silent-drop class as #241
+	// (search's file:) -- apply the identical post-hoc filtering.
+	if args.File != "" {
+		filtered := scored[:0]
+		for _, c := range scored {
+			if strings.Contains(c.Def.SourceFile, args.File) {
+				filtered = append(filtered, c)
+			}
+		}
+		scored = filtered
+	}
+	if args.Module != "" {
+		mods, _ := s.backend.ListModules()
+		modulePathByID := make(map[int64]string, len(mods))
+		for _, m := range mods {
+			modulePathByID[m.ID] = m.Path
+		}
+		filtered := scored[:0]
+		for _, c := range scored {
+			if strings.Contains(modulePathByID[c.Def.ModuleID], args.Module) {
+				filtered = append(filtered, c)
+			}
+		}
+		scored = filtered
+	}
+
+	contextTopN := 5
+	if args.Limit > 0 {
+		contextTopN = args.Limit
+	}
 	top := scored
 	if len(top) > contextTopN {
 		top = top[:contextTopN]

@@ -101,7 +101,20 @@ func OpenSQLite(path string) (*SQLiteDB, error) {
 		}
 	}
 
-	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(5000)"
+	// busy_timeout was 5000ms -- too short for the case that actually
+	// hits it in practice: an agent's foreground edit/create racing a
+	// large background startup ingest, which can hold/reacquire the
+	// write lock in bursts for the whole ingest's duration (minutes on
+	// a large repo like prometheus, not milliseconds). Real trajectory
+	// (prometheus-12024, 2026-08-10): raw "sqlite: update definition:
+	// database is locked (5) (SQLITE_BUSY)" surfaced directly to the
+	// agent from two SEQUENTIAL (not even parallel) edit calls while
+	// the "[startup ingest in progress]" banner was still attached to
+	// every tool result across the entire 638s session. 30s gives a
+	// foreground write a real chance to land during a long ingest
+	// instead of failing fast and pushing error recovery onto the
+	// model.
+	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(30000)"
 
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -575,18 +588,34 @@ func (s *SQLiteDB) FindDefinitions(namePattern string) ([]Definition, error) {
 }
 
 func (s *SQLiteDB) FindDefinitionsByFile(fileSuffix string, sourceFile string, line int) ([]Definition, error) {
-	query := `SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test,
+	// An exact sourceFile already disambiguates uniquely (it's the
+	// real repo-relative on-disk path) -- match on it alone rather
+	// than ALSO requiring m.path LIKE %fileSuffix%. That module-path
+	// filter assumes a module's Go import path is literally a
+	// filesystem-path suffix of the file's directory, which breaks
+	// for any nested module using semantic import versioning (e.g.
+	// etcd's go.etcd.io/etcd/client/pkg/v3/transport does NOT end
+	// with ".../client/pkg/transport" -- "v3" sits in the middle) --
+	// real definitions were silently dropped for every such file.
+	var query string
+	var args []any
+	if sourceFile != "" {
+		query = `SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test,
+	            COALESCE(d.receiver,''), COALESCE(d.signature,''),
+	            COALESCE(d.start_line,0), COALESCE(d.end_line,0),
+	            COALESCE(d.source_file,'')
+	          FROM definitions d
+	          WHERE d.source_file = ?`
+		args = []any{sourceFile}
+	} else {
+		query = `SELECT d.id, d.module_id, d.name, d.kind, d.exported, d.test,
 	            COALESCE(d.receiver,''), COALESCE(d.signature,''),
 	            COALESCE(d.start_line,0), COALESCE(d.end_line,0),
 	            COALESCE(d.source_file,'')
 	          FROM definitions d
 	          JOIN modules m ON d.module_id = m.id
 	          WHERE m.path LIKE ?`
-	args := []any{"%" + fileSuffix + "%"}
-
-	if sourceFile != "" {
-		query += " AND d.source_file = ?"
-		args = append(args, sourceFile)
+		args = []any{"%" + fileSuffix + "%"}
 	}
 	if line > 0 {
 		query += " AND d.start_line <= ? AND d.end_line >= ? AND d.start_line > 0"
@@ -829,8 +858,8 @@ func (s *SQLiteDB) UpsertDefinition(d *Definition) (int64, error) {
 	var existingHash string
 	err := s.db.QueryRowContext(ctx,
 		`SELECT id, hash FROM definitions
-		 WHERE module_id = ? AND name = ? AND kind = ? AND COALESCE(receiver,'') = COALESCE(?,'') AND test = ?`,
-		d.ModuleID, d.Name, d.Kind, d.Receiver, d.Test,
+		 WHERE module_id = ? AND name = ? AND kind = ? AND COALESCE(receiver,'') = COALESCE(?,'') AND test = ? AND source_file = ?`,
+		d.ModuleID, d.Name, d.Kind, d.Receiver, d.Test, d.SourceFile,
 	).Scan(&existingID, &existingHash)
 
 	if err == sql.ErrNoRows {
@@ -906,14 +935,15 @@ func (s *SQLiteDB) UpsertDefinitionsBulk(defs []*Definition) ([]int64, error) {
 	}
 
 	type natKey struct {
-		modID    int64
-		name     string
-		kind     string
-		receiver string
-		test     bool
+		modID      int64
+		name       string
+		kind       string
+		receiver   string
+		test       bool
+		sourceFile string
 	}
 	keyOf := func(d *Definition) natKey {
-		return natKey{d.ModuleID, d.Name, d.Kind, d.Receiver, d.Test}
+		return natKey{d.ModuleID, d.Name, d.Kind, d.Receiver, d.Test, d.SourceFile}
 	}
 	type existing struct {
 		id   int64
@@ -926,21 +956,21 @@ func (s *SQLiteDB) UpsertDefinitionsBulk(defs []*Definition) ([]int64, error) {
 	}
 	for modID := range modIDs {
 		rows, err := s.db.QueryContext(ctx,
-			`SELECT id, name, kind, COALESCE(receiver,''), test, hash
+			`SELECT id, name, kind, COALESCE(receiver,''), test, COALESCE(source_file,''), hash
 			 FROM definitions WHERE module_id = ?`, modID)
 		if err != nil {
 			return nil, fmt.Errorf("sqlite: UpsertDefinitionsBulk lookup module %d: %w", modID, err)
 		}
 		for rows.Next() {
 			var e existing
-			var name, kind, receiver, hash string
+			var name, kind, receiver, sourceFile, hash string
 			var test bool
-			if err := rows.Scan(&e.id, &name, &kind, &receiver, &test, &hash); err != nil {
+			if err := rows.Scan(&e.id, &name, &kind, &receiver, &test, &sourceFile, &hash); err != nil {
 				rows.Close()
 				return nil, fmt.Errorf("sqlite: UpsertDefinitionsBulk scan: %w", err)
 			}
 			e.hash = hash
-			existingByKey[natKey{modID, name, kind, receiver, test}] = e
+			existingByKey[natKey{modID, name, kind, receiver, test, sourceFile}] = e
 		}
 		rows.Close()
 	}
@@ -953,10 +983,10 @@ func (s *SQLiteDB) UpsertDefinitionsBulk(defs []*Definition) ([]int64, error) {
 	// variant (packages.Load Tests:true can produce overlapping pkg.Syntax
 	// under some layouts — FilterPackages catches the common case but not
 	// every one). Without this guard the batch INSERT hits the unique
-	// constraint on (module_id, name, kind, receiver, test) and the whole
-	// flush fails. Last-write-wins semantics: the later Definition value
-	// replaces the earlier one in the INSERT, and both input positions
-	// receive the same row ID after the insert.
+	// constraint on (module_id, name, kind, receiver, test, source_file)
+	// and the whole flush fails. Last-write-wins semantics: the later
+	// Definition value replaces the earlier one in the INSERT, and both
+	// input positions receive the same row ID after the insert.
 	pendingByKey := make(map[natKey]int) // key → index into toInsert
 	type dupPos struct{ inputPos, canonicalToInsertIdx int }
 	var dupes []dupPos
@@ -2351,7 +2381,7 @@ func (s *SQLiteDB) Query(query string) ([]map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	var results []map[string]any
+	results := make([]map[string]any, 0)
 	for rows.Next() {
 		vals := make([]any, len(cols))
 		ptrs := make([]any, len(cols))
@@ -2383,15 +2413,20 @@ func (s *SQLiteDB) Simulate(mutations []Mutation) (*SimulationResult, error) {
 	return nil, ErrNotImplemented
 }
 
-// SetDefSummaryMinHash stores a precomputed MinHash signature for defID.
-// Idempotent — INSERT OR REPLACE keys off def_id. Called at UpsertDefinition
-// time (below) and by the backfill pass on OpenSQLite.
+// SetDefSummaryMinHash writes/updates just the def_summaries.minhash
+// column for defID. Uses ON CONFLICT DO UPDATE targeting only minhash --
+// not INSERT OR REPLACE, which does a full row DELETE+INSERT and would
+// silently reset one_line/summary_body_hash/summary_model to NULL on
+// every call, wiping out a previously-generated #160 summary. Mirrors
+// SetDefSummary's own fix for the identical hazard in the other
+// direction (see its doc comment).
 func (s *SQLiteDB) SetDefSummaryMinHash(defID int64, minhash []byte) error {
 	_, err := s.db.ExecContext(s.Ctx(),
-		`INSERT OR REPLACE INTO def_summaries(def_id, minhash) VALUES (?, ?)`,
+		`INSERT INTO def_summaries(def_id, minhash) VALUES (?, ?)
+		 ON CONFLICT(def_id) DO UPDATE SET minhash = excluded.minhash`,
 		defID, minhash)
 	if err != nil {
-		return fmt.Errorf("sqlite: set def summary %d: %w", defID, err)
+		return fmt.Errorf("sqlite: set def summary minhash %d: %w", defID, err)
 	}
 	return nil
 }
@@ -2649,4 +2684,149 @@ func (s *SQLiteDB) SetExplainCache(cacheKey, question, scope, answer, model stri
 		return fmt.Errorf("sqlite: set explain cache %s: %w", cacheKey, err)
 	}
 	return nil
+}
+
+// CountDefinitionsByName returns how many definitions share name,
+// regardless of module/package.
+func (s *SQLiteDB) CountDefinitionsByName(name string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(s.Ctx(), "SELECT COUNT(*) FROM definitions WHERE name = ?", name).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// ListFileSourceNames is the metadata-only sibling of ListFileSources --
+// same WHERE clause, but selects source_file alone instead of source_file
+// + raw. Callers that only need filenames (e.g. testCoverageHint checking
+// for an existing _test.go sibling on every successful write) previously
+// paid for the full raw source text of every file in the module on every
+// call -- a real, avoidable cost on the hottest path in the system,
+// scaling with total file size in the package rather than file count.
+func (s *SQLiteDB) ListFileSourceNames(moduleID int64) ([]string, error) {
+	rows, err := s.db.QueryContext(s.Ctx(),
+		`SELECT source_file FROM file_sources WHERE module_id = ?`, moduleID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var sf string
+		if err := rows.Scan(&sf); err != nil {
+			return nil, err
+		}
+		out = append(out, sf)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLiteDB) UpdateDefinitionReceiver(id int64, newReceiver, newBody, newSignature string) error {
+	hash := HashBody(newBody)
+	ctx := s.Ctx()
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE definitions
+		 SET receiver = ?, signature = ?, hash = ?
+		 WHERE id = ?`,
+		newReceiver, newSignature, hash, id,
+	); err != nil {
+		return fmt.Errorf("sqlite: update definition receiver: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE bodies SET body = ? WHERE def_id = ?`, newBody, id,
+	); err != nil {
+		return fmt.Errorf("sqlite: update receiver body: %w", err)
+	}
+	return nil
+}
+
+// SetManyExternalInterfaces mirrors SetManyReferences's delete-then-insert
+// shape: for every def_id key present in namesByDef, wipe its existing
+// def_external_interfaces rows and reinsert the current set. A def_id
+// absent from the map is left untouched.
+func (s *SQLiteDB) SetManyExternalInterfaces(namesByDef map[int64][]string) error {
+	if len(namesByDef) == 0 {
+		return nil
+	}
+	ctx := s.Ctx()
+
+	defIDs := make([]int64, 0, len(namesByDef))
+	for id := range namesByDef {
+		defIDs = append(defIDs, id)
+	}
+	for start := 0; start < len(defIDs); start += 500 {
+		end := start + 500
+		if end > len(defIDs) {
+			end = len(defIDs)
+		}
+		chunk := defIDs[start:end]
+		placeholders := strings.Repeat("?,", len(chunk))
+		placeholders = placeholders[:len(placeholders)-1]
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		q := "DELETE FROM def_external_interfaces WHERE def_id IN (" + placeholders + ")"
+		if _, err := s.db.ExecContext(ctx, q, args...); err != nil {
+			return fmt.Errorf("sqlite: SetManyExternalInterfaces delete: %w", err)
+		}
+	}
+
+	type row struct {
+		defID int64
+		iface string
+	}
+	seen := make(map[row]bool)
+	var rows []row
+	for defID, names := range namesByDef {
+		for _, name := range names {
+			r := row{defID, name}
+			if seen[r] {
+				continue
+			}
+			seen[r] = true
+			rows = append(rows, r)
+		}
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	for start := 0; start < len(rows); start += 500 {
+		end := start + 500
+		if end > len(rows) {
+			end = len(rows)
+		}
+		chunk := rows[start:end]
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, 2*len(chunk))
+		for i, r := range chunk {
+			placeholders[i] = "(?, ?)"
+			args = append(args, r.defID, r.iface)
+		}
+		q := "INSERT OR IGNORE INTO def_external_interfaces (def_id, iface_name) VALUES " +
+			strings.Join(placeholders, ", ")
+		if _, err := s.db.ExecContext(ctx, q, args...); err != nil {
+			return fmt.Errorf("sqlite: SetManyExternalInterfaces insert: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *SQLiteDB) GetExternalInterfaces(defID int64) ([]string, error) {
+	ctx := s.Ctx()
+	rows, err := s.db.QueryContext(ctx, `SELECT iface_name FROM def_external_interfaces WHERE def_id = ?`, defID)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: get external interfaces: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("sqlite: scan external interface: %w", err)
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
 }

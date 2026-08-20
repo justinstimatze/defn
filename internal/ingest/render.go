@@ -186,6 +186,12 @@ func typeString(expr ast.Expr) string {
 		return typeString(t.X) + "." + t.Sel.Name
 	case *ast.IndexExpr:
 		return typeString(t.X) + "[" + typeString(t.Index) + "]"
+	case *ast.IndexListExpr:
+		args := make([]string, len(t.Indices))
+		for i, idx := range t.Indices {
+			args[i] = typeString(idx)
+		}
+		return typeString(t.X) + "[" + strings.Join(args, ", ") + "]"
 	default:
 		return "<unknown>"
 	}

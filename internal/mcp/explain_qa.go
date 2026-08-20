@@ -37,7 +37,17 @@ func (s *server) handleExplainWithQuestion(ctx context.Context, _ *sdkmcp.CallTo
 
 	items := make([]explainScopeItem, 0, len(scope))
 	for _, name := range scope {
-		d, err := s.backend.GetDefinitionByName(name, "")
+		// #248-class bug (2026-08-10, prometheus-18712): this used to
+		// call GetDefinitionByName(name, "") unconditionally, ignoring
+		// args.Module/args.File/args.Receiver entirely -- unlike every
+		// other name-resolving op (outline, read, test, plain explain),
+		// which all go through resolveEditTarget. An ambiguous name with
+		// an explicit module:/file: disambiguator still silently
+		// resolved to the wrong definition, and since explainCacheKey
+		// hashes the RESOLVED def's identity, changing the disambiguator
+		// between calls didn't even bust the cache -- the same wrong
+		// answer kept getting served back as a "cache hit".
+		d, err := s.resolveEditTarget(name, args.Receiver, args.Module, args.File)
 		if err != nil {
 			items = append(items, explainScopeItem{name: name})
 			continue

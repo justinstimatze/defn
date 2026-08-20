@@ -1,6 +1,9 @@
 package embed
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func TestCosine_EmptyVectorsReturnZero(t *testing.T) {
 	if got := Cosine(nil, nil); got != 0 {
@@ -81,5 +84,28 @@ func TestTokenize_CamelCaseAndSnakeCaseSplitting(t *testing.T) {
 				break
 			}
 		}
+	}
+}
+
+// TestCosine_NormalizesNonUnitVectors is the regression for Cosine
+// returning a raw dot product instead of actually dividing by the
+// vectors' norms: previously harmless only because the sole caller
+// (contextEmbeddingCandidates) always passes Embed's pre-normalized
+// output, but Cosine's own doc comment makes an unqualified "[-1, 1]"
+// claim for any two vectors. Two parallel but non-unit vectors must
+// report similarity 1.0, not their raw (much larger) dot product.
+func TestCosine_NormalizesNonUnitVectors(t *testing.T) {
+	a := []float32{3, 4} // norm 5
+	b := []float32{6, 8} // norm 10, same direction as a
+
+	got := Cosine(a, b)
+	if math.Abs(got-1.0) > 1e-9 {
+		t.Errorf("Cosine(a, b) = %v, want 1.0 (parallel vectors) -- raw dot product would be 50", got)
+	}
+
+	orth := []float32{-4, 3} // norm 5, orthogonal to a
+	got2 := Cosine(a, orth)
+	if math.Abs(got2) > 1e-9 {
+		t.Errorf("Cosine(a, orth) = %v, want 0.0 (orthogonal vectors)", got2)
 	}
 }

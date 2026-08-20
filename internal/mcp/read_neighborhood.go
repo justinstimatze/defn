@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/justinstimatze/defn/internal/store"
+	"github.com/justinstimatze/defn/internal/summary"
 )
 
 // renderReadNeighborhood emits a compact "Related:" footer appended to
@@ -33,9 +34,11 @@ func (s *server) renderReadNeighborhood(d *store.Definition) string {
 	var sb strings.Builder
 	sb.WriteString("\n---\n_Related (#202):_\n")
 
-	// 1. Summary
+	// 1. Summary. A Stub-backend placeholder ("TODO: <Name>") isn't a
+	// real summary -- same #248 rationale as handleGetDefinition's
+	// summary-mode check.
 	sum, _ := s.backend.GetDefSummary(d.ID)
-	if sum != nil && sum.OneLine != "" {
+	if sum != nil && sum.OneLine != "" && sum.Model != summary.StubModelName {
 		sb.WriteString(fmt.Sprintf("- Summary: %s\n", sum.OneLine))
 	}
 

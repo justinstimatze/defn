@@ -2,12 +2,14 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/justinstimatze/defn/internal/goload"
 	"github.com/justinstimatze/defn/internal/ingest"
+	"github.com/justinstimatze/defn/internal/planformat"
 	"github.com/justinstimatze/defn/internal/resolve"
 	"github.com/justinstimatze/defn/internal/store"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -1349,7 +1352,7 @@ func TestBodyScanResult_Empty(t *testing.T) {
 	defer db.Close()
 	s := &server{backend: db}
 
-	result, _, err := s.bodyScanResult("no-such-string-anywhere", 100)
+	result, _, err := s.bodyScanResult("no-such-string-anywhere", 100, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1364,7 +1367,7 @@ func TestBodyScanResult_Hits(t *testing.T) {
 	defer db.Close()
 	s := &server{backend: db}
 
-	result, _, err := s.bodyScanResult("Hello", 100)
+	result, _, err := s.bodyScanResult("Hello", 100, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1783,6 +1786,8 @@ type Claim struct {
 var C1 = Claim{Subject: "s1", Object: "OldTarget"}
 var C2 = Claim{Subject: "s2", Object: "OldTarget"}
 var C3 = Claim{Subject: "s3", Object: "Different"}
+
+func main() {}
 `), 0644)
 	if err := ingest.Ingest(db, projDir); err != nil {
 		t.Fatal("ingest:", err)
@@ -6332,5 +6337,4277 @@ func Other() int { return 3 }`
 	}
 	if defs[0].ModuleID == defs[1].ModuleID {
 		t.Fatalf("new package's helper must not share ModuleID with the unrelated pre-existing module")
+	}
+}
+
+// TestHandleCode_EditDryRunDoesNotEdit is a regression test for a real
+// bug found in a grpc-go head-to-head-go trajectory:
+// code(op:"edit", name:"X", new_body:"...", dry_run:true) silently
+// performed a REAL edit instead of previewing it -- worse than an
+// error, since nothing signaled the mistake. Root cause: editParam had
+// no DryRun field, and handleCode's dispatch built editParam{Name,
+// NewBody, Receiver, Module, File} for the edit case without copying
+// args.DryRun. delete's equivalent dry_run gap was already fixed
+// (TestHandleCode_DeleteDryRunDoesNotDelete); edit had the same gap
+// and was never covered.
+func TestHandleCode_EditDryRunDoesNotEdit(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	before, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldBody := before.Body
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op:   "edit",
+		Name: "Greet",
+		NewBody: `func Greet(name string) string {
+	return "Hi, " + name
+}`,
+		DryRun: true,
+	})
+	if err != nil {
+		t.Fatalf("handleCode: %v", err)
+	}
+	text := resultText(t, result)
+	if result.IsError {
+		t.Fatalf("expected dry-run edit to succeed, got error: %s", text)
+	}
+	if !strings.Contains(text, "would update") || !strings.Contains(text, "dry run") {
+		t.Fatalf("expected dry-run preview text, got: %s", text)
+	}
+
+	after, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Body != oldBody {
+		t.Fatalf("Greet's body should NOT have changed on a dry run, but changed from:\n%s\nto:\n%s", oldBody, after.Body)
+	}
+
+	onDisk, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(onDisk), `"Hi, "`) {
+		t.Fatalf("dry-run edit should not have written to disk, but main.go now contains the new body:\n%s", onDisk)
+	}
+}
+
+// TestHandleCode_FailedSyncStillInvalidatesCache is a regression test
+// for a real bug found in a grpc-go head-to-head-go trajectory:
+// handleCode's deferred cache bookkeeping gated ALL invalidation on
+// result.IsError == false, so a write op that failed never
+// invalidated the session's response cache -- even though defn's own
+// SQLite writes commit as they happen (no staged/uncommitted working
+// set to roll back to; see autoCommit's doc comment), so a
+// partially-applied write op can leave the DB genuinely changed
+// despite reporting an error. A later read of the same name then got
+// served defn's own "already read this session -- nothing has changed"
+// shortcut with false confidence.
+func TestHandleCode_FailedSyncStillInvalidatesCache(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package main
+
+func Make() string {
+	return "widget"
+}
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
+	ctx := context.Background()
+
+	first, _, err := s.handleCode(ctx, req, codeParam{Op: "read", Name: "Make", Full: true})
+	if err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	if !strings.Contains(resultText(t, first), "widget") {
+		t.Fatalf("expected first read to show Make's body, got: %s", resultText(t, first))
+	}
+
+	// Break main.go's syntax on disk (outside defn), then sync just that
+	// file -- a write op (isWriteOp("sync") == true) that fails.
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package main
+
+func Make() string {
+	return "widget-v2" +++ broken syntax
+}
+`), 0644)
+	syncResult, _, err := s.handleCode(ctx, req, codeParam{Op: "sync", File: "main.go"})
+	if err != nil {
+		t.Fatalf("sync call itself errored at the Go level: %v", err)
+	}
+	if !syncResult.IsError {
+		t.Fatalf("expected the syntax-broken sync to report an error, got: %s", resultText(t, syncResult))
+	}
+
+	// A follow-up plain read must NOT be served the stale "already read"
+	// shortcut -- the failed sync must still have invalidated it.
+	second, _, err := s.handleCode(ctx, req, codeParam{Op: "read", Name: "Make"})
+	if err != nil {
+		t.Fatalf("second read: %v", err)
+	}
+	secondText := resultText(t, second)
+	if strings.Contains(secondText, "already read in this session") {
+		t.Fatalf("a failed sync did not invalidate the response cache -- read was short-circuited to the stale shortcut:\n%s", secondText)
+	}
+}
+
+// TestHandleCode_ReplaceHunkBuildFailureShowsFullDiagnostics is a
+// regression test for a real bug found in a head-to-head-go
+// trajectory: applyEditTerse (the shared response path for
+// replace-hunk, replace-slice, insert-precondition, wrap-in-defer, and
+// rename-param) kept only the first line of a build failure -- "build
+// failed:" -- discarding the actual compiler diagnostic (undefined
+// symbol, file/line) that handleEdit's own failure path shows in full
+// for the exact same underlying error. Forced an agent to blind-guess
+// or fall back to the verbose edit op whenever a projection-op edit
+// failed to build. DEFN_STRICT_BUILD=1 forces the real go build gate
+// that applyEditTerse normally skips for its AST-guaranteed-sig-stable
+// fast path -- without it there's no BUILD FAILED text to truncate.
+func TestHandleCode_ReplaceHunkBuildFailureShowsFullDiagnostics(t *testing.T) {
+	t.Setenv("DEFN_STRICT_BUILD", "1")
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op:   "replace-hunk",
+		Name: "Greet",
+		Old:  `return "Hello, " + name`,
+		New:  `return undefinedHelperFunc(name)`,
+	})
+	if err != nil {
+		t.Fatalf("handleCode: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "undefinedHelperFunc") {
+		t.Fatalf("expected the full build diagnostic naming the undefined symbol, got only:\n%s", text)
+	}
+}
+
+// TestHandleSync_ModuleScopesToThatModuleOnly is a regression test for
+// a real bug found in a grpc-go head-to-head-go trajectory:
+// code(op:"sync", module:"...") was accepted by the schema but
+// handleSync only ever checked args.File, silently falling through to
+// a whole-repo ingestAndResolve() -- which loads and type-checks every
+// package in the module via packages.Load. An unrelated, unbuildable
+// sibling package elsewhere in the repo then failed the ENTIRE sync,
+// even though the caller only asked to resync one specific,
+// perfectly buildable module.
+func TestHandleSync_ModuleScopesToThatModuleOnly(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	if err := os.MkdirAll(filepath.Join(projDir, "widgets"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(projDir, "broken"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "widgets", "widgets.go"), []byte(`package widgets
+
+func Make() string {
+	return "widget"
+}
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "broken", "broken.go"), []byte(`package broken
+
+func Break() string {
+	return "ok"
+}
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	// Break the "broken" package on disk AFTER the initial successful
+	// ingest, without going through defn -- simulates an external edit
+	// that a full-repo resync would trip over. Update widgets.go too, so
+	// the module-scoped sync under test has something real to pick up.
+	os.WriteFile(filepath.Join(projDir, "broken", "broken.go"), []byte(`package broken
+
+func Break() string {
+	return undefinedSymbolHere
+}
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "widgets", "widgets.go"), []byte(`package widgets
+
+func Make() string {
+	return "widget-v2"
+}
+`), 0644)
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op:     "sync",
+		Module: "widgets",
+	})
+	if err != nil {
+		t.Fatalf("handleCode: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("module-scoped sync should not fail due to an unrelated broken sibling package, got: %s", resultText(t, result))
+	}
+
+	d, err := db.GetDefinitionByName("Make", "")
+	if err != nil {
+		t.Fatalf("Make should still be findable: %v", err)
+	}
+	if !strings.Contains(d.Body, "widget-v2") {
+		t.Errorf("expected Make's body to reflect the on-disk update after module-scoped sync, got:\n%s", d.Body)
+	}
+}
+
+// TestHandleApply_EditRefusesAmbiguousBareNameAcrossModules is the
+// #248 regression for the apply-batch path specifically: apply's
+// edit/delete/rename/projection sub-ops all resolve their target via
+// resolveApplyTarget, a completely separate function from
+// resolveEditTarget/resolveWriteTarget that had its own independent,
+// unguarded ambiguous bare-name lookup.
+func TestHandleApply_EditRefusesAmbiguousBareNameAcrossModules(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "bft"), 0755)
+	os.MkdirAll(filepath.Join(projDir, "chess"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "bft", "engine.go"), []byte("package bft\n\ntype Engine struct{ Replica string }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "chess", "engine.go"), []byte(`package chess
+
+type Engine struct{ Protocol string }
+
+func NewEngine() *Engine { return &Engine{} }
+func UseA(e *Engine) string { return e.Protocol }
+func UseB(e *Engine) string { return e.Protocol }
+func UseC(e *Engine) string { return e.Protocol }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{Operations: []applyOp{
+		{Op: "edit", Name: "Engine", NewBody: "type Engine struct {\n\tReplica string\n\tTransport string\n}"},
+	}})
+	text := resultText(t, result)
+	if strings.Contains(text, "~ edited Engine") {
+		t.Fatalf("expected the ambiguous edit to be refused, not silently applied, got: %s", text)
+	}
+
+	bftSrc, _ := os.ReadFile(filepath.Join(projDir, "bft", "engine.go"))
+	if strings.Contains(string(bftSrc), "Transport") {
+		t.Errorf("bft's Engine should NOT have been touched, got:\n%s", bftSrc)
+	}
+	chessSrc, _ := os.ReadFile(filepath.Join(projDir, "chess", "engine.go"))
+	if strings.Contains(string(chessSrc), "Transport") || strings.Contains(string(chessSrc), "Replica") {
+		t.Errorf("chess's Engine should NOT have been corrupted, got:\n%s", chessSrc)
+	}
+}
+
+// TestHandleEdit_RefusesAmbiguousBareNameAcrossModules is the #248
+// regression: a bare-name edit (no receiver/module/file) used to
+// silently resolve via GetDefinitionByName's blast-radius tiebreak and
+// could write into the WRONG same-named definition in an unrelated
+// package. Live-reproduced this session: code(op:"edit", name:"Backend")
+// with no module: clobbered internal/summary's small Backend interface
+// with a copy of internal/store's much larger one. Same bft/chess
+// Engine fixture as TestHandleEdit_ModuleDisambiguatesSameNamedType,
+// but this time WITHOUT the disambiguating module: -- must refuse, not
+// guess.
+func TestHandleEdit_RefusesAmbiguousBareNameAcrossModules(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	if err := os.MkdirAll(filepath.Join(projDir, "bft"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(projDir, "chess"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "bft", "engine.go"), []byte("package bft\n\ntype Engine struct{ Replica string }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "chess", "engine.go"), []byte(`package chess
+
+type Engine struct{ Protocol string }
+
+func NewEngine() *Engine { return &Engine{} }
+func UseA(e *Engine) string { return e.Protocol }
+func UseB(e *Engine) string { return e.Protocol }
+func UseC(e *Engine) string { return e.Protocol }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleEdit(context.Background(), nil, editParam{
+		Name:    "Engine",
+		NewBody: "type Engine struct {\n\tReplica string\n\tTransport string\n}",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "ambiguous") {
+		t.Fatalf("expected an ambiguity refusal, got: %s", text)
+	}
+
+	bftSrc, _ := os.ReadFile(filepath.Join(projDir, "bft", "engine.go"))
+	if strings.Contains(string(bftSrc), "Transport") {
+		t.Errorf("bft's Engine should NOT have been touched by a refused ambiguous edit, got:\n%s", bftSrc)
+	}
+	chessSrc, _ := os.ReadFile(filepath.Join(projDir, "chess", "engine.go"))
+	if strings.Contains(string(chessSrc), "Transport") || strings.Contains(string(chessSrc), "Replica") {
+		t.Errorf("chess's Engine should NOT have been corrupted by a refused ambiguous edit, got:\n%s", chessSrc)
+	}
+}
+
+// TestHandleRename_ModuleDisambiguatesSameNamedType is the positive
+// control for TestHandleRename_RefusesAmbiguousBareNameAcrossModules:
+// renameParam now carries receiver/module/file, so the same ambiguous
+// fixture must succeed and target only the intended def when module:
+// is given.
+func TestHandleRename_ModuleDisambiguatesSameNamedType(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "bft"), 0755)
+	os.MkdirAll(filepath.Join(projDir, "chess"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "bft", "engine.go"), []byte("package bft\n\ntype Engine struct{ Replica string }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "chess", "engine.go"), []byte(`package chess
+
+type Engine struct{ Protocol string }
+
+func NewEngine() *Engine { return &Engine{} }
+func UseA(e *Engine) string { return e.Protocol }
+func UseB(e *Engine) string { return e.Protocol }
+func UseC(e *Engine) string { return e.Protocol }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleRename(context.Background(), nil, renameParam{OldName: "Engine", NewName: "EngineV2", Module: "testproj/bft"})
+	if err != nil {
+		t.Fatalf("handleRename: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "ambiguous") {
+		t.Fatalf("module: should have disambiguated, got: %s", text)
+	}
+
+	bftSrc, _ := os.ReadFile(filepath.Join(projDir, "bft", "engine.go"))
+	if !strings.Contains(string(bftSrc), "EngineV2") {
+		t.Errorf("expected bft's Engine to be renamed to EngineV2, got:\n%s", bftSrc)
+	}
+	chessSrc, _ := os.ReadFile(filepath.Join(projDir, "chess", "engine.go"))
+	if !strings.Contains(string(chessSrc), "type Engine struct") || strings.Contains(string(chessSrc), "EngineV2") {
+		t.Errorf("chess's Engine should be untouched by a module-scoped rename, got:\n%s", chessSrc)
+	}
+}
+
+// TestHandleRename_RefusesAmbiguousBareNameAcrossModules is the #248
+// regression for rename: renameParam previously had no
+// receiver/module/file fields at all, and handleRename resolved
+// old_name via a raw GetDefinitionByName(name, "") call -- the worst
+// case of the ambiguous-write bug, since a caller couldn't disambiguate
+// even if it wanted to.
+func TestHandleRename_RefusesAmbiguousBareNameAcrossModules(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "bft"), 0755)
+	os.MkdirAll(filepath.Join(projDir, "chess"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "bft", "engine.go"), []byte("package bft\n\ntype Engine struct{ Replica string }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "chess", "engine.go"), []byte(`package chess
+
+type Engine struct{ Protocol string }
+
+func NewEngine() *Engine { return &Engine{} }
+func UseA(e *Engine) string { return e.Protocol }
+func UseB(e *Engine) string { return e.Protocol }
+func UseC(e *Engine) string { return e.Protocol }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleRename(context.Background(), nil, renameParam{OldName: "Engine", NewName: "EngineV2"})
+	text := resultText(t, result)
+	if !strings.Contains(text, "ambiguous") {
+		t.Fatalf("expected an ambiguity refusal, got: %s", text)
+	}
+
+	bftSrc, _ := os.ReadFile(filepath.Join(projDir, "bft", "engine.go"))
+	if !strings.Contains(string(bftSrc), "type Engine struct") || strings.Contains(string(bftSrc), "EngineV2") {
+		t.Errorf("bft's Engine should be untouched, got:\n%s", bftSrc)
+	}
+	chessSrc, _ := os.ReadFile(filepath.Join(projDir, "chess", "engine.go"))
+	if !strings.Contains(string(chessSrc), "type Engine struct") || strings.Contains(string(chessSrc), "EngineV2") {
+		t.Errorf("chess's Engine should be untouched, got:\n%s", chessSrc)
+	}
+}
+
+// TestBodyScanResult_FileScopesHits is the #248 regression: stage-3
+// body-scan never had a file parameter, so search(file:X) silently
+// lost its scoping whenever stages 1-2 (name-LIKE, FTS) came up empty
+// and fell through to bodyScanResult -- a regression-adjacent variant
+// of the already-fixed #241 file: bug, just in the third search stage.
+func TestBodyScanResult_FileScopesHits(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	os.MkdirAll(filepath.Join(projDir, "sub"), 0755)
+	subPath := filepath.Join(projDir, "sub", "sub.go")
+	os.WriteFile(subPath, []byte("package sub\n\nfunc SubGreet() string {\n\treturn \"Hello, sub\"\n}\n"), 0644)
+	if _, err := ingest.IngestFile(db, projDir, subPath); err != nil {
+		t.Fatal("ingest sub.go:", err)
+	}
+
+	s := &server{backend: db}
+	result, _, err := s.bodyScanResult("Hello, ", 100, "sub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, `"name": "SubGreet"`) {
+		t.Errorf("expected file:\"sub\" scoped body-scan to find SubGreet, got: %s", text)
+	}
+	if strings.Contains(text, `"name": "Greet"`) {
+		t.Errorf("expected file:\"sub\" to exclude main.go's Greet, got: %s", text)
+	}
+}
+
+// TestHandleCode_AmbiguityNoteOnBareNameReadAndOutline is the #248
+// read-side disclosure fix: a bare-name read/outline that resolves
+// via GetDefinitionByName's best-effort tiebreak now says so, instead
+// of silently returning one of several same-named candidates with no
+// indication another exists (unlike search, which lists every match).
+func TestHandleCode_AmbiguityNoteOnBareNameReadAndOutline(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "bft"), 0755)
+	os.MkdirAll(filepath.Join(projDir, "chess"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "bft", "engine.go"), []byte("package bft\n\ntype Engine struct{ Replica string }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "chess", "engine.go"), []byte(`package chess
+
+type Engine struct{ Protocol string }
+
+func NewEngine() *Engine { return &Engine{} }
+func UseA(e *Engine) string { return e.Protocol }
+func UseB(e *Engine) string { return e.Protocol }
+func UseC(e *Engine) string { return e.Protocol }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	for _, op := range []string{"read", "outline"} {
+		t.Run(op, func(t *testing.T) {
+			result, _, err := s.handleCode(context.Background(), nil, codeParam{Op: op, Name: "Engine"})
+			if err != nil {
+				t.Fatalf("handleCode %s: %v", op, err)
+			}
+			text := resultText(t, result)
+			if !strings.Contains(text, "2 definitions share the name") {
+				t.Errorf("expected an ambiguity note, got:\n%s", text)
+			}
+		})
+	}
+}
+
+// TestHandleCode_SearchQueryAliasesToPattern is the #248 regression:
+// query: is a real codeParam field, but search only ever read
+// pattern:, so search(query:"X") silently matched nearly everything
+// (empty pattern -> "%%") and returned a caller-count-ranked list that
+// looked like a real, relevant result.
+func TestHandleCode_SearchQueryAliasesToPattern(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{Op: "search", Query: "Greet"})
+	if err != nil {
+		t.Fatalf("handleCode search via query: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, `"name": "Greet"`) {
+		t.Errorf("expected query: to alias to pattern: and find Greet, got: %s", text)
+	}
+}
+
+// TestHandleGetDefinition_SummaryModeSkipsStubPlaceholder is the #248
+// regression: a Stub-backend placeholder ("TODO: <Name>") isn't a
+// real summary, but handleGetDefinition's summary-mode-by-default
+// check only compared BodyHash, not Model -- serving the literal stub
+// text as if it were a genuine intent line, contradicting
+// enqueueSummary's own documented fallback-to-full-body contract.
+func TestHandleGetDefinition_SummaryModeSkipsStubPlaceholder(t *testing.T) {
+	os.Unsetenv("DEFN_SUMMARY_READ_DEFAULT")
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	d, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatalf("setup: Greet not found: %v", err)
+	}
+	if err := db.SetDefSummary(d.ID, &store.DefSummary{
+		OneLine:  "TODO: Greet",
+		BodyHash: store.HashBodyStructural(d.Body),
+		Model:    "stub",
+	}); err != nil {
+		t.Fatalf("SetDefSummary: %v", err)
+	}
+
+	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Greet"})
+	text := resultText(t, result)
+	if strings.Contains(text, "TODO: Greet") {
+		t.Errorf("expected the stub placeholder NOT to be surfaced anywhere, got:\n%s", text)
+	}
+	if !strings.Contains(text, "return \"Hello, \"") {
+		t.Errorf("expected fallback to the full body when only a stub summary exists, got:\n%s", text)
+	}
+}
+
+// TestHandleOverview_CapsLargeDirectory is the #248 regression:
+// directory/module-scoped overview had no cap, unlike file-defs'
+// fileDefsCap -- a real trajectory hit a hard "exceeds maximum
+// allowed tokens" failure on a single overview call against a large
+// package.
+func TestHandleOverview_CapsLargeDirectory(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	var sb strings.Builder
+	sb.WriteString("package main\n\n")
+	const n = 60
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&sb, "func BigOv%d() {}\n", i)
+	}
+	bigPath := filepath.Join(projDir, "bigoverview.go")
+	if err := os.WriteFile(bigPath, []byte(sb.String()), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ingest.IngestFile(db, projDir, bigPath); err != nil {
+		t.Fatal("ingest bigoverview.go:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	result, _, err := s.handleOverview(context.Background(), nil, codeParam{File: "bigoverview.go"})
+	if err != nil {
+		t.Fatalf("overview: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, fmt.Sprintf("showing %d of %d definitions", overviewDefsCap, n)) {
+		t.Errorf("expected a cap/truncation message, got:\n%s", text)
+	}
+	if strings.Count(text, "BigOv") > overviewDefsCap {
+		t.Errorf("expected at most %d defs listed, got more:\n%s", overviewDefsCap, text)
+	}
+}
+
+// TestHandleTestByName_ScopesRootPackageTest is the #248 regression
+// for testScopeTarget's root-package edge case: a hint resolving to
+// the module's root package (dir==".") used to leave target at the
+// "./..." default instead of narrowing to ".", silently re-flooding
+// the exact whole-repo output #241 scoped this op to avoid.
+func TestHandleTestByName_ScopesRootPackageTest(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "sub"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc RootFunc() string { return \"root\" }\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main_test.go"), []byte("package main\n\nimport \"testing\"\n\nfunc TestRootFunc(t *testing.T) {\n\tif RootFunc() == \"\" {\n\t\tt.Fatal(\"empty\")\n\t}\n}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "sub", "sub.go"), []byte("package sub\n\nfunc SubFunc() string { return \"sub\" }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "sub", "sub_test.go"), []byte("package sub\n\nimport \"testing\"\n\nfunc TestSubFunc(t *testing.T) {\n\tif SubFunc() == \"\" {\n\t\tt.Fatal(\"sub-package-marker\")\n\t}\n}\n"), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleTestByName(context.Background(), nil, "TestRootFunc", "", "")
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "across .:") {
+		t.Errorf("expected root-package test to scope to \".\", got:\n%s", text)
+	}
+	if strings.Contains(text, "sub-package-marker") || strings.Contains(text, "TestSubFunc") {
+		t.Errorf("expected sub package NOT to have run, got:\n%s", text)
+	}
+	if !strings.Contains(text, "ALL TESTS PASSED") {
+		t.Errorf("expected the root test to pass, got:\n%s", text)
+	}
+}
+
+// TestHandleTest_ScopesToDefinitionsPackage is the #248 regression for
+// handleTest (the name:-based coverage-run path): it previously ran
+// `go test ./...` unconditionally, unlike its sibling handleTestByName
+// which already got #241's package scoping. Verifies both the
+// root-package and subpackage cases now scope correctly.
+func TestHandleTest_ScopesToDefinitionsPackage(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "sub"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc RootFunc() string { return \"root\" }\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main_test.go"), []byte("package main\n\nimport \"testing\"\n\nfunc TestRootFunc(t *testing.T) {\n\tif RootFunc() == \"\" {\n\t\tt.Fatal(\"root-package-marker\")\n\t}\n}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "sub", "sub.go"), []byte("package sub\n\nfunc SubFunc() string { return \"sub\" }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "sub", "sub_test.go"), []byte("package sub\n\nimport \"testing\"\n\nfunc TestSubFunc(t *testing.T) {\n\tif SubFunc() == \"\" {\n\t\tt.Fatal(\"sub-package-marker\")\n\t}\n}\n"), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	rootResult, _, err := s.handleTest(context.Background(), nil, nameParam{Name: "RootFunc"})
+	if err != nil {
+		t.Fatalf("handleTest(RootFunc): %v", err)
+	}
+	rootText := resultText(t, rootResult)
+	if !strings.Contains(rootText, "across .:") {
+		t.Errorf("expected RootFunc's coverage run to scope to \".\", got:\n%s", rootText)
+	}
+	if strings.Contains(rootText, "sub-package-marker") {
+		t.Errorf("expected sub package NOT to have run for RootFunc, got:\n%s", rootText)
+	}
+
+	subResult, _, err := s.handleTest(context.Background(), nil, nameParam{Name: "SubFunc"})
+	if err != nil {
+		t.Fatalf("handleTest(SubFunc): %v", err)
+	}
+	subText := resultText(t, subResult)
+	if !strings.Contains(subText, "across ./sub/...:") {
+		t.Errorf("expected SubFunc's coverage run to scope to ./sub/..., got:\n%s", subText)
+	}
+	if strings.Contains(subText, "root-package-marker") {
+		t.Errorf("expected root package NOT to have run for SubFunc, got:\n%s", subText)
+	}
+}
+
+// TestProjectOverview_NoModulesMessageMentionsSync is the #248
+// regression for the ingest-hint message: an MCP-only agent (no shell
+// access) can't act on "run defn ingest ." -- the message must point
+// at code(op:"sync"), the actual remedy available through the same
+// tool.
+func TestProjectOverview_NoModulesMessageMentionsSync(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := &server{backend: db}
+	result, _, err := s.projectOverview(context.Background())
+	if err != nil {
+		t.Fatalf("projectOverview: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, `code(op:"sync")`) {
+		t.Errorf("expected the no-modules message to point at code(op:\"sync\"), got: %s", text)
+	}
+}
+
+// TestHandleTestByName_ReportsNoTestsMatchedInsteadOfFalsePass guards
+// against a false-positive "ALL TESTS PASSED" when a -run pattern
+// matches zero tests. go test exits 0 in that case (just warns "no
+// tests to run"), which used to be indistinguishable from a real pass
+// -- a real trajectory targeted a grpctest-suite method by its bare
+// name (addressed by go test as a subtest, Test/TestFoo, not TestFoo),
+// silently matched nothing, and the agent moved on with false
+// confidence that nothing needed further investigation.
+func TestHandleTestByName_ReportsNoTestsMatchedInsteadOfFalsePass(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "alpha"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "alpha.go"), []byte(`package alpha
+
+func Widget() bool { return true }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "alpha_test.go"), []byte(`package alpha
+
+import "testing"
+
+func TestWidget(t *testing.T) {
+	if !Widget() {
+		t.Fatal("false")
+	}
+}
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+
+	result, _, err := s.handleTestByName(context.Background(), nil, "TestDoesNotExist", "", "alpha/alpha.go")
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "ALL TESTS PASSED") {
+		t.Errorf("a pattern matching zero tests must NOT report ALL TESTS PASSED (that's a false positive -- nothing was verified), got: %s", text)
+	}
+	if !strings.Contains(text, "NO TESTS MATCHED") {
+		t.Errorf("expected an explicit NO TESTS MATCHED signal, got: %s", text)
+	}
+}
+
+// TestHandleApply_CreateSingleDeclRefusesNameCollision guards handleApply's
+// single-declaration "create" branch (the common case -- most create ops
+// in a batch are single declarations), which used to skip the same
+// same-module name+receiver collision check handleCreate and the
+// multi-decl branch both have. Without it, a collision only surfaced as
+// a raw Go compiler error ("X redeclared in this block") at the build
+// stage, rolling back the whole batch instead of defn's own clear
+// "already exists" message.
+func TestHandleApply_CreateSingleDeclRefusesNameCollision(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "create", Body: "func Greet(name string) string { return \"Hi \" + name }", File: "other.go"},
+		},
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "already exists") {
+		t.Fatalf("expected an 'already exists' collision message instead of a raw build-stage failure, got: %s", text)
+	}
+
+	if _, err := os.Stat(filepath.Join(projDir, "other.go")); !os.IsNotExist(err) {
+		t.Errorf("expected other.go to never be written since the collision should be caught before the build stage, got err=%v", err)
+	}
+}
+
+// TestHandleExpand_AmbiguityNoteOnBareName is the expand-path sibling of
+// TestHandleCode_AmbiguityNoteOnBareNameReadAndOutline. The circuit
+// breaker (turn_state.go) silently redirects blocked bare-name
+// read/outline calls through handleExpand, which resolves via the same
+// best-effort tiebreak as handleCode's direct "read"/"outline" cases --
+// but until this fix, expand never disclosed it, so an ambiguous name
+// auto-batched through expand resolved silently with no indication
+// another same-named candidate existed.
+func TestHandleExpand_AmbiguityNoteOnBareName(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "bft"), 0755)
+	os.MkdirAll(filepath.Join(projDir, "chess"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "bft", "engine.go"), []byte("package bft\n\ntype Engine struct{ Replica string }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "chess", "engine.go"), []byte(`package chess
+
+type Engine struct{ Protocol string }
+
+func NewEngine() *Engine { return &Engine{} }
+func UseA(e *Engine) string { return e.Protocol }
+func UseB(e *Engine) string { return e.Protocol }
+func UseC(e *Engine) string { return e.Protocol }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleExpand(context.Background(), nil, codeParam{Name: "Engine"})
+	if err != nil {
+		t.Fatalf("handleExpand: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "2 definitions share the name") {
+		t.Errorf("expected an ambiguity note from expand, got:\n%s", text)
+	}
+}
+
+// TestHandleCode_CircuitBreakerAutoBatchIncludesBodyWhenReadWasBlocked
+// guards the #250 fix: a blocked op:"read" auto-batched through expand
+// used to hardcode Include:["outline","callers"], silently dropping the
+// body a "read" call is for -- a real grpc-go-3351 trajectory burned 2
+// extra round-trips re-requesting the body this should have returned
+// the first time.
+func TestHandleCode_CircuitBreakerAutoBatchIncludesBodyWhenReadWasBlocked(t *testing.T) {
+	t.Setenv("DEFN_CIRCUIT_BREAKER", "2")
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
+
+	for _, name := range []string{"Greet", "Farewell"} {
+		if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: name}); err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+	}
+
+	third, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "main"})
+	if err != nil {
+		t.Fatalf("third read: %v", err)
+	}
+	text := resultText(t, third)
+	if !strings.Contains(text, "auto-batched") {
+		t.Fatalf("expected an auto-batch note, got: %s", text)
+	}
+	if !strings.Contains(text, `"Hello, "`) {
+		t.Errorf("auto-batched result from a blocked op:\"read\" must include the actual source body (Greet's \"Hello, \" literal), not just outline+callers: %s", text)
+	}
+}
+
+// TestHandleSearch_IncludeParamNotedAsIgnored guards the #250 fix:
+// search accepted include: (a real codeParam field, but only wired up
+// for expand's graph-hop selection) with zero effect and zero signal --
+// a real go-zero-1964 trajectory tried include:["rest"] expecting
+// package scoping (by analogy with expand), got unfiltered repo-wide
+// results twice, and gave up on search entirely.
+func TestHandleSearch_IncludeParamNotedAsIgnored(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+
+	result, _, err := s.handleSearch(context.Background(), nil, codeParam{Pattern: "Greet", Include: []string{"rest"}})
+	if err != nil {
+		t.Fatalf("handleSearch: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "include") || !strings.Contains(text, "ignored") {
+		t.Errorf("expected a note that include: has no effect on search, got: %s", text)
+	}
+}
+
+// TestTestBuildFailed guards the #250 fix: handleTest/handleTestByName
+// used to report the same generic "SOME TESTS FAILED" for a genuine
+// test failure and for a compile/vet error that ran zero tests -- a
+// real cli-3997 trajectory hit exactly this with a pre-existing vet
+// error, indistinguishable from the agent's own edit breaking a test.
+func TestTestBuildFailed(t *testing.T) {
+	cases := []struct {
+		name string
+		out  string
+		want bool
+	}{
+		{"build failed", "# pkg\nfile.go:1:1: undefined: Foo\nFAIL\tpkg [build failed]\n", true},
+		{"setup failed", "FAIL\tpkg [setup failed]\n", true},
+		{"real test failure", "--- FAIL: TestX (0.00s)\nFAIL\n", false},
+		{"pass", "PASS\nok  \tpkg\t0.010s\n", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := testBuildFailed(c.out); got != c.want {
+				t.Errorf("testBuildFailed(%q) = %v, want %v", c.out, got, c.want)
+			}
+		})
+	}
+}
+
+// TestHandleFileDefs_LimitOverridesDefaultCap guards the #250 fix:
+// file-defs accepted a limit: param but silently ignored it, always
+// truncating to the fixed fileDefsCap with no way to ask for more.
+func TestHandleFileDefs_LimitOverridesDefaultCap(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	var sb strings.Builder
+	sb.WriteString("package main\n\n")
+	const n = 10
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&sb, "func Small%d() {}\n", i)
+	}
+	smallPath := filepath.Join(projDir, "small.go")
+	if err := os.WriteFile(smallPath, []byte(sb.String()), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ingest.IngestFile(db, projDir, smallPath); err != nil {
+		t.Fatal("ingest small.go:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	result, _, err := s.handleFileDefs(context.Background(), nil, codeParam{File: "small.go", Limit: 3})
+	if err != nil {
+		t.Fatalf("file-defs: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, fmt.Sprintf("3 of %d definitions", n)) {
+		t.Errorf("expected limit:3 to cap the result to 3 of %d, got:\n%s", n, text)
+	}
+	if strings.Count(text, "\"name\":") > 3 {
+		t.Errorf("expected at most 3 entries with limit:3, got more:\n%s", text)
+	}
+}
+
+// TestHandleLiterals_LimitAndFileScopeResults guards the #250 fix:
+// literals accepted limit:/file: params but silently ignored both --
+// results were always capped at a fixed 200 and never scoped to a
+// file, same silent-drop class as #241 (search's file:).
+func TestHandleLiterals_LimitAndFileScopeResults(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "alpha"), 0755)
+	os.MkdirAll(filepath.Join(projDir, "beta"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "alpha.go"), []byte(`package alpha
+
+type Config struct{ Name string }
+
+func New() Config { return Config{Name: "alpha"} }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "beta", "beta.go"), []byte(`package beta
+
+type Config struct{ Name string }
+
+func New() Config { return Config{Name: "beta"} }
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+
+	// Unscoped: both alpha's and beta's Config literal should appear.
+	result, _, err := s.handleLiterals(context.Background(), nil, codeParam{Pattern: "Config"})
+	if err != nil {
+		t.Fatalf("handleLiterals: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "`alpha`") || !strings.Contains(text, "`beta`") {
+		t.Fatalf("expected both alpha and beta literal values unscoped, got: %s", text)
+	}
+
+	// Scoped to alpha/: only the alpha literal should survive.
+	result, _, err = s.handleLiterals(context.Background(), nil, codeParam{Pattern: "Config", File: "alpha"})
+	if err != nil {
+		t.Fatalf("handleLiterals with file: %v", err)
+	}
+	text = resultText(t, result)
+	if !strings.Contains(text, "`alpha`") {
+		t.Errorf("file:\"alpha\" should still include the alpha literal, got: %s", text)
+	}
+	if strings.Contains(text, "`beta`") {
+		t.Errorf("file:\"alpha\" should have excluded the beta literal, got: %s", text)
+	}
+
+	// limit:1 must cap the unscoped result to a single row.
+	result, _, err = s.handleLiterals(context.Background(), nil, codeParam{Pattern: "Config", Limit: 1})
+	if err != nil {
+		t.Fatalf("handleLiterals with limit: %v", err)
+	}
+	text = resultText(t, result)
+	if strings.Contains(text, "`alpha`") && strings.Contains(text, "`beta`") {
+		t.Errorf("limit:1 should have capped to a single result, got both: %s", text)
+	}
+}
+
+// TestHandlePragmas_LimitOverridesDefaultCap guards the #250 fix:
+// pragmas accepted a limit: param but silently ignored it, always
+// truncating to the fixed pragmasCap with no way to ask for fewer or
+// more.
+func TestHandlePragmas_LimitOverridesDefaultCap(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	var sb strings.Builder
+	sb.WriteString("package main\n\n")
+	const n = 10
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&sb, "//test:pragma\nfunc PragmaTarget%d() {}\n\n", i)
+	}
+	pragmaPath := filepath.Join(projDir, "pragmas.go")
+	if err := os.WriteFile(pragmaPath, []byte(sb.String()), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	result, _, err := s.handlePragmas(context.Background(), nil, codeParam{Pattern: "test:pragma", Limit: 2})
+	if err != nil {
+		t.Fatalf("pragmas: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, fmt.Sprintf("showing 2 of %d", n)) {
+		t.Errorf("expected limit:2 to cap the result to 2, got:\n%s", text)
+	}
+	if got := strings.Count(text, "`test:pragma`"); got > 2 {
+		t.Errorf("expected at most 2 pragma lines with limit:2, got %d:\n%s", got, text)
+	}
+}
+
+// TestBodyScanResult_PipePatternHintsNotRegex guards the pilot8b fix:
+// search(pattern:"A|B|C") reads like regex alternation but search has
+// no regex support anywhere in its path (LIKE + FTS + substring, all
+// literal) -- a real go-zero-2283 trajectory got a generic "no
+// matches" for exactly this shape even though one of the terms
+// existed, found trivially by a follow-up single-term search.
+func TestBodyScanResult_PipePatternHintsNotRegex(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.bodyScanResult("NoSuchThing|AlsoNotThere", 100, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "not regex") {
+		t.Errorf("expected a hint that '|' is literal, not regex alternation, got:\n%s", text)
+	}
+}
+
+// TestHandleCode_AmbiguityNoteOnOtherReadShapedOps extends the #248
+// disclosure fix to every other read-shaped op that resolves a bare
+// name via resolveEditTarget's identical best-effort tiebreak but
+// (unlike read/outline/expand) never surfaced it: impact, explain,
+// similar, slice, test (name-based coverage lookup), test-coverage,
+// and traverse. Found via a systematic sweep of resolveEditTarget's
+// 11 production callers after the pilot8b digging pass turned up the
+// same gap on handleTestByName specifically.
+func TestHandleCode_AmbiguityNoteOnOtherReadShapedOps(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "bft"), 0755)
+	os.MkdirAll(filepath.Join(projDir, "chess"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "bft", "engine.go"), []byte("package bft\n\nfunc Engine() bool { return true }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "chess", "engine.go"), []byte(`package chess
+
+func Engine() bool { return false }
+
+func UseEngine() bool { return Engine() }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	cases := []struct {
+		op    string
+		extra codeParam
+	}{
+		{op: "impact"},
+		{op: "explain"},
+		{op: "similar"},
+		{op: "slice", extra: codeParam{Slice: "signature"}},
+		{op: "test"},
+		{op: "test-coverage"},
+		{op: "traverse", extra: codeParam{Direction: "callers"}},
+	}
+	for _, c := range cases {
+		t.Run(c.op, func(t *testing.T) {
+			args := c.extra
+			args.Op = c.op
+			args.Name = "Engine"
+			result, _, err := s.handleCode(context.Background(), nil, args)
+			if err != nil {
+				t.Fatalf("handleCode %s: %v", c.op, err)
+			}
+			text := resultText(t, result)
+			if !strings.Contains(text, "2 definitions share the name") {
+				t.Errorf("%s: expected an ambiguity note, got:\n%s", c.op, text)
+			}
+		})
+	}
+}
+
+// TestHandleExpand_BodyNotReservedWhenAlreadyServedThisSession guards
+// the pilot8b fix: renderExpandSection never checked bodyServedEpochsAgo
+// before honoring include:["body"], so a name whose full body was
+// already read via read(full:true) got it dumped in full again the
+// next time it was swept into an expand call (including the circuit
+// breaker's own auto-batch redirect) -- pure wasted tokens, confirmed
+// via a real grpc-go-3119 trajectory.
+func TestHandleExpand_BodyNotReservedWhenAlreadyServedThisSession(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
+
+	if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "Greet", Full: true}); err != nil {
+		t.Fatalf("read full: %v", err)
+	}
+
+	result, _, err := s.handleExpand(context.Background(), req, codeParam{Name: "Greet", Include: []string{"outline", "body", "callers"}})
+	if err != nil {
+		t.Fatalf("handleExpand: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, `"Hello, "`) {
+		t.Errorf("expected Greet's body (already served via read(full:true)) to be omitted from expand, got:\n%s", text)
+	}
+	if !strings.Contains(text, "already read in this session") {
+		t.Errorf("expected a note explaining why the body was omitted, got:\n%s", text)
+	}
+}
+
+// TestHandleTestByName_AmbiguousPatternDisclosesTiebreak guards the
+// pilot8b fix: test:"TestX" with no module:/file: hint used to
+// silently scope to whichever same-named test's package won
+// GetDefinitionByName's best-effort caller-count tiebreak, with zero
+// indication another package had a same-named test too -- a real
+// cli-5503 trajectory got a false "PASS" from an unrelated sibling
+// package's TestNewCmdList/TestListRun and only caught it by noticing
+// the printed subtest names looked wrong.
+func TestHandleTestByName_AmbiguousPatternDisclosesTiebreak(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "alpha"), 0755)
+	os.MkdirAll(filepath.Join(projDir, "beta"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "alpha.go"), []byte("package alpha\n\nfunc Widget() bool { return true }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "alpha_test.go"), []byte(`package alpha
+
+import "testing"
+
+func TestDup(t *testing.T) {
+	if !Widget() {
+		t.Fatal("false")
+	}
+}
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "beta", "beta.go"), []byte("package beta\n\nfunc Gadget() bool { return true }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "beta", "beta_test.go"), []byte(`package beta
+
+import "testing"
+
+func TestDup(t *testing.T) {
+	if !Gadget() {
+		t.Fatal("false")
+	}
+}
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+
+	result, _, err := s.handleTestByName(context.Background(), nil, "TestDup", "", "")
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "2 definitions share the name") {
+		t.Errorf("expected an ambiguity note disclosing the tiebreak, got:\n%s", text)
+	}
+	if strings.Contains(text, "./...") {
+		t.Errorf("expected scoping to one specific package's own test, not a whole-repo ./... run, got:\n%s", text)
+	}
+}
+
+// TestHandleTestByName_PanicReportedAsBinaryPanicNotTestFailure is the
+// end-to-end version of TestTestPanicked: a real test-binary crash
+// (not a normal assertion failure) must be labeled distinctly from
+// "SOME TESTS FAILED", the same way a build failure already is.
+func TestHandleTestByName_PanicReportedAsBinaryPanicNotTestFailure(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "crash_test.go"), []byte(`package main
+
+import "testing"
+
+func TestCrashes(t *testing.T) {
+	panic("boom")
+}
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+
+	result, _, err := s.handleTestByName(context.Background(), nil, "TestCrashes", "", "")
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "TEST BINARY PANICKED") {
+		t.Errorf("expected a distinct panic label, got:\n%s", text)
+	}
+	if strings.Contains(text, "SOME TESTS FAILED") {
+		t.Errorf("a binary panic must not also be labeled as a generic test failure:\n%s", text)
+	}
+}
+
+// TestTestPanicked guards the pilot8b fix: a test binary crash (e.g. a
+// duplicate flag/command registration panic shared across an entire
+// package's tests) used to get the same generic "SOME TESTS FAILED"
+// label as a genuine assertion failure -- confirmed via a real cli-405
+// trajectory (panic: create flag redefined: draft) that invited
+// suspicion of an unrelated, correct edit.
+func TestTestPanicked(t *testing.T) {
+	cases := []struct {
+		name string
+		out  string
+		want bool
+	}{
+		{"real panic with trace", "panic: create flag redefined: draft\n\ngoroutine 1 [running]:\nmain.main()\n", true},
+		{"build failed", "# pkg\nfile.go:1:1: undefined: Foo\nFAIL\tpkg [build failed]\n", false},
+		{"real test failure", "--- FAIL: TestX (0.00s)\nFAIL\n", false},
+		{"pass", "PASS\nok  \tpkg\t0.010s\n", false},
+		{"mentions panic without a trace", "--- FAIL: TestX\n    x_test.go:10: expected panic recovery, got nil\nFAIL\n", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := testPanicked(c.out); got != c.want {
+				t.Errorf("testPanicked(%q) = %v, want %v", c.out, got, c.want)
+			}
+		})
+	}
+}
+
+// TestHandleCode_MethodsFileParamThreadedThroughDispatch guards the
+// dispatch-layer half of the same fix: handleCode's "methods" case used
+// to silently drop file:/module: before ever calling handleMethods --
+// passing them had zero effect. Confirmed end-to-end through
+// handleCode, not just the handler directly.
+func TestHandleCode_MethodsFileParamThreadedThroughDispatch(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := &server{backend: db}
+	s.ready.Store(true)
+
+	modA, err := db.EnsureModule("example.com/a", "a", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	modB, err := db.EnsureModule("example.com/b", "b", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := func(mod *store.Module, file, methodName string) {
+		typeDef := &store.Definition{ModuleID: mod.ID, Name: "Engine", Kind: "type", SourceFile: file, Body: "type Engine struct{}"}
+		typeDef.Hash = store.HashBody(typeDef.Body)
+		if _, err := db.UpsertDefinition(typeDef); err != nil {
+			t.Fatal(err)
+		}
+		m := &store.Definition{ModuleID: mod.ID, Name: methodName, Kind: "method", Receiver: "*Engine",
+			SourceFile: file, Body: "func (e *Engine) " + methodName + "() {}", Signature: "func (e *Engine) " + methodName + "()"}
+		m.Hash = store.HashBody(m.Body)
+		if _, err := db.UpsertDefinition(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed(modA, "a/engine.go", "Drive")
+	seed(modB, "b/engine.go", "Fly")
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{Op: "methods", Name: "Engine", File: "b/engine.go"})
+	if err != nil {
+		t.Fatalf("handleCode: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Fly") || strings.Contains(text, "Drive") {
+		t.Errorf("expected file: to actually scope through handleCode's dispatch, got:\n%s", text)
+	}
+}
+
+// TestHandleMethods_SameNamedTypesAcrossFilesGetMergeWarning guards the
+// pilot8b sweep fix: methods were collected by receiver-type-NAME alone
+// with no module/file scoping, so two completely unrelated types
+// sharing a name in different packages had their method sets silently
+// merged into one list -- indistinguishable from a genuine single
+// type's method set. An unscoped call now warns; file: now actually
+// scopes to one.
+func TestHandleMethods_SameNamedTypesAcrossFilesGetMergeWarning(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := &server{backend: db}
+
+	modA, err := db.EnsureModule("example.com/a", "a", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	modB, err := db.EnsureModule("example.com/b", "b", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	seed := func(mod *store.Module, file, methodName string) {
+		typeDef := &store.Definition{ModuleID: mod.ID, Name: "Engine", Kind: "type", SourceFile: file, Body: "type Engine struct{}"}
+		typeDef.Hash = store.HashBody(typeDef.Body)
+		if _, err := db.UpsertDefinition(typeDef); err != nil {
+			t.Fatal(err)
+		}
+		m := &store.Definition{ModuleID: mod.ID, Name: methodName, Kind: "method", Receiver: "*Engine",
+			SourceFile: file, Body: "func (e *Engine) " + methodName + "() {}", Signature: "func (e *Engine) " + methodName + "()"}
+		m.Hash = store.HashBody(m.Body)
+		if _, err := db.UpsertDefinition(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed(modA, "a/engine.go", "Drive")
+	seed(modB, "b/engine.go", "Fly")
+
+	// Unscoped: both methods merged, with a warning disclosing it.
+	result, _, err := s.handleMethods(context.Background(), nil, nameParam{Name: "Engine"})
+	if err != nil {
+		t.Fatalf("handleMethods: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Drive") || !strings.Contains(text, "Fly") {
+		t.Fatalf("expected both unrelated types' methods merged (documenting the pre-fix behavior), got:\n%s", text)
+	}
+	if !strings.Contains(text, "UNRELATED same-named types") {
+		t.Errorf("expected a merge warning when methods came from >1 file with no scoping, got:\n%s", text)
+	}
+
+	// Scoped via file: -- only that file's method, no warning.
+	scoped, _, err := s.handleMethods(context.Background(), nil, nameParam{Name: "Engine", File: "a/engine.go"})
+	if err != nil {
+		t.Fatalf("handleMethods scoped: %v", err)
+	}
+	scopedText := resultText(t, scoped)
+	if !strings.Contains(scopedText, "Drive") || strings.Contains(scopedText, "Fly") {
+		t.Errorf("file: should scope to just that file's methods, got:\n%s", scopedText)
+	}
+	if strings.Contains(scopedText, "UNRELATED same-named types") {
+		t.Errorf("a file:-scoped call should not warn about merging, got:\n%s", scopedText)
+	}
+}
+
+// TestCoupledChangeHint_GrammaticallyCorrectMessage guards the stale8
+// fix: the template combined with pluralizeCallers's output produced
+// duplicated/broken grammar -- "Tip: a direct caller has a direct
+// caller (Foo)" for n==1, "Tip: direct callers has a direct caller
+// (Foo, Bar)" for n>1 (also subject/verb disagreement). Verified
+// directly against the pre-fix source before fixing.
+func TestCoupledChangeHint_GrammaticallyCorrectMessage(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	// setupTestDB's fixture has a real caller relationship: Farewell
+	// calls Greet, populated via real ingest+resolve.
+	d, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hint := s.coupledChangeHint(d.ID)
+	if hint == "" {
+		t.Fatal("expected a non-empty hint since Farewell calls Greet")
+	}
+	if !strings.Contains(hint, "Farewell") {
+		t.Errorf("expected Farewell named as the caller, got: %q", hint)
+	}
+	if strings.Contains(hint, "caller has a direct caller") {
+		t.Errorf("regression: duplicated 'has a direct caller' phrase, got: %q", hint)
+	}
+	if strings.Contains(hint, "callers has a direct caller") {
+		t.Errorf("regression: subject/verb disagreement, got: %q", hint)
+	}
+	if !strings.Contains(hint, "this def has") {
+		t.Errorf("expected the fixed template's 'this def has' phrasing, got: %q", hint)
+	}
+}
+
+// TestHandleAddImport_NoDefinitionsFoundSuggestsRecovery is
+// TestHandleOverview_NoDefinitionsFoundSuggestsRecovery's counterpart
+// for add-import's own zero-match error, found in the same sweep.
+func TestHandleAddImport_NoDefinitionsFoundSuggestsRecovery(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.handleAddImport(context.Background(), nil, codeParam{File: "nonexistent/path.go", ImportPath: "fmt"})
+	if err != nil {
+		t.Fatalf("handleAddImport: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "search") && !strings.Contains(text, "overview") {
+		t.Errorf("expected a recovery hint pointing at search/overview, got:\n%s", text)
+	}
+}
+
+// TestHandleFileDefs_EmptyFileReturnsEmptyArrayNotNull guards the sweep
+// fix: `var results []defSummary` stayed nil for a file with zero
+// top-level declarations (e.g. a doc.go with just a package clause),
+// so the response read "0 definitions in doc.go:\n\nnull" instead of
+// an empty array.
+func TestHandleFileDefs_EmptyFileReturnsEmptyArrayNotNull(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "doc.go"), []byte("// Package testproj does nothing interesting.\npackage testproj\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package testproj\n\nfunc main() {}\n"), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+
+	s := &server{backend: db}
+	result, _, err := s.handleFileDefs(context.Background(), nil, codeParam{File: "doc.go"})
+	if err != nil {
+		t.Fatalf("handleFileDefs: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "null") {
+		t.Errorf("regression: bare 'null' embedded in the response, got:\n%s", text)
+	}
+	if !strings.Contains(text, "0 definitions in doc.go") {
+		t.Errorf("expected the zero-count header, got:\n%s", text)
+	}
+}
+
+// TestHandleFind_NoDefinitionsFoundSuggestsRecovery is
+// TestHandleOverview_NoDefinitionsFoundSuggestsRecovery's counterpart
+// for find's own zero-match error, found in the same sweep.
+func TestHandleFind_NoDefinitionsFoundSuggestsRecovery(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.handleFind(context.Background(), nil, findParam{File: "nonexistent/path.go"})
+	if err != nil {
+		t.Fatalf("handleFind: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "search") && !strings.Contains(text, "overview") {
+		t.Errorf("expected a recovery hint pointing at search/overview, got:\n%s", text)
+	}
+}
+
+// TestHandleOverview_NoDefinitionsFoundSuggestsRecovery guards the
+// stale8 sweep fix: overview's zero-match error was the one dead-end
+// message in the file with no recovery hint, unlike every sibling
+// zero-match path (search suggests overview; read/outline's
+// file-without-name error suggests overview too).
+func TestHandleOverview_NoDefinitionsFoundSuggestsRecovery(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+	s.ready.Store(true)
+
+	result, _, err := s.handleOverview(context.Background(), nil, codeParam{File: "nonexistent/path.go"})
+	if err != nil {
+		t.Fatalf("handleOverview: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "search") && !strings.Contains(text, "overview") {
+		t.Errorf("expected a recovery hint pointing at search/overview, got:\n%s", text)
+	}
+}
+
+// TestHandleQuery_ZeroRowsReturnsEmptyArrayNotNull guards the sweep
+// fix: internal/store's Query left `var results []map[string]any` nil
+// when a SELECT matched zero rows, so a perfectly normal empty result
+// set JSON-marshaled to a bare top-level "null" instead of "[]" --
+// indistinguishable from a crash.
+func TestHandleQuery_ZeroRowsReturnsEmptyArrayNotNull(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.handleQuery(context.Background(), nil, sqlParam{SQL: "SELECT id FROM definitions WHERE id = -1"})
+	if err != nil {
+		t.Fatalf("handleQuery: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.TrimSpace(text) == "null" {
+		t.Errorf("regression: bare 'null' response for a zero-row query, got:\n%s", text)
+	}
+	if !strings.Contains(text, "[]") {
+		t.Errorf("expected an empty JSON array, got:\n%s", text)
+	}
+}
+
+// TestHandleSearch_DottedQualifiedNameRetriesWithBareSymbol guards the
+// stale8 fix: search never applied Go's own "pkg.Symbol" convention
+// that read/outline/edit already resolve via resolveDottedQualifiedName
+// -- a real zero-1907 trajectory got "no matches" for
+// search(pattern:"zrpc.WithUnaryClientInterceptor") even though the
+// bare symbol existed and was found trivially on the next call.
+func TestHandleSearch_DottedQualifiedNameRetriesWithBareSymbol(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.handleSearch(context.Background(), nil, codeParam{Pattern: "somepkg.Greet"})
+	if err != nil {
+		t.Fatalf("handleSearch: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Greet") {
+		t.Errorf("expected the qualified-name retry to find Greet via its bare symbol, got:\n%s", text)
+	}
+	if !strings.Contains(text, "retried with the bare symbol") {
+		t.Errorf("expected a note disclosing the retry, got:\n%s", text)
+	}
+}
+
+// TestHandleSearch_MidStringWildcardNoMatchReturnsEmptyArrayNotNull
+// guards the stale8 fix: a pattern with '%' in the MIDDLE (e.g. a
+// printf-style path like "runs/%d/jobs") skipped the Stage-3 no-match
+// fallback entirely (strings.Trim only strips edges) and fell through
+// to toJSON(nil-slice), producing a bare top-level "null" instead of
+// an explanatory no-match response. Reproduced live against the
+// pre-fix build; this locks in the fix.
+func TestHandleSearch_MidStringWildcardNoMatchReturnsEmptyArrayNotNull(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.handleSearch(context.Background(), nil, codeParam{Pattern: "NoSuch%DefinitionXYZ123"})
+	if err != nil {
+		t.Fatalf("handleSearch: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.TrimSpace(text) == "null" {
+		t.Errorf("regression: bare 'null' response for a mid-string wildcard with no matches")
+	}
+}
+
+// TestHandleSearch_ResultsIncludeSourceFile guards the stale8 fix:
+// search's summary struct never included the definition's file
+// location, unlike read/outline/impact -- forcing a caller who wanted
+// to jump to `overview file:"<the file>"` to guess the path, which
+// directly caused a wasted round-trip in a real grpc-go-3476
+// trajectory.
+func TestHandleSearch_ResultsIncludeSourceFile(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.handleSearch(context.Background(), nil, codeParam{Pattern: "Greet"})
+	if err != nil {
+		t.Fatalf("handleSearch: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, `"file"`) {
+		t.Errorf("expected search results to include the source file, got:\n%s", text)
+	}
+	if !strings.Contains(text, "main.go") {
+		t.Errorf("expected the actual file path in results, got:\n%s", text)
+	}
+}
+
+// TestHandleTestCoverage_ZeroTestsReturnsEmptyArrayNotNull guards the
+// sweep fix: `var tests []testInfo` stayed nil for a def with zero
+// covering tests, so the JSON response read `"tests": null` instead
+// of `"tests": []` -- wrong shape for any consumer expecting an array.
+func TestHandleTestCoverage_ZeroTestsReturnsEmptyArrayNotNull(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+
+	// main() in setupTestDB's fixture is called by nothing and covered
+	// by no TestX function -- zero covering tests, unlike Greet/Farewell.
+	result, _, err := s.handleTestCoverage(context.Background(), nil, codeParam{Name: "main"})
+	if err != nil {
+		t.Fatalf("handleTestCoverage: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, `"tests": null`) {
+		t.Errorf("regression: tests field is null instead of an empty array, got:\n%s", text)
+	}
+	if !strings.Contains(text, `"tests": []`) {
+		t.Errorf("expected \"tests\": [] for a def with zero covering tests, got:\n%s", text)
+	}
+}
+
+// TestRankedSearchResult_ResultsIncludeSourceFile is
+// TestHandleSearch_ResultsIncludeSourceFile's counterpart for the
+// ranked-results path (search's OTHER result shape, hit when the
+// candidate set exceeds limit or rank:true is passed) -- it had the
+// identical missing-file-location gap in its own rankedSummary struct.
+func TestRankedSearchResult_ResultsIncludeSourceFile(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	defs, err := db.FindDefinitions("%")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) == 0 {
+		t.Fatal("expected at least one definition in the fixture")
+	}
+	result, _, err := s.rankedSearchResult("Greet", defs, 1)
+	if err != nil {
+		t.Fatalf("rankedSearchResult: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, `"file"`) {
+		t.Errorf("expected ranked search results to include the source file, got:\n%s", text)
+	}
+}
+
+// TestHandleCode_RemovedDoltOpsGetSpecificAnswerNotUnknownOp guards a real
+// trajectory failure (prometheus-18712, 2026-08-10): op:"status" and
+// op:"diff" both fell through to the generic "unknown op" default, whose
+// own error message listed "status"/"diff" in its "valid:" whitelist while
+// rejecting them -- self-contradictory and misleading. Both ops (along
+// with the rest of the Dolt-era git-semantics family) were removed in the
+// v0.27 SQLite migration and were never coming back; the fix is a
+// specific, honest "not supported" answer instead of the generic
+// fallthrough.
+func TestHandleCode_RemovedDoltOpsGetSpecificAnswerNotUnknownOp(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	for _, op := range []string{"status", "diff", "branch", "checkout", "merge", "commit", "conflicts", "resolve", "merge-abort", "diff-defs", "history"} {
+		t.Run(op, func(t *testing.T) {
+			result, _, err := s.handleCode(context.Background(), nil, codeParam{Op: op, Branch: "x", Message: "x", Name: "x", Body: "x", From: "x"})
+			if err != nil {
+				t.Fatalf("handleCode(%q): %v", op, err)
+			}
+			text := resultText(t, result)
+			if strings.Contains(text, "unknown op") {
+				t.Errorf("op:%q got the generic unknown-op fallthrough, want a specific not-supported answer:\n%s", op, text)
+			}
+			if !strings.Contains(text, "not supported") {
+				t.Errorf("op:%q expected a \"not supported\" explanation, got:\n%s", op, text)
+			}
+			// The self-contradiction: an error must not list its own rejected
+			// op name inside a "valid:" whitelist.
+			if strings.Contains(text, "valid:") && strings.Contains(text, op) {
+				idx := strings.Index(text, "valid:")
+				if strings.Contains(text[idx:], op) {
+					t.Errorf("op:%q self-contradicts: appears in its own \"valid:\" whitelist:\n%s", op, text)
+				}
+			}
+		})
+	}
+}
+
+// TestHandleCode_StaleWarningAppliesToErrorResultsToo guards a real
+// trajectory failure (prometheus-18972, 2026-08-10): wrapStale only
+// prepended "[startup ingest in progress]" to non-error results, so
+// overview(file:...) during the startup race silently said "no
+// definitions found" with no hint the index might just be incomplete --
+// the agent had no signal to retry via op:"sync" instead of concluding
+// the path was wrong, which cost most of that task's 859s runtime.
+// search's "no matches" got the warning (it returns a plain text result,
+// not an error) while overview(file:)'s "no definitions found" (an error
+// result) didn't -- same underlying stale-index condition, inconsistent
+// signaling depending on which op hit it.
+func TestHandleCode_StaleWarningAppliesToErrorResultsToo(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: t.TempDir()} // ready left false: simulates startup ingest still running
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{Op: "overview", File: "nonexistent/path.go"})
+	if err != nil {
+		t.Fatalf("handleCode: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected an error result for a nonexistent file, got a success")
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "startup ingest in progress") {
+		t.Errorf("error result during startup race should carry the stale-index warning, got:\n%s", text)
+	}
+}
+
+// TestHandleImpact_JSONCapsLargeTestList guards a real trajectory failure
+// (prometheus-18652, 2026-08-10): impactJSON had no size guard at all,
+// unlike the markdown path (capped at impactCallerCap=15 with a "pass
+// format:\"json\" for full list" hint). A def with 1,314 covering tests
+// produced a 243,019-character/9,473-line response that blew past the
+// harness's own tool-result size limit and got redirected to a file the
+// agent never successfully paged through -- the JSON "full list" escape
+// hatch had no cap of its own to escape TO.
+func TestHandleImpact_JSONCapsLargeTestList(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := &server{backend: db}
+
+	m, _ := db.EnsureModule("example.com/lib", "lib", "")
+	target := &store.Definition{
+		ModuleID: m.ID, Name: "T", Kind: "function", Exported: true,
+		Body: "func T() {}", Signature: "func T()",
+	}
+	target.Hash = store.HashBody(target.Body)
+	targetID, _ := db.UpsertDefinition(target)
+
+	const n = impactJSONCap + 5
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("TestT_%d", i)
+		c := &store.Definition{
+			ModuleID: m.ID, Name: name, Kind: "function", Test: true,
+			Body: fmt.Sprintf("func %s(t *testing.T) { T() }", name),
+		}
+		c.Hash = store.HashBody(c.Body)
+		id, _ := db.UpsertDefinition(c)
+		_ = db.SetReferences(id, []store.Reference{{FromDef: id, ToDef: targetID, Kind: "call"}})
+	}
+
+	result, _, err := s.handleImpact(context.Background(), nil, codeParam{Name: "T", Format: "json"})
+	if err != nil {
+		t.Fatalf("handleImpact: %v", err)
+	}
+	text := resultText(t, result)
+
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(text), &parsed); err != nil {
+		t.Fatalf("impactJSON output is not valid JSON: %v\n%s", err, text)
+	}
+
+	tests, ok := parsed["tests"].([]any)
+	if !ok {
+		t.Fatalf("expected \"tests\" array in JSON, got: %v", parsed["tests"])
+	}
+	if len(tests) != impactJSONCap {
+		t.Errorf("expected tests capped at %d, got %d", impactJSONCap, len(tests))
+	}
+	testsTotal, _ := parsed["tests_total"].(float64)
+	if int(testsTotal) != n {
+		t.Errorf("expected tests_total=%d (uncapped true count), got %v", n, parsed["tests_total"])
+	}
+	if _, ok := parsed["truncated"]; !ok {
+		t.Errorf("expected a \"truncated\" field when the cap was hit, got none. Full response:\n%s", text)
+	}
+	if len(text) > 50000 {
+		t.Errorf("impactJSON response is %d bytes -- capping didn't bound the actual response size", len(text))
+	}
+}
+
+// TestHandleBatchImpact_ModuleDisambiguatesSameNamedType guards a real bug
+// class found sweeping for explain's #248-style resolution bug (2026-08-10):
+// handleBatchImpact received the full codeParam (Module/File/Receiver
+// already in scope) but called GetDefinitionByName(name, "") directly for
+// each name in the batch, discarding them -- an ambiguous name had no way
+// to be disambiguated even though the caller supplied the means to.
+func TestHandleBatchImpact_ModuleDisambiguatesSameNamedType(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	if err := os.MkdirAll(filepath.Join(projDir, "bft"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(projDir, "chess"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "bft", "engine.go"), []byte(`package bft
+
+func Engine() {}
+
+func UseBft() { Engine() }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "chess", "engine.go"), []byte(`package chess
+
+func Engine() {}
+
+func UseA() { Engine() }
+func UseB() { Engine() }
+func UseC() { Engine() }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleBatchImpact(context.Background(), nil, codeParam{
+		Names:  []string{"Engine"},
+		Module: "testproj/bft",
+	})
+	if err != nil {
+		t.Fatalf("handleBatchImpact: %v", err)
+	}
+	text := resultText(t, result)
+	// bft's Engine has 1 direct caller (UseBft); chess's has 3 (UseA/B/C).
+	// A wrong resolution to chess's Engine would report combined_callers=3.
+	if !strings.Contains(text, `"direct_callers": 1`) {
+		t.Errorf("module:\"testproj/bft\" should have resolved to bft's Engine (1 caller), got:\n%s", text)
+	}
+	if strings.Contains(text, `"direct_callers": 3`) {
+		t.Errorf("batch-impact scoped to module:\"testproj/bft\" returned chess's Engine (3 callers) instead:\n%s", text)
+	}
+}
+
+// TestHandleValidatePlan_ReceiverDisambiguatesSameNamedMethod guards the
+// same #248-class bug found in the 2026-08-10 sweep: Mutation carries
+// Receiver, but handleValidatePlan called plain GetDefinitionByName,
+// ignoring it -- validating a plan mutation for (*Foo).Bar could silently
+// resolve to an unrelated same-named method on a different receiver type.
+func TestHandleValidatePlan_ReceiverDisambiguatesSameNamedMethod(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	mod, _ := db.EnsureModule("example.com/lib", "lib", "")
+	foo := &store.Definition{ModuleID: mod.ID, Name: "Bar", Kind: "method", Receiver: "*Foo", Body: "func (f *Foo) Bar() {}"}
+	foo.Hash = store.HashBody(foo.Body)
+	db.UpsertDefinition(foo)
+	baz := &store.Definition{ModuleID: mod.ID, Name: "Bar", Kind: "method", Receiver: "*Baz", Body: "func (b *Baz) Bar() {}"}
+	baz.Hash = store.HashBody(baz.Body)
+	bazID, _ := db.UpsertDefinition(baz)
+	// Give Baz.Bar 2 callers, Foo.Bar 0 -- if the receiver is ignored, a
+	// blast-radius tiebreak resolves "Bar" to Baz's (more callers), which
+	// would silently validate the WRONG mutation.
+	for _, callerName := range []string{"CallerA", "CallerB"} {
+		c := &store.Definition{ModuleID: mod.ID, Name: callerName, Kind: "function", Body: "func " + callerName + "() { (&Baz{}).Bar() }"}
+		c.Hash = store.HashBody(c.Body)
+		cID, _ := db.UpsertDefinition(c)
+		_ = db.SetReferences(cID, []store.Reference{{FromDef: cID, ToDef: bazID, Kind: "call"}})
+	}
+
+	result, _, err := s.handleValidatePlan(context.Background(), nil, codeParam{
+		Mutations: []store.Mutation{{Type: "edit", Name: "Bar", Receiver: "*Foo"}},
+	})
+	if err != nil {
+		t.Fatalf("handleValidatePlan: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, `"direct_callers": 0`) {
+		t.Errorf("receiver:\"*Foo\" should have resolved to Foo's Bar (0 callers), got:\n%s", text)
+	}
+	if strings.Contains(text, `"direct_callers": 2`) {
+		t.Errorf("validate-plan for receiver:\"*Foo\" resolved to Baz's Bar (2 callers) instead:\n%s", text)
+	}
+}
+
+// TestHandleTestByName_ResolvesFullModulePathHint guards a real bug
+// found via a prometheus-18534 trajectory (2026-08-10): the agent
+// explicitly passed module:"github.com/prometheus/prometheus/promql"
+// -- the same full-import-path shape "module:" takes everywhere else
+// in this API -- but testScopeTarget only substring-matched against
+// repo-relative source_file paths, which a full module path never
+// matches. The hint was silently ignored 3 calls in a row, each
+// falling back to a whole-repo `go test ./...` that exhausted the
+// box's disk compiling every unrelated cloud-SDK dependency.
+func TestHandleTestByName_ResolvesFullModulePathHint(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "promql"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "promql", "functions.go"), []byte("package promql\n\nfunc Functions() string { return \"fn\" }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "promql", "functions_test.go"), []byte("package promql\n\nimport \"testing\"\n\nfunc TestFunctions(t *testing.T) {\n\tif Functions() == \"\" {\n\t\tt.Fatal(\"promql-marker\")\n\t}\n}\n"), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleTestByName(context.Background(), nil, "TestFunctions", "testproj/promql", "")
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "across ./promql/...:") {
+		t.Errorf("expected module: hint to scope to \"./promql/...\", got:\n%s", text)
+	}
+	if !strings.Contains(text, "ALL TESTS PASSED") {
+		t.Errorf("expected TestFunctions to pass, got:\n%s", text)
+	}
+}
+
+// TestHandleTestByName_ShortHintPrefersPackageRootOverSubdirectory guards
+// a real bug found via a prometheus-19114 trajectory (2026-08-11):
+// DistinctSourceFiles has no ORDER BY, so testScopeTarget's first-match
+// substring search picked whichever match SQLite happened to return
+// first. A short hint like "tsdb" substring-matches files in
+// tsdb/encoding/*.go just as well as tsdb/*.go itself, so it could
+// resolve to an arbitrary, wrong subdirectory instead of the package
+// the hint actually names -- the real trajectory scoped to
+// "./tsdb/encoding/..." and never found its target test, living in
+// tsdb/db_test.go, burning several dead test calls before giving up.
+func TestHandleTestByName_ShortHintPrefersPackageRootOverSubdirectory(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "tsdb", "encoding"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "tsdb", "db.go"), []byte("package tsdb\n\nfunc Open() string { return \"open\" }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "tsdb", "db_test.go"), []byte("package tsdb\n\nimport \"testing\"\n\nfunc TestQuerier(t *testing.T) {\n\tif Open() == \"\" {\n\t\tt.Fatal(\"tsdb-root-marker\")\n\t}\n}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "tsdb", "encoding", "enc.go"), []byte("package encoding\n\nfunc Encode() string { return \"enc\" }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "tsdb", "encoding", "enc_test.go"), []byte("package encoding\n\nimport \"testing\"\n\nfunc TestEncodingUnrelated(t *testing.T) {\n\tif Encode() == \"\" {\n\t\tt.Fatal(\"encoding-marker\")\n\t}\n}\n"), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleTestByName(context.Background(), nil, "TestQuerier", "tsdb", "")
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "across ./tsdb/...:") {
+		t.Errorf("expected hint \"tsdb\" to scope to the package root \"./tsdb/...\", not a subdirectory, got:\n%s", text)
+	}
+	if !strings.Contains(text, "ALL TESTS PASSED") {
+		t.Errorf("expected TestQuerier to be found and pass, got:\n%s", text)
+	}
+	if strings.Contains(text, "encoding-marker") {
+		t.Errorf("test run leaked into the unrelated tsdb/encoding subpackage:\n%s", text)
+	}
+}
+
+// TestTestMatchedNothing_IgnoresSiblingPackageNoise is the direct unit
+// test for the prometheus-19114 false positive: a recursive "./pkg/..."
+// scope prints "no tests to run" for every sibling subpackage lacking
+// the pattern, even when the target package's test ran and passed.
+func TestTestMatchedNothing_IgnoresSiblingPackageNoise(t *testing.T) {
+	cases := []struct {
+		name string
+		out  string
+		want bool
+	}{
+		{
+			name: "real pass alongside a sibling's no-op",
+			out: "=== RUN   TestQuerier\n" +
+				"--- PASS: TestQuerier (0.00s)\n" +
+				"PASS\n" +
+				"ok  \ttestproj/tsdb\t0.001s\n" +
+				"testing: warning: no tests to run\n" +
+				"PASS\n" +
+				"ok  \ttestproj/tsdb/encoding\t0.001s [no tests to run]\n",
+			want: false,
+		},
+		{
+			name: "real failure alongside a sibling's no-op",
+			out: "=== RUN   TestQuerier\n" +
+				"--- FAIL: TestQuerier (0.00s)\n" +
+				"FAIL\n" +
+				"testing: warning: no tests to run\n" +
+				"PASS\n" +
+				"ok  \ttestproj/tsdb/encoding\t0.001s [no tests to run]\n",
+			want: false,
+		},
+		{
+			name: "genuinely zero tests ran anywhere",
+			out: "testing: warning: no tests to run\n" +
+				"PASS\n" +
+				"ok  \ttestproj/tsdb\t0.001s [no tests to run]\n" +
+				"testing: warning: no tests to run\n" +
+				"PASS\n" +
+				"ok  \ttestproj/tsdb/encoding\t0.001s [no tests to run]\n",
+			want: true,
+		},
+		{
+			name: "no \"no tests to run\" text at all",
+			out:  "=== RUN   TestQuerier\n--- PASS: TestQuerier (0.00s)\nPASS\n",
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := testMatchedNothing(tc.out); got != tc.want {
+				t.Errorf("testMatchedNothing() = %v, want %v\noutput:\n%s", got, tc.want, tc.out)
+			}
+		})
+	}
+}
+
+// TestHandleCode_OpAliasesDispatchToAddImport guards opAliases: common
+// near-miss guesses for "add-import" (underscore convention, or the
+// bare short name) hit real trajectories repeatedly (prometheus-17395
+// tried it twice, plus 18765/18972/18841) and should dispatch exactly
+// like the real op instead of round-tripping an "unknown op" error.
+func TestHandleCode_OpAliasesDispatchToAddImport(t *testing.T) {
+	for _, alias := range []string{"import", "add_import", "addimport", "import_path"} {
+		t.Run(alias, func(t *testing.T) {
+			db, projDir := setupTestDB(t)
+			defer db.Close()
+			s := &server{backend: db, projectDir: projDir}
+			s.ready.Store(true)
+
+			result, _, err := s.handleCode(context.Background(), nil, codeParam{
+				Op:         alias,
+				File:       "main.go",
+				ImportPath: "hash/fnv",
+			})
+			if err != nil {
+				t.Fatalf("handleCode(op:%q): %v", alias, err)
+			}
+			text := resultText(t, result)
+			if strings.Contains(text, "unknown op") {
+				t.Fatalf("op:%q was not recognized as an add-import alias, got: %s", alias, text)
+			}
+			if !strings.Contains(text, "added import") {
+				t.Errorf("expected 'added import' in response for op:%q, got: %s", alias, text)
+			}
+
+			final, ferr := os.ReadFile(filepath.Join(projDir, "main.go"))
+			if ferr != nil {
+				t.Fatalf("read main.go: %v", ferr)
+			}
+			if !strings.Contains(string(final), "\"hash/fnv\"") {
+				t.Errorf("expected hash/fnv import to land on disk for op:%q, got:\n%s", alias, final)
+			}
+		})
+	}
+}
+
+func TestTestTimeoutFor_ScalesForLargeRunsRespectsExplicitOverride(t *testing.T) {
+	t.Run("small run keeps the default", func(t *testing.T) {
+		got := testTimeoutFor(10, "./tsdb/...")
+		if got != testTimeout {
+			t.Errorf("got %v, want default %v", got, testTimeout)
+		}
+	})
+	t.Run("many affected tests scales up", func(t *testing.T) {
+		got := testTimeoutFor(200, "./tsdb/...")
+		if got <= testTimeout {
+			t.Errorf("got %v, want > default %v for 200 affected tests", got, testTimeout)
+		}
+	})
+	t.Run("whole-repo scope scales up even with few tests", func(t *testing.T) {
+		got := testTimeoutFor(1, "./...")
+		if got <= testTimeout {
+			t.Errorf("got %v, want > default %v for a whole-repo scope", got, testTimeout)
+		}
+	})
+	t.Run("scaled timeout is capped", func(t *testing.T) {
+		got := testTimeoutFor(1_000_000, "./...")
+		if got > 5*time.Minute {
+			t.Errorf("got %v, want capped at 5m", got)
+		}
+	})
+	t.Run("an operator-set DEFN_TEST_TIMEOUT disables scaling entirely", func(t *testing.T) {
+		// testTimeout itself is resolved once at package init, so setting
+		// the env var here doesn't change ITS value -- what this actually
+		// verifies is that testTimeoutFor treats the env var's presence
+		// (checked fresh at call time) as "an operator made an explicit
+		// choice, don't second-guess it with scaling", not that it
+		// re-parses a new duration on every call.
+		t.Setenv("DEFN_TEST_TIMEOUT", "45s")
+		got := testTimeoutFor(1_000_000, "./...")
+		if got != testTimeout {
+			t.Errorf("got %v, want the unscaled package-level testTimeout %v -- an explicit env var must disable scaling, not just cap it", got, testTimeout)
+		}
+	})
+}
+
+// TestHandleReplaceHunk_NotFoundSuggestsWhitespaceNormalizedMatch guards
+// suggestClosestFragmentHint: a real trajectory (prometheus-18712)
+// burned 17 of 34 replace-hunk calls on bare "hunk not found in body"
+// errors with zero diagnostic information, each retry narrowing old to
+// a smaller guess rather than converging -- replace-hunk's success
+// response never shows the resulting body, so an agent making many
+// sequential edits to one large function has no way to see what its
+// remembered fragment's whitespace/indentation actually looks like now.
+// When old differs from the real body only in whitespace, the error
+// should show the exact real bytes to copy instead of a bare miss.
+func TestHandleReplaceHunk_NotFoundSuggestsWhitespaceNormalizedMatch(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	// Greet's real body line is exactly `\treturn "Hello, " + name` --
+	// pass a whitespace-mangled version (extra space, no tab) that will
+	// never byte-exact match.
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op:   "replace-hunk",
+		Name: "Greet",
+		Old:  `return  "Hello, " + name`,
+		New:  `return "Hi, " + name`,
+	})
+	if err != nil {
+		t.Fatalf("handleCode: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "hunk not found") {
+		t.Fatalf("expected the base 'not found' error to still be present, got: %s", text)
+	}
+	if !strings.Contains(text, `return "Hello, " + name`) {
+		t.Errorf("expected the hint to show the real body text to copy verbatim, got: %s", text)
+	}
+}
+
+// TestHandleCreate_NewFileInNestedModuleUsesNestedGoMod is a
+// regression for the etcd multi-module bench findings: handleCreate's
+// "brand new directory" path derived the new module's path via
+// emit.DetectModuleRoot(mods) + "/" + dir -- a DB-derived guess at
+// the repo's single common module root, wrong whenever the new file
+// actually sits inside its own nested go.mod (etcd's server/, tests/,
+// etcdctl/ each declare one). The new directory must resolve against
+// the real filesystem go.mod nearest it, not the DB's single-module
+// assumption.
+func TestHandleCreate_NewFileInNestedModuleUsesNestedGoMod(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	nestedDir := filepath.Join(projDir, "sub")
+	if err := os.MkdirAll(nestedDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nestedDir, "go.mod"), []byte("module sub.example/v2\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body:   "func NewSubFunc() int { return 1 }",
+		File:   "sub/newpkg/y.go",
+		Module: "testproj",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Created") {
+		t.Fatalf("expected 'Created', got: %s", text)
+	}
+
+	d, err := db.GetDefinitionByName("NewSubFunc", "")
+	if err != nil {
+		t.Fatalf("def not found: %v", err)
+	}
+	mod, err := db.GetModuleByPath("sub.example/v2/newpkg")
+	if err != nil || mod == nil {
+		t.Fatalf("expected module %q, got module=%v err=%v", "sub.example/v2/newpkg", mod, err)
+	}
+	if d.ModuleID != mod.ID {
+		t.Errorf("NewSubFunc landed in module id=%d, want id=%d (sub.example/v2/newpkg)", d.ModuleID, mod.ID)
+	}
+
+	if bogus, err := db.GetModuleByPath("testproj/sub/newpkg"); err == nil && bogus != nil {
+		t.Errorf("also created the bogus root-prefixed module %q (id=%d) -- new nested-module directories must resolve against their own go.mod, not the repo root's", "testproj/sub/newpkg", bogus.ID)
+	}
+}
+
+// TestHandleCreate_NestedModuleAddDoesNotLoseSiblingDefs is a
+// regression probe for an etcd bench trajectory (etcd-io__etcd-20342,
+// v2 rerun with the ModuleForDir/runScopedBuild fixes already
+// applied): the agent successfully created a new function in an
+// already-synced nested-module file (server/embed/config.go, 37
+// existing defs), the build succeeded, but immediately afterward a
+// sibling definition in that SAME file that existed before the
+// create (configFromFile) came back "not found" -- and a fresh
+// search for it returned zero matches, as if the whole file's defs
+// had been dropped from the index. This test reproduces the shape
+// with a minimal nested-module fixture to determine whether creating
+// a new def in an already-ingested nested-module file corrupts its
+// existing sibling defs.
+func TestHandleCreate_NestedModuleAddDoesNotLoseSiblingDefs(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	nestedDir := filepath.Join(projDir, "sub")
+	if err := os.MkdirAll(filepath.Join(nestedDir, "pkg"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nestedDir, "go.mod"), []byte("module sub.example/v2\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	xGoPath := filepath.Join(nestedDir, "pkg", "x.go")
+	if err := os.WriteFile(xGoPath, []byte("package pkg\n\nfunc FuncA() int { return 1 }\n\nfunc FuncB() int { return 2 }\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mirror what code(op:"sync", file:...) does: register the
+	// nested-module file's existing defs before any create touches it.
+	if _, err := ingest.IngestFile(db, projDir, xGoPath); err != nil {
+		t.Fatalf("IngestFile: %v", err)
+	}
+	if before, err := db.GetDefinitionByName("FuncA", "sub.example/v2/pkg"); err != nil || before == nil {
+		t.Fatalf("precondition: FuncA should be findable right after IngestFile, got err=%v", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body:   "func FuncC() int { return 3 }",
+		File:   "sub/pkg/x.go",
+		Module: "sub.example/v2/pkg",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Created") {
+		t.Fatalf("expected 'Created', got: %s", text)
+	}
+
+	if _, err := db.GetDefinitionByName("FuncA", "sub.example/v2/pkg"); err != nil {
+		t.Errorf("FuncA vanished after creating a sibling def in the same nested-module file: %v", err)
+	}
+	if _, err := db.GetDefinitionByName("FuncB", "sub.example/v2/pkg"); err != nil {
+		t.Errorf("FuncB vanished after creating a sibling def in the same nested-module file: %v", err)
+	}
+}
+
+// TestHandleEdit_SuccessSuggestsExistingUntouchedTestFile is a
+// regression for the etcd/traefik/caddy bench investigation: the
+// single largest driver of defn's correctness gap vs plain Edit/Write
+// was agents fixing the source file correctly, then never touching
+// the paired _test.go -- confirmed via real trajectories (e.g.
+// caddyserver__caddy-7729) where the agent ran existing tests to
+// verify nothing broke but never looked at the test file to add a new
+// case. setupTestDB's fixture project has main_test.go alongside
+// main.go; editing a non-test def there without touching main_test.go
+// should surface a hint pointing at it.
+func TestHandleEdit_SuccessSuggestsExistingUntouchedTestFile(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	newBody := `func Greet(name string) string {
+	return "Hi, " + name
+}`
+	result, _, _ := s.handleEdit(context.Background(), nil, editParam{Name: "Greet", NewBody: newBody})
+	text := resultText(t, result)
+
+	if !strings.Contains(text, "main_test.go") {
+		t.Errorf("expected a hint pointing at the untouched main_test.go, got: %s", text)
+	}
+}
+
+// TestHandleEdit_NoTestCoverageHintWhenEditingATestFunctionItself
+// checks testCoverageHint's isTest guard: editing a test function
+// itself shouldn't suggest touching "a test file" -- that's what's
+// already being edited.
+func TestHandleEdit_NoTestCoverageHintWhenEditingATestFunctionItself(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	newBody := `func TestGreet(t *testing.T) {
+	if Greet("x") == "" {
+		t.Fatal("empty")
+	}
+}`
+	result, _, _ := s.handleEdit(context.Background(), nil, editParam{Name: "TestGreet", NewBody: newBody})
+	text := resultText(t, result)
+
+	if strings.Contains(text, "Tip: this package has an existing test file") {
+		t.Errorf("expected no test-coverage hint when editing a test function itself, got: %s", text)
+	}
+}
+
+// TestHandleCreate_SuccessSuggestsExistingUntouchedTestFile mirrors
+// TestHandleEdit_SuccessSuggestsExistingUntouchedTestFile for the
+// create path: setupTestDB's module already has main_test.go, so
+// creating a new non-test function without touching it should surface
+// the same hint.
+func TestHandleCreate_SuccessSuggestsExistingUntouchedTestFile(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body: "func NewHelper() string { return \"help\" }",
+	})
+	text := resultText(t, result)
+
+	if !strings.Contains(text, "main_test.go") {
+		t.Errorf("expected a hint pointing at the untouched main_test.go, got: %s", text)
+	}
+}
+
+// TestHandleCreate_NoTestCoverageHintWhenNoModuleGiven checks
+// testCoverageHint degrades silently (empty string, not a crash) when
+// ListFileSources has nothing to offer -- e.g. module ID 0 for a
+// created def whose module lookup came back empty.
+func TestHandleCreate_NoTestCoverageHintWhenNoModuleGiven(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	hint := s.testCoverageHint(0, "")
+	if hint != "" {
+		t.Errorf("expected empty hint for a module with no file sources, got: %q", hint)
+	}
+}
+
+// TestHandleFragmentEdit_SuccessSuggestsExistingUntouchedTestFile is
+// the fragment-edit/replace-hunk-shaped counterpart to
+// TestHandleEdit_SuccessSuggestsExistingUntouchedTestFile -- found
+// missing via a real confirmatory rerun (caddyserver__caddy-7734):
+// the agent used the fragment-edit write path, not handleEdit, so the
+// hint wired only into handleEdit never fired.
+func TestHandleFragmentEdit_SuccessSuggestsExistingUntouchedTestFile(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, _ := s.handleFragmentEdit(context.Background(), nil, codeParam{
+		Name:        "Greet",
+		OldFragment: "Hello",
+		NewFragment: "Hey",
+	})
+	text := resultText(t, result)
+
+	if !strings.Contains(text, "main_test.go") {
+		t.Errorf("expected a hint pointing at the untouched main_test.go, got: %s", text)
+	}
+}
+
+// TestHandleReplaceHunk_SuccessSuggestsExistingUntouchedTestFile
+// covers applyEditTerse (the shared success path for replace-hunk,
+// replace-slice, insert-precondition, wrap-in-defer, rename-param) --
+// the single most commonly used write path per CLAUDE.md's own
+// guidance, and the one a real confirmatory rerun (caddyserver__caddy-7734)
+// showed missing the test-coverage hint entirely.
+func TestHandleReplaceHunk_SuccessSuggestsExistingUntouchedTestFile(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op:   "replace-hunk",
+		Name: "Greet",
+		Old:  `return "Hello, " + name`,
+		New:  `return "Hi, " + name`,
+	})
+	if err != nil {
+		t.Fatalf("handleCode: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "main_test.go") {
+		t.Errorf("expected a hint pointing at the untouched main_test.go, got: %s", text)
+	}
+}
+
+// TestHandleApply_SuccessSuggestsExistingUntouchedTestFile covers the
+// apply-batch write path -- a batch that edits a non-test def without
+// touching any of the module's existing test files should surface the
+// same test-coverage hint as the single-op handlers.
+func TestHandleApply_SuccessSuggestsExistingUntouchedTestFile(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "edit", Name: "Greet", NewBody: `func Greet(name string) string {
+	return "Hi, " + name
+}`},
+		},
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "main_test.go") {
+		t.Errorf("expected a hint pointing at the untouched main_test.go, got: %s", text)
+	}
+}
+
+// TestFindModuleByFile_VersionedNestedModuleResolvesViaFilesystem is a
+// regression for the etcd bench findings (issue #20342): findModuleByFile
+// matched a file's directory against module Paths via string-suffix
+// comparison, which silently breaks whenever the module's declared import
+// path has a semantic-version segment inserted mid-path -- e.g.
+// "example.com/server/v3/embed" does not end with "/server/embed" because
+// of the "/v3" in between. A real etcd trajectory hit this on every
+// create/edit against server/embed/config.go: findModuleByFile (and
+// everything downstream: handleCreate, handleApply, resolveEditTarget,
+// resolveApplyTarget) falsely reported the file unresolvable, forcing the
+// agent into a cascade of confused, wrong file:/module: retries.
+func TestFindModuleByFile_VersionedNestedModuleResolvesViaFilesystem(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	serverDir := filepath.Join(projDir, "server")
+	if err := os.MkdirAll(filepath.Join(serverDir, "embed"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(serverDir, "go.mod"), []byte("module example.com/server/v3\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(serverDir, "embed", "config.go"), []byte("package embed\n\nfunc Existing() int { return 1 }\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.EnsureModule("example.com/server/v3/embed", "embed", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	mod := s.findModuleByFile("server/embed/config.go")
+	if mod == nil {
+		t.Fatal("findModuleByFile returned nil for a real file under a versioned nested module")
+	}
+	if mod.Path != "example.com/server/v3/embed" {
+		t.Errorf("got module %q, want %q", mod.Path, "example.com/server/v3/embed")
+	}
+}
+
+// TestHandleApply_CreateSingleDeclFallsBackToModuleWhenFileUnresolved is a
+// regression: handleApply's single-decl "create" case bailed out with
+// "does not map to any known module" the instant findModuleByFile(file:)
+// returned nil, never trying an explicit module: the caller also passed --
+// unlike handleCreate's standalone path, which already fell through to
+// module: on a file: miss. A real etcd trajectory (#20342) hit this
+// directly: apply's create sub-op passed both a (mistyped) file: and a
+// correct module:, and got the same "does not map to any known module"
+// error even though the module unambiguously existed and module: alone
+// would have resolved it.
+func TestHandleApply_CreateSingleDeclFallsBackToModuleWhenFileUnresolved(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	pkgDir := filepath.Join(projDir, "pkg")
+	if err := os.MkdirAll(pkgDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkgDir, "pkg.go"), []byte("package pkg\n\nfunc Existing() int { return 1 }\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	result, _, err := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{
+				Op:     "create",
+				File:   "totally/bogus/path/file.go",
+				Module: "testproj/pkg",
+				Body:   "func NewApplyFallback() int { return 1 }",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleApply error: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "does not map to any known module") {
+		t.Fatalf("create should have fallen back to the explicit module: when file: didn't resolve, got: %s", text)
+	}
+	if !strings.Contains(text, "created NewApplyFallback") {
+		t.Fatalf("expected successful create, got: %s", text)
+	}
+	if _, err := db.GetDefinitionByName("NewApplyFallback", "testproj/pkg"); err != nil {
+		t.Fatalf("def not persisted under testproj/pkg: %v", err)
+	}
+}
+
+// TestHandleOverview_VersionedNestedModuleBareDirectoryResolves is a
+// regression for the etcd bench findings (issue #20342, follow-on sweep):
+// handleOverview's bare-directory shape (file: with no .go suffix, e.g.
+// "server/embed" rather than the full import path) resolved definitions
+// via FindDefinitionsByFile's `m.path LIKE %fileSuffix%` fallback, which
+// breaks whenever the module's import path has a semantic-version segment
+// inserted mid-path -- "go.etcd.io/etcd/server/v3/embed" does not contain
+// the contiguous substring "server/embed" because "v3" sits in between.
+// overview(file:"server/embed") on such a module silently returned "no
+// definitions found" even though the module was fully ingested with dozens
+// of real definitions -- the same failure shape as the already-fixed
+// findModuleByFile and FindDefinitionsByFile bugs, just reached through
+// handleOverview's bare-directory path instead.
+func TestHandleOverview_VersionedNestedModuleBareDirectoryResolves(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	serverDir := filepath.Join(projDir, "server")
+	if err := os.MkdirAll(filepath.Join(serverDir, "embed"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(serverDir, "go.mod"), []byte("module example.com/server/v3\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(serverDir, "embed", "config.go"), []byte("package embed\n\nfunc Existing() int { return 1 }\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	mod, err := db.EnsureModule("example.com/server/v3/embed", "embed", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.UpsertDefinition(&store.Definition{
+		ModuleID:   mod.ID,
+		Name:       "Existing",
+		Kind:       "function",
+		SourceFile: "server/embed/config.go",
+		StartLine:  3,
+		EndLine:    3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	result, _, err := s.handleOverview(context.Background(), nil, codeParam{File: "server/embed"})
+	if err != nil {
+		t.Fatalf("handleOverview error: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "no definitions found") {
+		t.Fatalf("overview should have resolved the versioned nested module via the filesystem, got: %s", text)
+	}
+	if !strings.Contains(text, "Existing") {
+		t.Fatalf("expected Existing in overview output, got: %s", text)
+	}
+}
+
+func TestHandleTestByName_VersionedNestedModuleHintScopesToRealDirectory(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	serverDir := filepath.Join(projDir, "server")
+	if err := os.MkdirAll(filepath.Join(serverDir, "embed"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(serverDir, "go.mod"), []byte("module example.com/server/v3\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(serverDir, "embed", "config.go"), []byte("package embed\n\nfunc Widget() string { return \"embed\" }\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	mod, err := db.EnsureModule("example.com/server/v3/embed", "embed", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.UpsertDefinition(&store.Definition{
+		ModuleID:   mod.ID,
+		Name:       "Widget",
+		Kind:       "function",
+		Body:       "func Widget() string { return \"embed\" }",
+		SourceFile: "server/embed/config.go",
+		StartLine:  3,
+		EndLine:    3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	got := s.testScopeTarget("example.com/server/v3/embed")
+	if got != "./server/embed/..." {
+		t.Errorf("testScopeTarget(%q) = %q, want %q (the real on-disk directory, not an import-path reconstruction)",
+			"example.com/server/v3/embed", got, "./server/embed/...")
+	}
+}
+
+// TestHandleTestByName_DoesNotRewriteUnrelatedFiles mirrors
+// TestHandleTest_DoesNotRewriteUnrelatedFiles for handleTestByName's own
+// separate "ensure files are current" emit call, scoped by module:/file:
+// rather than by a resolved def.
+func TestHandleTestByName_DoesNotRewriteUnrelatedFiles(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "other"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc RootFunc() string { return \"root\" }\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main_test.go"), []byte("package main\n\nimport \"testing\"\n\nfunc TestRootFunc(t *testing.T) {\n\tif RootFunc() == \"\" {\n\t\tt.Fatal(\"empty\")\n\t}\n}\n"), 0644)
+	otherSrc := "package other\n\nimport (\n\t\"strings\"\n\t\"fmt\"\n)\n\nfunc OtherFunc() string { return fmt.Sprintf(\"%s\", strings.ToUpper(\"x\")) }\n"
+	otherPath := filepath.Join(projDir, "other", "other.go")
+	os.WriteFile(otherPath, []byte(otherSrc), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	before, err := os.ReadFile(otherPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, _, err := s.handleTestByName(context.Background(), nil, "TestRootFunc", "", "")
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	if !strings.Contains(resultText(t, result), "ALL TESTS PASSED") {
+		t.Fatalf("expected TestRootFunc to pass, got: %s", resultText(t, result))
+	}
+
+	after, err := os.ReadFile(otherPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Errorf("handleTestByName rewrote an unrelated file it never needed to touch:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+// TestHandleTest_DoesNotRewriteUnrelatedFiles is a regression for a real
+// etcd bench trajectory (2026-08-17): handleTest's "ensure files are
+// current" step called the fully unscoped emit.Emit, which re-serializes
+// and goimports-normalizes EVERY file in the whole project on every
+// single code(op:"test") call -- not just the file(s) relevant to what's
+// being tested. On a real multi-module repo this silently rewrote the
+// import grouping of unrelated generated files nothing about the task
+// ever touched, corrupting an otherwise-exact edit's file-touch
+// precision. This fixture's "other" package has an on-disk import order
+// that doesn't match goimports' canonical grouping (deliberately, to
+// detect any full-project goimports pass) -- handleTest for RootFunc
+// must leave it untouched, byte for byte.
+func TestHandleTest_DoesNotRewriteUnrelatedFiles(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "other"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc RootFunc() string { return \"root\" }\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main_test.go"), []byte("package main\n\nimport \"testing\"\n\nfunc TestRootFunc(t *testing.T) {\n\tif RootFunc() == \"\" {\n\t\tt.Fatal(\"empty\")\n\t}\n}\n"), 0644)
+	// Non-canonical import grouping (stdlib imports NOT alphabetized/grouped
+	// the way goimports would write them) -- any full-project goimports pass
+	// would rewrite this file's import block.
+	otherSrc := "package other\n\nimport (\n\t\"strings\"\n\t\"fmt\"\n)\n\nfunc OtherFunc() string { return fmt.Sprintf(\"%s\", strings.ToUpper(\"x\")) }\n"
+	otherPath := filepath.Join(projDir, "other", "other.go")
+	os.WriteFile(otherPath, []byte(otherSrc), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	before, err := os.ReadFile(otherPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, _, err := s.handleTest(context.Background(), nil, nameParam{Name: "RootFunc"})
+	if err != nil {
+		t.Fatalf("handleTest: %v", err)
+	}
+	if !strings.Contains(resultText(t, result), "ALL TESTS PASSED") {
+		t.Fatalf("expected RootFunc's test to pass, got: %s", resultText(t, result))
+	}
+
+	after, err := os.ReadFile(otherPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Errorf("handleTest rewrote an unrelated file it never needed to touch:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+// TestHandleRename_StructFieldRenamesDeclarationAndCallers is the
+// positive regression: struct fields are excluded from emit by design
+// (#11), so a field rename has to rewrite the enclosing TYPE's own Body
+// (a separate DB row) in addition to the field's own row and its
+// callers. Verifies the struct declaration on disk actually changes,
+// both selector and keyed-composite-literal callers are rewritten, and
+// the result still builds (handleFieldRename pays for a real build gate
+// unlike the rest of rename).
+func TestHandleRename_StructFieldRenamesDeclarationAndCallers(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "fieldproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module fieldproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package fieldproj
+
+type Opts struct {
+	Count bool
+}
+
+func readSelector(o Opts) bool {
+	return o.Count
+}
+
+func buildLiteral() Opts {
+	return Opts{Count: true}
+}
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleRename(context.Background(), nil, renameParam{
+		OldName:  "Count",
+		NewName:  "CountOnly",
+		Receiver: "Opts",
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "rolled back") || strings.Contains(text, "not supported") {
+		t.Fatalf("expected rename to succeed, got: %s", text)
+	}
+	if !strings.Contains(text, "struct declaration") {
+		t.Errorf("expected the response to confirm the struct declaration was updated, got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(raw)
+	if strings.Contains(src, "Count bool") {
+		t.Errorf("expected the struct declaration to be renamed, still has old field:\n%s", src)
+	}
+	if !strings.Contains(src, "CountOnly bool") {
+		t.Errorf("expected the struct declaration to declare CountOnly, got:\n%s", src)
+	}
+	if !strings.Contains(src, "o.CountOnly") {
+		t.Errorf("expected the selector-expression caller to be rewritten, got:\n%s", src)
+	}
+	if !strings.Contains(src, "Opts{CountOnly: true}") {
+		t.Errorf("expected the keyed composite literal caller to be rewritten, got:\n%s", src)
+	}
+}
+
+// TestHandleApply_RenameStructFieldRenamesDeclarationAndCallers is
+// handleApply's rename case's half of the same regression as
+// TestHandleRename_StructFieldRenamesDeclarationAndCallers --
+// handleApply duplicates handleRename's rename logic inline rather than
+// calling it, so the same struct-declaration-rewrite fix has to be
+// applied there too.
+func TestHandleApply_RenameStructFieldRenamesDeclarationAndCallers(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "fieldproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module fieldproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package fieldproj
+
+type Opts struct {
+	Count bool
+}
+
+func readSelector(o Opts) bool {
+	return o.Count
+}
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "rename", Name: "Count", Receiver: "Opts", NewName: "CountOnly"},
+		},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "rolled back") {
+		t.Fatalf("expected rename to succeed, got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(raw)
+	if strings.Contains(src, "Count bool") {
+		t.Errorf("expected the struct declaration to be renamed, still has old field:\n%s", src)
+	}
+	if !strings.Contains(src, "CountOnly bool") {
+		t.Errorf("expected the struct declaration to declare CountOnly, got:\n%s", src)
+	}
+	if !strings.Contains(src, "o.CountOnly") {
+		t.Errorf("expected the selector-expression caller to be rewritten, got:\n%s", src)
+	}
+}
+
+// TestHandleRename_StructFieldNameCollisionInCallerRollsBackNotCorrupts
+// is the safety-net regression for the exact failure mode found via a
+// live etcd bench trajectory: astRename's caller-body rewrite is bare-
+// identifier-based, so a caller that references TWO different types'
+// same-named field (e.g. a.Count and b.Count, two unrelated structs)
+// gets BOTH renamed when only one was the actual target -- corrupting
+// a reference to a field that was never supposed to change. Before
+// handleFieldRename added a real build gate for struct field renames
+// (unlike the rest of rename, which skips it for perf), this shipped
+// silently: defn reported success while the emitted code no longer
+// compiled. Must roll back cleanly instead.
+func TestHandleRename_StructFieldNameCollisionInCallerRollsBackNotCorrupts(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "fieldproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module fieldproj\n\ngo 1.26\n"), 0644)
+	src := `package fieldproj
+
+type A struct {
+	Count bool
+}
+
+type B struct {
+	Count int
+}
+
+func combine(a A, b B) bool {
+	return a.Count == (b.Count > 0)
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleRename(context.Background(), nil, renameParam{
+		OldName:  "Count",
+		NewName:  "CountOnly",
+		Receiver: "A",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "rolled back") {
+		t.Fatalf("expected the build-breaking collision to roll back the whole rename, got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != src {
+		t.Errorf("expected main.go to be byte-identical after a rolled-back rename, got:\n%s", raw)
+	}
+}
+
+// TestHandleApply_DeleteRefusesStructField mirrors
+// TestHandleDelete_RefusesStructField but through handleApply's inline
+// delete case, which re-implements handleDelete's logic rather than
+// calling it -- the same duplication that let the original field-rename
+// bug diverge between the two paths. Verifies the batch is rolled back
+// and reports the field-specific refusal rather than deleting the row.
+func TestHandleApply_DeleteRefusesStructField(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "fieldproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module fieldproj\n\ngo 1.26\n"), 0644)
+	const src = `package fieldproj
+
+type Opts struct {
+	Count bool
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{{Op: "delete", Name: "Count", Receiver: "Opts"}},
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "does not support struct fields") {
+		t.Errorf("expected a struct-field refusal message, got: %s", text)
+	}
+
+	if _, err := db.GetDefinitionByNameAndReceiver("Count", "fieldproj", "Opts"); err != nil {
+		t.Errorf("expected the field's DB row to still exist after the rolled-back apply, got: %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != src {
+		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
+	}
+}
+
+// TestHandleDelete_RefusesStructField is the regression for the bug the
+// op/kind policy layer was built to close: handleDelete had no
+// field-kind check at all, so deleting a struct field's DB row (via
+// DeleteDefinition) succeeded, reported "Deleted", and left the struct
+// declaration on disk completely untouched -- the field kept existing
+// in the emitted file with no corresponding DB row, silently diverging
+// the two. Verifies the op is now refused up front, before either the
+// DB row or the file is touched.
+func TestHandleDelete_RefusesStructField(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "fieldproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module fieldproj\n\ngo 1.26\n"), 0644)
+	const src = `package fieldproj
+
+type Opts struct {
+	Count bool
+	Other int
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleDelete(context.Background(), nil, nameParam{
+		Name:     "Count",
+		Receiver: "Opts",
+		Force:    true,
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "Deleted") {
+		t.Fatalf("expected delete to be refused, got: %s", text)
+	}
+	if !strings.Contains(text, "does not support struct fields") {
+		t.Errorf("expected a struct-field refusal message, got: %s", text)
+	}
+
+	if _, err := db.GetDefinitionByNameAndReceiver("Count", "fieldproj", "Opts"); err != nil {
+		t.Errorf("expected the field's DB row to still exist after the refused delete, got: %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != src {
+		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
+	}
+}
+
+// TestHandlePatch_RefusesStructField is the second confirmed silent-
+// corruption path found while scoping the op/kind policy layer:
+// handlePatch has no syntax-validation guard at all (unlike edit/
+// fragment-edit/insert), so patching a struct field's body text wrote
+// straight into the DB row via UpsertDefinition and reported success,
+// while the struct declaration on disk -- the actual source of truth
+// for emit, since fields are excluded from emit by design (#11) --
+// never changed.
+func TestHandlePatch_RefusesStructField(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "fieldproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module fieldproj\n\ngo 1.26\n"), 0644)
+	const src = `package fieldproj
+
+type Opts struct {
+	Count bool
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handlePatch(context.Background(), nil, codeParam{
+		Name:     "Count",
+		Receiver: "Opts",
+		OldName:  "Count",
+		NewName:  "CountX",
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "Patched") {
+		t.Fatalf("expected patch to be refused, got: %s", text)
+	}
+	if !strings.Contains(text, "does not support struct fields") {
+		t.Errorf("expected a struct-field refusal message, got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != src {
+		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
+	}
+}
+
+// TestUnsupportedFieldOp is the policy-layer table: struct fields are
+// excluded from emit by design (#11), so every write op that resolves a
+// field as its target must either know how to rewrite the parent type's
+// Body alongside it (today, only rename does) or refuse explicitly
+// instead of silently diverging the DB from the file. Locks in the
+// policy so a new op added later doesn't quietly reopen the gap.
+func TestUnsupportedFieldOp(t *testing.T) {
+	for _, op := range []string{"delete", "edit", "patch", "insert", "move", "insert-precondition", "replace-slice", "replace-hunk", "wrap-in-defer", "rename-param"} {
+		if msg := unsupportedFieldOp("field", op); msg == "" {
+			t.Errorf("unsupportedFieldOp(%q, %q) = \"\", want a refusal message", "field", op)
+		}
+	}
+	if msg := unsupportedFieldOp("field", "rename"); msg != "" {
+		t.Errorf("unsupportedFieldOp(field, rename) = %q, want \"\" (rename has real field support)", msg)
+	}
+	for _, kind := range []string{"func", "method", "type", "var", "const"} {
+		if msg := unsupportedFieldOp(kind, "delete"); msg != "" {
+			t.Errorf("unsupportedFieldOp(%q, delete) = %q, want \"\" (only field kind is restricted)", kind, msg)
+		}
+	}
+}
+
+// TestHandleRename_RefusesInterfaceBreakingMethodRename is the
+// regression for a live-confirmed bug: #148 skips rename's build gate
+// on the assumption that renaming a method is always dispatch-safe.
+// That assumption is false when the method's receiver type also
+// satisfies an interface declaring a method under the OLD name --
+// interface methods live inline in the interface's own Body (same
+// #11 shape as struct fields), so nothing rewrote the interface's
+// text, and the caller-rewrite loop happily turned a valid
+// interface-dispatch call site (r.Bar()) into one that doesn't
+// compile (r.Baz undefined). Verifies the rename now routes through a
+// real build gate in this case and rolls back cleanly with the actual
+// compiler diagnostic instead of silently shipping broken code.
+func TestHandleRename_RefusesInterfaceBreakingMethodRename(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "ifaceproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module ifaceproj\n\ngo 1.26\n"), 0644)
+	const src = `package ifaceproj
+
+type Reader interface {
+	Bar() int
+}
+
+type Foo struct{}
+
+func (f Foo) Bar() int { return 1 }
+
+func use(r Reader) int {
+	return r.Bar()
+}
+
+func direct() int {
+	f := Foo{}
+	return f.Bar()
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleRename(context.Background(), nil, renameParam{
+		OldName:  "Bar",
+		NewName:  "Baz",
+		Receiver: "Foo",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "rolled back") {
+		t.Fatalf("expected the rename to be rolled back, got: %s", text)
+	}
+	if !strings.Contains(text, "Baz undefined") {
+		t.Errorf("expected the real compiler diagnostic to be surfaced, got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != src {
+		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
+	}
+
+	if d, err := db.GetDefinitionByNameAndReceiver("Bar", "ifaceproj", "Foo"); err != nil || d == nil {
+		t.Errorf("expected Foo.Bar's DB row to still exist after rollback, got def=%v err=%v", d, err)
+	}
+}
+
+// TestHandleRename_RefusesEmbeddedInterfaceBreakingMethodRename covers
+// a variant of TestHandleRename_RefusesInterfaceBreakingMethodRename
+// where the method is declared on an EMBEDDED interface (Reader embeds
+// BaseReader, which declares Bar()) rather than directly. This works
+// not because methodRenameRisksInterfaceBreak understands embedding
+// syntax, but because resolve() stages an "implements" edge for every
+// interface a type structurally satisfies independently -- Foo
+// satisfies BaseReader on its own merits, so that edge exists
+// alongside the one to the composite Reader, and BaseReader's own body
+// directly declares Bar(). Locks in that the embedded case is covered.
+func TestHandleRename_RefusesEmbeddedInterfaceBreakingMethodRename(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "ifaceproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module ifaceproj\n\ngo 1.26\n"), 0644)
+	const src = `package ifaceproj
+
+type BaseReader interface {
+	Bar() int
+}
+
+type Reader interface {
+	BaseReader
+}
+
+type Foo struct{}
+
+func (f Foo) Bar() int { return 1 }
+
+func use(r Reader) int {
+	return r.Bar()
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleRename(context.Background(), nil, renameParam{
+		OldName:  "Bar",
+		NewName:  "Baz",
+		Receiver: "Foo",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "rolled back") {
+		t.Fatalf("expected the rename to be rolled back, got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != src {
+		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
+	}
+}
+
+// TestHandleReplaceHunk_SignatureTypeChangeGatesOnRealBuild is the
+// regression for a live-confirmed bug: applyEditTerse (the shared
+// response path for all 5 projection ops) assumed every projection op
+// is "AST-guaranteed sig-stable" and unconditionally skipped the build
+// gate. That's true for insert-precondition/wrap-in-defer (body-
+// statement-only) and rename-param (renames an identifier, never a
+// type), but replace-hunk is deliberately content-addressed and
+// kind-agnostic -- it can target a function's own signature line
+// directly. Renaming a parameter's TYPE (not its name/receiver, so the
+// existing identity check never fires) reported "replaced hunk" as a
+// clean success while shipping a caller that no longer type-checks.
+// Verifies this now gates on a real build and rolls back cleanly.
+func TestHandleReplaceHunk_SignatureTypeChangeGatesOnRealBuild(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "sigproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module sigproj\n\ngo 1.26\n"), 0644)
+	const src = `package sigproj
+
+func double(x int) int {
+	return x * 2
+}
+
+func use() int {
+	return double(5)
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleReplaceHunk(context.Background(), nil, codeParam{
+		Name: "double",
+		Old:  "x int) int {\n\treturn x * 2",
+		New:  "x string) int {\n\treturn len(x) * 2",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "BUILD FAILED") {
+		t.Fatalf("expected the build failure to be surfaced, got: %s", text)
+	}
+	if !strings.Contains(text, "cannot use 5") {
+		t.Errorf("expected the real compiler diagnostic, got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != src {
+		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
+	}
+}
+
+// TestHandleReplaceSlice_SignatureKindTypeChangeGatesOnRealBuild covers
+// the same applyEditTerse gap via replace-slice's documented
+// slice:"signature" kind, which -- like replace-hunk -- can change a
+// parameter or return type directly.
+func TestHandleReplaceSlice_SignatureKindTypeChangeGatesOnRealBuild(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "sigproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module sigproj\n\ngo 1.26\n"), 0644)
+	const src = `package sigproj
+
+func double(x int) int {
+	return x * 2
+}
+
+func use() int {
+	return double(5)
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleReplaceSlice(context.Background(), nil, codeParam{
+		Name:  "double",
+		Slice: "signature",
+		New:   "func double(x string) int",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "BUILD FAILED") {
+		t.Fatalf("expected the build failure to be surfaced, got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != src {
+		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
+	}
+}
+
+// TestHandleEdit_InterfaceMethodRemovalGatesOnRealBuild is the
+// regression for the highest-leverage bug found this session:
+// extractSignature's *ast.TypeSpec case collapses to just "type
+// <Name>" regardless of the type's actual shape, so handleEdit's
+// oldSignature==newSignature sig-stable check was always true for a
+// type/interface-kind edit no matter what changed inside the braces.
+// Removing a method from an interface via the single most commonly
+// used write op reported "Updated Reader" as a clean success and
+// wrote it to disk while a caller still invoking that method no
+// longer compiled, with zero warning. Verifies this now gates on a
+// real build and rolls back cleanly with the actual diagnostic.
+func TestHandleEdit_InterfaceMethodRemovalGatesOnRealBuild(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "ifaceproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module ifaceproj\n\ngo 1.26\n"), 0644)
+	const src = `package ifaceproj
+
+type Reader interface {
+	Bar() int
+	Qux() string
+}
+
+func use(r Reader) string {
+	return r.Qux()
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleEdit(context.Background(), nil, editParam{
+		Name:    "Reader",
+		NewBody: "type Reader interface {\n\tBar() int\n}",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "rolled back") {
+		t.Fatalf("expected the edit to be rolled back, got: %s", text)
+	}
+	if !strings.Contains(text, "Qux undefined") {
+		t.Errorf("expected the real compiler diagnostic, got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != src {
+		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
+	}
+}
+
+// TestHandleEdit_StructFieldRemovalGatesOnRealBuild is the struct-kind
+// variant of TestHandleEdit_InterfaceMethodRemovalGatesOnRealBuild --
+// same extractSignature blind spot, this time removing a struct field
+// still referenced by a composite literal elsewhere.
+func TestHandleEdit_StructFieldRemovalGatesOnRealBuild(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "structproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module structproj\n\ngo 1.26\n"), 0644)
+	const src = `package structproj
+
+type Opts struct {
+	Count int
+}
+
+func use() Opts {
+	return Opts{Count: 5}
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleEdit(context.Background(), nil, editParam{
+		Name:    "Opts",
+		NewBody: "type Opts struct {\n}",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "rolled back") {
+		t.Fatalf("expected the edit to be rolled back, got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != src {
+		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
+	}
+}
+
+// TestHandleReplaceHunk_InterfaceMethodRemovalGatesOnRealBuild covers
+// the same extractSignature blind spot via applyEditTerse (the shared
+// response path for the 5 projection ops), confirming replace-hunk
+// landing directly on an interface's method list also gates on a real
+// build now instead of the sig-stable fast path.
+func TestHandleReplaceHunk_InterfaceMethodRemovalGatesOnRealBuild(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "ifaceproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module ifaceproj\n\ngo 1.26\n"), 0644)
+	const src = `package ifaceproj
+
+type Reader interface {
+	Bar() int
+	Qux() string
+}
+
+func use(r Reader) string {
+	return r.Qux()
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleReplaceHunk(context.Background(), nil, codeParam{
+		Name: "Reader",
+		Old:  "Bar() int\n\tQux() string",
+		New:  "Bar() int",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "BUILD FAILED") {
+		t.Fatalf("expected the build failure to be surfaced, got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != src {
+		t.Errorf("expected main.go to be untouched, got:\n%s", string(raw))
+	}
+}
+
+// TestHandleCreateScaffoldFile_RoutesThroughTransactionAndStillSucceeds
+// is the regression for wrapping handleCreateScaffoldFile's write in a
+// transaction (#12-class fix -- every sibling write handler already had
+// this): confirms the DB-side behavior is unaffected by the fix -- the
+// file_sources row is durably committed and reports success. See
+// TestHandleCreateScaffoldFile_ActuallyWritesFileToDisk for the
+// separate #276 fix (now shipped) confirming the content actually
+// lands on disk, not just in file_sources.
+func TestHandleCreateScaffoldFile_RoutesThroughTransactionAndStillSucceeds(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "proj")
+	os.MkdirAll(filepath.Join(projDir, "pkg"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module proj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "pkg", "existing.go"), []byte("package pkg\n\nfunc Real() int {\n\treturn 1\n}\n"), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	// Blank import: goimports (which now actually runs against this
+	// file post-#276) legitimately strips a genuinely unused named
+	// import, but keeps a blank one.
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op:   "create",
+		File: "pkg/newfile.go",
+		Body: "import _ \"fmt\"\n",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Scaffolded") {
+		t.Fatalf("expected a successful scaffold, got: %s", text)
+	}
+
+	mods, err := db.ListModules()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var modID int64
+	for _, m := range mods {
+		if m.Path == "proj/pkg" || strings.HasSuffix(m.Path, "/pkg") {
+			modID = m.ID
+		}
+	}
+	if modID == 0 {
+		t.Fatalf("could not find pkg module among: %+v", mods)
+	}
+	src, err := db.GetFileSource(modID, "pkg/newfile.go")
+	if err != nil || src == "" {
+		t.Fatalf("scaffold content not committed to file_sources: err=%v src=%q", err, src)
+	}
+	if !strings.Contains(src, "_ \"fmt\"") {
+		t.Errorf("committed file_sources missing expected content: %q", src)
+	}
+
+	// The pre-existing Real() def must be untouched.
+	real, err := db.GetDefinitionByName("Real", "")
+	if err != nil || real == nil {
+		t.Fatalf("Real definition should still exist: %v", err)
+	}
+}
+
+// TestHandleDelete_ForceWithBuildFailureStillRunsPostDeleteCleanup is the
+// regression for the shared buildResult=="" gate incorrectly covering
+// both the normal and force:true paths: on the force path, commit()
+// always runs regardless of buildResult (force is an explicit
+// acknowledgment the delete may break the build), so gating the
+// post-delete idf.Invalidate()/autoCommit() step on buildResult=="" too
+// skipped it whenever force:true's delete happened to also break the
+// build -- even though the delete was already durable. This confirms
+// the delete itself lands (durability, the directly observable half of
+// the fix) under exactly that force+build-failure combination.
+func TestHandleDelete_ForceWithBuildFailureStillRunsPostDeleteCleanup(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "proj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module proj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package main
+
+func Helper() int { return 1 }
+
+func Caller() int { return Helper() }
+
+func main() {}
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	// Force-delete Helper while Caller still references it -- the
+	// build will fail (undefined: Helper), but force:true means the
+	// delete must still land.
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op:    "delete",
+		Name:  "Helper",
+		Force: true,
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Deleted") {
+		t.Fatalf("expected the force delete to report Deleted despite the build failure, got: %s", text)
+	}
+
+	if _, err := db.GetDefinitionByName("Helper", ""); err == nil {
+		t.Fatal("Helper should be gone from the DB after a force delete")
+	}
+}
+
+// TestHandleApply_EditResolvesDottedQualifiedName is the regression for
+// resolveApplyTarget missing the dotted-qualified-name fallback
+// resolveEditTarget already has (#241): a batched edit for
+// "beta.Widget" used to fail with resolveApplyTarget's own ambiguous-
+// name refusal (two Widgets share the bare name across packages) even
+// though the dotted form unambiguously names one of them -- the exact
+// same shape code(op:"edit", name:"beta.Widget") already resolves
+// outside a batch.
+func TestHandleApply_EditResolvesDottedQualifiedName(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "alpha"), 0755)
+	os.MkdirAll(filepath.Join(projDir, "beta"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "widget.go"), []byte(`package alpha
+
+func Widget() string { return "alpha" }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "beta", "widget.go"), []byte(`package beta
+
+func Widget() string { return "beta" }
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op: "apply",
+		Operations: []applyOp{
+			{Op: "edit", Name: "beta.Widget", NewBody: `func Widget() string { return "beta-edited" }`},
+		},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "ambiguous") || strings.Contains(text, "not found") {
+		t.Fatalf("expected the dotted name to disambiguate, got: %s", text)
+	}
+
+	betaWidget, err := db.GetDefinitionByName("Widget", "testproj/beta")
+	if err != nil {
+		t.Fatalf("lookup beta.Widget: %v", err)
+	}
+	if !strings.Contains(betaWidget.Body, "beta-edited") {
+		t.Errorf("beta.Widget was not edited, body: %s", betaWidget.Body)
+	}
+
+	alphaWidget, err := db.GetDefinitionByName("Widget", "testproj/alpha")
+	if err != nil {
+		t.Fatalf("lookup alpha.Widget: %v", err)
+	}
+	if strings.Contains(alphaWidget.Body, "beta-edited") {
+		t.Errorf("alpha.Widget was wrongly edited instead of beta.Widget: %s", alphaWidget.Body)
+	}
+}
+
+// TestRunPlanSteps_ResolvesDottedQualifiedName is the regression for
+// runPlanSteps resolving step targets via a bare GetDefinitionByName
+// instead of resolveEditTarget: a step naming "beta.Widget" (Go's own
+// qualified-name convention) used to report not-found even though the
+// identical name resolves fine via read/outline/every other op, since
+// the bare lookup has no dotted-name fallback and Widget is ambiguous
+// by bare name alone (two packages each declare one).
+func TestRunPlanSteps_ResolvesDottedQualifiedName(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "alpha"), 0755)
+	os.MkdirAll(filepath.Join(projDir, "beta"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "widget.go"), []byte(`package alpha
+
+func Widget() string { return "alpha" }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "beta", "widget.go"), []byte(`package beta
+
+func Widget() string { return "beta" }
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+
+	result, _, err := s.runPlanSteps([]planformat.Step{
+		{Target: "beta.Widget", Field: "outline"},
+	})
+	if err != nil {
+		t.Fatalf("runPlanSteps: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "not found") {
+		t.Fatalf("expected beta.Widget to resolve, got: %s", text)
+	}
+	if !strings.Contains(text, "Widget") {
+		t.Errorf("expected Widget's outline in the result, got: %s", text)
+	}
+}
+
+// TestExtractQueryTokensLower_MatchesProjectionMirrorOnNonASCII is the
+// regression for the calque-found drift between this function and its
+// declared mirror, internal/projection's extractQueryTokens (#157):
+// this copy checked ASCII-only 'a'-'z'/'0'-'9' ranges while the
+// projection version used unicode.IsLetter/IsDigit, so a non-ASCII
+// identifier rune (a legal Go identifier character) was silently
+// treated as a token separator here but not there. See
+// TestExtractQueryTokens_MatchesMCPMirrorOnNonASCII in
+// internal/projection for the same expected literal asserted against
+// the other copy -- extractQueryTokens is unexported, so the two
+// can't call each other across packages; asserting both against the
+// same literal is the cross-check.
+func TestExtractQueryTokensLower_MatchesProjectionMirrorOnNonASCII(t *testing.T) {
+	got := extractQueryTokensLower("café über λambda")
+	want := []string{"café", "über", "λambda"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("extractQueryTokensLower(%q) = %v, want %v", "café über λambda", got, want)
+	}
+}
+
+// TestHandleEdit_DiskIOFailureRollsBackNotSilentSuccess is the
+// verification for #275: does a genuine OS-level write failure (not
+// just a data-loss safety-net refusal) actually propagate as a
+// rollback, or can it be silently swallowed? Simulates external
+// interference by replacing the target file with a directory on disk
+// after ingest -- writeFile/safeWriteGoFile's os.ReadFile hits a real
+// "is a directory" error, not os.IsNotExist, so it must propagate as
+// writeFile's own error return (not just the softer data-loss warning
+// string), all the way up through emitModule/emitWithOpts/
+// emitAndBuildAgainst to a rolled-back commitOrRollbackOnBuild.
+func TestHandleEdit_DiskIOFailureRollsBackNotSilentSuccess(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "proj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module proj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc F() int {\n\treturn 1\n}\n\nfunc main() {}\n"), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	// Simulate external interference: the target file is now a
+	// directory, not a regular file. os.ReadFile inside
+	// safeWriteGoFile will get a real I/O error here, not ENOENT.
+	os.Remove(filepath.Join(projDir, "main.go"))
+	os.MkdirAll(filepath.Join(projDir, "main.go"), 0755)
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op:      "edit",
+		Name:    "F",
+		NewBody: "func F() int {\n\treturn 2\n}",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "rolled back") {
+		t.Fatalf("expected the edit to be refused/rolled back when the target path is a directory, got: %s", text)
+	}
+
+	// The DB must not durably believe F's body changed either.
+	f, err := db.GetDefinitionByName("F", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(f.Body, "return 2") {
+		t.Errorf("DB durably committed the edit despite the disk write failing: %s", f.Body)
+	}
+}
+
+// TestHandleCreateScaffoldFile_ActuallyWritesFileToDisk is the
+// regression for #276: emitModule built its write set exclusively from
+// Definitions, so a scaffold-only file (zero defs, just a raw
+// file_sources row) was invisible to it in EVERY scenario -- a module
+// with other defs never put a def-less file in byFile at all, and a
+// module with zero defs total hit the len(defs)==0 bailout before
+// byFile was even built. handleCreateScaffoldFile reported "Scaffolded
+// ... N bytes" success while the file was never actually created on
+// disk. This confirms the file now genuinely lands, in a module that
+// also has an existing real definition (the shape that hit the bug --
+// a module with SOME defs, just not for this specific new file).
+func TestHandleCreateScaffoldFile_ActuallyWritesFileToDisk(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "proj")
+	os.MkdirAll(filepath.Join(projDir, "pkg"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module proj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "pkg", "existing.go"), []byte("package pkg\n\nfunc Real() int {\n\treturn 1\n}\n"), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	// Blank import: goimports legitimately strips a genuinely unused
+	// named import ("fmt" referenced nowhere), but a blank import is
+	// kept -- it's the realistic shape a real scaffold body would use.
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op:   "create",
+		File: "pkg/newfile.go",
+		Body: "import _ \"fmt\"\n",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Scaffolded") {
+		t.Fatalf("expected a successful scaffold, got: %s", text)
+	}
+
+	src, err := os.ReadFile(filepath.Join(projDir, "pkg", "newfile.go"))
+	if err != nil {
+		t.Fatalf("scaffolded file was NOT written to disk despite reporting success: %v", err)
+	}
+	if !strings.Contains(string(src), "package pkg") || !strings.Contains(string(src), "_ \"fmt\"") {
+		t.Errorf("scaffolded file on disk missing expected content:\n%s", src)
+	}
+
+	// Real() must still be intact -- this write must be purely
+	// additive, not disturb the sibling file.
+	realSrc, err := os.ReadFile(filepath.Join(projDir, "pkg", "existing.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(realSrc), "func Real()") {
+		t.Errorf("existing.go lost Real() as a side effect of scaffolding a sibling file:\n%s", realSrc)
+	}
+}
+
+// TestHandleCode_DryRunNeverWritesForAnyWriteOp is the single
+// authoritative table for dry_run:true across every write-capable op.
+// It exists because dry_run turned out to be a "silently ignored
+// param" class of bug, not a one-off: edit and delete each had their
+// own independent fix at different times (#246 and its sibling), and
+// this session found the SAME gap freshly in create, add-import, and
+// all five projection ops (insert-precondition, replace-slice,
+// replace-hunk, wrap-in-defer, rename-param) -- confirmed live in a
+// real trajectory (prometheus-18712, v4 mining round) where 30+
+// replace-hunk calls with dry_run:true silently wrote for real. Rather
+// than let each op accumulate its own bespoke dry-run test (the same
+// "slightly different duplicated guardrails" risk as the bug itself),
+// every op that accepts dry_run gets one row here. Adding a new write
+// op should mean adding one row, not writing a new test from scratch.
+func TestHandleCode_DryRunNeverWritesForAnyWriteOp(t *testing.T) {
+	cases := []struct {
+		name string
+		args codeParam
+	}{
+		{"edit", codeParam{Op: "edit", Name: "Greet", NewBody: "func Greet(name string) string {\n\treturn \"Hi, \" + name\n}", DryRun: true}},
+		{"delete", codeParam{Op: "delete", Name: "Greet", Force: true, DryRun: true}},
+		{"create", codeParam{Op: "create", Body: "func Zorp() int {\n\treturn 1\n}", File: "main.go", DryRun: true}},
+		{"add-import", codeParam{Op: "add-import", File: "main.go", ImportPath: "fmt", DryRun: true}},
+		{"insert-precondition", codeParam{Op: "insert-precondition", Name: "Greet", Condition: `name == ""`, Ret: `return ""`, DryRun: true}},
+		{"replace-slice", codeParam{Op: "replace-slice", Name: "Greet", Slice: "return", New: `return "Hi, " + name`, DryRun: true}},
+		{"replace-hunk", codeParam{Op: "replace-hunk", Name: "Greet", Old: "Hello, ", New: "Hi, ", DryRun: true}},
+		{"wrap-in-defer", codeParam{Op: "wrap-in-defer", Name: "Greet", DeferBody: `println("done")`, DryRun: true}},
+		{"rename-param", codeParam{Op: "rename-param", Name: "Greet", OldParam: "name", NewParam: "n", DryRun: true}},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			db, projDir := setupTestDB(t)
+			defer db.Close()
+			s := &server{backend: db, projectDir: projDir}
+			s.ready.Store(true)
+
+			before, err := db.GetDefinitionByName("Greet", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			diskBefore, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			result, _, err := s.handleCode(context.Background(), nil, c.args)
+			if err != nil {
+				t.Fatalf("handleCode: %v", err)
+			}
+			text := resultText(t, result)
+			if result.IsError {
+				t.Fatalf("expected dry-run %s to succeed, got error: %s", c.name, text)
+			}
+			if !strings.Contains(text, "dry run") {
+				t.Errorf("expected dry-run preview text for %s, got: %s", c.name, text)
+			}
+
+			after, err := db.GetDefinitionByName("Greet", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.Body != before.Body {
+				t.Errorf("%s: Greet's body changed under dry_run:true\nbefore:\n%s\nafter:\n%s", c.name, before.Body, after.Body)
+			}
+
+			diskAfter, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(diskAfter) != string(diskBefore) {
+				t.Errorf("%s: main.go changed on disk under dry_run:true\nbefore:\n%s\nafter:\n%s", c.name, diskBefore, diskAfter)
+			}
+
+			if c.name == "create" {
+				if _, err := db.GetDefinitionByName("Zorp", ""); err == nil {
+					t.Errorf("create: Zorp should NOT have been created under dry_run:true, but it exists in the DB")
+				}
+			}
+		})
+	}
+}
+
+// TestHandleCode_VersionReportsBuildIdentity locks in op:"version": a
+// cheap, no-param self-check for "is the process answering my tool
+// calls actually running current code." Added after a real friction
+// point in this session -- defn's auto-sharing HTTP architecture
+// means reconnecting the MCP client can re-attach to an
+// already-running, stale serve process instead of spawning a fresh
+// one from a just-rebuilt binary, and the only prior signal for that
+// was an indirect, confusing schema-validation failure on a
+// brand-new param. This gives a direct one-call answer instead.
+func TestHandleCode_VersionReportsBuildIdentity(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{Op: "version"})
+	if err != nil {
+		t.Fatalf("handleCode: %v", err)
+	}
+	text := resultText(t, result)
+	if result.IsError {
+		t.Fatalf("expected op:version to succeed, got error: %s", text)
+	}
+	if !strings.Contains(text, "defn "+Version) {
+		t.Errorf("expected version string %q in response, got: %s", Version, text)
+	}
+	if !strings.Contains(text, "pid:") {
+		t.Errorf("expected pid in response, got: %s", text)
 	}
 }

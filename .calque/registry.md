@@ -207,6 +207,108 @@ Result: 13 pairs, 6 clusters. Adjudicated: **0 drift**, 5 contracted-twin-ok,
     different projections. If a future kind like `blast-radius` is added
     to expand's include set, this pair MUST fold into a shared helper.
 
+## Added 2026-08-17 (project-wide rookie-mistake sweep + calque scan)
+
+- pair: internal/mcp/server.go::extractQueryTokensLower | internal/projection/query_filter.go::extractQueryTokens
+  - verdict: drift (fixed)
+  - reviewed: 2026-08-17
+  - note: extractQueryTokensLower's own doc comment already declared it a
+    deliberate inline mirror of extractQueryTokens (#157, kept unexported
+    rather than shared to avoid an internal/mcp -> internal/projection
+    export). The two had silently drifted: extractQueryTokensLower checked
+    ASCII-only `r >= 'a' && r <= 'z'` / `'0'-'9'`, while extractQueryTokens
+    used `unicode.IsLetter`/`unicode.IsDigit`. A non-ASCII identifier rune
+    (legal in a Go identifier) tokenized differently depending on which
+    copy ran -- silently inconsistent search/filter token matching for
+    non-ASCII-named identifiers. Fixed by aligning
+    extractQueryTokensLower's rune check to unicode.IsLetter/IsDigit.
+    Deliberately did NOT unify into one shared exported function -- #157's
+    reasoning for keeping this an inline copy still stands; this was a
+    same-logic-drifted-apart fix, not a dedup.
+
+- pair: internal/mcp/server.go::astRename | internal/mcp/server.go::renameFieldInType
+  - verdict: contracted-twin-ok
+  - reviewed: 2026-08-17
+  - note: renameFieldInType's own doc comment explains the distinction:
+    astRename walks a whole caller body and can collide with an unrelated
+    same-named field on a different type (confirmed live in an earlier
+    fix this session); renameFieldInType is scoped to one struct's own
+    *ast.StructType, where Go's no-duplicate-field-names-per-struct rule
+    makes every match unambiguously the target field. Different collision
+    risk, deliberately different implementation -- not drift.
+
+## Added 2026-08-18 (dry_run sweep + shared-utility check)
+
+Prompted by a real bug: `applyEditTerse` (the shared write path for
+insert-precondition/replace-slice/replace-hunk/wrap-in-defer/rename-param)
+and standalone `create`/`add-import` all accepted `dry_run:true` via the
+shared `codeParam` schema but silently performed real writes anyway —
+confirmed live in a real trajectory (prometheus-18712) where 30+
+`replace-hunk` dry-run calls each wrote for real. Fixed by threading
+`DryRun` through to all of them and introducing one shared
+`dryRunResult(msg string)` helper (internal/mcp/server.go) used by every
+write op's preview response, including converging the two pre-existing
+independent implementations (`handleEdit`, `handleDelete`) onto it. Added
+`TestHandleCode_DryRunNeverWritesForAnyWriteOp` as the single authoritative
+table-driven test covering every write op's dry_run behavior in one place,
+so a future write op that forgets to wire dry_run fails a shared test
+instead of shipping silently.
+
+Ran `calque scan --left "internal/mcp/**/*.go" --right "internal/mcp/**/*.go"`
+afterward per the user's "check for other implementations across the
+project that should be shared utilities" ask. 30 pairwise suspects, 13
+n-ary clusters. Most pairwise hits are sibling test pairs (op X's test vs
+op X's apply-batch equivalent test) — expected, not drift. Adjudicated the
+non-test candidates:
+
+- pair: internal/mcp/server.go::autoResolve | internal/mcp/server.go::autoResolveFile
+  - verdict: false-alarm
+  - reviewed: 2026-08-18
+  - note: legitimate layering, not drift. autoResolveFile is the
+    file-scoped (single-package resolve.ResolveFile) counterpart to
+    autoResolve's module-scoped resolve.ResolveModule, and explicitly
+    calls autoResolve as its own fallback when sourceFile is empty —
+    composition, not duplication.
+
+- pair: internal/mcp/server.go::filterCallersByQuery | internal/mcp/context_op.go::contextFilterTokens (+ extractQueryTokensLower)
+  - verdict: false-alarm
+  - reviewed: 2026-08-18
+  - note: calque's n-ary clustering (C6, shared-callers heuristic) flagged
+    these as one seam because several handlers call all three in
+    sequence, but they're three genuinely distinct pipeline stages, not
+    parallel reimplementations: extractQueryTokensLower tokenizes a raw
+    query string; contextFilterTokens applies stop-word/length filtering
+    to that token stream; filterCallersByQuery partitions a []Definition
+    by those tokens. Already properly factored into single-purpose
+    functions.
+
+- finding: internal/mcp/server.go::autoEmitAndBuildForFile — DEAD CODE, deleted
+  - reviewed: 2026-08-18
+  - note: not a drift/duplication pair — calque's 0.72 pairwise score
+    against autoEmitAndBuildForCreate was real (both are thin
+    file-scoped wrappers over autoEmitAndBuild/autoEmitAndBuildWithOpts),
+    but autoEmitAndBuildForFile had ZERO callers (production or test) —
+    unexported method, so the outline caller count is authoritative.
+    Deleted outright rather than adjudicated as a twin; build stayed
+    green, confirming it was genuinely unused.
+
+- cluster: C8 (8 members) — applyEditTerse, handleApply, handleCreate,
+  handleCreateMultiDecl, handleEdit, handleFieldRename, handleRename,
+  handleMove, sharing the renameFieldInType/sliceDecls/enqueueSummary seam
+  - verdict: deferred (real architectural debt, not actioned this session)
+  - reviewed: 2026-08-18
+  - note: this is the concrete evidence behind the user's "we could end up
+    with a lot of slightly different duplicated guardrails instead of a
+    single authoritative set" concern -- these 8 functions are largely
+    independent parallel implementations of "resolve target → validate →
+    write → build/emit → respond," not a single shared write path (unlike
+    the 5 projection ops, which DO already funnel through applyEditTerse).
+    Consolidating them safely is a multi-day refactor touching some of the
+    most heavily-tested code in the project (each has 10-20+ dedicated
+    tests) -- explicitly NOT attempted speculatively in this session.
+    Flagged here so it isn't rediscovered from scratch; a future session
+    should scope it as its own dedicated pass, not a drive-by fix.
+
 ## Follow-up refactors (deferred, not drift)
 
 None of these are gate-worthy — mild ergonomics wins surfaced by the scan:
@@ -218,3 +320,10 @@ None of these are gate-worthy — mild ergonomics wins surfaced by the scan:
    a shared upstream package is possible).
 3. Op-name list extracted from `handleCode` switch to a `map[string]struct{}`
    so `TestHandleCodeValidation` and `handleApply` read the same source.
+4. `humanSize(n int64) string` (2026-08-17 calque scan) — byte-for-byte
+   identical between cmd/defn/commands.go and internal/mcp/server.go.
+   No active drift/bug (they're currently identical), but a future edit
+   to one copy without the other would reintroduce the exact class of bug
+   this session fixed three separate times elsewhere (receiver-name
+   stripping). Low priority: trivial formatting helper, low change
+   frequency.

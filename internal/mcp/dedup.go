@@ -58,6 +58,12 @@ type sessionCache struct {
 	// circuit-breaker block can auto-batch them via expand instead of
 	// just refusing. Reset alongside readShapedCount.
 	pendingReadNames []string
+	// pendingWantsBody is true when any call folded into pendingReadNames
+	// this turn was op:"read" (the one nameable op whose whole point is
+	// the source body) -- so an auto-batch redirect through expand can
+	// include "body" instead of silently downgrading a read into an
+	// outline+callers-only response. See #250.
+	pendingWantsBody bool
 }
 
 type cacheEntry struct {
@@ -87,10 +93,23 @@ func newRespCache() *respCache {
 func dedupOpKey(args codeParam) (string, string, bool) {
 	switch args.Op {
 	case "read":
+		// #274-mining finding: Query activates #153's query-adaptive
+		// narrowing (return only body statements matching a token) --
+		// a full-body read followed by a query-scoped read of the same
+		// def used to collide on one key, serving the stale full-body
+		// stub for what should have been genuinely different, smaller
+		// output. Confirmed live in a real trajectory (prometheus-18712).
+		key := args.Name
 		if args.Full {
-			return "read", args.Name + "|full", true
+			key += "|full"
 		}
-		return "read", args.Name, true
+		if args.Query != "" {
+			key += "|query:" + args.Query
+		}
+		if args.LineRange != "" {
+			key += "|range:" + args.LineRange
+		}
+		return "read", key, true
 	case "outline":
 		return "outline", args.Name, true
 	case "slice":
@@ -130,7 +149,27 @@ func dedupOpKey(args codeParam) (string, string, bool) {
 	case "methods":
 		return "methods", args.Name, true
 	case "explain":
-		return "explain", args.Name, true
+		// #186: explain(name:) and explain(question:) route to entirely
+		// different handlers (legacy static-context vs the Sonnet Q&A
+		// co-processor) and explain(question:) also accepts a multi-def
+		// Names scope distinct from Name. Keying on Name alone (as if
+		// every explain call were the legacy path) meant two different
+		// questions about the same def, or the same question against two
+		// different Names scopes, collided on one dedup key -- silently
+		// defeating dedup for the question-driven path rather than ever
+		// serving a wrong answer (dedup() still hashes the real response
+		// before comparing), but interleaved explain-with-question calls
+		// on the same def essentially never dedup. Match "context"'s
+		// convention below: fold in every dimension the response actually
+		// depends on.
+		key := args.Name
+		if len(args.Names) > 0 {
+			key += "|" + fmt.Sprintf("%v", args.Names)
+		}
+		if args.Question != "" {
+			key += "|" + args.Question
+		}
+		return "explain", key, true
 	// 2026-08-05: context was defn's most expensive uncovered op --
 	// potentially a top-N-defs outline + refs graph + Sonnet synthesis
 	// bundle -- yet had zero dedup coverage. Confirmed against a real
@@ -334,6 +373,17 @@ func (c *respCache) invalidateNames(sess *sdkmcp.ServerSession, names, files []s
 			delete(sc.entries, key)
 			continue
 		}
+		// context's key is free-text question, modeled explicitly on
+		// search's own "any determinable write could shift the answer"
+		// reasoning (its own case comment says so) -- give it the same
+		// blanket-clear treatment. Without this, a cached context bundle
+		// was untouched by every scoped write (edit/rename/create/delete/
+		// apply) and only ever cleared by a full invalidate (sync/resolve/
+		// merge), unlike search which explicitly gets this.
+		if strings.HasPrefix(key, "context|") {
+			delete(sc.entries, key)
+			continue
+		}
 		for _, name := range names {
 			for _, op := range readOpsWithNameKey {
 				prefix := op + "|" + name
@@ -384,10 +434,20 @@ func writeTargets(args codeParam) (names, files []string, ok bool) {
 		}
 		return []string{args.Name}, nil, true
 	case "rename":
-		if args.OldName == "" || args.NewName == "" {
-			return nil, nil, false
-		}
-		return []string{args.OldName, args.NewName}, nil, true
+		// Unlike the other name-scoped ops above, a rename's real blast
+		// radius isn't just OldName/NewName -- handleRename also rewrites
+		// every caller's body (astRename + UpsertDefinition) and, for a
+		// type rename, every sibling method's receiver clause. None of
+		// those names are knowable from args alone (they only exist after
+		// tx.GetCallers/GetModuleDefinitions runs inside the handler), so
+		// a scoped invalidate here would leave a caller's stale bodyServed
+		// entry in place even though its source text just changed --
+		// confirmed reachable: the bodyServed short-circuit in dedup.go is
+		// not hash-gated, so a later read of that caller could report
+		// "nothing has changed since" when it, in fact, has. Report the
+		// blast radius as undeterminable so the caller falls back to a
+		// full invalidate, same as sync/resolve/merge do.
+		return nil, nil, false
 	case "move":
 		if args.Name == "" {
 			return nil, nil, false
@@ -410,12 +470,13 @@ func writeTargets(args codeParam) (names, files []string, ok bool) {
 				}
 				allNames = append(allNames, op.Name)
 			case "rename":
-				// Batch rename uses Name (old) + NewName -- applyOp has no
-				// separate OldName field, unlike top-level codeParam.
-				if op.Name == "" || op.NewName == "" {
-					return nil, nil, false
-				}
-				allNames = append(allNames, op.Name, op.NewName)
+				// Same reasoning as the top-level "rename" case above --
+				// a rename's real blast radius (rewritten callers, and for
+				// type renames sibling method receivers) isn't knowable
+				// from op.Name/op.NewName alone. Undetermined blast radius
+				// for one op in the batch means the whole batch falls back
+				// to a full invalidate.
+				return nil, nil, false
 			case "move":
 				if op.Name == "" {
 					return nil, nil, false

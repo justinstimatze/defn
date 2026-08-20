@@ -429,3 +429,104 @@ func init() {
 		t.Errorf("expected exactly 1 init-shaped definition in alpha/alpha.go after mixing ingest modes, got %d: %+v", initCount, defs)
 	}
 }
+
+// TestIngest_DiscoversAndIngestsNestedModules is a regression for a
+// severe real-world gap found via an etcd bench trajectory
+// (etcd-io/etcd#20929, 2026-08): Ingest/IngestPackages/LoadAll's
+// underlying packages.Load("./...") never crosses a nested go.mod
+// boundary -- standard go/packages behavior, not a defn bug in
+// isolation, but it meant a full `defn ingest .` on ANY multi-module
+// repo (etcd's server/, tests/, client/v3, etcdctl/, etc. each declare
+// their own module) silently indexed ONLY the root module. Every
+// nested module's code was completely invisible to search/overview/
+// sync -- not a wrong answer, a MISSING one, with no error or warning
+// anywhere. A real agent trajectory burned its entire turn budget
+// searching exhaustively and guessing file paths for code that was
+// never ingested in the first place, unable to succeed no matter what
+// it tried. LoadAll now also loads every nested module found under the
+// root and folds its packages into the same result, so one Ingest call
+// covers the whole multi-module tree.
+func TestIngest_DiscoversAndIngestsNestedModules(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/root\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n\nfunc RootFunc() {}\n\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(root, "sub")
+	if err := os.MkdirAll(nested, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "go.mod"), []byte("module example.com/sub/v2\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "subfile.go"), []byte("package sub\n\nfunc SubFunc() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	db := testDB(t)
+	if err := Ingest(db, root); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.GetDefinitionByName("RootFunc", "example.com/root"); err != nil {
+		t.Errorf("RootFunc not found in root module: %v", err)
+	}
+	subDef, err := db.GetDefinitionByName("SubFunc", "example.com/sub/v2")
+	if err != nil {
+		t.Fatalf("SubFunc not found in nested module example.com/sub/v2 -- nested module was not ingested: %v", err)
+	}
+	if subDef.SourceFile != "sub/subfile.go" {
+		t.Errorf("expected SubFunc's source_file to be repo-root-relative %q, got %q", "sub/subfile.go", subDef.SourceFile)
+	}
+
+	// Re-ingest (idempotent refresh, the common `defn ingest .` re-run
+	// case) must NOT prune away the nested module's defs just because a
+	// later ingest pass processes packages in a different order --
+	// PruneStaleDefinitions prunes globally across ALL modules in one
+	// call, so this guards against a regression where nested-module
+	// packages silently drop out of a subsequent combined pkgs slice.
+	if err := Ingest(db, root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.GetDefinitionByName("RootFunc", "example.com/root"); err != nil {
+		t.Errorf("RootFunc pruned away after re-ingest: %v", err)
+	}
+	if _, err := db.GetDefinitionByName("SubFunc", "example.com/sub/v2"); err != nil {
+		t.Errorf("SubFunc pruned away after re-ingest: %v", err)
+	}
+}
+
+// TestIngest_BrokenNestedModuleDoesNotFailWholeIngest guards the
+// best-effort contract in goload.LoadAll: a nested module that fails
+// to load (unparseable go.mod, missing dependency, etc.) must not sink
+// the whole ingest -- the root module (and any other, healthy nested
+// module) should still ingest successfully. A real multi-module repo
+// can have an experimental or half-maintained nested module; one bad
+// subtree shouldn't take down ingestion for everything else.
+func TestIngest_BrokenNestedModuleDoesNotFailWholeIngest(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/root\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n\nfunc RootFunc() {}\n\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	broken := filepath.Join(root, "broken")
+	if err := os.MkdirAll(broken, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Unparseable go.mod -- packages.Load on this directory should error.
+	if err := os.WriteFile(filepath.Join(broken, "go.mod"), []byte("this is not a valid go.mod file {{{"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	db := testDB(t)
+	if err := Ingest(db, root); err != nil {
+		t.Fatalf("Ingest should succeed despite the broken nested module, got: %v", err)
+	}
+	if _, err := db.GetDefinitionByName("RootFunc", "example.com/root"); err != nil {
+		t.Errorf("root module should still ingest despite a broken nested module: %v", err)
+	}
+}

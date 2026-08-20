@@ -107,9 +107,6 @@ type Hazard struct {
 	Apply func(r *rand.Rand, m *SyntheticModule)
 }
 
-// AllHazards is the full v1 hazard menu. Order doesn't affect correctness
-// but is kept stable so a given seed produces reproducible-looking
-// output across runs.
 var AllHazards = []Hazard{
 	{"colliding_basenames", hazardCollidingBasenames},
 	{"scattered_init", hazardScatteredInit},
@@ -121,4 +118,18 @@ var AllHazards = []Hazard{
 	{"blank_imports", hazardBlankImports},
 	{"test_file_interleave", hazardTestFileInterleave},
 	{"go_embed_directive", hazardGoEmbedDirective},
+	{"interface_satisfaction", hazardInterfaceSatisfaction},
+}
+
+// hazardInterfaceSatisfaction adds an interface and a concrete type that
+// satisfies it in the same package, plus a caller that dispatches
+// through the interface. Exercises the interface-satisfaction class of
+// bug found in a real defn session: a rename/edit of the concrete
+// method (or a shape-changing edit of the interface/type itself) must
+// be gated on a real build rather than defn's own fast-path heuristics,
+// since a broken interface satisfaction is a compile error, not
+// something the AST alone can rule out.
+func hazardInterfaceSatisfaction(_ *rand.Rand, m *SyntheticModule) {
+	m.AddFile("pkg/ifacesat/iface.go", "package ifacesat\n\ntype Greeter interface {\n\tGreet() string\n}\n")
+	m.AddFile("pkg/ifacesat/impl.go", "package ifacesat\n\ntype Person struct {\n\tName string\n}\n\nfunc (p *Person) Greet() string {\n\treturn \"hello \" + p.Name\n}\n\nfunc UseGreeter(g Greeter) string {\n\treturn g.Greet()\n}\n")
 }

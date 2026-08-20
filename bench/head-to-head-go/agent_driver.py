@@ -25,9 +25,12 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TASKS = os.path.join(HERE, "tasks.jsonl")
-ARM_DIR = os.path.join(HERE, "arm_defn")
-ARM_DIR_FILES = os.path.join(HERE, "arm_files")
+# --corpus-dir (default: this script's own directory) picks which
+# tasks.jsonl / arm_defn / arm_files to use -- lets the same driver run
+# against any hand-curated or Multi-SWE-bench-sourced task set that
+# follows the same schema (e.g. bench/prometheus-repo/), not just the
+# original cli/grpc-go/go-zero corpus this script was built for.
+DEFAULT_CORPUS_DIR = HERE
 # Homedir, NOT /tmp: an EC2 stop/start cycle clears /tmp (systemd-tmpfiles
 # on boot), which silently destroyed every task's scoring workdir the
 # first time this bench got run across an instance restart (2026-08-09)
@@ -35,6 +38,7 @@ ARM_DIR_FILES = os.path.join(HERE, "arm_files")
 # between the agent run and a later (possibly next-session) scoring pass.
 # ~/.cache survives stop/start since it's on the persistent root volume.
 WORKDIR_ROOT = os.path.expanduser("~/.cache/defn-h2h-go")
+DISK_FREE_MIN_GB = 5.0
 # Cached fresh .defn/ per (instance_id, defn_binary_hash). Contamination
 # fix (6abe8e1) forces a fresh ingest per arm — ~30-90s of pure CPU per
 # arm. Snapshot after first ingest, restore on subsequent runs; hit path
@@ -59,6 +63,22 @@ def _defn_cache_path(inst_id, binhash):
     return os.path.join(DEFN_CACHE_ROOT, f"{inst_id}__{binhash}.tar")
 
 
+def _defn_version_string():
+    """Output of `defn version` (e.g. "0.26.71") — stamped into every
+    trajectory alongside _defn_binary_hash() so a trajectory file is
+    self-describing about exactly which build produced it. Added
+    2026-08-18 after a real investigation (etcd-multifile bench) burned
+    several calls doing git-log archaeology to work out whether a
+    trajectory ran on pre- or post-fix code, only reachable by comparing
+    the trajectory's file mtime against when a commit landed. That
+    should never require archaeology again — it's answerable by reading
+    one field in the file itself."""
+    try:
+        return subprocess.check_output(["defn", "version"], text=True).strip()
+    except subprocess.CalledProcessError:
+        return "unknown"
+
+
 DEFN_MCP_CONFIG = {
     "mcpServers": {"defn": {"type": "stdio", "command": "defn", "args": ["serve"]}}
 }
@@ -71,13 +91,31 @@ EMPTY_MCP_CONFIG = {"mcpServers": {}}
 # `code` covers all source access. If a task truly requires arbitrary bash
 # (e.g., `go build` for compile check), it will fail visibly rather than
 # silently exec unknown commands.
-ALLOWED_TOOLS = "mcp__defn__code TodoWrite"
+#
+# 2026-08-18: Read/Write/Edit added back for NON-Go files only (see
+# SYSTEM_APPEND's rule below) after a real Opus trajectory
+# (prometheus-18972) proved the prior Go-only-defn-only isolation was
+# too strict to be a fair comparison: the gold fix required a
+# docs/configuration/configuration.md edit, the defn arm had
+# structurally NO way to make it (code's scope is Go source only, by
+# design -- see this project's own CLAUDE.md), and the model correctly
+# diagnosed the needed doc change but explicitly said it had no tool to
+# make it with. 6 of 15 tasks in the prometheus-repo-opus corpus have
+# at least one non-.go gold file; this was silently costing defn recall
+# on every one of them, an artifact of the harness's tool isolation,
+# not of defn itself. Real-world defn usage always pairs `code` for Go
+# with Edit/Write for everything else (CLAUDE.md's own documented
+# convention) -- this restores that pairing for the bench too, while
+# keeping Grep/Glob/Bash/MultiEdit closed to preserve the original
+# "no escape hatch dilutes the Go-side measurement" protection below.
+ALLOWED_TOOLS = "mcp__defn__code TodoWrite Read Write Edit"
 # Escape hatches close: Grep/Glob let the model bypass defn's `search` op;
 # Agent/Task* let it spawn subagents that use full tool set; dispatch is
 # cross-session messaging. n=10 measurement 2026-07-20 found 170k / 481k
 # (35%) of measured wire went to these off-tool paths, invisibly diluting
 # every defn-side lever we measured. Closing them here so the "defn arm"
-# actually is defn-only.
+# actually is defn-only for its GO-side measurement (see the Read/Write/
+# Edit carve-out above for non-Go files).
 #
 # 2026-08-07: found the hard way that this list goes stale every time
 # Claude Code ships a new tool -- Monitor didn't exist when this list was
@@ -94,7 +132,7 @@ ALLOWED_TOOLS = "mcp__defn__code TodoWrite"
 # `claude -p ... -- "list your tools"` output before trusting any future
 # run's arm isolation.
 DISALLOWED_TOOLS = (
-    "Read Write Edit MultiEdit NotebookEdit Bash "
+    "MultiEdit NotebookEdit Bash "
     "Grep Glob "
     "Agent Task TaskCreate TaskUpdate TaskGet TaskList TaskOutput TaskStop "
     "mcp__dispatch__dispatch mcp__dispatch__peek mcp__dispatch__ack "
@@ -106,12 +144,16 @@ DISALLOWED_TOOLS = (
 )
 
 SYSTEM_APPEND = """
-IMPORTANT — this session is Go-only, defn-only. Use `mcp__defn__code` for ALL
-Go source access and edits: op:overview for project shape, op:outline for a
-def's shape, op:search for symbol/text search, op:read for a def body, op:edit
-/ op:replace-hunk / op:create for writes. Never call Read/Write/Edit on .go
-files — those are disabled. For running tests, use code op:test (scoped to
-defs) — direct shell is not available. Complete the task and stop.
+IMPORTANT — this session measures `mcp__defn__code` against files-mode on Go
+source specifically. Use `mcp__defn__code` for ALL Go (.go) source access and
+edits: op:overview for project shape, op:outline for a def's shape, op:search
+for symbol/text search, op:read for a def body, op:edit / op:replace-hunk /
+op:create for writes. Never call Read/Write/Edit on .go files — use `code` for
+every one of those, no exceptions. Read/Write/Edit ARE available, but ONLY for
+non-Go files (docs/*.md, testdata, config, etc.) that the fix may also need to
+touch — `code`'s scope is Go source only, by design. For running tests, use
+code op:test (scoped to defs) — direct shell is not available. Complete the
+task and stop.
 
 The issue describes a bug that CURRENTLY EXISTS in this codebase. Assume
 the fix is not already in place until you have PROVEN it — either by
@@ -188,13 +230,14 @@ already have what you need.
 """.strip()
 
 
-def load_task(instance_id):
-    with open(TASKS) as f:
+def load_task(instance_id, corpus_dir=DEFAULT_CORPUS_DIR):
+    tasks_path = os.path.join(corpus_dir, "tasks.jsonl")
+    with open(tasks_path) as f:
         for line in f:
             r = json.loads(line)
             if r["instance_id"] == instance_id:
                 return r
-    raise KeyError(instance_id)
+    raise KeyError(f"{instance_id} not found in {tasks_path}")
 
 
 def setup_workspace(task, arm="defn"):
@@ -263,17 +306,22 @@ def setup_workspace(task, arm="defn"):
         stderr=subprocess.DEVNULL,
     )
 
-    # Force a fresh .defn/ per arm. Keeping it across reruns wedges the DB
-    # in the previous run's post-write state (fabricated tests etc.);
-    # subsequent op:test would call emit.Emit and write that stale state
-    # back to the freshly-reset disk. Cache the fresh ingest result per
-    # (inst_id, defn binary hash) so repeat runs pay ~2s tarball extract
-    # instead of ~30-90s full re-parse.
+    # files-mode arm gets none of this: no .defn/, no defn-authored CLAUDE.md
+    # block. It must be the honest native baseline -- Read/Write/Edit/Bash
+    # against a repo that has never seen defn -- or the comparison isn't
+    # measuring what CLAUDE.md's "parity is the floor" rule requires (the
+    # real native baseline, not defn-on-defn). Found 2026-08-09: this function
+    # ran `defn init`/`ingest` unconditionally regardless of arm, so every
+    # files-mode workdir got a CLAUDE.md telling it to use `mcp__defn__code`
+    # for all Go work -- a tool that arm's allowlist doesn't grant it.
     import shutil
 
     defn_dir = os.path.join(workdir, ".defn")
     if os.path.isdir(defn_dir):
         shutil.rmtree(defn_dir)
+
+    if arm != "defn":
+        return workdir
 
     binhash = _defn_binary_hash()
     cache_path = _defn_cache_path(inst, binhash)
@@ -342,7 +390,7 @@ Use defn's code MCP for all source access. When done, stop — do not open a she
 """
 
 
-def run_claude(workdir, prompt, budget_usd, max_turns, arm="defn"):
+def run_claude(workdir, prompt, budget_usd, max_turns, arm="defn", model="sonnet"):
     """Invoke claude -p with the given arm's tool set; return list of stream-json event dicts."""
     mcp_config_path = os.path.join(workdir, ".mcp-defn-only.json")
     with open(mcp_config_path, "w") as f:
@@ -363,16 +411,18 @@ def run_claude(workdir, prompt, budget_usd, max_turns, arm="defn"):
         # CLAUDE.md may still fire; use --strict-mcp-config + tool filters
         # to isolate. Set CLAUDE_CODE_SIMPLE=1 in env for lighter runs.
         #
-        # --model sonnet: this bench had been running on the CLI's default
-        # (Opus 5, confirmed via the raw stream-json "model" field) with
-        # no explicit pin. Every bug found so far -- test op parameter
-        # confusion, receiver disambiguation, cross-module name collisions
-        # -- is basic tool-API friction, not something that needs
-        # frontier-tier reasoning to surface. Pinning Sonnet keeps the
-        # bug-finding signal while making reruns (this bench has needed
-        # several in one session) much cheaper.
+        # model defaults to "sonnet": this bench had been running on the
+        # CLI's default (Opus 5, confirmed via the raw stream-json "model"
+        # field) with no explicit pin. Every bug found so far -- test op
+        # parameter confusion, receiver disambiguation, cross-module name
+        # collisions -- is basic tool-API friction, not something that
+        # needs frontier-tier reasoning to surface. Pinning Sonnet keeps
+        # the bug-finding signal while making exploratory reruns (this
+        # bench has needed several in one session) much cheaper. Pass
+        # --model opus for the "real", trusted-for-publication comparison
+        # per the standing instruction to use Opus for that pass.
         "--model",
-        "sonnet",
+        model,
         "--mcp-config",
         mcp_config_path,
         "--strict-mcp-config",
@@ -501,9 +551,37 @@ def events_to_fncall_messages(events):
 
 
 def apply_edits_via_defn(workdir):
-    """After the agent finishes, `defn emit` writes the mutated DB back to
-    .go files so the workdir reflects the agent's changes. This lets the
-    correctness scorer diff files."""
+    """DEAD CODE, deliberately unused as of 2026-08-17 -- see run_one's
+    comment for why it's no longer called. Kept only as a documented
+    historical marker in case some future defn regression makes writes
+    NOT land on disk in real time again, in which case this is the
+    fallback to reach for -- not as a matter of course.
+
+    Originally: "After the agent finishes, `defn emit` writes the
+    mutated DB back to .go files so the workdir reflects the agent's
+    changes. This lets the correctness scorer diff files." That premise
+    was stale by the time this was traced down: every defn write op
+    (edit/create/apply/rename/...) already emits its own touched file(s)
+    to disk immediately on success (commitOrRollbackOnBuild /
+    autoEmitAndBuild), confirmed exhaustively this session via direct
+    MCP replay + the DEFN_EMIT_DEBUG instrumentation (internal/emit's
+    emitDebugf). This function's own `defn emit workdir` call -- bare,
+    unscoped, run AFTER every single defn-arm task regardless of what
+    the agent touched -- was the actual, sole source of a real mystery
+    that looked exactly like a defn correctness bug: three unrelated
+    generated .pb.gw.go files in etcd, whose on-disk import grouping
+    doesn't match goimports' canonical output, got silently rewritten
+    on every defn-arm run, tanking that run's file-touch precision on
+    every single etcd task scored this way -- not because of anything
+    defn's request handlers or the agent did, but because this
+    unconditional post-step re-normalized the WHOLE project's formatting
+    every time. Confirmed by bisecting a live DEFN_EMIT_DEBUG trace:
+    the exact three files logged "WROTE ... scoped=false" from a
+    completely separate `defn emit <workdir>` CLI invocation -- not
+    from anything inside the MCP server's own request handling -- right
+    after the agent's Claude process exited (rc=0), with the log's own
+    "emitting to ..." banner matching cmdEmit's stdout verbatim.
+    """
     try:
         subprocess.check_call(
             ["defn", "emit", workdir],
@@ -515,21 +593,75 @@ def apply_edits_via_defn(workdir):
         print(f"[emit] defn emit failed: {e}", file=sys.stderr)
 
 
-def run_one(instance_id, budget_usd, max_turns, arm="defn"):
-    task = load_task(instance_id)
+def _ensure_disk_space(min_gb=DISK_FREE_MIN_GB):
+    """Bail loudly instead of silently losing a task to "no space left
+    on device" -- found 2026-08-11: a 15-task prometheus rerun lost 2
+    tasks to disk exhaustion mid-run, and one of them didn't even
+    surface as an error -- the agent reported it as an "environment
+    blocker" in its own final message, scoring as a cheap, clean-looking
+    failure instead of the infra problem it actually was. Cleans go's
+    build cache and orphaned go-build temp dirs (the actual repeat
+    offender -- crashed/killed `go test`/`go vet` runs leave these
+    behind) before giving up."""
+    import glob
+    import shutil
+
+    free_gb = shutil.disk_usage(WORKDIR_ROOT).free / 1e9
+    if free_gb >= min_gb:
+        return
+    print(
+        f"[disk] {free_gb:.1f}GB free, below {min_gb}GB -- cleaning caches",
+        file=sys.stderr,
+    )
+    subprocess.run(
+        ["go", "clean", "-cache"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    for entry in glob.glob("/tmp/go-build*"):
+        shutil.rmtree(entry, ignore_errors=True)
+    free_gb = shutil.disk_usage(WORKDIR_ROOT).free / 1e9
+    print(f"[disk] {free_gb:.1f}GB free after cleanup", file=sys.stderr)
+    if free_gb < min_gb:
+        raise RuntimeError(
+            f"only {free_gb:.1f}GB free on {WORKDIR_ROOT}'s filesystem after "
+            f"cleanup (need {min_gb}GB) -- resize the volume or free space "
+            f"manually before continuing"
+        )
+
+
+def run_one(
+    instance_id,
+    budget_usd,
+    max_turns,
+    arm="defn",
+    corpus_dir=DEFAULT_CORPUS_DIR,
+    model="sonnet",
+):
+    out_dir = os.path.join(corpus_dir, "arm_defn" if arm == "defn" else "arm_files")
+    out_path = os.path.join(out_dir, instance_id + ".json")
+    if os.path.exists(out_path):
+        print(f"[skip] {out_path} already exists", file=sys.stderr)
+        return
+
+    _ensure_disk_space()
+    task = load_task(instance_id, corpus_dir)
     workdir = setup_workspace(task, arm=arm)
     prompt = build_prompt(task)
-    events, rc, elapsed = run_claude(workdir, prompt, budget_usd, max_turns, arm=arm)
+    events, rc, elapsed = run_claude(
+        workdir, prompt, budget_usd, max_turns, arm=arm, model=model
+    )
     traj, cost = events_to_fncall_messages(events)
-    if arm == "defn":
-        # files-mode already writes directly to disk via Edit/Write --
-        # calling `defn emit` here would overwrite those changes with the
-        # DB's (untouched, since files-mode never called defn) stale state.
-        apply_edits_via_defn(workdir)
+    # 2026-08-17: deliberately NOT calling apply_edits_via_defn(workdir)
+    # here anymore -- see its docstring. Every defn write op already
+    # writes its own touched file(s) to disk in real time; a redundant
+    # unscoped `defn emit` afterward was the actual source of a real,
+    # multi-hour "why does defn touch unrelated generated files" chase
+    # that turned out to be this harness re-normalizing the WHOLE
+    # project's formatting after every single defn-arm task, not a defn
+    # bug. The scorer diffs the live workdir directly (score_gitdiff.py),
+    # which already reflects every real-time write -- nothing further
+    # needed here for scoring to work correctly.
 
-    out_dir = ARM_DIR if arm == "defn" else ARM_DIR_FILES
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, instance_id + ".json")
     with open(out_path, "w") as f:
         json.dump(
             {
@@ -540,6 +672,8 @@ def run_one(instance_id, budget_usd, max_turns, arm="defn"):
                 "elapsed_sec": elapsed,
                 "cost_usd": cost,
                 "n_raw_events": len(events),
+                "defn_version": _defn_version_string() if arm == "defn" else None,
+                "defn_binary_hash": _defn_binary_hash() if arm == "defn" else None,
             },
             f,
         )
@@ -557,21 +691,47 @@ def main():
     ap.add_argument("--budget-usd", type=float, default=3.0)
     ap.add_argument("--max-turns", type=int, default=50)
     ap.add_argument("--arm", choices=["defn", "files"], default="defn")
+    ap.add_argument(
+        "--model",
+        default="sonnet",
+        help="claude -p --model value (default sonnet, cheap exploratory pass; "
+        "pass 'opus' for the real, trusted-for-publication comparison)",
+    )
+    ap.add_argument(
+        "--corpus-dir",
+        default=DEFAULT_CORPUS_DIR,
+        help="directory containing tasks.jsonl (and where arm_defn/arm_files get written); "
+        "default is this script's own directory (the original cli/grpc-go/go-zero corpus)",
+    )
     args = ap.parse_args()
 
     if args.all:
-        with open(TASKS) as f:
+        with open(os.path.join(args.corpus_dir, "tasks.jsonl")) as f:
             tasks = [json.loads(l)["instance_id"] for l in f]
         for i, tid in enumerate(tasks, 1):
             print(f"\n===== [{i}/{len(tasks)}] {tid} =====", file=sys.stderr)
             try:
-                run_one(tid, args.budget_usd, args.max_turns, arm=args.arm)
+                run_one(
+                    tid,
+                    args.budget_usd,
+                    args.max_turns,
+                    arm=args.arm,
+                    corpus_dir=args.corpus_dir,
+                    model=args.model,
+                )
             except Exception as e:
                 print(f"[fail] {tid}: {type(e).__name__}: {e}", file=sys.stderr)
     else:
         if not args.instance_id:
             ap.error("provide instance_id or --all")
-        run_one(args.instance_id, args.budget_usd, args.max_turns, arm=args.arm)
+        run_one(
+            args.instance_id,
+            args.budget_usd,
+            args.max_turns,
+            arm=args.arm,
+            corpus_dir=args.corpus_dir,
+            model=args.model,
+        )
 
 
 if __name__ == "__main__":

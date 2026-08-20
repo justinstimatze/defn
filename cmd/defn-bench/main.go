@@ -411,29 +411,57 @@ func main() {
 		claudeMDPath := filepath.Join(dir, "CLAUDE.md")
 		mcpBackup, _ := os.ReadFile(mcpPath)
 		claudeMDBackup, _ := os.ReadFile(claudeMDPath)
-		os.Remove(mcpPath)
-		os.Remove(claudeMDPath)
 
-		r1 := runClaude(dir, q, "files")
-		filesResults = append(filesResults, r1)
-		writeRow(q, r1)
+		// runFilesArm strips defn's config for the duration of the
+		// files-mode call and restores it after; runDefnArm assumes the
+		// config is present (true both when it runs first -- projects
+		// were defn-init'd before this loop -- and when it runs second,
+		// since runFilesArm always restores before returning).
+		runFilesArm := func() result {
+			os.Remove(mcpPath)
+			os.Remove(claudeMDPath)
+			r := runClaude(dir, q, "files")
+			if len(mcpBackup) > 0 {
+				os.WriteFile(mcpPath, mcpBackup, 0644)
+			}
+			if len(claudeMDBackup) > 0 {
+				os.WriteFile(claudeMDPath, claudeMDBackup, 0644)
+			}
+			return r
+		}
+		runDefnArm := func() result {
+			return runClaude(dir, q, "defn")
+		}
+
+		// Alternate execution order by case index instead of always
+		// running files then defn -- every prior run of this loop gave
+		// "defn" the second slot unconditionally, so any warm-up
+		// asymmetry (OS page-cache warmth on the shared scratch dir,
+		// claude CLI/model-routing warm-up on the host, network jitter
+		// drifting over a long batch) would systematically favor
+		// whichever arm happened to run second, with no way to detect
+		// or rule it out. Deterministic (not random) so a rerun with
+		// the same question order is reproducible.
+		var filesResult, defnResult result
+		if i%2 == 0 {
+			filesResult = runFilesArm()
+			defnResult = runDefnArm()
+		} else {
+			defnResult = runDefnArm()
+			filesResult = runFilesArm()
+		}
+
+		filesResults = append(filesResults, filesResult)
+		writeRow(q, filesResult)
 		fmt.Printf("  files:  %d calls, %s, in/out/cacheR/cacheW=%d/%d/%d/%d tok, correct=%v\n",
-			r1.toolCalls, r1.duration.Round(time.Second),
-			r1.inputTokens, r1.outputTokens, r1.cachedTokens, r1.cacheCreationTokens, r1.correct)
+			filesResult.toolCalls, filesResult.duration.Round(time.Second),
+			filesResult.inputTokens, filesResult.outputTokens, filesResult.cachedTokens, filesResult.cacheCreationTokens, filesResult.correct)
 
-		if len(mcpBackup) > 0 {
-			os.WriteFile(mcpPath, mcpBackup, 0644)
-		}
-		if len(claudeMDBackup) > 0 {
-			os.WriteFile(claudeMDPath, claudeMDBackup, 0644)
-		}
-
-		r2 := runClaude(dir, q, "defn")
-		defnResults = append(defnResults, r2)
-		writeRow(q, r2)
+		defnResults = append(defnResults, defnResult)
+		writeRow(q, defnResult)
 		fmt.Printf("  defn:   %d calls, %s, in/out/cacheR/cacheW=%d/%d/%d/%d tok, correct=%v\n",
-			r2.toolCalls, r2.duration.Round(time.Second),
-			r2.inputTokens, r2.outputTokens, r2.cachedTokens, r2.cacheCreationTokens, r2.correct)
+			defnResult.toolCalls, defnResult.duration.Round(time.Second),
+			defnResult.inputTokens, defnResult.outputTokens, defnResult.cachedTokens, defnResult.cacheCreationTokens, defnResult.correct)
 		fmt.Println()
 	}
 

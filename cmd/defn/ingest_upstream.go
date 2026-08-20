@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/justinstimatze/defn/internal/astutil"
 	"github.com/justinstimatze/defn/internal/store"
 )
 
@@ -227,15 +228,7 @@ func funcNameKindReceiver(d *ast.FuncDecl) (name, kind, receiver string) {
 	if d.Recv == nil || len(d.Recv.List) == 0 {
 		return d.Name.Name, "function", ""
 	}
-	recv := ""
-	switch t := d.Recv.List[0].Type.(type) {
-	case *ast.Ident:
-		recv = t.Name
-	case *ast.StarExpr:
-		if id, ok := t.X.(*ast.Ident); ok {
-			recv = "*" + id.Name
-		}
-	}
+	recv := receiverExprName(d.Recv.List[0].Type)
 	recvBase := strings.TrimPrefix(recv, "*")
 	return recvBase + "." + d.Name.Name, "method", recv
 }
@@ -262,4 +255,11 @@ func extractSignature(fset *token.FileSet, d *ast.FuncDecl) string {
 		return strings.TrimSpace(full[:idx])
 	}
 	return strings.TrimSpace(full)
+}
+
+// receiverExprName extracts a method receiver's bare type name.
+// Delegates to astutil.BareReceiverName -- see its doc comment for why
+// this used to be an independently-maintained copy.
+func receiverExprName(e ast.Expr) string {
+	return astutil.BareReceiverName(e)
 }

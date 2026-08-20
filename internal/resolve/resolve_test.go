@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/justinstimatze/defn/internal/goload"
 	"github.com/justinstimatze/defn/internal/ingest"
 	"github.com/justinstimatze/defn/internal/store"
 )
@@ -489,5 +490,583 @@ func TestDispatch(t *testing.T) {
 	}
 	if len(impact.Tests) == 0 {
 		t.Fatalf("expected TestDispatch to cover (*LBPicker).Pick via interface dispatch, got zero tests in impact: %+v", impact)
+	}
+}
+
+func TestResolveFileCapturesCrossPackageCallRef(t *testing.T) {
+	// Regression for a bug found via real head-to-head-go trajectories:
+	// impact(name:"Emit") reported 0 production callers even though
+	// cmdEmit and handleTest call emit.Emit directly. Root cause:
+	// ResolveFile loads ONLY the touched file's own package (NeedDeps
+	// intentionally omitted for speed), so pass1's objToDef only has
+	// entries for defs declared in that one package. A call from the
+	// touched file to a func in ANY other package always missed
+	// objToDef and collectRefs silently dropped the ref -- and since
+	// SetManyReferences deletes-then-reinserts the touched def's whole
+	// ref set, this didn't just fail to ADD cross-package refs, it
+	// ERASED previously-correct ones on every edit through this path
+	// (used by code(op:"sync", file:) and after nearly every write op
+	// via autoResolveFile). Fixed by collectRefs falling back to a
+	// DB-backed lookup (lookupDefID/lookupTypeDefID, same as pass1's
+	// "from" side) when an Ident's object isn't in objToDef.
+	dir := writeModule(t, map[string]string{
+		"sub/sub.go": "package sub\n\nfunc Target() int { return 1 }\nfunc Other() int { return 2 }\n",
+		"main.go":    "package refsbug\n\nimport \"example.com/refsbug/sub\"\n\nfunc Caller() int { return sub.Target() }\n",
+	})
+
+	db := testDB(t)
+	if err := ingest.Ingest(db, dir); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if err := Resolve(db, dir); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	rs, _ := db.QueryRefs("Caller", "Target", "call", 0)
+	if len(rs) == 0 {
+		t.Fatalf("setup: expected initial Caller -> Target cross-package call ref")
+	}
+
+	// Edit main.go (the caller's OWN file) to call a different
+	// cross-package function -- same shape as a real code(op:"edit").
+	writeFile(t, dir, "main.go", "package refsbug\n\nimport \"example.com/refsbug/sub\"\n\nfunc Caller() int { return sub.Other() }\n")
+	if _, err := ingest.IngestFile(db, dir, filepath.Join(dir, "main.go")); err != nil {
+		t.Fatalf("ingest file: %v", err)
+	}
+	if err := ResolveFile(db, dir, filepath.Join(dir, "main.go")); err != nil {
+		t.Fatalf("resolve file: %v", err)
+	}
+
+	rs, _ = db.QueryRefs("Caller", "Other", "call", 0)
+	if len(rs) == 0 {
+		t.Errorf("ResolveFile (the scoped single-package path used after every code(op:\"edit\")) failed to capture the new cross-package Caller -> Other call ref")
+	}
+	rs, _ = db.QueryRefs("Caller", "Target", "call", 0)
+	if len(rs) != 0 {
+		t.Errorf("ResolveFile left a stale Caller -> Target ref after the call target changed: %+v", rs)
+	}
+}
+
+// TestResolveModule_PreservesCrossModuleInterfaceDispatch guards a severe
+// bug found digging prometheus-batch trajectories (2026-08-10): ifaceMethodToImpls
+// is rebuilt from scratch on every resolve() call, and pass 2's population loop
+// (unlike ifacesByPkg's collection loop, which is unconditional) is gated by
+// onlyModule -- packages.Load always loads the whole project ("./..."), but
+// ResolveModule/ResolveFile's onlyModule filter skips processing any package
+// OTHER than the scoped one when building the concrete-type/interface pairing.
+// If the interface's implementer lives in a DIFFERENT module than the one
+// being partially resolved, ifaceMethodToImpls never gets an entry for it in
+// THAT call -- so collectRefs finds nothing for the caller's dispatch call
+// site, and SetManyReferences (a full delete+reinsert per fromID) silently
+// WIPES a previously-correct interface_dispatch ref a prior full Resolve had
+// computed. Live symptom: op:"impact"/op:"traverse" on any store.Backend
+// method reported near-zero callers despite dozens of real cross-package call
+// sites through the interface, because internal/mcp (the caller module) had
+// been through many incremental per-file/per-module resolves since the last
+// full one.
+func TestResolveModule_PreservesCrossModuleInterfaceDispatch(t *testing.T) {
+	// Mirrors the real defn shape: interface (Backend) and its sole
+	// implementer (SQLiteDB) declared in the SAME package (store) -- no
+	// import needed for pass 2's "own package's interfaces" branch to
+	// pair them. The caller (mcp) lives in a DIFFERENT module and only
+	// ever touches the interface type.
+	// dispatch also calls a sibling function (helper) so it has at least
+	// one OTHER ref -- a real-world function calling s.backend.X() always
+	// has other refs too (formatting, sibling calls). That matters here:
+	// collectRefs only appends to defRefs[fromID] when len(refs) > 0, so a
+	// function whose ONLY possible ref is the (in-this-pass-unresolvable)
+	// interface dispatch call never becomes a key in defRefs at all, and
+	// SetManyReferences leaves untouched IDs alone -- accidentally
+	// sidestepping the bug. helper() ensures dispatch is a real entry
+	// that DOES get its ref set replaced by this scoped resolve.
+	dir := writeModule(t, map[string]string{
+		"store/store.go": `package store
+
+type Backend interface{ Pick() int }
+
+type SQLiteDB struct{ n int }
+
+func (p *SQLiteDB) Pick() int { return p.n }
+`,
+		"mcp/mcp.go": `package mcp
+
+import "example.com/refsbug/store"
+
+type Server struct{ backend store.Backend }
+
+func helper() int { return 1 }
+
+func (s *Server) dispatch() int {
+	return s.backend.Pick() + helper()
+}
+`,
+	})
+
+	db := testDB(t)
+	if err := ingest.Ingest(db, dir); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if err := Resolve(db, dir); err != nil {
+		t.Fatalf("initial full Resolve: %v", err)
+	}
+
+	pick, err := db.GetDefinitionByNameAndReceiver("Pick", "", "*SQLiteDB")
+	if err != nil {
+		t.Fatalf("lookup (*SQLiteDB).Pick: %v", err)
+	}
+
+	hasDispatchRef := func() bool {
+		refs, err := db.QueryRefs("dispatch", "", "interface_dispatch", 0)
+		if err != nil {
+			t.Fatalf("query interface_dispatch refs: %v", err)
+		}
+		for _, r := range refs {
+			if r.ToDef == pick.ID {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !hasDispatchRef() {
+		t.Fatalf("expected dispatch -> (*SQLiteDB).Pick interface_dispatch ref after the initial full Resolve")
+	}
+
+	// Simulate the real-world pattern: an edit to the CALLER's own module
+	// (mcp, containing dispatch) triggers a scoped ResolveModule for just
+	// that module -- the implementer (store.SQLiteDB) lives in a DIFFERENT
+	// module and is never re-processed by pass 2 in this call.
+	if err := ResolveModule(db, dir, "example.com/refsbug/mcp"); err != nil {
+		t.Fatalf("ResolveModule: %v", err)
+	}
+
+	if !hasDispatchRef() {
+		t.Fatalf("ResolveModule scoped to the CALLER's own module silently wiped the dispatch -> (*SQLiteDB).Pick interface_dispatch ref computed by the prior full Resolve")
+	}
+}
+
+// TestResolveFile_PreservesCrossModuleInterfaceDispatch is the real-world
+// counterpart to TestResolveModule_PreservesCrossModuleInterfaceDispatch:
+// autoResolveFile (called after nearly every code(op:"edit")/op:"create") uses
+// ResolveFile, not ResolveModule. ResolveFile loads only the touched file's
+// own package (NeedDeps intentionally omitted for speed -- see its doc
+// comment), so it structurally cannot see an interface's implementer at all
+// when that implementer lives in a different package. Even after fixing
+// resolve()'s onlyModule-gated pass 2, a ResolveFile call has no data to
+// rebuild the dispatch edge with -- so it must PRESERVE the existing
+// interface_dispatch ref a prior full Resolve established, the same way its
+// own doc comment already accepts for incoming cross-package refs.
+func TestResolveFile_PreservesCrossModuleInterfaceDispatch(t *testing.T) {
+	dir := writeModule(t, map[string]string{
+		"store/store.go": `package store
+
+type Backend interface{ Pick() int }
+
+type SQLiteDB struct{ n int }
+
+func (p *SQLiteDB) Pick() int { return p.n }
+`,
+		"mcp/mcp.go": `package mcp
+
+import "example.com/refsbug/store"
+
+type Server struct{ backend store.Backend }
+
+func helper() int { return 1 }
+
+func (s *Server) dispatch() int {
+	return s.backend.Pick() + helper()
+}
+`,
+	})
+
+	db := testDB(t)
+	if err := ingest.Ingest(db, dir); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if err := Resolve(db, dir); err != nil {
+		t.Fatalf("initial full Resolve: %v", err)
+	}
+
+	pick, err := db.GetDefinitionByNameAndReceiver("Pick", "", "*SQLiteDB")
+	if err != nil {
+		t.Fatalf("lookup (*SQLiteDB).Pick: %v", err)
+	}
+
+	hasDispatchRef := func() bool {
+		refs, err := db.QueryRefs("dispatch", "", "interface_dispatch", 0)
+		if err != nil {
+			t.Fatalf("query interface_dispatch refs: %v", err)
+		}
+		for _, r := range refs {
+			if r.ToDef == pick.ID {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !hasDispatchRef() {
+		t.Fatalf("expected dispatch -> (*SQLiteDB).Pick interface_dispatch ref after the initial full Resolve")
+	}
+
+	// Simulate the real edit path: touch the caller's OWN file (an
+	// unrelated body change, same shape as any code(op:"edit")) and
+	// re-resolve via ResolveFile -- what autoResolveFile actually calls.
+	writeFile(t, dir, "mcp/mcp.go", `package mcp
+
+import "example.com/refsbug/store"
+
+type Server struct{ backend store.Backend }
+
+func helper() int { return 2 }
+
+func (s *Server) dispatch() int {
+	return s.backend.Pick() + helper()
+}
+`)
+	if _, err := ingest.IngestFile(db, dir, filepath.Join(dir, "mcp", "mcp.go")); err != nil {
+		t.Fatalf("ingest file: %v", err)
+	}
+	if err := ResolveFile(db, dir, filepath.Join(dir, "mcp", "mcp.go")); err != nil {
+		t.Fatalf("ResolveFile: %v", err)
+	}
+
+	if !hasDispatchRef() {
+		t.Fatalf("ResolveFile (the path used after every real code(op:\"edit\")) silently wiped the dispatch -> (*SQLiteDB).Pick interface_dispatch ref computed by the prior full Resolve")
+	}
+}
+
+// TestResolvePackages_LoadAllInterfaceDispatch checks whether the exact
+// loading path the live server uses (ingestAndResolve -> goload.LoadAll ->
+// resolve.ResolvePackages) computes cross-package interface_dispatch refs
+// correctly -- goload.LoadAll deliberately omits packages.NeedDeps (unlike
+// resolve()'s own internal fallback loader used by plain Resolve/
+// ResolveModule), and that difference is unverified against pass 2's
+// interface-satisfaction check.
+func TestResolvePackages_LoadAllInterfaceDispatch(t *testing.T) {
+	dir := writeModule(t, map[string]string{
+		"store/store.go": `package store
+
+type Backend interface{ Pick() int }
+
+type SQLiteDB struct{ n int }
+
+func (p *SQLiteDB) Pick() int { return p.n }
+`,
+		"mcp/mcp.go": `package mcp
+
+import "example.com/refsbug/store"
+
+type Server struct{ backend store.Backend }
+
+func helper() int { return 1 }
+
+func (s *Server) dispatch() int {
+	return s.backend.Pick() + helper()
+}
+`,
+	})
+
+	db := testDB(t)
+	if err := ingest.Ingest(db, dir); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	pkgs, err := goload.LoadAll(dir)
+	if err != nil {
+		t.Fatalf("goload.LoadAll: %v", err)
+	}
+	if err := ResolvePackages(db, pkgs, dir); err != nil {
+		t.Fatalf("ResolvePackages: %v", err)
+	}
+
+	pick, err := db.GetDefinitionByNameAndReceiver("Pick", "", "*SQLiteDB")
+	if err != nil {
+		t.Fatalf("lookup (*SQLiteDB).Pick: %v", err)
+	}
+	refs, err := db.QueryRefs("dispatch", "", "interface_dispatch", 0)
+	if err != nil {
+		t.Fatalf("query interface_dispatch refs: %v", err)
+	}
+	found := false
+	for _, r := range refs {
+		if r.ToDef == pick.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ResolvePackages via goload.LoadAll (the live server's actual full-resolve path) failed to compute dispatch -> (*SQLiteDB).Pick, got %d interface_dispatch refs: %+v", len(refs), refs)
+	}
+}
+
+// TestResolve_InterfaceDispatchSurvivesTestVariantPreference is the real
+// root cause behind the two ResolveModule/ResolveFile bugs fixed above --
+// found by diagnosing why defn's own live dogfooding session still showed
+// zero interface-dispatch callers for store.Backend methods even after
+// those fixes and a full re-sync. Direct diagnostic against defn's own repo
+// (a standalone go/packages program) proved: internal/store.Backend.GetImpact's
+// method Object as seen from internal/store's OWN type-checking session has a
+// DIFFERENT pointer than the Object internal/mcp's call site resolves via
+// info.Uses -- identical String() representation, different addresses.
+//
+// Root cause: packages.Load(Tests:true) produces a separate "test variant"
+// *packages.Package for any package with its own _test.go files (bundling
+// test + non-test files into one type-checking session, distinct from the
+// plain variant). goload.FilterPackages deliberately PREFERS the test
+// variant when iterating a package directly ("superset of files") -- but a
+// package that IMPORTS it normally (never a test variant, per Go's own
+// import rules) gets Objects from the PLAIN variant's session. Two
+// structurally-identical *types.Func for "the same" method then have
+// different pointers. ifaceMethodToImpls, keyed by types.Object, silently
+// never matches across this boundary -- breaking cross-package interface
+// dispatch tracking for EVERY package with its own tests, i.e. nearly every
+// real package. This fixture reproduces it precisely: store/ has a _test.go
+// file (unlike the fixtures above, which never triggered FilterPackages'
+// preference at all and so never exercised this specific mechanism).
+func TestResolve_InterfaceDispatchSurvivesTestVariantPreference(t *testing.T) {
+	dir := writeModule(t, map[string]string{
+		"store/store.go": `package store
+
+type Backend interface{ Pick() int }
+
+type SQLiteDB struct{ n int }
+
+func (p *SQLiteDB) Pick() int { return p.n }
+`,
+		"store/store_test.go": `package store
+
+import "testing"
+
+func TestSomething(t *testing.T) {
+	var b Backend = &SQLiteDB{}
+	_ = b.Pick()
+}
+`,
+		"mcp/mcp.go": `package mcp
+
+import "example.com/refsbug/store"
+
+type Server struct{ backend store.Backend }
+
+func helper() int { return 1 }
+
+func (s *Server) dispatch() int {
+	return s.backend.Pick() + helper()
+}
+`,
+	})
+
+	db := testDB(t)
+	if err := ingest.Ingest(db, dir); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	// The exact real-world path: goload.LoadAll (Tests:true, triggers
+	// FilterPackages' test-variant preference for store/) + ResolvePackages.
+	pkgs, err := goload.LoadAll(dir)
+	if err != nil {
+		t.Fatalf("goload.LoadAll: %v", err)
+	}
+	if err := ResolvePackages(db, pkgs, dir); err != nil {
+		t.Fatalf("ResolvePackages: %v", err)
+	}
+
+	pick, err := db.GetDefinitionByNameAndReceiver("Pick", "", "*SQLiteDB")
+	if err != nil {
+		t.Fatalf("lookup (*SQLiteDB).Pick: %v", err)
+	}
+	refs, err := db.QueryRefs("dispatch", "", "interface_dispatch", 0)
+	if err != nil {
+		t.Fatalf("query interface_dispatch refs: %v", err)
+	}
+	found := false
+	for _, r := range refs {
+		if r.ToDef == pick.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("mcp.dispatch -> (*SQLiteDB).Pick interface_dispatch ref missing -- the caller package (mcp) imports store's PLAIN variant while pass 2 iterated store's TEST variant (preferred by FilterPackages since store/ has its own _test.go file), and a types.Object-keyed ifaceMethodToImpls map can never bridge the two. Got %d interface_dispatch refs: %+v", len(refs), refs)
+	}
+}
+
+// TestResolveTracksStructFieldReferences is the regression for the
+// "rename struct field updates 0 callers" bug: struct field objects
+// never entered objToDef (obj.Parent() is nil for a field, same as a
+// param/local var, so isPackageLevelOrMethod filtered them out), so
+// collectRefs could never resolve a selector expression (ro.Count) or
+// keyed composite literal (T{Count: ...}) back to the field's def ID.
+// GetCallers on the field then always reported zero, so code(op:"rename")
+// on a struct field silently failed to propagate to any call site --
+// confirmed via a real bench trajectory (etcd RangeOptions.Count ->
+// CountOnly) where this forced ~15 extra manual search/read/edit calls
+// to hand-propagate a rename the tool was supposed to do atomically.
+func TestResolveTracksStructFieldReferences(t *testing.T) {
+	src := `package fieldrefs
+
+type Opts struct {
+	Count bool
+}
+
+func readSelector(o Opts) bool {
+	return o.Count
+}
+
+func buildLiteral() Opts {
+	return Opts{Count: true}
+}
+`
+	dir := writeModule(t, map[string]string{"main.go": src})
+
+	db := testDB(t)
+	if err := ingest.Ingest(db, dir); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if err := Resolve(db, dir); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	field, err := db.GetDefinitionByNameAndReceiver("Count", "example.com/refsbug", "Opts")
+	if err != nil {
+		t.Fatalf("get field def: %v", err)
+	}
+
+	callers, err := db.GetCallers(field.ID)
+	if err != nil {
+		t.Fatalf("get callers: %v", err)
+	}
+	names := map[string]bool{}
+	for _, c := range callers {
+		names[c.Name] = true
+	}
+	if !names["readSelector"] {
+		t.Errorf("expected readSelector (o.Count selector) to be a caller of Opts.Count, got: %+v", names)
+	}
+	if !names["buildLiteral"] {
+		t.Errorf("expected buildLiteral (Opts{Count: ...} keyed literal) to be a caller of Opts.Count, got: %+v", names)
+	}
+}
+
+// TestResolveTracksCrossPackageStructFieldReferences is the second half of
+// the struct-field-ref regression (see
+// TestResolveTracksStructFieldReferences for the same-package case).
+// Real-world bench trajectory: renaming go.etcd.io/etcd's
+// RangeOptions.Count -> CountOnly updated same-package callers fine but
+// left a keyed composite literal in a DIFFERENT package
+// (mvcc.RangeOptions{Count: ...} inside etcdserver/txn) untouched --
+// because mvcc has _test.go files, FilterPackages prefers its test
+// variant for objToDef, and a field declared there gets a DIFFERENT
+// types.Object identity than what an ordinary (non-test) importer's own
+// TypesInfo resolves the same field access to. Object-identity lookups
+// alone can never see this; only a DB-backed lookup (lookupFieldDefID)
+// can. This fixture mirrors that exact shape: package a has a _test.go
+// file (forcing FilterPackages to prefer a's test variant), package b
+// has no tests and references a.Opts.Count both via a keyed composite
+// literal and a plain selector.
+func TestResolveTracksCrossPackageStructFieldReferences(t *testing.T) {
+	dir := writeModule(t, map[string]string{
+		"a/a.go": `package a
+
+type Opts struct {
+	Count bool
+}
+`,
+		"a/a_test.go": `package a
+
+import "testing"
+
+func TestNothing(t *testing.T) {}
+`,
+		"b/b.go": `package b
+
+import "example.com/refsbug/a"
+
+func buildLiteral() a.Opts {
+	return a.Opts{Count: true}
+}
+
+func readSelector(o a.Opts) bool {
+	return o.Count
+}
+`,
+	})
+
+	db := testDB(t)
+	if err := ingest.Ingest(db, dir); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if err := Resolve(db, dir); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	field, err := db.GetDefinitionByNameAndReceiver("Count", "example.com/refsbug/a", "Opts")
+	if err != nil {
+		t.Fatalf("get field def: %v", err)
+	}
+
+	callers, err := db.GetCallers(field.ID)
+	if err != nil {
+		t.Fatalf("get callers: %v", err)
+	}
+	names := map[string]bool{}
+	for _, c := range callers {
+		names[c.Name] = true
+	}
+	if !names["buildLiteral"] {
+		t.Errorf("expected cross-package buildLiteral (a.Opts{Count: ...} keyed literal) to be a caller of a.Opts.Count, got: %+v", names)
+	}
+	if !names["readSelector"] {
+		t.Errorf("expected cross-package readSelector (o.Count selector) to be a caller of a.Opts.Count, got: %+v", names)
+	}
+}
+
+// TestResolveExternalInterfaceSatisfaction is the resolve-level regression
+// for widening ifacesByPkg to external (stdlib/third-party) packages: a
+// type satisfying io.ReaderAt with no local interface declared anywhere
+// used to be entirely invisible to interface-satisfaction tracking (the
+// "implements" ref-graph edge needs a defn ID on both sides, and io.ReaderAt
+// has none -- it was never ingested). def_external_interfaces is the
+// ID-less sidecar that closes that gap: this checks the concrete method's
+// own def row gets "io.ReaderAt" recorded via GetExternalInterfaces.
+func TestResolveExternalInterfaceSatisfaction(t *testing.T) {
+	dir := writeModule(t, map[string]string{
+		"main.go": `package extifacebug
+
+import "io"
+
+type File struct{ n int }
+
+func (f *File) ReadAt(p []byte, off int64) (int, error) { return 0, nil }
+
+func use() io.ReaderAt { return &File{} }
+`,
+	})
+
+	db := testDB(t)
+	if err := ingest.Ingest(db, dir); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if err := Resolve(db, dir); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	readAt, err := db.GetDefinitionByNameAndReceiver("ReadAt", "", "*File")
+	if err != nil {
+		t.Fatalf("lookup (*File).ReadAt: %v", err)
+	}
+
+	extIfaces, err := db.GetExternalInterfaces(readAt.ID)
+	if err != nil {
+		t.Fatalf("GetExternalInterfaces: %v", err)
+	}
+	found := false
+	for _, name := range extIfaces {
+		if name == "io.ReaderAt" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected (*File).ReadAt to be recorded as satisfying io.ReaderAt, got: %v", extIfaces)
 	}
 }

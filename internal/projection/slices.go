@@ -105,6 +105,14 @@ func Slices(body, kind string) ([]Slice, error) {
 				match = true
 			}
 		case "loop":
+			// Deliberately includes *ast.SelectStmt alongside for/range:
+			// a select{} is control flow commonly reworked the same way
+			// a loop body is (see replaceSliceFixtures' "loop_select"
+			// case, which replaces a bare select block via slice:"loop"
+			// -- confirmed this is real, exercised behavior, not an
+			// oversight, before a prior attempt at "fixing" this as an
+			// inconsistency with stmtKind's Flow-summary labeling broke
+			// that fixture).
 			switch n.(type) {
 			case *ast.ForStmt, *ast.RangeStmt, *ast.SelectStmt:
 				match = true

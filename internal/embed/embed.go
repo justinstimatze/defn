@@ -64,7 +64,17 @@ func Cosine(a, b []float32) float64 {
 	if sumA == 0 || sumB == 0 {
 		return 0
 	}
-	return dot
+	// sumA/sumB are each vector's squared norm -- dividing by the
+	// product of their square roots is what actually makes this cosine
+	// similarity rather than a raw dot product. Previously this
+	// returned dot unchanged: harmless today because Embed's output is
+	// already L2-normalized (its own doc comment says so, which is
+	// what let this go unnoticed), but this function's doc comment
+	// makes an unqualified "[-1, 1]" claim for ANY two vectors, not
+	// just pre-normalized ones -- a future caller passing raw
+	// (non-unit) vectors would have silently gotten a value outside
+	// that range and not actually a cosine similarity.
+	return dot / (math.Sqrt(sumA) * math.Sqrt(sumB))
 }
 
 func normalize(vec []float32) {

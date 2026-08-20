@@ -12,11 +12,13 @@ import (
 	"go/token"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/justinstimatze/defn/internal/astutil"
 	"github.com/justinstimatze/defn/internal/store"
 )
 
@@ -151,6 +153,16 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, []
 		}
 		touchedSet[filepath.ToSlash(clean)] = true
 	}
+	emitDebugf("scope: touchedFiles=%d goimportsFiles=%d skipGoimports=%v allowedRemovals=%d allowedAdds=%d",
+		len(opts.TouchedFiles), len(opts.GoimportsFiles), opts.SkipGoimports, len(opts.AllowedRemovals), len(opts.AllowedAdds))
+	if scoped {
+		names := make([]string, 0, len(touchedSet))
+		for f := range touchedSet {
+			names = append(names, f)
+		}
+		sort.Strings(names)
+		emitDebugf("touchedSet: %v", names)
+	}
 
 	// Write project-level files (go.mod, go.sum). Kept unconditional even
 	// in scoped mode: a fresh tempdir needs go.mod to build, and the cost
@@ -265,6 +277,7 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, []
 		} else {
 			args = append(args, outDir)
 		}
+		emitDebugf("goimports args: %v", args)
 		if out, err := exec.Command(goimports, args...).CombinedOutput(); err != nil {
 			return nil, nil, fmt.Errorf("goimports: %s", out)
 		}
@@ -419,21 +432,25 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 	}
 
 	// Group definitions by source file, keyed on the full cleaned
-	// project-relative path -- NOT the bare basename. A store.Module is
-	// per go.mod, not per package (#241), so a single module routinely
-	// spans many package directories; keying on basename alone collapses
-	// every same-named file across the whole module into one bucket
-	// (e.g. cli/cli's pkg/cmd/gist/create/create.go and
-	// pkg/cmd/repo/create/create.go both reduce to "create.go"). Only
-	// one of the colliding files would then get written -- with the
-	// OTHER package's definitions merged into it -- silently corrupting
-	// one file and dropping the other. Confirmed via a real cli-2671
-	// head-to-head-go trajectory: editing repo/create's createRun
-	// overwrote gist/create's createRun with repo's body and imports.
-	// The full path collapses to a bare basename naturally whenever
-	// SourceFile itself has no directory component (root-level files,
-	// or the empty-SourceFile synthetic-name fallback below), so this
-	// doesn't change behavior for genuinely single-directory modules.
+	// project-relative path -- NOT the bare basename. store.Module is
+	// one row per Go package (see EnsureModule's callers -- #241's
+	// "per go.mod, spanning every package" theory was wrong and was
+	// corrected 2026-08-09, docs/lessons-learned.md), but pkgDir below
+	// can still collapse to the same directory for two different
+	// packages when the module-root-relative path computation does --
+	// and keying on basename alone then collapses every same-named
+	// file across those packages into one bucket (e.g. cli/cli's
+	// pkg/cmd/gist/create/create.go and pkg/cmd/repo/create/create.go
+	// both reduce to "create.go"). Only one of the colliding files
+	// would then get written -- with the OTHER package's definitions
+	// merged into it -- silently corrupting one file and dropping the
+	// other. Confirmed via a real cli-2671 head-to-head-go trajectory:
+	// editing repo/create's createRun overwrote gist/create's
+	// createRun with repo's body and imports. The full path collapses
+	// to a bare basename naturally whenever SourceFile itself has no
+	// directory component (root-level files, or the empty-SourceFile
+	// synthetic-name fallback below), so this doesn't change behavior
+	// for genuinely single-directory packages.
 	byFile := map[string][]store.Definition{}
 	for _, d := range defs {
 		file := d.SourceFile
@@ -460,12 +477,27 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 	}
 	sort.Strings(fileNames)
 
+	// Phase C: pre-fetch the raw sources for this module. When present,
+	// writeFile uses them as the authoritative merge base — that's the
+	// byte-faithful copy, unaffected by whatever's on disk (which might
+	// be stale or never have existed, e.g. fresh `defn emit /tmp/out`).
+	// Fetched here, before the scoped filter below (not after) -- the
+	// #276 def-less pass at the end of this function needs to influence
+	// whether the scoped filter's early-return actually fires. It used
+	// to be fetched after that early return, so a module whose ONLY
+	// relevant content for this emit was a def-less file_sources entry
+	// (a freshly scaffolded file, no defs yet) bailed out before ever
+	// reaching the code that would have written it.
+	rawMap, _ := db.ListFileSources(mod.ID)
+
 	// Scoped emit filter: keep only files whose canonical project-relative
 	// path is in touchedSet. Pick the canonical path from the bucket's
 	// first def with a non-empty SourceFile (same invariant as projectRelByFile
 	// below — buckets share a SourceFile). Files without any SourceFile
 	// (fresh defs) are always kept. If no file in this module matched,
-	// return early — nothing to emit here.
+	// return early -- unless a def-less file_sources entry is still
+	// relevant to this emit (#276), in which case fall through so the
+	// pass at the end of this function gets a chance to run.
 	if scoped {
 		kept := fileNames[:0]
 		for _, file := range fileNames {
@@ -476,21 +508,32 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 					break
 				}
 			}
-			if projectRel == "" || touchedSet[projectRel] {
+			keep := projectRel == "" || touchedSet[projectRel]
+			if keep {
+				reason := "in touchedSet"
+				if projectRel == "" {
+					reason = "no def in this file has a SourceFile (fresh file-less create fallback)"
+				}
+				emitDebugf("  KEEP %s/%s (sourceFile=%q): %s", mod.Path, file, projectRel, reason)
 				kept = append(kept, file)
+			} else {
+				emitDebugf("  DROP %s/%s (sourceFile=%q): not in touchedSet", mod.Path, file, projectRel)
 			}
 		}
 		fileNames = kept
 		if len(fileNames) == 0 {
-			return nil, nil, nil, nil
+			relevantDeflessFile := false
+			for sourceFile := range rawMap {
+				if touchedSet[filepath.ToSlash(filepath.Clean(sourceFile))] {
+					relevantDeflessFile = true
+					break
+				}
+			}
+			if !relevantDeflessFile {
+				return nil, nil, nil, nil
+			}
 		}
 	}
-
-	// Phase C: pre-fetch the raw sources for this module. When present,
-	// writeFile uses them as the authoritative merge base — that's the
-	// byte-faithful copy, unaffected by whatever's on disk (which might
-	// be stale or never have existed, e.g. fresh `defn emit /tmp/out`).
-	rawMap, _ := db.ListFileSources(mod.ID)
 
 	// Per-file rawFromDB lookup, cached once for reuse.
 	rawByFile := make(map[string][]byte, len(fileNames))
@@ -604,11 +647,64 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 		if warning != "" {
 			warnings = append(warnings, warning)
 		}
+		emitDebugf("  WROTE %s (module=%s sourceFile=%q scoped=%v)", path, mod.Path, projectRelByFile[file], scoped)
 		allLocs = append(allLocs, locs...)
 		written = append(written, writtenFile{
 			Path:       path,
 			ModuleID:   mod.ID,
 			SourceFile: projectRelByFile[file],
+		})
+	}
+
+	// #276: byFile/fileNames above are built exclusively from
+	// Definitions, so a file recorded in file_sources with ZERO
+	// matching defs -- most notably handleCreateScaffoldFile's whole
+	// reason to exist -- was invisible to every emit call in every
+	// scenario: a module with other defs never puts a def-less file
+	// into byFile at all, and a module with zero defs total hits the
+	// len(defs)==0 bailout above before byFile is even built. Confirmed
+	// live: a scaffolded file reported "Scaffolded ... N bytes" success
+	// and was never actually written to disk. Handle these separately
+	// from the def-driven path above -- there's nothing to AST-merge,
+	// just the raw file_sources content to place on disk (safeWriteGoFile's
+	// own data-loss check still applies if the target already has
+	// on-disk decls this content doesn't account for). Additive only:
+	// this can write a new file or refresh an existing one, never
+	// delete -- consistent with the len(defs)==0 module bailout's own
+	// "file_sources alone is not proof of ownership" reasoning, which
+	// only ever applied to DELETION, not to placing content a caller
+	// explicitly just asked to be written.
+	handledPaths := make(map[string]bool, len(projectRelByFile))
+	for _, pr := range projectRelByFile {
+		if pr != "" {
+			handledPaths[pr] = true
+		}
+	}
+	for sourceFile, raw := range rawMap {
+		clean := filepath.ToSlash(filepath.Clean(sourceFile))
+		if handledPaths[clean] {
+			continue
+		}
+		if scoped && !touchedSet[clean] {
+			continue
+		}
+		path := filepath.Join(outDir, clean)
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			return nil, nil, nil, err
+		}
+		wrote, lost, err := safeWriteGoFile(path, []byte(raw), allowedRemovals)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if !wrote {
+			warnings = append(warnings, fmt.Sprintf("%s: skipped writing a def-less file_sources entry -- would remove %d on-disk declaration(s) not in the database: %v", path, len(lost), lost))
+			continue
+		}
+		emitDebugf("  WROTE %s (module=%s sourceFile=%q scoped=%v, def-less file_sources entry)", path, mod.Path, clean, scoped)
+		written = append(written, writtenFile{
+			Path:       path,
+			ModuleID:   mod.ID,
+			SourceFile: clean,
 		})
 	}
 
@@ -718,6 +814,12 @@ func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import,
 		}
 		filtered = append(filtered, imp)
 	}
+	// #new: this is the regenerate path -- there's no on-disk file to
+	// preserve a real per-file import block from, so restrict the
+	// per-module union down to what this file's own bodies actually
+	// reference (deduped on local name) rather than writing the whole
+	// union into every file. See relevantImportsForFile.
+	filtered = relevantImportsForFile(filtered, defs)
 	if len(filtered) > 0 {
 		src.WriteString("import (\n")
 		for _, imp := range filtered {
@@ -902,19 +1004,11 @@ func topLevelDeclNames(src []byte) ([]string, error) {
 }
 
 // recvTypeName extracts the receiver type name for a method declaration,
-// unwrapping pointer receivers and generic type params.
+// unwrapping pointer receivers and generic type params. Delegates to
+// astutil.BareReceiverName -- see its doc comment for why this used to
+// be an independently-maintained copy.
 func recvTypeName(e ast.Expr) string {
-	switch t := e.(type) {
-	case *ast.Ident:
-		return t.Name
-	case *ast.StarExpr:
-		return "*" + recvTypeName(t.X)
-	case *ast.IndexExpr:
-		return recvTypeName(t.X)
-	case *ast.IndexListExpr:
-		return recvTypeName(t.X)
-	}
-	return ""
+	return astutil.BareReceiverName(e)
 }
 
 // buildLocIndex re-reads an emitted file and finds each definition's line.
@@ -1104,15 +1198,24 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 			reps = append(reps, replacement{s, e, body})
 			delete(wantFuncs, ident)
 		case *ast.GenDecl:
-			// Whole-decl removal via allowedRemovals: matches on the
-			// first spec name (same key as whole-decl replacement).
-			// Only applies when the whole GenDecl represents a single
-			// removable unit (single-spec block or grouped block whose
-			// first-spec name is the one being deleted).
-			if name := firstSpecName(d); name != "" && remove[name] {
-				sp, ep := declRange(d.Pos(), d.End(), d.Doc, true)
-				reps = append(reps, replacement{sp, ep, ""})
-				continue
+			// Whole-decl removal via allowedRemovals: only for a genuinely
+			// single-spec (ungrouped) GenDecl, where the whole decl IS the
+			// one removable unit. A grouped (parenthesized) block's removal
+			// is handled per-spec below instead -- using this same
+			// firstSpecName shortcut for a grouped block used to either
+			// silently no-op (removing a NON-first member matched nothing
+			// here, and the per-spec loop below never checked `remove` at
+			// all) or, when the target WAS first, delete the entire block
+			// including untouched sibling specs that were never authorized
+			// for removal (caught by safeWriteGoFile's data-loss check, so
+			// it failed safe, but made "delete A" unconditionally refused
+			// whenever A shared a group with anything else).
+			if !d.Lparen.IsValid() {
+				if name := firstSpecName(d); name != "" && remove[name] {
+					sp, ep := declRange(d.Pos(), d.End(), d.Doc, true)
+					reps = append(reps, replacement{sp, ep, ""})
+					continue
+				}
 			}
 			// Whole-decl replacement: ingest bundles iota const blocks
 			// (and any future whole-GenDecl case) under the first spec
@@ -1132,6 +1235,20 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 				switch s := spec.(type) {
 				case *ast.TypeSpec:
 					if d.Tok != token.TYPE {
+						continue
+					}
+					// Per-spec removal: the whole-decl shortcut above only
+					// fires for an ungrouped GenDecl, so a grouped block's
+					// member -- first or not -- is removed here, scoped to
+					// just its own spec range. Sibling specs are untouched.
+					if remove[s.Name.Name] {
+						if grouped {
+							sp, ep := declRange(s.Pos(), s.End(), nil, false)
+							reps = append(reps, replacement{sp, ep, ""})
+						} else {
+							sp, ep := declRange(d.Pos(), d.End(), d.Doc, true)
+							reps = append(reps, replacement{sp, ep, ""})
+						}
 						continue
 					}
 					body, ok := wantTypes[s.Name.Name]
@@ -1155,6 +1272,18 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 						continue
 					}
 					name := s.Names[0].Name
+					// Per-spec removal -- same rationale as the TypeSpec case
+					// above.
+					if remove[name] {
+						if grouped {
+							sp, ep := declRange(s.Pos(), s.End(), nil, false)
+							reps = append(reps, replacement{sp, ep, ""})
+						} else {
+							sp, ep := declRange(d.Pos(), d.End(), d.Doc, true)
+							reps = append(reps, replacement{sp, ep, ""})
+						}
+						continue
+					}
 					var body string
 					var ok bool
 					switch d.Tok {
@@ -1482,4 +1611,76 @@ func DetectModuleRoot(modules []store.Module) string {
 		}
 	}
 	return prefix
+}
+
+// relevantImportsForFile filters imports down to the subset a single
+// file's own definition bodies actually reference, deduping on local
+// name so two same-name-but-different-path imports (e.g. several AWS
+// SDK "types" sub-packages sharing a package's per-module import
+// union) never both land in one file's import block -- see writeFile's
+// regenerate path, which has no on-disk file to preserve a real
+// per-file import block from and would otherwise write the FULL
+// per-module union into every file, including imports that file never
+// uses or that collide with each other on local name ("redeclared",
+// unrecoverable) rather than merely going unused ("undefined: X",
+// actionable).
+func relevantImportsForFile(imports []store.Import, defs []store.Definition) []store.Import {
+	referenced := func(name string) bool {
+		for _, d := range defs {
+			if strings.Contains(d.Body, name+".") {
+				return true
+			}
+		}
+		return false
+	}
+	localName := func(imp store.Import) string {
+		if imp.Alias != "" {
+			return imp.Alias
+		}
+		return path.Base(imp.ImportedPath)
+	}
+	seen := map[string]bool{}
+	var out []store.Import
+	for _, imp := range imports {
+		ln := localName(imp)
+		if ln == "_" || ln == "." {
+			out = append(out, imp)
+			continue
+		}
+		if seen[ln] {
+			continue
+		}
+		if referenced(ln) {
+			seen[ln] = true
+			out = append(out, imp)
+		}
+	}
+	return out
+}
+
+// emitDebugf prints a trace line to stderr when DEFN_EMIT_DEBUG=1,
+// prefixed for easy grepping. No-op (and effectively free -- one env
+// lookup) otherwise. Companion to the existing DEFN_SYNC_TIMING /
+// DEFN_MEASURE_TIMING dev-instrumentation env vars; re-checks the env
+// var on every call rather than caching it at package init so tests
+// can toggle it per-case via t.Setenv and a long-lived `defn serve`
+// process doesn't need a restart to pick up the flag.
+//
+// Built to trace a real, unresolved mystery (2026-08-17): a scoped
+// emit during a real etcd bench trajectory rewrote three unrelated
+// generated .pb.gw.go files' import grouping even after every known
+// unscoped-emit call site had been found and fixed. Static reading of
+// emitWithOpts/emitModule's ~450 combined lines couldn't pin down
+// which of several plausible branches was responsible. This gives
+// live per-file keep/drop reasoning and the actual goimports
+// invocation for the next time that (or a similar) mystery shows up --
+// meant to stay in the tree as a permanent, reusable dev tool, not a
+// one-off diagnostic ripped out after use.
+//
+// Usage: DEFN_EMIT_DEBUG=1 defn <ingest|serve|...> 2>&1 | grep emit-debug
+func emitDebugf(format string, args ...any) {
+	if os.Getenv("DEFN_EMIT_DEBUG") != "1" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[emit-debug] "+format+"\n", args...)
 }

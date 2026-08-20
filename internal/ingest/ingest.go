@@ -17,6 +17,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/justinstimatze/defn/internal/astutil"
 	"github.com/justinstimatze/defn/internal/goload"
 	"github.com/justinstimatze/defn/internal/store"
 	"golang.org/x/tools/go/packages"
@@ -567,7 +568,7 @@ func ingestFunc(db store.Backend, fset *token.FileSet, mod *store.Module, file *
 
 	var receiver string
 	if fn.Recv != nil && len(fn.Recv.List) > 0 {
-		receiver = typeString(fn.Recv.List[0].Type)
+		receiver = receiverTypeName(fn.Recv.List[0].Type)
 	}
 
 	kind := "function"
@@ -836,4 +837,13 @@ type structFieldCtx struct {
 	isTest     bool
 	sourceFile string
 	state      *ingestState
+}
+
+// receiverTypeName extracts a method's receiver type name for storage in
+// Definition.Receiver. Delegates to astutil.BareReceiverName -- see its
+// doc comment for why this used to be an independently-maintained copy
+// (and why typeString, used for composite-literal types, is the wrong
+// tool for a receiver identity key).
+func receiverTypeName(e ast.Expr) string {
+	return astutil.BareReceiverName(e)
 }

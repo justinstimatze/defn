@@ -1904,17 +1904,23 @@ func TestEmitZeroDefModuleNeverDeletesEvenWithFileSources(t *testing.T) {
 // TestEmitModule_SameBasenameDifferentPackagesDontCollide guards a
 // severe data-corruption bug found via a real cli/cli head-to-head-go
 // trajectory (cli-2671, 2026-08-09): pkg/cmd/gist/create/create.go and
-// pkg/cmd/repo/create/create.go share the basename "create.go" and
-// live under the SAME store.Module (one go.mod = one Module row,
-// spanning every package in the repo -- store.Module is per go.mod,
-// not per package). emitModule grouped definitions by
-// filepath.Base(SourceFile) instead of the full project-relative
-// path, so both files' definitions landed in ONE map bucket keyed
-// "create.go". Only one of the two real files ended up written (with
-// the OTHER package's definitions merged into it); the sibling file
-// was silently skipped. Live symptom: editing repo/create's createRun
-// overwrote gist/create's createRun with repo's body and imports,
-// corrupting a file the agent never touched or referenced.
+// pkg/cmd/repo/create/create.go share the basename "create.go". The
+// fixture below simulates the corruption with one store.Module and
+// two SourceFile subdirectories for simplicity; real ingest never
+// actually puts two packages under one Module row (store.Module is
+// one row per Go package, keyed on pkg.PkgPath -- corrected
+// 2026-08-09, docs/lessons-learned.md, after the opposite claim
+// shipped in this comment and the fix commit for a full day). The
+// real collision path is emitModule's per-package output directory
+// (pkgDir) landing on the same path for two different packages, then
+// grouping definitions by filepath.Base(SourceFile) instead of the
+// full project-relative path -- so both files' definitions landed in
+// ONE map bucket keyed "create.go" regardless of which package(s)
+// contributed them. Only one of the two real files ended up written
+// (with the OTHER package's definitions merged into it); the sibling
+// file was silently skipped. Live symptom: editing repo/create's
+// createRun overwrote gist/create's createRun with repo's body and
+// imports, corrupting a file the agent never touched or referenced.
 func TestEmitModule_SameBasenameDifferentPackagesDontCollide(t *testing.T) {
 	db := testDB(t)
 	mod, _ := db.EnsureModule("github.com/x/y", "y", "")
@@ -1952,5 +1958,256 @@ func TestEmitModule_SameBasenameDifferentPackagesDontCollide(t *testing.T) {
 	}
 	if strings.Contains(string(betaSrc), "AlphaCreate") {
 		t.Errorf("beta/create.go was corrupted with alpha's AlphaCreate:\n%s", betaSrc)
+	}
+}
+
+// TestEmitPreservesInitAcrossSiblingFilesInSamePackage guards a severe
+// data-corruption bug found via a real prometheus/prometheus head-to-head
+// trajectory (prometheus-19338/17395/19184/19114, 2026-08-10): Go
+// explicitly permits multiple func init() per package -- one per file is
+// the normal shape for generated code (every protoc-gogo .pb.go file gets
+// its own init() registering its enums/types) and for driver/plugin
+// registration patterns. definitions' natural key was (module_id, name,
+// kind, receiver, test) with NO source_file component, so two sibling
+// files in the SAME package each declaring their own (per-file-counter)
+// bare "init" collided on that key -- UpsertDefinition treated the
+// second file's init() as an UPDATE of the first's row instead of a
+// separate definition, silently discarding one file's init() content
+// and duplicating the other's onto both files on emit. Live symptom:
+// go test on packages the agent never touched panicked with "duplicate
+// enum registered" / "Config named ... is already registered", because
+// both on-disk files now independently called the same registration
+// code at runtime. Fixed by adding source_file to the UNIQUE constraint
+// (schema_sqlite.sql) and to UpsertDefinition/UpsertDefinitionsBulk's
+// natural key.
+func TestEmitPreservesInitAcrossSiblingFilesInSamePackage(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("github.com/x/y/pkgx", "pkgx", "")
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "init", Kind: "function", Exported: false,
+		Body: "func init() {\n\tACalls++\n}", SourceFile: "pkgx/a.go",
+	})
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "init", Kind: "function", Exported: false,
+		Body: "func init() {\n\tBCalls++\n}", SourceFile: "pkgx/b.go",
+	})
+
+	defs, err := db.FindDefinitionsByFile("pkgx", "pkgx/a.go", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) != 1 || defs[0].Name != "init" {
+		t.Fatalf("a.go: expected exactly 1 init def, got %+v", defs)
+	}
+	aID := defs[0].ID
+
+	defs, err = db.FindDefinitionsByFile("pkgx", "pkgx/b.go", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) != 1 || defs[0].Name != "init" {
+		t.Fatalf("b.go: expected exactly 1 init def, got %+v", defs)
+	}
+	bID := defs[0].ID
+
+	if aID == bID {
+		t.Fatalf("a.go and b.go's init() collided onto the same definition row (id=%d) -- source_file is not part of the natural key", aID)
+	}
+
+	outDir := t.TempDir()
+	if err := Emit(db, outDir); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+
+	aSrc, err := os.ReadFile(filepath.Join(outDir, "pkgx", "a.go"))
+	if err != nil {
+		t.Fatalf("pkgx/a.go was never written: %v", err)
+	}
+	bSrc, err := os.ReadFile(filepath.Join(outDir, "pkgx", "b.go"))
+	if err != nil {
+		t.Fatalf("pkgx/b.go was never written: %v", err)
+	}
+
+	if !strings.Contains(string(aSrc), "ACalls++") {
+		t.Errorf("pkgx/a.go missing its own init() body:\n%s", aSrc)
+	}
+	if strings.Contains(string(aSrc), "BCalls++") {
+		t.Errorf("pkgx/a.go was corrupted with b.go's init() body:\n%s", aSrc)
+	}
+	if !strings.Contains(string(bSrc), "BCalls++") {
+		t.Errorf("pkgx/b.go missing its own init() body:\n%s", bSrc)
+	}
+	if strings.Contains(string(bSrc), "ACalls++") {
+		t.Errorf("pkgx/b.go was corrupted with a.go's init() body:\n%s", bSrc)
+	}
+
+	// Both files must declare exactly one init() each -- not zero (dropped)
+	// and not two (duplicated from the other file).
+	if n := strings.Count(string(aSrc), "func init()"); n != 1 {
+		t.Errorf("pkgx/a.go has %d init() funcs, want 1:\n%s", n, aSrc)
+	}
+	if n := strings.Count(string(bSrc), "func init()"); n != 1 {
+		t.Errorf("pkgx/b.go has %d init() funcs, want 1:\n%s", n, bSrc)
+	}
+}
+
+func TestEmitRegeneratePathDedupesCollidingLocalImportNames(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("github.com/x/pkgy", "pkgy", "")
+	if err := db.SetImports(mod.ID, []store.Import{
+		{ModuleID: mod.ID, ImportedPath: "context"},
+		{ModuleID: mod.ID, ImportedPath: "github.com/x/ec2/types"},
+		{ModuleID: mod.ID, ImportedPath: "github.com/x/msk/types"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "UseEC2", Kind: "function", Exported: true,
+		Body:       "func UseEC2(ctx context.Context) types.Instance {\n\t_ = ctx\n\treturn types.Instance{}\n}",
+		SourceFile: "pkgy/ec2.go",
+	})
+
+	outDir := t.TempDir()
+	if err := Emit(db, outDir); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+
+	src, err := os.ReadFile(filepath.Join(outDir, "pkgy", "ec2.go"))
+	if err != nil {
+		t.Fatalf("pkgy/ec2.go was never written: %v", err)
+	}
+	s := string(src)
+
+	hasEC2 := strings.Contains(s, "github.com/x/ec2/types")
+	hasMSK := strings.Contains(s, "github.com/x/msk/types")
+	if hasEC2 && hasMSK {
+		t.Fatalf("pkgy/ec2.go got BOTH colliding \"types\" imports -- guaranteed \"redeclared\" compile error:\n%s", s)
+	}
+	if !hasEC2 && !hasMSK {
+		t.Fatalf("pkgy/ec2.go got NEITHER \"types\" import -- UseEC2 references types.Instance and won't compile:\n%s", s)
+	}
+	if !strings.Contains(s, `"context"`) {
+		t.Errorf("pkgy/ec2.go missing unrelated referenced import \"context\" -- filter over-restricted:\n%s", s)
+	}
+}
+
+// TestEmitDebug_TracesKeepDropAndWriteDecisions verifies the
+// DEFN_EMIT_DEBUG=1 instrumentation added 2026-08-17 (see emitDebugf's
+// doc comment for the mystery it exists to help debug next time) --
+// both as a regression against silently breaking the trace output,
+// and as executable documentation of what a scoped emit's debug
+// log actually looks like.
+func TestEmitDebug_TracesKeepDropAndWriteDecisions(t *testing.T) {
+	t.Setenv("DEFN_EMIT_DEBUG", "1")
+
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test/pkg", "pkg", "")
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Touched", Kind: "function", Exported: true,
+		Body: "func Touched() {}", SourceFile: "pkg/touched.go",
+	})
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Untouched", Kind: "function", Exported: true,
+		Body: "func Untouched() {}", SourceFile: "pkg/untouched.go",
+	})
+	outDir := t.TempDir()
+	if err := Emit(db, outDir); err != nil {
+		t.Fatal(err)
+	}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	origStderr := os.Stderr
+	os.Stderr = w
+	_, emitErr := EmitWithOpts(db, outDir, Opts{TouchedFiles: []string{"pkg/touched.go"}})
+	w.Close()
+	os.Stderr = origStderr
+	if emitErr != nil {
+		t.Fatal(emitErr)
+	}
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+
+	for _, want := range []string{
+		"[emit-debug] scope: touchedFiles=1",
+		"[emit-debug] touchedSet: [pkg/touched.go]",
+		"KEEP example.com/test/pkg/pkg/touched.go",
+		"DROP example.com/test/pkg/pkg/untouched.go",
+		"WROTE",
+		"goimports args:",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected debug output to contain %q, got:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "WROTE") && strings.Contains(out, "untouched.go)") {
+		t.Errorf("debug log claims untouched.go was written, but the scoped emit should never touch it:\n%s", out)
+	}
+}
+
+// TestMergeDeclsIntoSource_RemovesFirstGroupedMemberWithoutTouchingSiblings
+// is the companion direction: deleting the FIRST member of a grouped
+// block used to remove the entire parenthesized GenDecl -- including
+// untouched sibling specs never authorized for removal -- because the
+// whole-decl shortcut matched on firstSpecName regardless of grouping.
+// That got caught by safeWriteGoFile's data-loss check and refused, but
+// meant "delete A" was unconditionally blocked whenever A shared a
+// group with anything else.
+func TestMergeDeclsIntoSource_RemovesFirstGroupedMemberWithoutTouchingSiblings(t *testing.T) {
+	existing := []byte(`package p
+
+type (
+	A struct{ N int }
+	B struct{ S string }
+)
+`)
+	defs := []store.Definition{
+		{Name: "B", Kind: "type", Body: "B struct{ S string }"},
+	}
+	merged, ok, unmatched := mergeDeclsIntoSource(existing, defs, []string{"A"}, nil)
+	if !ok {
+		t.Fatalf("mergeDeclsIntoSource returned ok=false, unmatched=%v", unmatched)
+	}
+	got := string(merged)
+	if strings.Contains(got, "A struct") {
+		t.Errorf("A was not removed:\n%s", got)
+	}
+	if !strings.Contains(got, "B struct{ S string }") {
+		t.Errorf("B was incorrectly removed alongside A (first-member-removes-whole-block bug):\n%s", got)
+	}
+}
+
+// TestMergeDeclsIntoSource_RemovesNonFirstGroupedMember is the
+// regression for the grouped-decl delete asymmetry: the removal check
+// used to only fire via a whole-GenDecl shortcut keyed on the FIRST
+// spec's name (firstSpecName), so deleting a non-first member of a
+// grouped type/const/var block matched nothing at all and silently
+// left the on-disk decl in place while the DB believed it was gone.
+func TestMergeDeclsIntoSource_RemovesNonFirstGroupedMember(t *testing.T) {
+	existing := []byte(`package p
+
+type (
+	A struct{ N int }
+	B struct{ S string }
+)
+`)
+	defs := []store.Definition{
+		{Name: "A", Kind: "type", Body: "A struct{ N int }"},
+	}
+	merged, ok, unmatched := mergeDeclsIntoSource(existing, defs, []string{"B"}, nil)
+	if !ok {
+		t.Fatalf("mergeDeclsIntoSource returned ok=false, unmatched=%v", unmatched)
+	}
+	got := string(merged)
+	if strings.Contains(got, "B struct") {
+		t.Errorf("B was not removed from the grouped block:\n%s", got)
+	}
+	if !strings.Contains(got, "A struct{ N int }") {
+		t.Errorf("A was incorrectly removed alongside B:\n%s", got)
 	}
 }

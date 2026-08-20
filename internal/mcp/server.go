@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.30"
+const Version = "0.26.71"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -381,7 +381,7 @@ For any "how does X work in this codebase" discovery question, reach for context
 
 Orient before you read: overview (project shape) → outline (def shape) → impact (when you know which def matters). Only read whole bodies when you're about to edit them; whole-file reads on files you won't touch are pure wire cost — use outline or search instead.
 
-Ops: overview (project-wide shape when called with no args — one line per module with def counts + first exported names; pass file:"pkg-path" or file:"pkg-path/file.go" to drill in; the right first-touch when you don't know which def matters yet), outline (compact projection of a def — sig + doc + caller/callee summary, no body; use when body isn't needed), search, impact (blast radius of a known def — pass format:"json" for structured output; callers, transitives, test coverage in one call), read (returns the def body + a compact "Related" footer with summary, top-3 callers, top-3 callees, and semantically-adjacent defs — one call gives you what would otherwise take 3-4 sequential impact/outline calls; auto-downgrades to outline when body > 1500 bytes, pass full:true or mode:"body" to force), read-and-verify (read a def AND run its covering tests in one call — use during bug triage so you see behavior alongside source and don't spiral into read-loops; pass name), read-file (all defs' bodies in one file — pass file:"path"; whole-file counterpart to read; prefer over N sequential read calls when scanning), expand (bundle a def's outline/body/callers in one call — pass name:"F", or names:["A","B",...] to batch several targets into ONE response instead of one expand per target; include:["outline","callers","body"] controls sections, defaults to outline+callers; prefer over read+impact+read chains AND over N sequential single-name expand calls — round-trip count within a turn is the dominant session cost driver, not per-call size), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), replace-hunk (replace a byte-exact occurrence of 'old' inside a def body with 'new' — byte-exact PUTGET, content-addressed inside the def; pass name+old+new, plus index=1..N if 'old' occurs more than once; empty 'new' deletes the hunk. Send zero anchor context when the hunk is def-unique — the name argument does the file-level disambiguation), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), explain (structural analysis of a def — pass name to get sig + callers + callees + test coverage; ALSO accepts question:"how does X handle Y" which routes to a Sonnet co-processor that returns a prose answer grounded in the def's source with provenance refs. Cheaper than reading + interpreting a large body yourself when the answer is prose, not code. names:["A","B"] for multi-def scope. Requires ANTHROPIC_API_KEY), plan (pass intent:"..." — the co-processor grounds your intent in real defs via context's own candidate search, emits a compact trajectory, and defn mechanically walks it server-side in one round-trip instead of you sequencing several read/outline/impact calls yourself. Requires ANTHROPIC_API_KEY; falls back to a clear error pointing at plan-dsl/plan-sexpr when unset), plan-dsl / plan-sexpr (mechanically walk a trajectory YOU already wrote — pass plan:"..." in the compact DSL "@Def.field[!test]" form (plan-dsl) or the S-expression "(op target [!test])" form (plan-sexpr), op one of read/outline/impact; no API key needed), similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create (single def from body; with file: set, body may hold multiple top-level decls to author a whole file in one call — the whole-file equivalent of files-mode Write), delete (safe by default — refuses when other defs still reference this def; pass force:true to delete anyway. Refusal message lists the callers so you can rewrite them first), retarget-field-value (rewrite a composite-literal field's string value across every def whose body matches — pass name:"<StructType>" field:"<Field>" old:"<oldStr>" new:"<newStr>"; AST-safe, so unrelated occurrences of the string won't match), rename, move, test (run ONLY tests that cover a given def — pass name; scoped subset, not the full suite; prefer over bash 'go test ./...' when you only need coverage for a specific change. Also accepts test:"TestX" to run one test by name — use this to REPRODUCE a bug from the issue BEFORE writing any code; a passing test means your hypothesis about which def is broken is wrong), apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 6 projection ops insert-precondition/replace-slice/replace-hunk/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (rarely needed — every edit op auto-syncs the DB; only use after external file changes outside the code tool), query (raw SQL escape hatch — for schema analytics only; NEVER use to look up a def by name, grep bodies, or list files/defs-in-file — use search/outline/read-file/file-defs/impact instead, which are far cheaper on the wire), patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), commit (snapshot current state), status (current branch + dirty state), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree)`,
+Ops: overview (project-wide shape when called with no args — one line per module with def counts + first exported names; pass file:"pkg-path" or file:"pkg-path/file.go" to drill in; the right first-touch when you don't know which def matters yet), outline (compact projection of a def — sig + doc + caller/callee summary, no body; use when body isn't needed), search, impact (blast radius of a known def — pass format:"json" for structured output; callers, transitives, test coverage in one call), read (returns the def body + a compact "Related" footer with summary, top-3 callers, top-3 callees, and semantically-adjacent defs — one call gives you what would otherwise take 3-4 sequential impact/outline calls; auto-downgrades to outline when body > 1500 bytes, pass full:true or mode:"body" to force; for a large body, pass line_range:"700-820" (1-indexed, file-relative, "-" or ":" both accepted) to get back just that span instead — also bypasses the auto-downgrade, and composes with query: to filter further within the returned range), read-and-verify (read a def AND run its covering tests in one call — use during bug triage so you see behavior alongside source and don't spiral into read-loops; pass name), read-file (all defs' bodies in one file — pass file:"path"; whole-file counterpart to read; prefer over N sequential read calls when scanning), expand (bundle a def's outline/body/callers in one call — pass name:"F", or names:["A","B",...] to batch several targets into ONE response instead of one expand per target; include:["outline","callers","body"] controls sections, defaults to outline+callers; prefer over read+impact+read chains AND over N sequential single-name expand calls — round-trip count within a turn is the dominant session cost driver, not per-call size), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), replace-hunk (replace a byte-exact occurrence of 'old' inside a def body with 'new' — byte-exact PUTGET, content-addressed inside the def; pass name+old+new, plus index=1..N if 'old' occurs more than once; empty 'new' deletes the hunk. Send zero anchor context when the hunk is def-unique — the name argument does the file-level disambiguation), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), explain (structural analysis of a def — pass name to get sig + callers + callees + test coverage; ALSO accepts question:"how does X handle Y" which routes to a Sonnet co-processor that returns a prose answer grounded in the def's source with provenance refs. Cheaper than reading + interpreting a large body yourself when the answer is prose, not code. names:["A","B"] for multi-def scope. Requires ANTHROPIC_API_KEY), plan (pass intent:"..." — the co-processor grounds your intent in real defs via context's own candidate search, emits a compact trajectory, and defn mechanically walks it server-side in one round-trip instead of you sequencing several read/outline/impact calls yourself. Requires ANTHROPIC_API_KEY; falls back to a clear error pointing at plan-dsl/plan-sexpr when unset), plan-dsl / plan-sexpr (mechanically walk a trajectory YOU already wrote — pass plan:"..." in the compact DSL "@Def.field[!test]" form (plan-dsl) or the S-expression "(op target [!test])" form (plan-sexpr), op one of read/outline/impact; no API key needed), similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create (single def from body; with file: set, body may hold multiple top-level decls to author a whole file in one call — the whole-file equivalent of files-mode Write), delete (safe by default — refuses when other defs still reference this def; pass force:true to delete anyway. Refusal message lists the callers so you can rewrite them first), retarget-field-value (rewrite a composite-literal field's string value across every def whose body matches — pass name:"<StructType>" field:"<Field>" old:"<oldStr>" new:"<newStr>"; AST-safe, so unrelated occurrences of the string won't match), rename, move, test (run ONLY tests that cover a given def — pass name; scoped subset, not the full suite; prefer over bash 'go test ./...' when you only need coverage for a specific change. Also accepts test:"TestX" to run one test by name — use this to REPRODUCE a bug from the issue BEFORE writing any code; a passing test means your hypothesis about which def is broken is wrong), apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 6 projection ops insert-precondition/replace-slice/replace-hunk/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (rarely needed — every edit op auto-syncs the DB; only use after external file changes outside the code tool), query (raw SQL escape hatch — for schema analytics only; NEVER use to look up a def by name, grep bodies, or list files/defs-in-file — use search/outline/read-file/file-defs/impact instead, which are far cheaper on the wire), patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), commit (snapshot current state), status (current branch + dirty state), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), version (no params — running build's version string + on-disk binary path/mtime; call this after a rebuild+reconnect to confirm you're actually talking to fresh code, not a stale already-running serve process)`,
 	}, s.handleCode)
 
 	return s, mcpServer
@@ -401,7 +401,7 @@ Ops: overview (project-wide shape when called with no args — one line per modu
 //	find: file (+ optional line)
 //	query: sql
 //	apply: operations
-//	untested, diff, sync: (no params)
+//	untested, diff, sync, version: (no params)
 //	branch: (none to list; branch + optional from to create; branch + force=true to delete)
 //	checkout: branch
 //	merge: branch
@@ -455,14 +455,15 @@ type codeParam struct {
 	StmtIndex   int              `json:"stmt_index,omitempty"`
 	DeferBody   string           `json:"defer_body,omitempty"`
 	Full        bool             `json:"full,omitempty"`
-	Include     []string         `json:"include,omitempty"`  // expand op: which graph hops to fold in
-	Test        string           `json:"test,omitempty"`     // L11: op:test named-test reproduction (`-run <regex>` verbatim)
-	Field       string           `json:"field,omitempty"`    // retarget-field-value: composite-literal field name
-	Query       string           `json:"query,omitempty"`    // #153: query-adaptive read — keep only body branches touching the query
-	Mode        string           `json:"mode,omitempty"`     // #160: "summary" returns model-generated one-line intent instead of body
-	Question    string           `json:"question,omitempty"` // #186: natural-language question for op:"explain" co-processor
-	Plan        string           `json:"plan,omitempty"`     // #187/#188/#189: trajectory plan text for op:"plan-dsl" / op:"plan-sexpr"
-	Intent      string           `json:"intent,omitempty"`   // #186: natural-language exploration goal for op:"plan" (co-processor-generated trajectory)
+	Include     []string         `json:"include,omitempty"`    // expand op: which graph hops to fold in
+	Test        string           `json:"test,omitempty"`       // L11: op:test named-test reproduction (`-run <regex>` verbatim)
+	Field       string           `json:"field,omitempty"`      // retarget-field-value: composite-literal field name
+	Query       string           `json:"query,omitempty"`      // #153: query-adaptive read — keep only body branches touching the query
+	Mode        string           `json:"mode,omitempty"`       // #160: "summary" returns model-generated one-line intent instead of body
+	Question    string           `json:"question,omitempty"`   // #186: natural-language question for op:"explain" co-processor
+	Plan        string           `json:"plan,omitempty"`       // #187/#188/#189: trajectory plan text for op:"plan-dsl" / op:"plan-sexpr"
+	Intent      string           `json:"intent,omitempty"`     // #186: natural-language exploration goal for op:"plan" (co-processor-generated trajectory)
+	LineRange   string           `json:"line_range,omitempty"` // read: file-relative 1-indexed inclusive range, "700-820" or "700:820" -- narrows the returned body to just those lines, bypassing summary-mode/outline-downgrade the same way full:true does
 }
 
 // applyOp is one operation inside an apply batch. Only Op is
@@ -547,6 +548,12 @@ type nameParam struct {
 	// wins when both are set, mirroring resolveEditTarget's precedence.
 	Module string `json:"module,omitempty"`
 	File   string `json:"file,omitempty"`
+	// LineRange, when non-empty, narrows a read's returned body to a
+	// file-relative 1-indexed inclusive line range ("700-820" or
+	// "700:820"). Bypasses summary-mode-by-default and the #184
+	// auto-outline-downgrade the same way Full does -- an explicit
+	// range request means the caller wants body text, not a projection.
+	LineRange string `json:"line_range,omitempty"`
 }
 
 type editParam struct {
@@ -569,12 +576,18 @@ type editParam struct {
 	// both are set (most specific), mirroring createParam's precedent.
 	Module string `json:"module,omitempty"`
 	File   string `json:"file,omitempty"`
+	// DryRun previews the edit (mirrors delete's dry_run) without
+	// touching the DB or disk. #246: was accepted by the top-level
+	// codeParam schema but silently dropped before reaching handleEdit
+	// -- a caller asking for a preview got a real edit instead.
+	DryRun bool `json:"dry_run,omitempty"`
 }
 
 type createParam struct {
 	Body   string `json:"body"`
 	Module string `json:"module,omitempty"`
 	File   string `json:"file,omitempty"`
+	DryRun bool   `json:"dry_run,omitempty"`
 }
 
 type applyParam struct {
@@ -583,8 +596,11 @@ type applyParam struct {
 }
 
 type renameParam struct {
-	OldName string `json:"old_name"`
-	NewName string `json:"new_name"`
+	OldName  string `json:"old_name"`
+	NewName  string `json:"new_name"`
+	Receiver string `json:"receiver,omitempty"`
+	Module   string `json:"module,omitempty"`
+	File     string `json:"file,omitempty"`
 }
 
 type sqlParam struct {
@@ -803,23 +819,22 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	// write ops invalidate the session cache so the next read is a clean
 	// miss. See internal/mcp/dedup.go.
 	defer func() {
-		if err != nil || result == nil || result.IsError || req == nil {
+		if req == nil {
 			return
 		}
-		// #176: record before dedup potentially replaces result with a
-		// stub -- marking is driven by args (what was asked for), not
-		// by the final response bytes. Only an explicit full:true with
-		// no query is an unambiguous full-body serve: a plain read()
-		// can be silently downgraded to summary or auto-outline mode
-		// (#174/#184), and a query-filtered read elides statements, so
-		// neither is a reliable "the caller has everything" signal.
-		if args.Op == "read" && args.Full && strings.TrimSpace(args.Query) == "" && args.Module == "" && args.File == "" {
-			s.respCache.markBodyServed(req.Session, args.Name)
-		}
-		if op, argKey, ok := dedupOpKey(args); ok {
-			result = s.respCache.dedup(req.Session, op, argKey, result)
-			return
-		}
+		// #245: write ops can partially mutate the DB even when they
+		// return an error -- e.g. a module-spanning sync/apply that
+		// fails partway through has already durably committed the
+		// packages/ops processed before the failure (SQLite writes
+		// commit as they happen; see autoCommit's doc comment -- there's
+		// no staged/uncommitted working set to fall back on here). The
+		// old code gated ALL invalidation on !result.IsError, so a
+		// failed sync/apply left stale cache entries served with false
+		// "nothing has changed since" confidence for exactly the defs
+		// that DID change. Invalidate for write ops regardless of
+		// success/failure; only the dedup/markBodyServed bookkeeping
+		// below (which needs a genuine successful response) stays
+		// gated on error.
 		if isWriteOp(args.Op) {
 			// Scope invalidation to what this write actually touched when
 			// we can determine it, instead of wiping every other def's
@@ -844,12 +859,29 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 			if s.reach != nil {
 				s.reach.invalidate()
 			}
-			if args.Name != "" {
+			if err == nil && result != nil && !result.IsError && args.Name != "" {
 				// A read right after a mutation is almost always "show me
 				// what I just did" -- mark it so the next read of this
-				// name skips the summary-mode default.
+				// name skips the summary-mode default. Only meaningful
+				// on a genuine success.
 				s.respCache.markMutated(req.Session, args.Name)
 			}
+		}
+		if err != nil || result == nil || result.IsError {
+			return
+		}
+		// #176: record before dedup potentially replaces result with a
+		// stub -- marking is driven by args (what was asked for), not
+		// by the final response bytes. Only an explicit full:true with
+		// no query is an unambiguous full-body serve: a plain read()
+		// can be silently downgraded to summary or auto-outline mode
+		// (#174/#184), and a query-filtered read elides statements, so
+		// neither is a reliable "the caller has everything" signal.
+		if args.Op == "read" && args.Full && strings.TrimSpace(args.Query) == "" && args.Module == "" && args.File == "" {
+			s.respCache.markBodyServed(req.Session, args.Name)
+		}
+		if op, argKey, ok := dedupOpKey(args); ok {
+			result = s.respCache.dedup(req.Session, op, argKey, result)
 		}
 	}()
 
@@ -861,8 +893,25 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		return nil, nil, nil
 	}
 
+	// Dolt-era git-semantics ops removed in the v0.27 SQLite migration --
+	// "git-style branch/merge on definitions turned out to be a non-goal;
+	// users prefer git worktrees + `defn sync`" (docs/lessons-learned.md).
+	// Give a specific, honest answer instead of falling through to the
+	// generic "unknown op" default below, which listed every one of these
+	// names in its own "valid:" whitelist while rejecting them -- and, for
+	// branch/checkout/merge/commit/resolve/diff-defs, first ran real param
+	// validation (e.g. "branch: branch is required") that implied the op
+	// would work once that param was supplied, when it never could.
+	if removedDoltOps[args.Op] {
+		return errResult(fmt.Errorf("%s: not supported -- git-style branch/merge/commit/diff ops on definitions were removed in the v0.27 SQLite migration (users prefer git worktrees + op:\"sync\"); use plain git for version control", args.Op))
+	}
+
+	if canonical, ok := opAliases[args.Op]; ok {
+		args.Op = canonical
+	}
+
 	switch args.Op {
-	case "read", "outline", "impact", "delete", "history", "similar":
+	case "read", "outline", "impact", "delete", "similar":
 		if strings.TrimSpace(args.Name) == "" {
 			if strings.TrimSpace(args.File) != "" {
 				return errResult(fmt.Errorf("%s: name is required — pass name:\"<def>\" for one definition, or use op:\"overview\", file:%q to see every def in that file", args.Op, args.File))
@@ -1030,38 +1079,6 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if args.Direction != "callers" && args.Direction != "callees" {
 			return errResult(fmt.Errorf("traverse: direction must be 'callers' or 'callees', got %q", args.Direction))
 		}
-	case "checkout", "merge":
-		if r, o, e := need(args.Branch, "branch"); r != nil {
-			return r, o, e
-		}
-	case "commit":
-		if r, o, e := need(args.Message, "message"); r != nil {
-			return r, o, e
-		}
-	case "branch":
-		// Deleting requires branch; creating requires branch; listing needs nothing.
-		if args.Force && strings.TrimSpace(args.Branch) == "" {
-			return errResult(fmt.Errorf("branch: force requires branch"))
-		}
-	case "resolve":
-		// Either (name + body) for a custom resolution, or pick=ours|theirs
-		// for a one-shot shortcut. name alone with no body/pick is an error.
-		if args.Pick != "" {
-			if args.Pick != "ours" && args.Pick != "theirs" {
-				return errResult(fmt.Errorf("resolve: pick must be 'ours' or 'theirs', got %q", args.Pick))
-			}
-		} else {
-			if r, o, e := need(args.Name, "name"); r != nil {
-				return r, o, e
-			}
-			if r, o, e := need(args.Body, "body (or pick:'ours'|'theirs')"); r != nil {
-				return r, o, e
-			}
-		}
-	case "diff-defs":
-		if r, o, e := need(args.From, "from"); r != nil {
-			return r, o, e
-		}
 	case "emit":
 		if r, o, e := need(args.Out, "out"); r != nil {
 			return r, o, e
@@ -1079,7 +1096,18 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	// Tag results from read-only ops while startup ingest is still running.
 	stale := !s.ready.Load() && s.projectDir != ""
 	wrapStale := func(r *sdkmcp.CallToolResult, o any, e error) (*sdkmcp.CallToolResult, any, error) {
-		if stale && r != nil && !r.IsError {
+		// Previously gated on !r.IsError, which meant an error result
+		// during the startup race (e.g. overview(file:) hitting "no
+		// definitions found" because ingest hasn't reached that file
+		// yet) got no stale-index warning at all, while a NON-error "no
+		// matches" from search did -- an inconsistency a real trajectory
+		// (prometheus-18972) hit directly: overview(file:...) silently
+		// said "no definitions found" with nothing to suggest the index
+		// might just be incomplete, so the agent had no signal to try
+		// op:"sync" instead of concluding the path was wrong. An error
+		// during a stale window is exactly when this context matters
+		// most -- it's the case most likely to be a false negative.
+		if stale && r != nil {
 			if len(r.Content) > 0 {
 				if tc, ok := r.Content[0].(*sdkmcp.TextContent); ok {
 					tc.Text = "[startup ingest in progress — results may be stale]\n\n" + tc.Text
@@ -1122,14 +1150,26 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		// makes the server robust to that instead of depending on the
 		// model's compliance.
 		var autoNames []string
+		var autoWantsBody bool
 		if breakerMsg != "" && nameableReadOps[args.Op] && len(sc.pendingReadNames) > 0 {
 			autoNames = append([]string(nil), sc.pendingReadNames...)
+			autoWantsBody = sc.pendingWantsBody
 			sc.pendingReadNames = nil
+			sc.pendingWantsBody = false
 			sc.readShapedCount = 0
 		}
 		s.respCache.mu.Unlock()
 		if len(autoNames) > 0 {
-			r, o, e := wrapStale(s.handleExpand(ctx, req, codeParam{Names: autoNames, Include: []string{"outline", "callers"}}))
+			include := []string{"outline", "callers"}
+			if autoWantsBody {
+				// #250: a blocked op:"read" mid-batch wants source, not just
+				// outline+callers -- dropping the body silently downgraded the
+				// response below what was actually asked for (a real
+				// grpc-go-3351 trajectory burned 2 extra round-trips
+				// re-requesting the body this should have returned).
+				include = append(include, "body")
+			}
+			r, o, e := wrapStale(s.handleExpand(ctx, req, codeParam{Names: autoNames, Include: include}))
 			note := fmt.Sprintf("[circuit breaker: auto-batched %d individual lookups this turn (%s) into one expand call instead of refusing -- call code(op:\"context\"/op:\"expand\", names:[...]) yourself next time to skip this extra round-trip.]\n\n", len(autoNames), strings.Join(autoNames, ", "))
 			return prependNote(r, note), o, e
 		}
@@ -1147,7 +1187,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		// or a downgraded subset -- never more. Bypassed when full:true or
 		// a query is set: those aren't redundant with a prior plain-args
 		// full-body serve check the same way outline's bypass works.
-		if !args.Full && req != nil && s.respCache != nil && strings.TrimSpace(args.Query) == "" && args.Module == "" && args.File == "" {
+		if !args.Full && req != nil && s.respCache != nil && strings.TrimSpace(args.Query) == "" && strings.TrimSpace(args.LineRange) == "" && args.Module == "" && args.File == "" {
 			if epochsAgo, ok := s.respCache.bodyServedEpochsAgo(req.Session, args.Name); ok {
 				if epochsAgo <= staleEpochThreshold {
 					stub := fmt.Sprintf(
@@ -1164,7 +1204,11 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 				return wrapStale(s.handleExpand(ctx, req, codeParam{Name: args.Name, Include: []string{"outline", "callers", "body"}, Module: args.Module, File: args.File}))
 			}
 		}
-		return wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name, Full: args.Full, Query: args.Query, Mode: args.Mode, Receiver: args.Receiver, Module: args.Module, File: args.File}))
+		r, o, e := wrapStale(s.handleGetDefinition(ctx, req, nameParam{Name: args.Name, Full: args.Full, Query: args.Query, Mode: args.Mode, Receiver: args.Receiver, Module: args.Module, File: args.File, LineRange: args.LineRange}))
+		if note := s.ambiguityNote(args.Name, args.Receiver, args.Module, args.File); note != "" {
+			r = prependNote(r, note)
+		}
+		return r, o, e
 	case "resummarize":
 		return s.handleResummarize(ctx, req, args)
 	case "read-and-verify":
@@ -1191,7 +1235,11 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 				return wrapStale(s.handleExpand(ctx, req, codeParam{Name: args.Name, Include: []string{"outline", "callers", "body"}, Module: args.Module, File: args.File}))
 			}
 		}
-		return wrapStale(s.handleOutline(ctx, req, nameParam{Name: args.Name, Query: args.Query, Receiver: args.Receiver, Module: args.Module, File: args.File}))
+		r, o, e := wrapStale(s.handleOutline(ctx, req, nameParam{Name: args.Name, Query: args.Query, Receiver: args.Receiver, Module: args.Module, File: args.File}))
+		if note := s.ambiguityNote(args.Name, args.Receiver, args.Module, args.File); note != "" {
+			r = prependNote(r, note)
+		}
+		return r, o, e
 	case "slice":
 		// Same cross-def context reuse as read/outline above: any slice
 		// kind is a strict subset of the full body already served.
@@ -1207,7 +1255,11 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 				return wrapStale(s.handleExpand(ctx, req, codeParam{Name: args.Name, Include: []string{"outline", "callers", "body"}, Module: args.Module, File: args.File}))
 			}
 		}
-		return wrapStale(s.handleSlice(ctx, req, args))
+		r, o, e := wrapStale(s.handleSlice(ctx, req, args))
+		if note := s.ambiguityNote(args.Name, args.Receiver, args.Module, args.File); note != "" {
+			r = prependNote(r, note)
+		}
+		return r, o, e
 	case "insert-precondition":
 		return s.handleInsertPrecondition(ctx, req, args)
 	case "replace-slice":
@@ -1224,10 +1276,24 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if args.Pattern == "" {
 			args.Pattern = args.Name
 		}
+		// #248: query: is a real codeParam field, but only op:"read" wires
+		// it up (query-adaptive body filtering). A caller reaching for
+		// search(query:"X") instead of search(pattern:"X") got pattern=="",
+		// which silently matched nearly everything and returned a
+		// caller-count-ranked list dressed up with a plausible "score" --
+		// indistinguishable from a real, relevant result. Accept query: as
+		// a pattern alias here, same precedent as the name: fallback above.
+		if args.Pattern == "" {
+			args.Pattern = args.Query
+		}
 		r, o, e := wrapStale(s.handleSearch(ctx, req, args))
 		return s.appendStarter(r, o, e, req, args.Pattern)
 	case "impact":
-		return wrapStale(s.handleImpact(ctx, req, args))
+		r, o, e := wrapStale(s.handleImpact(ctx, req, args))
+		if note := s.ambiguityNote(args.Name, args.Receiver, args.Module, args.File); note != "" {
+			r = prependNote(r, note)
+		}
+		return r, o, e
 	case "explain":
 		// #186: when a `question` is passed, route to the Sonnet
 		// co-processor path (assembles bodies, calls Sonnet, returns
@@ -1236,7 +1302,11 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if strings.TrimSpace(args.Question) != "" {
 			return wrapStale(s.handleExplainWithQuestion(ctx, req, args))
 		}
-		return wrapStale(s.handleExplain(ctx, req, nameParam{Name: args.Name, Receiver: args.Receiver, Module: args.Module, File: args.File}))
+		r, o, e := wrapStale(s.handleExplain(ctx, req, nameParam{Name: args.Name, Receiver: args.Receiver, Module: args.Module, File: args.File}))
+		if note := s.ambiguityNote(args.Name, args.Receiver, args.Module, args.File); note != "" {
+			r = prependNote(r, note)
+		}
+		return r, o, e
 	case "context":
 		// #195: server-side bundle to collapse turn-1 exploration.
 		// Question drives the search; server picks top-N relevant
@@ -1244,6 +1314,8 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		// Sonnet synthesis. One tool call replaces 10-40 sequential
 		// exploration calls in the anti-exploration turn shape.
 		return wrapStale(s.handleContext(ctx, req, args))
+	case "version":
+		return s.handleVersion(ctx, req, args)
 	case "untested":
 		return wrapStale(s.handleUntested(ctx, req, emptyParam{}))
 	case "edit":
@@ -1254,24 +1326,32 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if body == "" {
 			body = args.Body
 		}
-		return s.handleEdit(ctx, req, editParam{Name: args.Name, NewBody: body, Receiver: args.Receiver, Module: args.Module, File: args.File})
+		return s.handleEdit(ctx, req, editParam{Name: args.Name, NewBody: body, Receiver: args.Receiver, Module: args.Module, File: args.File, DryRun: args.DryRun})
 	case "insert":
 		return s.handleInsert(ctx, req, args)
 	case "create":
-		return s.handleCreate(ctx, req, createParam{Body: args.Body, Module: args.Module, File: args.File})
+		return s.handleCreate(ctx, req, createParam{Body: args.Body, Module: args.Module, File: args.File, DryRun: args.DryRun})
 	case "delete":
 		return s.handleDelete(ctx, req, nameParam{Name: args.Name, Force: args.Force, DryRun: args.DryRun, Receiver: args.Receiver, Module: args.Module, File: args.File})
 	case "rename":
-		return s.handleRename(ctx, req, renameParam{OldName: args.OldName, NewName: args.NewName})
+		return s.handleRename(ctx, req, renameParam{OldName: args.OldName, NewName: args.NewName, Receiver: args.Receiver, Module: args.Module, File: args.File})
 	case "move":
 		return s.handleMove(ctx, req, moveParam{Name: args.Name, ToModule: args.Module, Receiver: args.Receiver, File: args.File})
 	case "test":
 		if args.Test != "" {
 			return s.handleTestByName(ctx, req, args.Test, args.Module, args.File)
 		}
-		return s.handleTest(ctx, req, nameParam{Name: args.Name, Receiver: args.Receiver, Module: args.Module, File: args.File})
+		r, o, e := s.handleTest(ctx, req, nameParam{Name: args.Name, Receiver: args.Receiver, Module: args.Module, File: args.File})
+		if note := s.ambiguityNote(args.Name, args.Receiver, args.Module, args.File); note != "" {
+			r = prependNote(r, note)
+		}
+		return r, o, e
 	case "similar":
-		return wrapStale(s.handleSimilar(ctx, req, nameParam{Name: args.Name, Receiver: args.Receiver, Module: args.Module, File: args.File}))
+		r, o, e := wrapStale(s.handleSimilar(ctx, req, nameParam{Name: args.Name, Receiver: args.Receiver, Module: args.Module, File: args.File}))
+		if note := s.ambiguityNote(args.Name, args.Receiver, args.Module, args.File); note != "" {
+			r = prependNote(r, note)
+		}
+		return r, o, e
 	case "apply":
 		return s.handleApply(ctx, req, applyParam{Operations: args.Operations, DryRun: args.DryRun})
 	case "query":
@@ -1286,13 +1366,17 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		}
 		return s.appendStarter(r, o, e, req, q)
 	case "methods":
-		return wrapStale(s.handleMethods(ctx, req, nameParam{Name: args.Name, Query: args.Query}))
+		return wrapStale(s.handleMethods(ctx, req, nameParam{Name: args.Name, Query: args.Query, Module: args.Module, File: args.File}))
 	case "patch":
 		return s.handlePatch(ctx, req, args)
 	case "sync":
 		return s.handleSync(ctx, req, args)
 	case "test-coverage":
-		return wrapStale(s.handleTestCoverage(ctx, req, args))
+		r, o, e := wrapStale(s.handleTestCoverage(ctx, req, args))
+		if note := s.ambiguityNote(args.Name, args.Receiver, args.Module, args.File); note != "" {
+			r = prependNote(r, note)
+		}
+		return r, o, e
 	case "batch-impact":
 		return wrapStale(s.handleBatchImpact(ctx, req, args))
 	case "simulate":
@@ -1316,13 +1400,17 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "literals":
 		return wrapStale(s.handleLiterals(ctx, req, args))
 	case "traverse":
-		return wrapStale(s.handleTraverse(ctx, req, args))
+		r, o, e := wrapStale(s.handleTraverse(ctx, req, args))
+		if note := s.ambiguityNote(args.Name, args.Receiver, args.Module, args.File); note != "" {
+			r = prependNote(r, note)
+		}
+		return r, o, e
 	case "emit":
 		return s.handleEmit(ctx, req, args)
 	case "gc":
 		return s.handleGC(ctx, req, args)
 	default:
-		return errResult(fmt.Errorf("unknown op %q — valid: read, read-and-verify, outline, slice, insert-precondition, replace-slice, replace-hunk, wrap-in-defer, rename-param, add-import, search, impact, explain, context, similar, untested, edit, create, delete, retarget-field-value, rename, move, test, apply, diff, history, query, find, sync, test-coverage, batch-impact, simulate, validate-plan, pragmas, literals, traverse, branch, checkout, merge, commit, status, conflicts, resolve, merge-abort, diff-defs, emit, gc, resummarize, plan-dsl, plan-sexpr, plan", args.Op))
+		return errResult(fmt.Errorf("unknown op %q — valid: read, read-and-verify, outline, slice, insert-precondition, replace-slice, replace-hunk, wrap-in-defer, rename-param, add-import, search, impact, explain, context, similar, untested, edit, insert, create, delete, retarget-field-value, rename, move, test, apply, query, find, sync, test-coverage, batch-impact, simulate, file-defs, validate-plan, pragmas, literals, traverse, emit, gc, resummarize, plan-dsl, plan-sexpr, plan, overview, methods, patch, expand, read-file, version", args.Op))
 	}
 }
 
@@ -1462,7 +1550,14 @@ func extractQueryTokensLower(query string) []string {
 		cur.Reset()
 	}
 	for _, r := range low {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+		// unicode.IsLetter/IsDigit, not an ASCII a-z/0-9 range check --
+		// the two "mirror" copies had silently drifted: this one only
+		// recognized ASCII letters as token characters, so a non-ASCII
+		// identifier character (a real, legal Go identifier rune) got
+		// treated as a separator here but not in extractQueryTokens,
+		// producing different tokens for the same query depending on
+		// which of the two copies ran.
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
 			cur.WriteRune(r)
 		} else {
 			flush()
@@ -1640,18 +1735,31 @@ func (s *server) impactJSON(impact *store.Impact) (*sdkmcp.CallToolResult, any, 
 		}
 	}
 
-	callers := make([]impactDefRef, 0, len(impact.DirectCallers))
-	for _, c := range impact.DirectCallers {
+	callersTotal := len(impact.DirectCallers)
+	callers := make([]impactDefRef, 0, min(callersTotal, impactJSONCap))
+	for i, c := range impact.DirectCallers {
+		if i >= impactJSONCap {
+			break
+		}
 		callers = append(callers, toRef(c))
 	}
-	ifaceDispatch := make([]impactDefRef, 0, len(impact.InterfaceDispatchCallers))
-	for _, c := range impact.InterfaceDispatchCallers {
+	ifaceTotal := len(impact.InterfaceDispatchCallers)
+	ifaceDispatch := make([]impactDefRef, 0, min(ifaceTotal, impactJSONCap))
+	for i, c := range impact.InterfaceDispatchCallers {
+		if i >= impactJSONCap {
+			break
+		}
 		ifaceDispatch = append(ifaceDispatch, toRef(c))
 	}
-	tests := make([]impactDefRef, 0, len(impact.Tests))
-	for _, t := range impact.Tests {
+	testsTotal := len(impact.Tests)
+	tests := make([]impactDefRef, 0, min(testsTotal, impactJSONCap))
+	for i, t := range impact.Tests {
+		if i >= impactJSONCap {
+			break
+		}
 		tests = append(tests, toRef(t))
 	}
+	truncated := callersTotal > impactJSONCap || ifaceTotal > impactJSONCap || testsTotal > impactJSONCap
 
 	result := map[string]any{
 		"definition": impactDefRef{
@@ -1663,11 +1771,17 @@ func (s *server) impactJSON(impact *store.Impact) (*sdkmcp.CallToolResult, any, 
 		},
 		"module":                     impact.Module,
 		"direct_callers":             callers,
+		"direct_callers_total":       callersTotal,
 		"interface_dispatch_callers": ifaceDispatch,
+		"interface_dispatch_total":   ifaceTotal,
 		"transitive_count":           impact.TransitiveCount,
 		"tests":                      tests,
+		"tests_total":                testsTotal,
 		"uncovered_by":               impact.UncoveredBy,
 		"blast_radius":               blastRadius,
+	}
+	if truncated {
+		result["truncated"] = fmt.Sprintf("each list capped at %d entries -- use op:\"query\" or narrow with op:\"impact\", query:\"<term>\" to see more of a specific list", impactJSONCap)
 	}
 	text, err := toJSON(result)
 	if err != nil {
@@ -1727,7 +1841,13 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 	// since args.Mode == "" is now no longer a reliable signal that
 	// the caller wants the body.
 	justMutated := req != nil && s.respCache != nil && s.respCache.takeMutated(req.Session, args.Name)
-	if args.Mode == "" && !args.Full && !justMutated && os.Getenv("DEFN_SUMMARY_READ_DEFAULT") != "0" {
+	// wantsBody mirrors what args.Full already means to every gate below:
+	// an explicit line_range request is just as unambiguous an "I want
+	// body text" signal as full:true -- both should bypass summary-mode-
+	// by-default, the upstream-match/diverged-from-upstream projections,
+	// and the #184 auto-outline-downgrade the same way.
+	wantsBody := args.Full || strings.TrimSpace(args.LineRange) != ""
+	if args.Mode == "" && !wantsBody && !justMutated && os.Getenv("DEFN_SUMMARY_READ_DEFAULT") != "0" {
 		args.Mode = "summary"
 	}
 	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
@@ -1743,10 +1863,15 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 	if args.Mode == "summary" {
 		if sum, sErr := s.backend.GetDefSummary(d.ID); sErr == nil && sum != nil {
 			currentHash := store.HashBodyStructural(d.Body)
-			if sum.BodyHash == currentHash {
+			// #248: a Stub-backend placeholder ("TODO: <Name>") is not a
+			// real summary -- enqueueSummary's own doc comment promises the
+			// read path treats it as a miss and falls back to full body,
+			// but this check was missing, so summary-mode-by-default served
+			// the literal stub text as if it were a genuine intent line.
+			if sum.BodyHash == currentHash && sum.Model != summary.StubModelName {
 				return renderSummaryOnly(d, sum), nil, nil
 			}
-			// Stale — fall through to body but signal it.
+			// Stale or stub — fall through to body but signal it.
 		}
 		// Falls through to full-body rendering; the reader can see
 		// no summary appeared in the response header.
@@ -1765,7 +1890,7 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 	// Delta-from-prior: if this def belongs to a module we have upstream
 	// fingerprints for AND the caller hasn't asked for the full body,
 	// try the compact provenance form. See project_d_delta_from_prior.
-	if !args.Full && modulePath != "" {
+	if !wantsBody && modulePath != "" {
 		upstreamName := upstreamDefName(d)
 		hash := store.HashBodyStructural(d.Body)
 		if match, _ := s.backend.FindUpstreamMatch(modulePath, upstreamName, d.Kind, d.Receiver, hash); match != nil {
@@ -1787,7 +1912,7 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 	// tells the model how to get the body if it actually needs it.
 	// Rationale: #174 receipt showed CLAUDE.md-level outline-first
 	// nudges failed. Taking the choice away is the recommended lever.
-	if !args.Full &&
+	if !wantsBody &&
 		args.Mode != "body" &&
 		strings.TrimSpace(args.Query) == "" &&
 		len(d.Body) > readAutoOutlineThreshold {
@@ -1819,8 +1944,28 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 	// or the hint header would exceed the byte savings.
 	body := d.Body
 	var queryHint string
+	var rangeHint string
+	if strings.TrimSpace(args.LineRange) != "" {
+		wantStart, wantEnd, rErr := projection.ParseLineRange(args.LineRange)
+		if rErr != nil {
+			return errResult(fmt.Errorf("read: %w", rErr))
+		}
+		bodyStartLine := projection.BodyStartLine(d.Body, d.StartLine, d.EndLine)
+		if narrowed, actualStart, actualEnd, ok := projection.ExtractLineRange(d.Body, bodyStartLine, wantStart, wantEnd); ok {
+			body = narrowed
+			rangeHint = fmt.Sprintf(
+				"[line_range read: showing file lines %d-%d (requested %d-%d) of %s's full range %d-%d. Pass line_range=\"\" for the full body.]\n\n",
+				actualStart, actualEnd, wantStart, wantEnd, args.Name, d.StartLine, d.EndLine,
+			)
+		} else {
+			rangeHint = fmt.Sprintf(
+				"[line_range read: requested %d-%d does not overlap %s's actual range %d-%d — showing the full body instead. Pass line_range=\"\" to skip this check next time.]\n\n",
+				wantStart, wantEnd, args.Name, d.StartLine, d.EndLine,
+			)
+		}
+	}
 	if strings.TrimSpace(args.Query) != "" {
-		filtered, kept, elided := projection.FilterBodyByQuery(d.Body, args.Query)
+		filtered, kept, elided := projection.FilterBodyByQuery(body, args.Query)
 		if elided > 0 && kept > 0 {
 			candidateHint := fmt.Sprintf(
 				"[query-adaptive read: query=%q, %d/%d statements kept, %d elided. Pass query=\"\" for the full body.]\n\n",
@@ -1829,7 +1974,7 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 			// Only apply when the filter is a net win — the hint
 			// header costs ~140 bytes; on tiny bodies it can dwarf
 			// the elision savings.
-			if len(filtered)+len(candidateHint) < len(d.Body) {
+			if len(filtered)+len(candidateHint) < len(body) {
 				body = filtered
 				queryHint = candidateHint
 			}
@@ -1840,6 +1985,9 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 	recv := formatReceiver(d.Receiver)
 	sb.WriteString(fmt.Sprintf("## %s%s (%s)\n", recv, d.Name, d.Kind))
 	sb.WriteString(fmt.Sprintf("Module: %s\n\n", modulePath))
+	if rangeHint != "" {
+		sb.WriteString(rangeHint)
+	}
 	if queryHint != "" {
 		sb.WriteString(queryHint)
 	}
@@ -1864,7 +2012,7 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 	// not it asked, which collapses the read→impact→read-caller chain
 	// into one round-trip. Skipped only for query-adaptive filtered
 	// reads (query is set) since those are already narrower on purpose.
-	if strings.TrimSpace(args.Query) == "" && !stripped("related-footer") {
+	if strings.TrimSpace(args.Query) == "" && strings.TrimSpace(args.LineRange) == "" && !stripped("related-footer") {
 		sb.WriteString(s.renderReadNeighborhood(d))
 	}
 
@@ -1968,6 +2116,49 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		return errResult(err)
 	}
 
+	// #stale8: search doesn't apply Go's own "pkg.Symbol" qualified-name
+	// convention that name-based ops resolve via resolveDottedQualifiedName
+	// -- a caller reaching for search(pattern:"zrpc.WithUnaryClientInterceptor")
+	// got a literal substring match against a string no def's name/body
+	// actually contains verbatim (defs are named "WithUnaryClientInterceptor"
+	// alone), even though the bare symbol finds it trivially. Retry with
+	// just the part after the last "." when the qualified form comes up
+	// empty and looks like an identifier, not a file path or LIKE glob.
+	dottedNote := ""
+	if len(defs) == 0 {
+		if idx := strings.LastIndex(args.Pattern, "."); idx > 0 && !strings.ContainsAny(args.Pattern, "/%") {
+			bare := args.Pattern[idx+1:]
+			if bare != "" {
+				bareDefs, bareErr := s.backend.FindDefinitions("%" + bare + "%")
+				if bareErr == nil {
+					if ftsDefs, ftsErr := s.backend.SearchDefinitions(bare); ftsErr == nil {
+						bareDefs = mergeDefsByID(bareDefs, ftsDefs)
+					}
+					if len(bareDefs) > 0 {
+						defs = bareDefs
+						dottedNote = fmt.Sprintf("_note: no match for the qualified name %q -- retried with the bare symbol %q (search doesn't parse package qualifiers, unlike read/outline/edit). Pass file: to scope to the right package instead._\n\n", args.Pattern, bare)
+					}
+				}
+			}
+		}
+	}
+
+	// #250: include: is a real codeParam field, but only op:"expand" wires
+	// it up (graph-hop selection). A caller reaching for
+	// search(pattern:"X", include:["pkg"]) by analogy with expand's
+	// scoping-flavored include got total silence -- no error, no note,
+	// just an unfiltered repo-wide result set indistinguishable from a
+	// genuinely scoped-and-empty query. Confirmed via a real
+	// go-zero-1964 trajectory: search(pattern:"logx.Info", include:["rest"])
+	// returned 12 unrelated repo-wide defs, twice, before the agent gave
+	// up on search entirely. Same precedent as #241's file: fix and
+	// expand's own "unsupported include kinds ignored" note -- surface it
+	// instead of silently dropping it.
+	includeNote := dottedNote
+	if len(args.Include) > 0 {
+		includeNote += fmt.Sprintf("_note: \"include\" has no effect on search (that's expand's graph-hop selector) -- ignored: %s. Use file:\"<hint>\" to scope search results by source path instead._\n\n", strings.Join(args.Include, ", "))
+	}
+
 	// #241: file: was accepted as a param but silently ignored -- every
 	// search ran repo-wide regardless. Root-caused via a real
 	// grpc-go-2630 trajectory: the agent called
@@ -2001,7 +2192,11 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	if len(defs) == 0 && args.Pattern != "" {
 		scanPattern := strings.Trim(args.Pattern, "%")
 		if scanPattern != "" && !strings.Contains(scanPattern, "%") {
-			return s.bodyScanResult(scanPattern, limit)
+			r, o, e := s.bodyScanResult(scanPattern, limit, args.File)
+			if includeNote != "" {
+				r = prependNote(r, includeNote)
+			}
+			return r, o, e
 		}
 	}
 
@@ -2010,16 +2205,21 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// so trigger the caller-count/text-overlap ranker so the head of
 	// the list is actually informative. Explicit rank:true still works.
 	if args.Rank || len(defs) > limit {
-		return s.rankedSearchResult(args.Pattern, defs, limit)
+		r, o, e := s.rankedSearchResult(args.Pattern, defs, limit)
+		if includeNote != "" {
+			r = prependNote(r, includeNote)
+		}
+		return r, o, e
 	}
 
 	type summary struct {
-		Name     string `json:"name"`
-		Kind     string `json:"kind"`
-		Receiver string `json:"receiver,omitempty"`
-		Preview  string `json:"preview,omitempty"`
+		Name       string `json:"name"`
+		Kind       string `json:"kind"`
+		Receiver   string `json:"receiver,omitempty"`
+		SourceFile string `json:"file,omitempty"`
+		Preview    string `json:"preview,omitempty"`
 	}
-	var results []summary
+	results := make([]summary, 0, limit)
 	for _, d := range defs {
 		if len(results) >= limit {
 			break
@@ -2029,7 +2229,7 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		// corpus). Cap at 3 previews per response so it doesn't inflate
 		// on name-browse queries; cap each preview at 5 lines. Model can
 		// still call read for the full body.
-		s := summary{Name: d.Name, Kind: d.Kind, Receiver: d.Receiver}
+		s := summary{Name: d.Name, Kind: d.Kind, Receiver: d.Receiver, SourceFile: d.SourceFile}
 		if len(results) < searchPreviewCount {
 			s.Preview = topLinesOfBody(d.Body, searchPreviewLines)
 		}
@@ -2045,6 +2245,9 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	}
 	if truncated != "" {
 		text += truncated
+	}
+	if includeNote != "" {
+		text = includeNote + text
 	}
 	return textResult(text), nil, nil
 }
@@ -2069,15 +2272,53 @@ func topLinesOfBody(body string, n int) string {
 // re-locate the match without a follow-up read. Empty result set returns
 // a message that names the fallback tried, distinguishing "no def named
 // X + no body containing X" from "search op failed silently."
-func (s *server) bodyScanResult(pattern string, limit int) (*sdkmcp.CallToolResult, any, error) {
-	hits, err := s.backend.SearchBodiesLike(pattern, limit)
+func (s *server) bodyScanResult(pattern string, limit int, file string) (*sdkmcp.CallToolResult, any, error) {
+	// #241 covered stages 1-2's file: scoping but missed this stage-3
+	// fallback -- SearchBodiesLike itself has no file parameter, so a
+	// wider fetch is over-fetched here and filtered by SourceFile before
+	// truncating to limit, rather than trusting the store layer to scope it.
+	fetchLimit := limit
+	if file != "" {
+		fetchLimit = limit * 20
+		if fetchLimit > 500 {
+			fetchLimit = 500
+		}
+	}
+	hits, err := s.backend.SearchBodiesLike(pattern, fetchLimit)
 	if err != nil {
 		return errResult(fmt.Errorf("search body-scan: %w", err))
 	}
+	if file != "" {
+		filtered := hits[:0]
+		for _, h := range hits {
+			if strings.Contains(h.SourceFile, file) {
+				filtered = append(filtered, h)
+			}
+		}
+		hits = filtered
+	}
+	if len(hits) > limit {
+		hits = hits[:limit]
+	}
 	if len(hits) == 0 {
+		scope := ""
+		if file != "" {
+			scope = fmt.Sprintf(" scoped to file:%q", file)
+		}
+		// A pattern like "A|B|C" reads as regex alternation but search has
+		// no regex support anywhere in its path (LIKE + FTS + substring
+		// scan, all literal) -- confirmed via a real go-zero-2283
+		// trajectory where search(pattern:"SetCors|WithCors|...") came back
+		// "no matches" even though WithCors existed, found trivially by a
+		// follow-up single-term search. "|" is a reasonable multi-term
+		// guess an agent will keep making without this hint.
+		regexHint := ""
+		if strings.Contains(pattern, "|") {
+			regexHint = " Note: pattern is a plain substring/LIKE match, not regex — \"|\" is searched for as a literal character, not alternation. Call search once per term instead."
+		}
 		msg := fmt.Sprintf(
-			"[no matches for %q — tried name-LIKE, FTS on doc+body, and substring body-scan. If you're grepping for a comment or string literal, this substring wasn't found in any indexed body. Try `overview` for project shape or a broader pattern.]",
-			pattern,
+			"[no matches for %q%s — tried name-LIKE, FTS on doc+body, and substring body-scan.%s If you're grepping for a comment or string literal, this substring wasn't found in any indexed body. Try `overview` for project shape or a broader pattern.]",
+			pattern, scope, regexHint,
 		)
 		return textResult(msg), nil, nil
 	}
@@ -2167,11 +2408,12 @@ func (s *server) rankedSearchResult(query string, defs []store.Definition, limit
 	scored := rank.Rank(query, cands, s.idf, rank.DefaultWeights)
 
 	type rankedSummary struct {
-		Name     string  `json:"name"`
-		Kind     string  `json:"kind"`
-		Receiver string  `json:"receiver,omitempty"`
-		Score    float64 `json:"score"`
-		Preview  string  `json:"preview,omitempty"`
+		Name       string  `json:"name"`
+		Kind       string  `json:"kind"`
+		Receiver   string  `json:"receiver,omitempty"`
+		SourceFile string  `json:"file,omitempty"`
+		Score      float64 `json:"score"`
+		Preview    string  `json:"preview,omitempty"`
 	}
 	out := make([]rankedSummary, 0, limit)
 	for i, r := range scored {
@@ -2180,7 +2422,7 @@ func (s *server) rankedSearchResult(query string, defs []store.Definition, limit
 		}
 		rs := rankedSummary{
 			Name: r.Def.Name, Kind: r.Def.Kind, Receiver: r.Def.Receiver,
-			Score: r.Score,
+			SourceFile: r.Def.SourceFile, Score: r.Score,
 		}
 		// #159: preview the top-N ranked hits — model can identify the
 		// winner from body head without a follow-up read.
@@ -2218,12 +2460,15 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 	// across different types; module:/file: disambiguate same-named
 	// non-method defs across different packages -- same gap, no
 	// receiver to key off of. See resolveEditTarget.
-	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
+	d, err := s.resolveWriteTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		if args.Receiver != "" {
 			return s.notFoundOrErr(fmt.Sprintf("%s.%s", args.Receiver, args.Name), err)
 		}
 		return s.notFoundOrErr(args.Name, err)
+	}
+	if msg := unsupportedFieldOp(d.Kind, "edit"); msg != "" {
+		return errResult(fmt.Errorf("%s", msg))
 	}
 
 	// Validate new body parses as Go.
@@ -2260,6 +2505,17 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 		return errResult(fmt.Errorf("edit %s%s: new_body declares %s%s, which changes its name/receiver — use code(op:\"rename\") to rename a definition; op:\"edit\" only changes body content", formatReceiver(d.Receiver), d.Name, formatReceiver(newReceiver), newName))
 	}
 
+	// #246: dry_run was accepted by the top-level codeParam schema and
+	// silently dropped before reaching editParam -- the same
+	// accepted-but-not-wired gap already fixed for delete's dry_run,
+	// except here the effect is worse: the caller asked for a preview
+	// and got a REAL edit instead, with no error to signal the mistake.
+	// All validation above (parse, multi-decl, identity) has already
+	// run, so a dry-run report here is a genuine preview, not a guess.
+	if args.DryRun {
+		return dryRunResult(fmt.Sprintf("- would update %s%s (id=%d)", formatReceiver(d.Receiver), d.Name, d.ID))
+	}
+
 	// Capture the pre-edit signature so we can decide whether the build
 	// gate is safely skippable (#148: body-only edit with a stable
 	// signature keeps dispatch invariant — callers don't need re-typecheck).
@@ -2292,6 +2548,23 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 	recv := formatReceiver(d.Receiver)
 
 	sigStable := oldSignature == d.Signature
+	// extractSignature's *ast.TypeSpec case collapses to just "type
+	// <Name>" regardless of the type's actual shape -- it can't tell a
+	// struct/interface whose fields or methods changed from one that
+	// didn't, so the plain signature-string comparison above is always
+	// true for a type/interface-kind edit no matter what changed inside.
+	// Confirmed live: removing a method from an interface, or a field
+	// from a struct, via this exact edit path reported "Updated X" and
+	// wrote it to disk while every caller/composite-literal still
+	// referencing the removed member no longer compiled -- with zero
+	// warning, since sigStable routed it through the no-build-gate fast
+	// path. For these two kinds the whole body IS the shape (there's no
+	// meaningful body/signature split the way a func has), so only a
+	// byte-identical body is provably safe to fast-path; any real change
+	// forces the real build gate below.
+	if d.Kind == "type" || d.Kind == "interface" {
+		sigStable = oldBody == args.NewBody
+	}
 	var buildResult string
 	if sigStable {
 		opts := emit.Opts{}
@@ -2374,6 +2647,9 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 			}
 			sb.WriteString(fmt.Sprintf("\nFYI: %d callers, %d tests affected. Run code(op:\"test\", name:\"%s\") to verify.\n",
 				prodCallers, len(impact.Tests), d.Name))
+		}
+		if !d.Test {
+			sb.WriteString(s.testCoverageHint(d.ModuleID, d.SourceFile))
 		}
 	}
 	return textResult(sb.String()), nil, nil
@@ -2612,24 +2888,6 @@ func (s *server) autoEmitAndBuild() string {
 	return s.autoEmitAndBuildWithOpts(emit.Opts{})
 }
 
-// autoEmitAndBuildForFile is the file-scoped variant: pass the single
-// source file the mutation touched, get goimports AND emit scoped to
-// that file via emit.Opts.GoimportsFiles + Opts.TouchedFiles. On
-// cli/cli warm rename this dropped goimports from 707ms → 11ms (#109
-// pass 3); #117 adds the same scoping to emit itself so we don't
-// rewrite every file in the tree for a single-def mutation (winze:
-// 1.2s full-emit → per-touched-file cost). Empty file falls through
-// to the full-project recursive form.
-func (s *server) autoEmitAndBuildForFile(sourceFile string) string {
-	if sourceFile == "" {
-		return s.autoEmitAndBuild()
-	}
-	return s.autoEmitAndBuildWithOpts(emit.Opts{
-		GoimportsFiles: []string{sourceFile},
-		TouchedFiles:   []string{sourceFile},
-	})
-}
-
 // autoEmitOnly emits without running `go build` — for projection ops
 // that are AST-guaranteed sig-stable (insert-precondition, replace-slice,
 // replace-hunk, wrap-in-defer, rename-param, add-import). Task #148:
@@ -2743,25 +3001,22 @@ func (s *server) emitAndBuildAgainst(backend store.Backend, opts emit.Opts) stri
 	// with `go build .` (25ms). When TouchedFiles is set, scope the build
 	// to just the packages containing those files. Empty TouchedFiles
 	// (full-tree emit) keeps the old ./... behavior for correctness on
-	// broad changes.
-	buildTargets := buildTargetsForFiles(opts.TouchedFiles)
-	args := append([]string{"build"}, buildTargets...)
-	cmd := exec.CommandContext(ctx, "go", args...)
-	cmd.Dir = s.projectDir
-	out, err := cmd.CombinedOutput()
+	// broad changes. runScopedBuild further scopes each touched file's
+	// build to its NEAREST go.mod -- see its doc for why.
+	out, buildErr := s.runScopedBuild(ctx, opts.TouchedFiles)
 	if timing {
-		fmt.Fprintf(os.Stderr, "  [emit] go %s: %s\n", strings.Join(args, " "), time.Since(t).Round(time.Millisecond))
+		fmt.Fprintf(os.Stderr, "  [emit] go build: %s\n", time.Since(t).Round(time.Millisecond))
 	}
 	var sb strings.Builder
 	if len(warnings) > 0 {
 		sb.WriteString("WARNING: " + strings.Join(warnings, "\nWARNING: "))
 	}
-	if err != nil {
+	if buildErr != nil {
 		if sb.Len() > 0 {
 			sb.WriteString("\n\n")
 		}
-		sb.WriteString(fmt.Sprintf("BUILD FAILED:\n%s", string(out)))
-		sb.WriteString(s.suggestMissingImportFixes(string(out)))
+		sb.WriteString(fmt.Sprintf("BUILD FAILED:\n%s", out))
+		sb.WriteString(s.suggestMissingImportFixes(out))
 	}
 	return sb.String()
 }
@@ -2853,12 +3108,15 @@ func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest
 	// receiver/module/file were available on this handler's own
 	// codeParam but never consulted, so GetDefinitionByName's blast-
 	// radius tiebreak could silently target the wrong same-named def.
-	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
+	d, err := s.resolveWriteTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		if args.Receiver != "" {
 			return s.notFoundOrErr(fmt.Sprintf("%s.%s", args.Receiver, args.Name), err)
 		}
 		return s.notFoundOrErr(args.Name, err)
+	}
+	if msg := unsupportedFieldOp(d.Kind, "edit"); msg != "" {
+		return errResult(fmt.Errorf("%s", msg))
 	}
 
 	// Reject empty old_fragment (strings.ReplaceAll inserts between every char).
@@ -2952,14 +3210,20 @@ func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest
 			}
 			sb.WriteString(fmt.Sprintf("\nFYI: %d callers, %d tests affected.\n", prodCallers, len(impact.Tests)))
 		}
+		if !d.Test {
+			sb.WriteString(s.testCoverageHint(d.ModuleID, d.SourceFile))
+		}
 	}
 	return textResult(sb.String()), nil, nil
 }
 
 func (s *server) handleInsert(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
+	d, err := s.resolveWriteTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
+	}
+	if msg := unsupportedFieldOp(d.Kind, "insert"); msg != "" {
+		return errResult(fmt.Errorf("%s", msg))
 	}
 
 	idx := strings.Index(d.Body, args.After)
@@ -2984,19 +3248,31 @@ func (s *server) handleInsert(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	d.Signature = extractSignature(newBody)
 	recv := formatReceiver(d.Receiver)
 
-	if _, err := s.backend.UpsertDefinition(d); err != nil {
+	// #12-class gap: this used to write straight to s.backend with no
+	// transaction at all, same shape as handleMove/handlePatch/
+	// handleRetargetFieldValue before their own #12 fixes -- a build
+	// failure after the write still left the DB durably mutated with
+	// nothing to show for it on disk.
+	tx, commit, rollback, txErr := s.backend.Begin()
+	if txErr != nil {
+		return errResult(txErr)
+	}
+	defer rollback()
+	if _, err := tx.UpsertDefinition(d); err != nil {
 		return errResult(err)
 	}
 
-	buildResult := s.autoEmitAndBuildForFile(d.SourceFile)
+	var opts emit.Opts
+	if d.SourceFile != "" {
+		opts = emit.Opts{GoimportsFiles: []string{d.SourceFile}, TouchedFiles: []string{d.SourceFile}}
+	}
+	buildResult := s.commitOrRollbackOnBuild(tx, commit, rollback, opts)
+	if buildResult != "" {
+		return textResult(fmt.Sprintf("insert into %s%s rolled back — nothing was saved\n\n%s", recv, d.Name, buildResult)), nil, nil
+	}
 	s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
 
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Inserted into %s%s\n", recv, d.Name))
-	if buildResult != "" {
-		sb.WriteString("\n" + buildResult)
-	}
-	return textResult(sb.String()), nil, nil
+	return textResult(fmt.Sprintf("Inserted into %s%s\n", recv, d.Name)), nil, nil
 }
 
 func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args createParam) (*sdkmcp.CallToolResult, any, error) {
@@ -3090,10 +3366,26 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// fallback's identity.
 	if !fileResolvedDirectly && args.File != "" {
 		if dir := filepath.ToSlash(filepath.Dir(args.File)); dir != "" && dir != "." {
-			mods, _ := s.backend.ListModules()
 			newPath := dir
-			if root := emit.DetectModuleRoot(mods); root != "" {
-				newPath = root + "/" + dir
+			// Prefer the real filesystem go.mod nearest this new
+			// directory (correct even when it's inside a nested
+			// module, e.g. etcd's server/, tests/, etcdctl/ each
+			// have their own go.mod) over the DB-derived common-prefix
+			// guess below, which is only right for single-module repos.
+			absDir := filepath.Join(s.projectDir, dir)
+			if modPrefix, modDir, mErr := ingest.ModuleForDir(absDir); mErr == nil {
+				if relPkgDir, rErr := filepath.Rel(modDir, absDir); rErr == nil {
+					if relPkgDir == "." {
+						newPath = modPrefix
+					} else {
+						newPath = modPrefix + "/" + filepath.ToSlash(relPkgDir)
+					}
+				}
+			} else {
+				mods, _ := s.backend.ListModules()
+				if root := emit.DetectModuleRoot(mods); root != "" {
+					newPath = root + "/" + dir
+				}
 			}
 			newMod, ensureErr := tx.EnsureModule(newPath, filepath.Base(dir), "")
 			if ensureErr != nil {
@@ -3120,6 +3412,23 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	if existErr == nil {
 		recv := formatReceiver(existing.Receiver)
 		return errResult(fmt.Errorf("definition %s%s already exists in %s (id=%d) — use code(op:\"edit\") to modify it", recv, name, mod.Path, existing.ID))
+	}
+
+	// #dry-run-create: create's own instance of the same "accepted by the
+	// shared codeParam schema but silently dropped" gap #246 fixed for
+	// edit/delete and the projection-op family above -- createParam had
+	// no DryRun field at all, so dry_run:true on op:"create" wrote for
+	// real with no signal anything was off. Placed after every validation
+	// gate above (multi-decl/scaffold routing, name inference, module
+	// resolution, the existing-definition collision check) so the
+	// preview genuinely reflects what create would do, not a guess.
+	if args.DryRun {
+		recv := formatReceiver(receiver)
+		loc := mod.Path
+		if args.File != "" {
+			loc = args.File + " (" + mod.Path + ")"
+		}
+		return dryRunResult(fmt.Sprintf("would create %s%s (kind=%s) in %s", recv, name, kind, loc))
 	}
 
 	exported := len(name) > 0 && name[0] >= 'A' && name[0] <= 'Z'
@@ -3177,6 +3486,9 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		fmt.Fprintf(&sb, "create %s%s rolled back — nothing was saved\n\n%s", recv, name, buildResult)
 	} else {
 		sb.WriteString(fmt.Sprintf("Created %s (id=%d, kind=%s) in %s\n", name, id, kind, loc))
+		if !isTest {
+			sb.WriteString(s.testCoverageHint(mod.ID, args.File))
+		}
 	}
 	return textResult(sb.String()), nil, nil
 }
@@ -3440,10 +3752,6 @@ func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult
 	return textResult(sb.String()), nil, nil
 }
 
-// findModuleByFile maps a source file path to its module by matching the
-// file's directory against module Paths (which are import paths like
-// "github.com/x/y/internal/code"). Accepts repo-relative or absolute paths;
-// matches by suffix on the directory component.
 func (s *server) findModuleByFile(file string) *store.Module {
 	mods, _ := s.backend.ListModules() // best effort — nil is safe
 	if len(mods) == 0 {
@@ -3451,6 +3759,9 @@ func (s *server) findModuleByFile(file string) *store.Module {
 	}
 	dir := filepath.ToSlash(filepath.Dir(file))
 	dir = strings.TrimPrefix(dir, "./")
+	if mod := s.findModuleForRelDir(mods, dir); mod != nil {
+		return mod
+	}
 	if dir == "" || dir == "." {
 		// File sits at repo root — pick the module whose Path has no
 		// internal segment beyond the module root (shortest path wins).
@@ -3558,14 +3869,18 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 					sb.WriteString(fmt.Sprintf("+ would create %s (%s)\n", name, kind))
 				}
 			case "edit":
-				if _, err := s.resolveApplyTarget(s.backend, op.Name, op.Receiver, op.Module, op.File); err != nil {
+				if d, err := s.resolveApplyTarget(s.backend, op.Name, op.Receiver, op.Module, op.File); err != nil {
 					errors = append(errors, fmt.Sprintf("edit %s: not found", op.Name))
+				} else if msg := unsupportedFieldOp(d.Kind, "edit"); msg != "" {
+					errors = append(errors, fmt.Sprintf("edit %s: %s", op.Name, msg))
 				} else {
 					sb.WriteString(fmt.Sprintf("~ would edit %s\n", op.Name))
 				}
 			case "delete":
-				if _, err := s.resolveApplyTarget(s.backend, op.Name, op.Receiver, op.Module, op.File); err != nil {
+				if d, err := s.resolveApplyTarget(s.backend, op.Name, op.Receiver, op.Module, op.File); err != nil {
 					errors = append(errors, fmt.Sprintf("delete %s: not found", op.Name))
+				} else if msg := unsupportedFieldOp(d.Kind, "delete"); msg != "" {
+					errors = append(errors, fmt.Sprintf("delete %s: %s", op.Name, msg))
 				} else {
 					sb.WriteString(fmt.Sprintf("- would delete %s\n", op.Name))
 				}
@@ -3587,8 +3902,10 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 						name = inferred
 					}
 				}
-				if _, err := s.resolveApplyTarget(s.backend, name, op.Receiver, op.Module, op.File); err != nil {
+				if d, err := s.resolveApplyTarget(s.backend, name, op.Receiver, op.Module, op.File); err != nil {
 					errors = append(errors, fmt.Sprintf("%s %s: not found", op.Op, name))
+				} else if msg := unsupportedFieldOp(d.Kind, op.Op); msg != "" {
+					errors = append(errors, fmt.Sprintf("%s %s: %s", op.Op, name, msg))
 				} else {
 					sb.WriteString(fmt.Sprintf("~ would %s on %s\n", op.Op, name))
 				}
@@ -3634,6 +3951,10 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	resolveSet := map[filePkg]bool{}
 	var allowedRemovals []string
 	var allowedAdds []string
+	// Tracks the module of the first non-test def this batch touches,
+	// so a successful batch that never touches a test file can nudge
+	// toward the paired test coverage -- see testCoverageHint's doc.
+	var firstNonTestModuleID int64
 	// #241: IDs of defs edited in this batch, so a rolled-back build can
 	// point at their callers via coupledChangeHint -- same rationale as
 	// handleEdit's singleton path, just collected across the batch since
@@ -3680,6 +4001,9 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		if err != nil {
 			return "", fmt.Sprintf("%s %s: not found", op.Op, name)
 		}
+		if msg := unsupportedFieldOp(d.Kind, op.Op); msg != "" {
+			return "", fmt.Sprintf("%s %s: %s", op.Op, name, msg)
+		}
 		newBody, err := compute(d.Body)
 		if err != nil {
 			return "", fmt.Sprintf("%s %s: %v", op.Op, name, err)
@@ -3701,6 +4025,9 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		}
 		addTouched(d.SourceFile)
 		addResolve(d.SourceFile, d.ModuleID)
+		if !d.Test && firstNonTestModuleID == 0 {
+			firstNonTestModuleID = d.ModuleID
+		}
 		return fmt.Sprintf("~ %s on %s\n", op.Op, name), ""
 	}
 
@@ -3787,6 +4114,9 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 					addTouched(op.File)
 					addResolve(op.File, mod.ID)
 					allowedAdds = append(allowedAdds, emit.FuncIdentity(d.Name, d.Receiver))
+					if !d.IsTest && firstNonTestModuleID == 0 {
+						firstNonTestModuleID = mod.ID
+					}
 					sb.WriteString(fmt.Sprintf("+ created %s (id=%d)\n", d.Name, id))
 				}
 				continue
@@ -3796,13 +4126,17 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				errors = append(errors, "create: couldn't infer name from body")
 				continue
 			}
+			// Mirrors handleCreate's precedence: file: is tried first (most
+			// specific) but a miss there falls through to module:, not an
+			// immediate error -- the two were previously inconsistent here.
+			// findModuleByFile legitimately returns nil for a real file on a
+			// versioned nested module in some fallback configurations (see
+			// its own #20342 fix); bailing out on that nil instead of trying
+			// the caller's explicit module: turned a resolvable request into
+			// a spurious "does not map to any known module" error.
 			var mod *store.Module
 			if op.File != "" {
 				mod = s.findModuleByFile(op.File)
-				if mod == nil {
-					errors = append(errors, fmt.Sprintf("create %s: file %q does not map to any known module", name, op.File))
-					continue
-				}
 			}
 			if mod == nil && op.Module != "" {
 				mod = s.findModule(op.Module)
@@ -3810,6 +4144,10 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 					errors = append(errors, fmt.Sprintf("create %s: module %q not found", name, op.Module))
 					continue
 				}
+			}
+			if mod == nil && op.File != "" {
+				errors = append(errors, fmt.Sprintf("create %s: file %q does not map to any known module", name, op.File))
+				continue
 			}
 			if mod == nil {
 				mods, _ := s.backend.ListModules()
@@ -3819,6 +4157,26 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			}
 			if mod == nil {
 				errors = append(errors, "create: no modules found")
+				continue
+			}
+			// Same same-module name+receiver collision check as
+			// handleCreate and this same handler's multi-decl branch a
+			// few lines above -- without it, a collision here (the
+			// common case: most create ops in a batch are single
+			// declarations) only failed at the Go-build stage with a
+			// raw compiler error ("X redeclared in this block"), rolling
+			// back the whole batch, instead of defn's own clear message.
+			existing, existErr := tx.GetDefinitionByNameAndReceiver(name, mod.Path, receiver)
+			if existErr != nil && receiver != "" {
+				if alt := strings.TrimPrefix(receiver, "*"); alt != receiver {
+					existing, existErr = tx.GetDefinitionByNameAndReceiver(name, mod.Path, alt)
+				} else {
+					existing, existErr = tx.GetDefinitionByNameAndReceiver(name, mod.Path, "*"+receiver)
+				}
+			}
+			if existErr == nil {
+				recv := formatReceiver(existing.Receiver)
+				errors = append(errors, fmt.Sprintf("create %s%s: already exists in %s (id=%d)", recv, name, mod.Path, existing.ID))
 				continue
 			}
 			exported := len(name) > 0 && name[0] >= 'A' && name[0] <= 'Z'
@@ -3836,6 +4194,9 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				addTouched(op.File)
 				addResolve(op.File, mod.ID)
 				allowedAdds = append(allowedAdds, emit.FuncIdentity(name, receiver))
+				if !isTest && firstNonTestModuleID == 0 {
+					firstNonTestModuleID = mod.ID
+				}
 				sb.WriteString(fmt.Sprintf("+ created %s (id=%d)\n", name, id))
 			}
 
@@ -3843,6 +4204,10 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			d, err := s.resolveApplyTarget(tx, op.Name, op.Receiver, op.Module, op.File)
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("edit %s: not found", op.Name))
+				continue
+			}
+			if msg := unsupportedFieldOp(d.Kind, "edit"); msg != "" {
+				errors = append(errors, fmt.Sprintf("edit %s: %s", op.Name, msg))
 				continue
 			}
 			if op.OldFragment != "" {
@@ -3897,6 +4262,9 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				addTouched(d.SourceFile)
 				addResolve(d.SourceFile, d.ModuleID)
 				editedIDs = append(editedIDs, d.ID)
+				if !d.Test && firstNonTestModuleID == 0 {
+					firstNonTestModuleID = d.ModuleID
+				}
 				sb.WriteString(fmt.Sprintf("~ edited %s\n", op.Name))
 			}
 
@@ -3904,6 +4272,10 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			d, err := s.resolveApplyTarget(tx, op.Name, op.Receiver, op.Module, op.File)
 			if err != nil {
 				errors = append(errors, fmt.Sprintf("delete %s: not found", op.Name))
+				continue
+			}
+			if msg := unsupportedFieldOp(d.Kind, "delete"); msg != "" {
+				errors = append(errors, fmt.Sprintf("delete %s: %s", op.Name, msg))
 				continue
 			}
 			if err := tx.DeleteDefinition(d.ID); err != nil {
@@ -3927,9 +4299,44 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				errors = append(errors, fmt.Sprintf("rename %s: not found", op.Name))
 				continue
 			}
+			// Struct fields are excluded from emit by design (#11) -- the
+			// enclosing TYPE's own Body (a separate row) is what's really
+			// emitted, so it has to be rewritten too, via renameFieldInType
+			// (safe against astRename's caller-body collision risk since
+			// field names are unique within one struct -- see
+			// handleFieldRename's doc comment for the full story). Written
+			// through tx like everything else in this batch, so the tail's
+			// existing commitOrRollbackOnBuild gives this real build
+			// validation for free -- unlike handleRename's singleton path,
+			// which normally skips the build gate and has to open its own
+			// transaction just for this case.
+			var parentType *store.Definition
+			if d.Kind == "field" {
+				mp := s.modulePath(d.ModuleID)
+				pt, ptErr := tx.GetDefinitionByName(d.Receiver, mp)
+				if ptErr != nil || pt == nil || pt.Kind != "type" {
+					errors = append(errors, fmt.Sprintf("rename %s: could not find its declaring type %q to update the struct declaration", op.Name, d.Receiver))
+					continue
+				}
+				newParentBody, renamedCount := renameFieldInType(pt.Body, d.Name, op.NewName)
+				if renamedCount == 0 {
+					errors = append(errors, fmt.Sprintf("rename %s: could not locate its declaration inside %s's struct body", op.Name, d.Receiver))
+					continue
+				}
+				pt.Body = newParentBody
+				pt.Signature = extractSignature(newParentBody)
+				if _, err := tx.UpsertDefinition(pt); err != nil {
+					errors = append(errors, fmt.Sprintf("rename %s: update struct declaration for %s: %v", op.Name, d.Receiver, err))
+					continue
+				}
+				addTouched(pt.SourceFile)
+				parentType = pt
+			}
 			// Reserve the qualified pre-rename name so safeWriteGoFile lets
 			// the disappearing decl actually vanish from the file (same as
-			// handleRename's qualifiedOld).
+			// handleRename's qualifiedOld). Meaningless for a field (its
+			// row is excluded from emit's FuncDecl matching) but harmless
+			// to still set -- it simply never matches anything there.
 			qualifiedOld := emit.FuncIdentity(d.Name, d.Receiver)
 			allowedRemovals = append(allowedRemovals, qualifiedOld)
 			addTouched(d.SourceFile)
@@ -3975,7 +4382,11 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			}
 			// #109: rename is ID-preserving semantic transform — refs edges
 			// unchanged. Skip adding to resolveSet.
-			sb.WriteString(fmt.Sprintf("→ renamed %s → %s (%d callers updated)\n", op.Name, op.NewName, callerCount))
+			if parentType != nil {
+				sb.WriteString(fmt.Sprintf("→ renamed %s → %s (struct declaration + %d callers updated)\n", op.Name, op.NewName, callerCount))
+			} else {
+				sb.WriteString(fmt.Sprintf("→ renamed %s → %s (%d callers updated)\n", op.Name, op.NewName, callerCount))
+			}
 
 		case "insert-precondition":
 			line, errStr := projEdit(op, func(body string) (string, error) {
@@ -4243,19 +4654,22 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		sb.WriteString("\n" + buildResult)
 	}
 
+	if buildResult == "" && firstNonTestModuleID != 0 {
+		touchedTestFile := false
+		for f := range touchedFiles {
+			if strings.HasSuffix(f, "_test.go") {
+				touchedTestFile = true
+				break
+			}
+		}
+		if !touchedTestFile {
+			sb.WriteString(s.testCoverageHint(firstNonTestModuleID, ""))
+		}
+	}
+
 	return textResult(sb.String()), nil, nil
 }
 
-// handleRetargetFieldValue rewrites composite-literal field values across
-// every def whose body contains a matching pattern. Winze use case: given
-// `Claim{Subject: "s", Object: "OldTarget"}` var-decls scattered across
-// many files, change every `Object: "OldTarget"` to `Object: "NewTarget"`
-// atomically. Native equivalent is `sed -i 's/Object: "OldTarget"/Object:
-// "NewTarget"/g'` + pray no unrelated occurrence collides — AST-safe here.
-//
-// MVP scope: matches Type{...Field: OLD...} where Field's value is a
-// string literal. Non-string values (idents, other composites) skipped;
-// return count reports affected defs so the model knows how much moved.
 func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	if args.Name == "" || args.Field == "" {
 		return errResult(fmt.Errorf("retarget-field-value: name (struct type) and field are required"))
@@ -4266,11 +4680,22 @@ func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolR
 	typeName := args.Name
 	field := args.Field
 
-	// Iterate all modules → all defs. Load once, filter AST-side.
 	mods, err := s.backend.ListModules()
 	if err != nil {
 		return errResult(fmt.Errorf("list modules: %w", err))
 	}
+
+	// #12-class gap: this used to loop over every module writing straight
+	// to s.backend with no transaction at all -- potentially dozens of
+	// UpsertDefinition calls with zero atomicity, so a build failure after
+	// the loop left an arbitrary PARTIAL subset of them durably committed
+	// with nothing on disk to show for it.
+	tx, commit, rollback, txErr := s.backend.Begin()
+	if txErr != nil {
+		return errResult(txErr)
+	}
+	defer rollback()
+
 	updated := 0
 	var affectedNames []string
 	// #109 pass 2: collect the (file, modulePath) tuples we touched so
@@ -4283,7 +4708,7 @@ func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolR
 	}
 	touched := make(map[filePkg]bool)
 	for _, m := range mods {
-		defs, err := s.backend.GetModuleDefinitions(m.ID)
+		defs, err := tx.GetModuleDefinitions(m.ID)
 		if err != nil {
 			continue
 		}
@@ -4294,7 +4719,7 @@ func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolR
 			}
 			d.Body = newBody
 			d.Signature = extractSignature(newBody)
-			if _, err := s.backend.UpsertDefinition(&d); err != nil {
+			if _, err := tx.UpsertDefinition(&d); err != nil {
 				return errResult(fmt.Errorf("update %s: %w", d.Name, err))
 			}
 			updated++
@@ -4314,10 +4739,14 @@ func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolR
 	for fp := range touched {
 		goimportsFiles = append(goimportsFiles, fp.file)
 	}
-	buildResult := s.autoEmitAndBuildWithOpts(emit.Opts{
+	buildResult := s.commitOrRollbackOnBuild(tx, commit, rollback, emit.Opts{
 		GoimportsFiles: goimportsFiles,
 		TouchedFiles:   goimportsFiles,
 	})
+	if buildResult != "" {
+		return textResult(fmt.Sprintf("retarget-field-value %s.%s rolled back — nothing was saved\n\n%s", typeName, field, buildResult)), nil, nil
+	}
+
 	// Scoped resolve: iterate the unique touched files instead of the
 	// whole project. Safety valve: if we couldn't collect any touched
 	// files (e.g., every def had empty SourceFile — shouldn't happen),
@@ -4339,9 +4768,6 @@ func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolR
 			suffix = fmt.Sprintf(" (+%d more)", updated-len(affectedNames))
 		}
 		sb.WriteString("  Affected: " + strings.Join(affectedNames, ", ") + suffix + "\n")
-	}
-	if buildResult != "" {
-		sb.WriteString("\n" + buildResult)
 	}
 	return textResult(sb.String()), nil, nil
 }
@@ -4433,9 +4859,12 @@ func compositeMatchesType(expr ast.Expr, typeName string) bool {
 }
 
 func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
-	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
+	d, err := s.resolveWriteTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
+	}
+	if msg := unsupportedFieldOp(d.Kind, "delete"); msg != "" {
+		return errResult(fmt.Errorf("%s", msg))
 	}
 
 	// #105 safe-delete: refuse when references remain unless caller
@@ -4465,7 +4894,7 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	recv := formatReceiver(d.Receiver)
 
 	if args.DryRun {
-		return textResult(fmt.Sprintf("- would delete %s%s (id=%d)\n\n(dry run — no changes made)", recv, d.Name, d.ID)), nil, nil
+		return dryRunResult(fmt.Sprintf("- would delete %s%s (id=%d)", recv, d.Name, d.ID))
 	}
 
 	// #12: delete + build-gate through a transaction so a build failure
@@ -4516,7 +4945,14 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// autoResolve removes the full-project ResolveModule walk on every
 	// delete. force:true delete still applies (safe-delete's caller
 	// check gates unforced deletes at zero-callers anyway).
-	if buildResult == "" {
+	// buildResult=="" means committed (both paths). The force path also
+	// always commits regardless of buildResult (that's the whole point
+	// of force -- see the comment above) -- gating this solely on
+	// buildResult=="" skipped it there even though the delete was
+	// already durable, leaving the search-index cache stale (pointing
+	// at a definition that's actually gone) until some later successful
+	// write happened to invalidate it.
+	if buildResult == "" || args.Force {
 		if err := s.autoCommit(); err != nil {
 			fmt.Fprintf(os.Stderr, "defn: auto-commit failed (post-delete): %v\n", err)
 		}
@@ -4542,10 +4978,38 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// state gets corrupted. Waiting for ready serializes them.
 	s.waitReady()
 
-	d, err := s.backend.GetDefinitionByName(args.OldName, "")
+	// #248: was a raw bare-name lookup hardcoded to modulePath="" with no
+	// receiver/module/file params on renameParam at all -- rename couldn't
+	// be disambiguated even if the caller wanted to, the worst case of the
+	// same silent-wrong-target bug fixed elsewhere via resolveWriteTarget.
+	d, err := s.resolveWriteTarget(args.OldName, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.OldName, err)
 	}
+
+	// Struct fields are indexed as their own "field" kind def for
+	// Type.Field lookup (GetCallers/impact), but they aren't independent
+	// top-level declarations -- a field only exists syntactically inside
+	// its struct's braces, and emitModule deliberately EXCLUDES field-kind
+	// defs from emit (#11). The rest of this function's fast, no-build-gate
+	// path assumes rename is a name-preserving, dispatch-safe transform --
+	// true for funcs/methods/types/vars, but not for a field, which also
+	// needs the enclosing TYPE's own Body rewritten (a separate DB row)
+	// and pays for real build validation (astRename's caller-body rewrite
+	// can't tell this field apart from an unrelated same-named field on
+	// some other type -- confirmed live). See handleFieldRename.
+	if d.Kind == "field" {
+		return s.handleFieldRename(d, args)
+	}
+
+	// See methodRenameRisksInterfaceBreak's doc comment: renaming a
+	// method that also satisfies an interface under the old name can
+	// silently ship code that no longer compiles, since nothing here
+	// rewrites the interface's own (separately-stored) method text. When
+	// at risk, pay for a real build gate below instead of skipping it, so
+	// a break surfaces as an honest rollback with the real compiler
+	// diagnostic instead of silently-written broken code.
+	riskyInterfaceRename := s.methodRenameRisksInterfaceBreak(s.backend, d, d.Name)
 
 	// Compose the qualified old-name the safety net compares against (methods
 	// use "<Recv>.Name", pointer receivers unwrapped). Reserve it BEFORE we
@@ -4563,6 +5027,17 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// operation instead of the possibly-qualified args.OldName.
 	oldBareName := d.Name
 
+	// #12/#218-class protection: route every write through a transaction
+	// so a build failure (risky path) or an emit-level WARNING (either
+	// path) leaves neither the DB nor the file changed, instead of the
+	// prior plain s.backend writes which always committed immediately
+	// regardless of what emit reported.
+	tx, commit, rollback, txErr := s.backend.Begin()
+	if txErr != nil {
+		return errResult(txErr)
+	}
+	defer rollback()
+
 	// Update the definition name in its own body using AST rename.
 	// Only renames identifiers — preserves comments and string literals.
 	totalSkipped := 0
@@ -4574,27 +5049,22 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// Do NOT use UpsertDefinition here: it looks up by (module,name,kind,recv,test)
 	// and would INSERT a new row for the new name, leaving the old row orphaned
 	// in the DB and both defs in the emitted file.
-	if err := s.backend.RenameDefinition(originalID, args.NewName, newBody, newSig, exported); err != nil {
+	if err := tx.RenameDefinition(originalID, args.NewName, newBody, newSig, exported); err != nil {
 		return errResult(err)
 	}
-	// #160: renamed def has new intent (name is a strong signal in the
-	// summary prompt) — regenerate. Body/receiver/kind stay the same
-	// otherwise; enqueue uses the post-rename shape.
-	d.Name = args.NewName
-	d.Body = newBody
-	d.Signature = newSig
-	d.Exported = exported
-	s.enqueueSummary(d)
 
 	// Update all callers' bodies that reference the old name. Also collect
 	// each touched file so goimports can scope to just those (#109 pass 3):
 	// rename touches the def's own file + every caller's file, typically a
 	// small handful vs the whole project tree.
-	callers, err := s.backend.GetCallers(originalID)
+	callers, err := tx.GetCallers(originalID)
 	if err != nil {
 		return errResult(fmt.Errorf("get callers for rename: %w", err))
 	}
 	touchedFiles := map[string]bool{}
+	var allowedRemovals, allowedAdds []string
+	allowedRemovals = append(allowedRemovals, qualifiedOld)
+	allowedAdds = append(allowedAdds, emit.FuncIdentity(args.NewName, d.Receiver))
 	if d.SourceFile != "" {
 		touchedFiles[d.SourceFile] = true
 	}
@@ -4605,7 +5075,7 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 			caller.Body, skipped = astRename(caller.Body, oldBareName, args.NewName)
 			totalSkipped += skipped
 			caller.Signature = extractSignature(caller.Body)
-			if _, err := s.backend.UpsertDefinition(&caller); err != nil {
+			if _, err := tx.UpsertDefinition(&caller); err != nil {
 				return errResult(fmt.Errorf("update caller %s: %w", caller.Name, err))
 			}
 			if caller.SourceFile != "" {
@@ -4614,34 +5084,110 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 			updated++
 		}
 	}
+
+	// A type's methods are declared elsewhere as their OWN top-level
+	// definitions with the type name stored as a free-text Receiver
+	// string ("*Widget"), not as a refs-graph edge into the type's def
+	// -- GetCallers above never surfaces them. Renaming the type without
+	// also rewriting every method's receiver clause left them pointing
+	// at a type name that no longer existed, in a file rename never even
+	// touched, while still reporting success (#148-class bug: found via
+	// the mutation fuzzer after widening it to include type kinds).
+	// Bounded and cheap: methods can only be declared in the SAME
+	// package as their receiver type, so this is one same-module scan,
+	// not a project-wide search.
+	updatedReceivers := 0
+	if d.Kind == "type" {
+		siblings, sErr := tx.GetModuleDefinitions(d.ModuleID)
+		if sErr == nil {
+			for _, m := range siblings {
+				if m.Kind != "method" || m.ID == originalID {
+					continue
+				}
+				if strings.TrimPrefix(m.Receiver, "*") != oldBareName {
+					continue
+				}
+				oldRecv := m.Receiver
+				newRecv := args.NewName
+				if strings.HasPrefix(oldRecv, "*") {
+					newRecv = "*" + args.NewName
+				}
+				newMethodBody, mSkipped := astRename(m.Body, oldBareName, args.NewName)
+				totalSkipped += mSkipped
+				newMethodSig := extractSignature(newMethodBody)
+				// UpdateDefinitionReceiver, not UpsertDefinition: receiver
+				// is part of the natural key, so upserting a Definition
+				// whose Receiver field already changed would insert a
+				// second row instead of updating this one in place (see
+				// its doc comment -- caught live via the mutation fuzzer
+				// reporting an "unmatched want" for the OLD receiver
+				// identity, meaning the stale row was still there).
+				if err := tx.UpdateDefinitionReceiver(m.ID, newRecv, newMethodBody, newMethodSig); err != nil {
+					return errResult(fmt.Errorf("update method %s%s receiver: %w", oldRecv, m.Name, err))
+				}
+				allowedRemovals = append(allowedRemovals, emit.FuncIdentity(m.Name, oldRecv))
+				allowedAdds = append(allowedAdds, emit.FuncIdentity(m.Name, newRecv))
+				if m.SourceFile != "" {
+					touchedFiles[m.SourceFile] = true
+				}
+				updatedReceivers++
+			}
+		}
+	}
+
 	goimportsFiles := make([]string, 0, len(touchedFiles))
 	for f := range touchedFiles {
 		goimportsFiles = append(goimportsFiles, f)
 	}
 
-	// #148: rename is dispatch-safe by construction — refs are by def-ID,
-	// no ID changes on rename, so the ref graph and interface satisfaction
-	// are preserved regardless of build outcome. Skip the build gate;
-	// this is the biggest single win of #148 (rename was 187ms wall on
-	// winze with 148ms in go build; drops to ~40ms).
 	// #163: rename = delete-old + create-new to the emit path. Declare
 	// both so the merge can splice in-place (old name removed, new
 	// name spliced) instead of leaving the new name behind as drift.
-	buildResult := s.autoEmitOnlyWithOpts(emit.Opts{
-		AllowedRemovals: []string{qualifiedOld},
-		AllowedAdds:     []string{emit.FuncIdentity(args.NewName, d.Receiver)},
+	opts := emit.Opts{
+		AllowedRemovals: allowedRemovals,
+		AllowedAdds:     allowedAdds,
 		GoimportsFiles:  goimportsFiles,
 		TouchedFiles:    goimportsFiles,
-	})
+	}
+	var buildResult string
+	if riskyInterfaceRename || updatedReceivers > 0 {
+		buildResult = s.commitOrRollbackOnBuild(tx, commit, rollback, opts)
+	} else {
+		// #148: rename is dispatch-safe by construction for the ref
+		// graph — refs are by def-ID, no ID changes on rename — so the
+		// go build check itself is skippable here; this is the biggest
+		// single win of #148 (rename was 187ms wall on winze with 148ms
+		// in go build; drops to ~40ms). Still routed through the real
+		// commit/rollback machinery (not a bare emit) so an emit-level
+		// WARNING gets the same #218 rollback protection every other
+		// write path has, rather than being reported as informational
+		// text after the DB write already landed.
+		buildResult = s.commitOrRollbackOnEmit(tx, commit, rollback, opts)
+	}
+
+	if buildResult != "" {
+		return textResult(fmt.Sprintf("rename %s → %s rolled back — nothing was saved\n\n%s", args.OldName, args.NewName, buildResult)), nil, nil
+	}
+
+	// #160: renamed def has new intent (name is a strong signal in the
+	// summary prompt) — regenerate. Body/receiver/kind stay the same
+	// otherwise; enqueue uses the post-rename shape.
+	d.Name = args.NewName
+	d.Body = newBody
+	d.Signature = newSig
+	d.Exported = exported
+	s.enqueueSummary(d)
+
 	// #109: rename is a name-preserving semantic transform — every from_def
 	// → to_def edge in the refs table is ID-based, and no def IDs change
 	// on rename. Caller bodies were already rewritten via astRename so
 	// their AST-shape matches, but the edge SET is identical. Interface
-	// satisfaction is preserved because it's driven by types.Object
-	// identities (also stable). Skipping autoResolve here removes the
-	// full-module ResolveModule call that dominated a single-symbol
-	// rename on winze (5,239 refs re-derived for one name change).
-	// Still autocommit so the DB working set stays clean.
+	// satisfaction is preserved when riskyInterfaceRename was false (the
+	// common case); when true, the build gate above already confirmed it
+	// still compiles. Skipping autoResolve here removes the full-module
+	// ResolveModule call that dominated a single-symbol rename on winze
+	// (5,239 refs re-derived for one name change). Still autocommit so
+	// the DB working set stays clean.
 	if err := s.autoCommit(); err != nil {
 		fmt.Fprintf(os.Stderr, "defn: auto-commit failed (post-rename): %v\n", err)
 	}
@@ -4652,30 +5198,15 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Renamed %s → %s\n", args.OldName, args.NewName))
 	sb.WriteString(fmt.Sprintf("Updated %d callers\n", updated))
+	if updatedReceivers > 0 {
+		sb.WriteString(fmt.Sprintf("Updated %d method receiver(s)\n", updatedReceivers))
+	}
 	if totalSkipped > 0 {
 		sb.WriteString(fmt.Sprintf("\nNote: %d local variable(s) named %q were preserved (not renamed).\n", totalSkipped, args.OldName))
-	}
-	if buildResult != "" {
-		sb.WriteString("\n" + buildResult)
 	}
 	return textResult(sb.String()), nil, nil
 }
 
-// handleTestByName runs `go test -run <pattern>` so the model can
-// reproduce a bug from an issue that names the failing test directly.
-// L11: agents that read the right code but never confirm the failure loop
-// through the read graph without committing to a fix. Naming a test lets
-// the model turn a hypothesis into an observation before writing.
-//
-// #241: module/file scope the run to one package (go test -run P
-// ./<dir>/...) instead of always running the ENTIRE repo (./...) just
-// to filter by name -- on a large repo this is both a real wire-cost
-// tax (every unrelated package's build+test output ships back, most
-// of it "no tests to run") and confusing enough that a real trajectory
-// retried the same named test 5+ times with different -run variations,
-// unable to tell its own result apart from the flood of irrelevant
-// package output. module/file are best-effort: an unresolvable scope
-// falls back to today's ./... behavior, never an error.
 func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, pattern, module, file string) (*sdkmcp.CallToolResult, any, error) {
 	if s.projectDir == "" {
 		return errResult(fmt.Errorf("no project directory configured"))
@@ -4683,11 +5214,6 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 	if pattern == "" {
 		return errResult(fmt.Errorf("test: pattern is empty"))
 	}
-	// Ensure files reflect any pending DB edits so the test sees them.
-	if err := emit.Emit(s.backend, s.projectDir); err != nil {
-		return errResult(fmt.Errorf("emit: %w", err))
-	}
-
 	// store.Module is per go.mod, not per package -- a single-module repo
 	// (the common case: go-zero, grpc-go, cli all have exactly one go.mod
 	// at the root) has exactly one Module row covering every package, so
@@ -4696,11 +5222,11 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 	// is meant to replace. Match directly against source_file paths
 	// instead (same approach as search's file: fix), which actually
 	// distinguishes "core/logx" from every other package in the repo.
-	target := "./..."
 	hint := file
 	if hint == "" {
 		hint = module
 	}
+	ambiguityMsg := ""
 	if hint == "" && testNamePattern.MatchString(pattern) {
 		// No explicit scope, but pattern is very often the literal test
 		// name being targeted (the documented, common case: reproduce an
@@ -4710,42 +5236,95 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 		// `go test ./...` fail regardless of whether the agent's actual
 		// edit -- in a completely different package -- was correct.
 		// Scoping to the named test's own package sidesteps any sibling
-		// package that isn't even imported by it. Best-effort: silently
-		// falls through to ./... if the name doesn't resolve or is
-		// ambiguous across packages.
+		// package that isn't even imported by it. Best-effort tiebreak
+		// (most production callers) when the name is ambiguous across
+		// packages -- real trajectory (cli-5503): test:"TestNewCmdList"
+		// silently ran against an unrelated same-named test in a sibling
+		// package and reported PASS, with nothing verified in the package
+		// actually edited. ambiguityNote discloses the tiebreak below
+		// instead of staying silent about it, same precedent as #248's
+		// read/outline fix.
 		if d, err := s.backend.GetDefinitionByName(pattern, ""); err == nil && d != nil {
 			hint = d.SourceFile
+			ambiguityMsg = s.ambiguityNote(pattern, "", "", "")
 		}
 	}
-	if hint != "" {
-		if files, err := s.backend.DistinctSourceFiles(); err == nil {
-			for _, f := range files {
-				if !strings.Contains(f, hint) {
-					continue
+	target := s.testScopeTarget(hint)
+
+	// Ensure files reflect any pending DB edits so the test sees them.
+	// Every write op already emits its own touched file(s) immediately
+	// on success (commitOrRollbackOnBuild/autoEmitAndBuild) -- this is a
+	// defensive catch-all for the rare case a DB write landed without
+	// going through that path, not a routine "the project has pending
+	// edits" step. A full unscoped emit.Emit here used to re-serialize
+	// and goimports-normalize EVERY file in the whole project on every
+	// single test run, silently rewriting the import grouping of files
+	// nothing about this task ever touched (confirmed via a real etcd
+	// bench trajectory: unrelated generated .pb.gw.go files in
+	// completely different modules got their imports reordered by a
+	// test call, tanking that run's precision even though the actual
+	// edit was exact). Scope to whatever directory testScopeTarget
+	// already resolved -- same scope the go test invocation itself
+	// uses below, so this can never under-cover what's about to run.
+	// Only the genuinely-unscoped "./..." case (no hint resolved at
+	// all) still pays the full emit, same as before.
+	if target == "./..." {
+		if err := emit.Emit(s.backend, s.projectDir); err != nil {
+			return errResult(fmt.Errorf("emit: %w", err))
+		}
+	} else {
+		scopeDir := strings.TrimSuffix(strings.TrimPrefix(target, "./"), "/...")
+		var scopedFiles []string
+		if all, err := s.backend.DistinctSourceFiles(); err == nil {
+			for _, f := range all {
+				switch {
+				case scopeDir == ".":
+					// testScopeTarget's "." means the root package ONLY
+					// (distinct from "./..." recursive-everything) --
+					// match root-level files alone, not every file.
+					if !strings.Contains(f, "/") {
+						scopedFiles = append(scopedFiles, f)
+					}
+				case f == scopeDir || strings.HasPrefix(f, scopeDir+"/"):
+					scopedFiles = append(scopedFiles, f)
 				}
-				if dir := filepath.ToSlash(filepath.Dir(f)); dir != "" && dir != "." {
-					target = "./" + dir + "/..."
-				}
-				break
+			}
+		}
+		if len(scopedFiles) > 0 {
+			if _, err := emit.EmitWithOpts(s.backend, s.projectDir, emit.Opts{
+				TouchedFiles:   scopedFiles,
+				GoimportsFiles: scopedFiles,
+			}); err != nil {
+				return errResult(fmt.Errorf("emit: %w", err))
 			}
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeoutFor(0, target))
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "go", "test", "-run", pattern, "-count=1", "-v", target)
 	cmd.Dir = s.projectDir
 	out, err := cmd.CombinedOutput()
 
+	outStr := string(out)
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Running -run %q across %s:\n\n", pattern, target))
-	sb.WriteString(truncateTestOutput(string(out)))
-	if err != nil {
+	sb.WriteString(truncateTestOutput(outStr))
+	switch {
+	case err != nil && testBuildFailed(outStr):
+		sb.WriteString("\nBUILD FAILED -- the package did not compile; zero tests ran. This is NOT a test-failure signal, fix the compile error shown above first")
+	case err != nil && testPanicked(outStr):
+		sb.WriteString("\nTEST BINARY PANICKED -- not a normal assertion failure; likely caused by state unrelated to your edit (e.g. duplicate flag/command registration shared across tests in one binary). Investigate the panic trace above before assuming your edit is wrong")
+	case ctx.Err() == context.DeadlineExceeded:
+		sb.WriteString(fmt.Sprintf("\nTIMED OUT after %s -- this is NOT a pass; the run was killed before finishing. This may be a hang from your edit, or simply a large/slow test package -- set DEFN_TEST_TIMEOUT=<duration> (e.g. \"5m\") to allow more time before assuming a hang", testTimeout))
+	case err != nil:
 		sb.WriteString("\nSOME TESTS FAILED")
-	} else {
+	case testMatchedNothing(outStr):
+		sb.WriteString(fmt.Sprintf("\nNO TESTS MATCHED — pattern %q matched zero tests in %s; nothing was verified. Check the name/pattern and scope (module:/file:) before trusting this as a pass", pattern, target))
+	default:
 		sb.WriteString("\nALL TESTS PASSED")
 	}
-	return textResult(sb.String()), nil, nil
+	return prependNote(textResult(sb.String()), ambiguityMsg), nil, nil
 }
 
 func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
@@ -4770,8 +5349,25 @@ func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args n
 		return errResult(fmt.Errorf("no project directory configured"))
 	}
 
-	// Ensure files are current.
-	if err := emit.Emit(s.backend, s.projectDir); err != nil {
+	// Ensure the target def's own file is current. Every write op already
+	// emits its own touched file(s) immediately on success
+	// (commitOrRollbackOnBuild/autoEmitAndBuild) -- this is a defensive
+	// catch-all for the rare case a DB write landed without going
+	// through that path, not a routine "the project has pending edits"
+	// step. A full unscoped emit.Emit here used to re-serialize and
+	// goimports-normalize EVERY file in the whole project on every
+	// single test run, silently rewriting the import grouping of files
+	// nothing about this task ever touched (confirmed via a real etcd
+	// bench trajectory: three unrelated generated .pb.gw.go files in
+	// completely different modules got their imports reordered by a
+	// code(op:"test") call, tanking that run's precision even though
+	// the actual edit was exact). Scoping to just the def's file removes
+	// that blast radius entirely while still covering the one case this
+	// exists for.
+	if _, err := emit.EmitWithOpts(s.backend, s.projectDir, emit.Opts{
+		TouchedFiles:   []string{d.SourceFile},
+		GoimportsFiles: []string{d.SourceFile},
+	}); err != nil {
 		return errResult(fmt.Errorf("emit: %w", err))
 	}
 
@@ -4782,20 +5378,37 @@ func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args n
 	}
 	runPattern := "^(" + strings.Join(testNames, "|") + ")$"
 
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	// #248: this used to always run `./...` regardless of where the
+	// target definition and its tests actually live -- the same
+	// whole-repo flood #241 fixed for handleTestByName, just on the
+	// sibling name-based entry point. Scope to the target definition's
+	// own package the same way.
+	target := s.testScopeTarget(d.SourceFile)
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeoutFor(len(testNames), target))
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "test", "-run", runPattern, "-count=1", "-v", "./...")
+	cmd := exec.CommandContext(ctx, "go", "test", "-run", runPattern, "-count=1", "-v", target)
 	cmd.Dir = s.projectDir
 	out, err := cmd.CombinedOutput()
 
+	outStr := string(out)
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Running %d of %d tests (affected by %s):\n\n",
-		len(testNames), len(testNames), args.Name))
-	sb.WriteString(truncateTestOutput(string(out)))
+	sb.WriteString(fmt.Sprintf("Running %d of %d tests (affected by %s) across %s:\n\n",
+		len(testNames), len(testNames), args.Name, target))
+	sb.WriteString(truncateTestOutput(outStr))
 
-	if err != nil {
+	switch {
+	case err != nil && testBuildFailed(outStr):
+		sb.WriteString("\nBUILD FAILED -- the package did not compile; zero tests ran. This is NOT a test-failure signal, fix the compile error shown above first")
+	case err != nil && testPanicked(outStr):
+		sb.WriteString("\nTEST BINARY PANICKED -- not a normal assertion failure; likely caused by state unrelated to your edit (e.g. duplicate flag/command registration shared across tests in one binary). Investigate the panic trace above before assuming your edit is wrong")
+	case ctx.Err() == context.DeadlineExceeded:
+		sb.WriteString(fmt.Sprintf("\nTIMED OUT after %s -- this is NOT a pass; the run was killed before finishing. This may be a hang from your edit, or simply a large/slow test package -- set DEFN_TEST_TIMEOUT=<duration> (e.g. \"5m\") to allow more time before assuming a hang", testTimeout))
+	case err != nil:
 		sb.WriteString("\nSOME TESTS FAILED")
-	} else {
+	case testMatchedNothing(outStr):
+		sb.WriteString(fmt.Sprintf("\nNO TESTS MATCHED — the %d covering test(s) didn't run in %s (likely scoped to the wrong package, e.g. coverage via interface dispatch in a sibling package); nothing was verified", len(testNames), target))
+	default:
 		sb.WriteString("\nALL TESTS PASSED")
 	}
 
@@ -4935,6 +5548,44 @@ func (s *server) handleSync(_ context.Context, _ *sdkmcp.CallToolRequest, args c
 			return errResult(fmt.Errorf("commit after sync: %w", err))
 		}
 		return textResult(fmt.Sprintf("Synced %s: updated %d definitions.", args.File, n)), nil, nil
+	}
+
+	// Fast path: sync every file belonging to one module without a
+	// full-repo packages.Load. Without this, module: was accepted by
+	// the schema but silently ignored, falling through to a whole-repo
+	// resync -- one unrelated, unbuildable package elsewhere in a large
+	// repo then failed the ENTIRE sync (verified via a real grpc-go
+	// trajectory: google.golang.org/grpc/balancer/rls/internal/keys
+	// couldn't be resynced because an unrelated xds/experimental
+	// package failed to load).
+	if args.Module != "" {
+		mod := s.findModule(args.Module)
+		if mod == nil {
+			return errResult(fmt.Errorf("sync: no module matching %q", args.Module))
+		}
+		sources, err := s.backend.ListFileSources(mod.ID)
+		if err != nil {
+			return errResult(fmt.Errorf("list module files: %w", err))
+		}
+		n := 0
+		for sourceFile := range sources {
+			filePath := sourceFile
+			if !filepath.IsAbs(filePath) {
+				filePath = filepath.Join(s.projectDir, filePath)
+			}
+			defs, err := ingest.IngestFile(s.backend, s.projectDir, filePath)
+			if err != nil {
+				return errResult(fmt.Errorf("ingest file %s: %w", sourceFile, err))
+			}
+			if err := resolve.ResolveFile(s.backend, s.projectDir, filePath); err != nil {
+				return errResult(fmt.Errorf("resolve file %s: %w", sourceFile, err))
+			}
+			n += defs
+		}
+		if err := s.autoCommit(); err != nil {
+			return errResult(fmt.Errorf("commit after sync: %w", err))
+		}
+		return textResult(fmt.Sprintf("Synced module %s: updated %d definitions across %d files.", mod.Path, n, len(sources))), nil, nil
 	}
 
 	// Full sync: re-ingest all packages and rebuild references.
@@ -5099,7 +5750,7 @@ func (s *server) projectOverview(ctx context.Context) (*sdkmcp.CallToolResult, a
 		return errResult(fmt.Errorf("list modules: %w", err))
 	}
 	if len(mods) == 0 {
-		return textResult("[project overview: no modules ingested — run defn ingest .]"), nil, nil
+		return textResult("[project overview: no modules ingested — call code(op:\"sync\") to ingest the project, or run `defn ingest .` from a shell.]"), nil, nil
 	}
 	sort.Slice(mods, func(i, j int) bool { return mods[i].Path < mods[j].Path })
 
@@ -5237,9 +5888,29 @@ func (s *server) handleOverview(ctx context.Context, _ *sdkmcp.CallToolRequest, 
 		dir = file
 	}
 
-	defs, err := s.backend.FindDefinitionsByFile(dir, sourceFile, 0)
+	// #253: for the bare-directory shape (no sourceFile), FindDefinitionsByFile
+	// falls back to `m.path LIKE %fileSuffix%`, which assumes a module's
+	// import path is literally a filesystem-path suffix of the directory --
+	// false for any nested module using semantic import versioning (etcd's
+	// server/embed/ -> go.etcd.io/etcd/server/v3/embed does not end with
+	// "/server/embed" because "v3" sits in the middle). Resolve via the
+	// filesystem first (same mechanism as findModuleByFile) and scope by
+	// exact module ID when that succeeds; only fall back to the LIKE-based
+	// lookup when it doesn't (e.g. `file:` was already a full import path,
+	// or projectDir is unset).
+	var defs []store.Definition
+	var err error
+	if sourceFile == "" {
+		mods, _ := s.backend.ListModules()
+		if mod := s.findModuleForRelDir(mods, dir); mod != nil {
+			defs, err = s.backend.GetModuleDefinitions(mod.ID)
+		}
+	}
+	if len(defs) == 0 {
+		defs, err = s.backend.FindDefinitionsByFile(dir, sourceFile, 0)
+	}
 	if err != nil || len(defs) == 0 {
-		return errResult(fmt.Errorf("no definitions found for %s", file))
+		return errResult(fmt.Errorf("no definitions found for %s -- check the path (try op:\"overview\" with no file: for the project map, or op:\"search\" to find the right path)", file))
 	}
 
 	// #157 query-context: filter defs to those whose name/doc/
@@ -5272,11 +5943,22 @@ func (s *server) handleOverview(ctx context.Context, _ *sdkmcp.CallToolRequest, 
 		}
 	}
 
+	// #248: cap AFTER query filtering so a narrowing query still returns
+	// its own matches in full when they fit.
+	var cappedFrom int
+	if len(defs) > overviewDefsCap {
+		cappedFrom = len(defs)
+		defs = defs[:overviewDefsCap]
+	}
+
 	// Get full definitions with bodies to check relationships.
 	var sb strings.Builder
-	if hiddenDefs > 0 {
+	switch {
+	case hiddenDefs > 0:
 		sb.WriteString(fmt.Sprintf("## %s (%d of %d definitions, filtered by query=%q)\n\n", file, len(defs), totalDefs, args.Query))
-	} else {
+	case cappedFrom > 0:
+		sb.WriteString(fmt.Sprintf("## %s (showing %d of %d definitions — pass a narrower file/query for the rest)\n\n", file, len(defs), cappedFrom))
+	default:
 		sb.WriteString(fmt.Sprintf("## %s (%d definitions)\n\n", file, len(defs)))
 	}
 
@@ -5372,9 +6054,12 @@ func (s *server) handlePatch(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		return errResult(fmt.Errorf("patch: old_name and new_name are required (the old and new text)"))
 	}
 
-	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
+	d, err := s.resolveWriteTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
+	}
+	if msg := unsupportedFieldOp(d.Kind, "patch"); msg != "" {
+		return errResult(fmt.Errorf("%s", msg))
 	}
 
 	if !strings.Contains(d.Body, args.OldName) {
@@ -5384,19 +6069,28 @@ func (s *server) handlePatch(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	d.Body = strings.Replace(d.Body, args.OldName, args.NewName, 1)
 	d.Signature = extractSignature(d.Body)
 
-	if _, err := s.backend.UpsertDefinition(d); err != nil {
+	// #12-class gap: see handleInsert's comment -- this handler had the
+	// same unprotected direct-to-s.backend write.
+	tx, commit, rollback, txErr := s.backend.Begin()
+	if txErr != nil {
+		return errResult(txErr)
+	}
+	defer rollback()
+	if _, err := tx.UpsertDefinition(d); err != nil {
 		return errResult(err)
 	}
 
-	buildResult := s.autoEmitAndBuildForFile(d.SourceFile)
+	var opts emit.Opts
+	if d.SourceFile != "" {
+		opts = emit.Opts{GoimportsFiles: []string{d.SourceFile}, TouchedFiles: []string{d.SourceFile}}
+	}
+	buildResult := s.commitOrRollbackOnBuild(tx, commit, rollback, opts)
+	if buildResult != "" {
+		return textResult(fmt.Sprintf("patch %s rolled back — nothing was saved\n\n%s", args.Name, buildResult)), nil, nil
+	}
 	s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
 
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Patched %s: replaced %q → %q\n", args.Name, args.OldName, args.NewName))
-	if buildResult != "" {
-		sb.WriteString("\n" + buildResult)
-	}
-	return textResult(sb.String()), nil, nil
+	return textResult(fmt.Sprintf("Patched %s: replaced %q → %q\n", args.Name, args.OldName, args.NewName)), nil, nil
 }
 
 // astRename renames identifiers in Go source using go/parser.
@@ -5527,7 +6221,7 @@ func (s *server) handleFind(_ context.Context, _ *sdkmcp.CallToolRequest, args f
 		return errResult(err)
 	}
 	if len(defs) == 0 {
-		return errResult(fmt.Errorf("no definitions found at %s:%d", args.File, args.Line))
+		return errResult(fmt.Errorf("no definitions found at %s:%d -- check the path (try op:\"overview\" with no file: for the project map, or op:\"search\" to find the right path)", args.File, args.Line))
 	}
 
 	var sb strings.Builder
@@ -5655,30 +6349,7 @@ func compactReadFile(file, modulePath string, defs []store.Definition, fullSize 
 	return sb.String()
 }
 
-// handleExpand returns a definition plus caller-chosen graph neighborhoods
-// in one tool_result. Attacks the N² cache-read cost problem: every kind
-// under `include:` is a hop that would otherwise cost a separate turn.
-//
-// Supported include kinds: "outline" (sig+doc+body-size+callees+flow —
-// the compact projection, 5-10× smaller than body), "body" (full source),
-// "callers" (direct callers with source locations).
-//
-// Default when include is omitted: ["outline","callers"] — the pair that
-// answers most exploratory questions ("what does X do / who calls it")
-// without paying for the body. Explicitly request "body" when you're
-// about to edit or need to see branching. See #172.
-//
-// #210: accepts names:["A","B",...] (plural) to expand several defs in
-// ONE call instead of one expand per target -- the #206/#209 chi-explore
-// bench found the model making 11 separate expand calls in a single turn
-// for exactly this shape (routeHTTP, Handle, Middlewares, Chain, Route,
-// Mount, ...), each paying a full round-trip's cache-read cost on top of
-// the growing conversation prefix. name (singular) still works and is
-// equivalent to names:[name] -- fully backward compatible. Unresolvable
-// names are skipped with a note rather than failing the whole call.
-//
-// Design notes in scratchpad/expand-op-design.md.
-func (s *server) handleExpand(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) handleExpand(_ context.Context, req *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	names := args.Names
 	if len(names) == 0 {
 		if strings.TrimSpace(args.Name) == "" {
@@ -5718,7 +6389,40 @@ func (s *server) handleExpand(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		if resolved > 0 {
 			sb.WriteString("\n---\n\n")
 		}
-		if err := s.renderExpandSection(&sb, d, modulePathByID[d.ModuleID], want); err != nil {
+		// #248 gap: the circuit breaker (turn_state.go) silently redirects
+		// blocked bare-name read/outline calls through this same expand
+		// path, which resolves via the identical best-effort tiebreak as
+		// handleCode's direct "read"/"outline" cases but -- unlike those --
+		// never disclosed it. An ambiguous name auto-batched through expand
+		// resolved silently, with no way to tell it wasn't the only match.
+		if note := s.ambiguityNote(name, "", args.Module, args.File); note != "" {
+			sb.WriteString(note)
+		}
+		// This name's own want-map: a per-name copy only when body needs to
+		// be suppressed below, so other names in the same batch still get
+		// whatever the caller asked for.
+		sectionWant := want
+		if want["body"] && req != nil && s.respCache != nil {
+			// The direct read/outline/slice dispatch cases in handleCode all
+			// check bodyServedEpochsAgo before re-serving a body, but this
+			// batched path -- including the circuit breaker's own auto-batch
+			// redirect through here -- never did, so a name whose full body
+			// was already read verbatim this session got it re-dumped in
+			// full again on the very next expand/auto-batch that swept it
+			// in. Confirmed via a real grpc-go-3119 trajectory: a function
+			// read explicitly via read(full:true) got its body re-served 10
+			// calls later purely because it was caught in an unrelated
+			// circuit-breaker batch.
+			if epochsAgo, ok := s.respCache.bodyServedEpochsAgo(req.Session, name); ok && epochsAgo <= staleEpochThreshold {
+				sectionWant = map[string]bool{}
+				for k, v := range want {
+					sectionWant[k] = v
+				}
+				sectionWant["body"] = false
+				sb.WriteString(fmt.Sprintf("_(%s's full body was already read in this session via read(full:true) -- omitted here, nothing new. If it may have changed since, call code(op:\"sync\") first.)_\n", name))
+			}
+		}
+		if err := s.renderExpandSection(&sb, d, modulePathByID[d.ModuleID], sectionWant); err != nil {
 			return errResult(fmt.Errorf("expand: gather callers for %s: %w", name, err))
 		}
 		resolved++
@@ -5868,11 +6572,17 @@ func (s *server) handleFileDefs(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 		StartLine int    `json:"start_line"`
 		EndLine   int    `json:"end_line"`
 	}
-	total := len(defs)
-	if total > fileDefsCap {
-		defs = defs[:fileDefsCap]
+	// #250: Limit was accepted but silently ignored -- output was always
+	// capped at the fixed fileDefsCap with no way to ask for more.
+	limit := fileDefsCap
+	if args.Limit > 0 {
+		limit = args.Limit
 	}
-	var results []defSummary
+	total := len(defs)
+	if total > limit {
+		defs = defs[:limit]
+	}
+	results := make([]defSummary, 0, len(defs))
 	for _, d := range defs {
 		results = append(results, defSummary{
 			Name: d.Name, Kind: d.Kind, Receiver: d.Receiver,
@@ -5883,8 +6593,8 @@ func (s *server) handleFileDefs(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 	if err != nil {
 		return errResult(err)
 	}
-	if total > fileDefsCap {
-		return textResult(fmt.Sprintf("%d of %d definitions in %s (showing first %d — pass a narrower file/query for the rest):\n\n%s", len(results), total, file, fileDefsCap, text)), nil, nil
+	if total > limit {
+		return textResult(fmt.Sprintf("%d of %d definitions in %s (showing first %d — pass limit: for more):\n\n%s", len(results), total, file, limit, text)), nil, nil
 	}
 	return textResult(fmt.Sprintf("%d definitions in %s:\n\n%s", len(results), file, text)), nil, nil
 }
@@ -6011,7 +6721,32 @@ func (s *server) handleLiterals(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 	} else if !strings.Contains(typeName, "%") {
 		typeName = "%" + typeName + "%" // convenience: partial match
 	}
-	fields, err := s.backend.QueryLiteralFields(typeName, args.Name, args.Body, nil, nil, 200, false, false)
+	limit := 200
+	if args.Limit > 0 {
+		limit = args.Limit
+	}
+
+	// #250: File was accepted but silently ignored -- every literals query
+	// ran repo-wide regardless, same silent-drop class as #241 (search's
+	// file:). Scope via defIDs, the pre-filter QueryLiteralFields already
+	// supports for exactly this purpose.
+	var defIDs []int64
+	if args.File != "" {
+		allDefs, ferr := s.backend.FindDefinitions("%")
+		if ferr != nil {
+			return errResult(fmt.Errorf("query literals: %w", ferr))
+		}
+		for _, d := range allDefs {
+			if strings.Contains(d.SourceFile, args.File) {
+				defIDs = append(defIDs, d.ID)
+			}
+		}
+		if len(defIDs) == 0 {
+			return textResult("No literal fields found"), nil, nil
+		}
+	}
+
+	fields, err := s.backend.QueryLiteralFields(typeName, args.Name, args.Body, nil, defIDs, limit, false, false)
 	if err != nil {
 		return errResult(fmt.Errorf("query literals: %w", err))
 	}
@@ -6066,14 +6801,20 @@ func (s *server) handlePragmas(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 		comments = filtered
 	}
 
+	// #250: Limit was accepted but silently ignored -- output was always
+	// capped at the fixed pragmasCap with no way to ask for more.
+	limit := pragmasCap
+	if args.Limit > 0 {
+		limit = args.Limit
+	}
 	total := len(comments)
-	if total > pragmasCap {
-		comments = comments[:pragmasCap]
+	if total > limit {
+		comments = comments[:limit]
 	}
 
 	var sb strings.Builder
-	if total > pragmasCap {
-		fmt.Fprintf(&sb, "## Pragmas matching %q (showing %d of %d results — pass file: or a narrower pattern for the rest)\n\n", pragmaKey, len(comments), total)
+	if total > limit {
+		fmt.Fprintf(&sb, "## Pragmas matching %q (showing %d of %d results — pass limit: or file: or a narrower pattern for the rest)\n\n", pragmaKey, len(comments), total)
 	} else {
 		fmt.Fprintf(&sb, "## Pragmas matching %q (%d results)\n\n", pragmaKey, len(comments))
 	}
@@ -6122,7 +6863,26 @@ func (s *server) handleValidatePlan(_ context.Context, _ *sdkmcp.CallToolRequest
 	for _, m := range args.Mutations {
 		cr := changeResult{Name: m.Name, ChangeType: m.Type}
 
-		d, err := s.backend.GetDefinitionByName(m.Name, "")
+		// Mutation carries Receiver but this used to call plain
+		// GetDefinitionByName, ignoring it -- same #248-class bug as
+		// explain/batch-impact (2026-08-10 sweep): validating a plan
+		// mutation for (*Foo).Bar could silently resolve to an unrelated
+		// same-named method on a different receiver type instead of the
+		// one actually being changed.
+		var d *store.Definition
+		var err error
+		if m.Receiver != "" {
+			d, err = s.backend.GetDefinitionByNameAndReceiver(m.Name, "", m.Receiver)
+			if err != nil {
+				if alt := strings.TrimPrefix(m.Receiver, "*"); alt != m.Receiver {
+					d, err = s.backend.GetDefinitionByNameAndReceiver(m.Name, "", alt)
+				} else {
+					d, err = s.backend.GetDefinitionByNameAndReceiver(m.Name, "", "*"+m.Receiver)
+				}
+			}
+		} else {
+			d, err = s.backend.GetDefinitionByName(m.Name, "")
+		}
 		if err != nil {
 			cr.Error = fmt.Sprintf("definition %q not found", m.Name)
 			results = append(results, cr)
@@ -6205,7 +6965,7 @@ func (s *server) handleTestCoverage(_ context.Context, _ *sdkmcp.CallToolRequest
 	type testInfo struct {
 		Name string `json:"name"`
 	}
-	var tests []testInfo
+	tests := make([]testInfo, 0, len(impact.Tests))
 	for _, t := range impact.Tests {
 		tests = append(tests, testInfo{Name: t.Name})
 	}
@@ -6285,7 +7045,13 @@ func (s *server) handleBatchImpact(ctx context.Context, _ *sdkmcp.CallToolReques
 	var perDef []map[string]any
 
 	for _, name := range names {
-		d, err := s.backend.GetDefinitionByName(name, "")
+		// Same #248-class bug as explain (2026-08-10, prometheus batch
+		// digging sweep): batch-impact receives the full codeParam
+		// (Module/File/Receiver already in scope) but called
+		// GetDefinitionByName(name, "") directly, discarding them --
+		// an ambiguous name in a multi-name batch had no way to be
+		// disambiguated even though the caller supplied the means to.
+		d, err := s.resolveEditTarget(name, args.Receiver, args.Module, args.File)
 		if err != nil {
 			perDef = append(perDef, map[string]any{"name": name, "error": "not found"})
 			continue
@@ -6461,54 +7227,65 @@ func truncateFlow(flow []string, cap int) string {
 	return strings.Join(flow[:cap], " → ") + fmt.Sprintf(" → … (%d more)", len(flow)-cap)
 }
 
-// handleMethods returns a compact projection of every method whose
-// receiver is (or points to) the given type. Task #79: browsing a
-// type's method set is one of the most common exploration patterns
-// (agents ask "what can I do with this thing?") and the alternatives
-// today are all bad: `read` on every method (N×full-body tokens),
-// `overview` on the file (mixes methods with unrelated defs and
-// includes bodies), or grep (misses interface dispatch, no signatures).
-//
-// Response shape: header line ("TypeName — N methods"), exported
-// methods grouped first (alphabetical), then unexported, each on one
-// line as `Method(args) return  // first-line doc`. Ends with a
-// pointer at `code(op:"read")` for full body access.
-//
-// Also handles interfaces by parsing the interface body's inline
-// method declarations — those live in the type body, not as separate
-// method rows.
 func (s *server) handleMethods(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
 	name := strings.TrimSpace(args.Name)
 	if name == "" {
 		return errResult(fmt.Errorf("methods: name is required (a type or interface name)"))
 	}
-	// Strip leading '*' — callers often paste "*Mux" from a receiver.
+	// Strip leading '*' -- callers often paste "*Mux" from a receiver.
 	name = strings.TrimPrefix(name, "*")
+
+	// #250 sweep: module:/file: were accepted codeParam fields but never
+	// threaded into this op's nameParam at the handleCode dispatch site --
+	// a caller trying to disambiguate two same-named types got silent
+	// non-scoping. Resolve the same way resolveEditTarget does.
+	var modulePath string
+	if args.File != "" {
+		if mod := s.findModuleByFile(args.File); mod != nil {
+			modulePath = mod.Path
+		}
+	}
+	if modulePath == "" && args.Module != "" {
+		if mod := s.findModule(args.Module); mod != nil {
+			modulePath = mod.Path
+		}
+	}
 
 	// Interface path: methods live inline in the interface body, not
 	// as separate method rows. If we find a type/interface def by
 	// this name and its kind is 'interface', parse its body.
-	if typeDef, err := s.backend.GetDefinitionByName(name, ""); err == nil && typeDef != nil && typeDef.Kind == "interface" {
+	if typeDef, err := s.backend.GetDefinitionByName(name, modulePath); err == nil && typeDef != nil && typeDef.Kind == "interface" {
 		return s.methodsFromInterfaceBody(typeDef)
 	}
 
 	// Type path: scan all methods, keep those whose receiver matches.
 	// Handles pointer receivers (*T), value receivers (T), and
-	// generic receivers (T[X], *T[X]) — we compare against T after
+	// generic receivers (T[X], *T[X]) -- we compare against T after
 	// stripping the pointer prefix and generic bracket suffix.
 	allMethods, err := s.backend.FilterDefinitions("", "method", "", 0)
 	if err != nil {
 		return errResult(fmt.Errorf("methods: list: %w", err))
 	}
 	var mine []store.Definition
+	// distinctFiles tracks every source file contributing a match so an
+	// unscoped lookup can warn when it silently merged methods from more
+	// than one file -- two unrelated same-named types in different
+	// packages would otherwise have their method sets combined into one
+	// list with no indication they aren't the same type.
+	distinctFiles := map[string]bool{}
 	for _, m := range allMethods {
 		recv := strings.TrimPrefix(m.Receiver, "*")
 		if idx := strings.Index(recv, "["); idx > 0 {
 			recv = recv[:idx]
 		}
-		if recv == name {
-			mine = append(mine, m)
+		if recv != name {
+			continue
 		}
+		if args.File != "" && !strings.Contains(m.SourceFile, args.File) {
+			continue
+		}
+		mine = append(mine, m)
+		distinctFiles[m.SourceFile] = true
 	}
 	if len(mine) == 0 {
 		return errResult(fmt.Errorf("methods: no methods found for type %q (check spelling, or try code(op:\"search\", pattern:%q))", name, name))
@@ -6524,7 +7301,17 @@ func (s *server) handleMethods(_ context.Context, _ *sdkmcp.CallToolRequest, arg
 		}
 	}
 
-	return s.formatMethodList(name, "type", mine, args.Query)
+	r, o, e := s.formatMethodList(name, "type", mine, args.Query)
+	if args.File == "" && len(distinctFiles) > 1 {
+		files := make([]string, 0, len(distinctFiles))
+		for f := range distinctFiles {
+			files = append(files, f)
+		}
+		sort.Strings(files)
+		note := fmt.Sprintf("[note: methods came from %d different files (%s) sharing receiver type %q -- these may be UNRELATED same-named types merged into one list. Pass file: to scope to a single one.]\n\n", len(distinctFiles), strings.Join(files, ", "), name)
+		r = prependNote(r, note)
+	}
+	return r, o, e
 }
 
 // filterMethodsByQuery keeps only methods whose name or doc contains
@@ -6893,7 +7680,7 @@ func (s *server) handleInsertPrecondition(_ context.Context, req *sdkmcp.CallToo
 		}
 		name = inferred
 	}
-	d, err := s.resolveEditTarget(name, args.Receiver, args.Module, args.File)
+	d, err := s.resolveWriteTarget(name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", name))
 	}
@@ -6902,7 +7689,7 @@ func (s *server) handleInsertPrecondition(_ context.Context, req *sdkmcp.CallToo
 		return errResult(err)
 	}
 	snippet := fmt.Sprintf("if %s {\n\t%s\n}", args.Condition, args.Ret)
-	return s.applyEditTerse(sessionOf(req), d, "inserted precondition at entry", snippet, newBody)
+	return s.applyEditTerse(sessionOf(req), d, "insert-precondition", "inserted precondition at entry", snippet, newBody, args.DryRun)
 }
 
 // handleAddImport adds a new import (with optional alias) to the given
@@ -6957,9 +7744,24 @@ func (s *server) handleAddImport(_ context.Context, _ *sdkmcp.CallToolRequest, a
 		return errResult(fmt.Errorf("add-import: locate file: %w", err))
 	}
 	if len(defs) == 0 {
-		return errResult(fmt.Errorf("add-import: no definitions found in file %q — cannot resolve module", file))
+		return errResult(fmt.Errorf("add-import: no definitions found in file %q -- cannot resolve module (check the path via op:\"overview\" or op:\"search\")", file))
 	}
 	moduleID := defs[0].ModuleID
+
+	// #dry-run-add-import: add-import's own instance of the same
+	// silently-dropped dry_run gap fixed for edit/delete/create/the
+	// projection-op family -- this handler never checked args.DryRun at
+	// all, so dry_run:true on op:"add-import" wrote to disk for real.
+	// Placed after file/module resolution so the preview reflects a
+	// genuinely resolvable target, but before patchImportOnDisk actually
+	// touches anything.
+	if args.DryRun {
+		snippet := fmt.Sprintf("%q", args.ImportPath)
+		if args.Alias != "" {
+			snippet = fmt.Sprintf("%s %q", args.Alias, args.ImportPath)
+		}
+		return dryRunResult(fmt.Sprintf("%s: would add import %s", file, snippet))
+	}
 
 	changed, perr := s.patchImportOnDisk(moduleID, file, args.ImportPath, args.Alias)
 	if perr != nil {
@@ -7028,7 +7830,7 @@ func (s *server) handleRenameParam(_ context.Context, req *sdkmcp.CallToolReques
 		}
 		name = inferred
 	}
-	d, err := s.resolveEditTarget(name, args.Receiver, args.Module, args.File)
+	d, err := s.resolveWriteTarget(name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", name))
 	}
@@ -7041,7 +7843,7 @@ func (s *server) handleRenameParam(_ context.Context, req *sdkmcp.CallToolReques
 	if idx := strings.Index(newBody, "\n"); idx > 0 {
 		snippet = newBody[:idx]
 	}
-	return s.applyEditTerse(sessionOf(req), d, action, snippet, newBody)
+	return s.applyEditTerse(sessionOf(req), d, "rename-param", action, snippet, newBody, args.DryRun)
 }
 
 // handleWrapInDefer inserts a `defer <defer_body>` statement immediately
@@ -7062,7 +7864,7 @@ func (s *server) handleWrapInDefer(_ context.Context, req *sdkmcp.CallToolReques
 		}
 		name = inferred
 	}
-	d, err := s.resolveEditTarget(name, args.Receiver, args.Module, args.File)
+	d, err := s.resolveWriteTarget(name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", name))
 	}
@@ -7076,7 +7878,7 @@ func (s *server) handleWrapInDefer(_ context.Context, req *sdkmcp.CallToolReques
 	}
 	action := fmt.Sprintf("inserted defer before stmt #%d", stmtIdx)
 	snippet := fmt.Sprintf("defer %s", args.DeferBody)
-	return s.applyEditTerse(sessionOf(req), d, action, snippet, newBody)
+	return s.applyEditTerse(sessionOf(req), d, "wrap-in-defer", action, snippet, newBody, args.DryRun)
 }
 
 // handleReplaceSlice replaces the Nth (1-based) match of the given AST
@@ -7111,7 +7913,7 @@ func (s *server) handleReplaceSlice(_ context.Context, req *sdkmcp.CallToolReque
 		}
 		name = inferred
 	}
-	d, err := s.resolveEditTarget(name, args.Receiver, args.Module, args.File)
+	d, err := s.resolveWriteTarget(name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", name))
 	}
@@ -7125,7 +7927,7 @@ func (s *server) handleReplaceSlice(_ context.Context, req *sdkmcp.CallToolReque
 		return errResult(err)
 	}
 	action := fmt.Sprintf("replaced %s #%d", args.Slice, index)
-	return s.applyEditTerse(sessionOf(req), d, action, args.New, newBody)
+	return s.applyEditTerse(sessionOf(req), d, "replace-slice", action, args.New, newBody, args.DryRun)
 }
 
 // handleReplaceHunk replaces a byte-exact occurrence of `old` inside
@@ -7154,36 +7956,30 @@ func (s *server) handleReplaceHunk(_ context.Context, req *sdkmcp.CallToolReques
 		}
 		name = inferred
 	}
-	d, err := s.resolveEditTarget(name, args.Receiver, args.Module, args.File)
+	d, err := s.resolveWriteTarget(name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return errResult(fmt.Errorf("definition %q not found", name))
 	}
 	newBody, err := projection.ReplaceHunk(d.Body, args.Old, args.New, args.Index)
 	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			if hint := suggestClosestFragmentHint(d.Body, args.Old); hint != "" {
+				return errResult(fmt.Errorf("%w%s", err, hint))
+			}
+		}
 		return errResult(err)
 	}
 	action := "replaced hunk"
 	if args.Index > 0 {
 		action = fmt.Sprintf("replaced hunk #%d", args.Index)
 	}
-	return s.applyEditTerse(sessionOf(req), d, action, args.New, newBody)
+	return s.applyEditTerse(sessionOf(req), d, "replace-hunk", action, args.New, newBody, args.DryRun)
 }
 
-// applyEditTerse is the projection-op response path: takes a computed
-// newBody + a compact human summary of what changed, does the same DB
-// write + build that handleEdit does, and returns a much tighter
-// response so the agent doesn't feel compelled to Read-verify.
-//
-// Format:
-//
-//	F: <action>
-//	    <snippet-line-1>
-//	    <snippet-line-2>
-//	build: ok
-//
-// Snippet is truncated to ~200 chars / ~6 lines. Skips the caller-count
-// FYI nudge that handleEdit prints (agents can ask for impact if they want).
-func (s *server) applyEditTerse(session *sdkmcp.ServerSession, d *store.Definition, action, snippet, newBody string) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) applyEditTerse(session *sdkmcp.ServerSession, d *store.Definition, op, action, snippet, newBody string, dryRun bool) (*sdkmcp.CallToolResult, any, error) {
+	if msg := unsupportedFieldOp(d.Kind, op); msg != "" {
+		return errResult(fmt.Errorf("%s", msg))
+	}
 	// #edit-disambiguation dispatch (gemot): this used to re-resolve its
 	// target by bare name (GetDefinitionByName(name, "")), discarding
 	// the caller's already-disambiguated d and silently undoing whatever
@@ -7207,8 +8003,51 @@ func (s *server) applyEditTerse(session *sdkmcp.ServerSession, d *store.Definiti
 	if newName, _, newReceiver, _ := s.inferFromBody(newBody); newName != "" && (newName != d.Name || newReceiver != d.Receiver) {
 		return errResult(fmt.Errorf("%s%s: new_body declares %s%s, which changes its name/receiver — use code(op:\"rename\") to rename a definition; this op only changes body content", formatReceiver(d.Receiver), d.Name, formatReceiver(newReceiver), newName))
 	}
+
+	// #148's "AST-guaranteed sig-stable" claim was only actually true for
+	// insert-precondition/wrap-in-defer (body-statement-only edits) and
+	// rename-param (renames an identifier, never a type). replace-hunk is
+	// deliberately content-addressed and kind-agnostic -- it can target a
+	// function's own signature line directly -- and replace-slice accepts
+	// slice:"signature" as one of its documented kinds. Both can change a
+	// parameter or return TYPE without touching name/receiver, sailing
+	// past the identity check above. Confirmed live: replace-hunk turned
+	// `func double(x int) int` into `func double(x string) int` and
+	// reported "replaced hunk" while every caller still passed an int,
+	// with zero warning since the build gate below was unconditionally
+	// skipped. Compare the real old vs new signature instead of assuming
+	// -- same distinction handleEdit already draws for its own body/sig
+	// split.
+	// #dry-run-projection-ops: same "accepted by the schema but silently
+	// dropped before it could matter" gap #246 already fixed for
+	// handleEdit/handleDelete -- every projection op (insert-precondition,
+	// replace-slice, replace-hunk, wrap-in-defer, rename-param) funnels
+	// through this one shared write path, and none of them threaded
+	// args.DryRun through to it, so dry_run:true silently performed the
+	// real write anyway. Confirmed live in a real trajectory
+	// (prometheus-18712, v4 mining round): 30+ replace-hunk calls with
+	// dry_run:true each wrote for real, repeatedly re-emitting a large
+	// function while the caller believed it was only probing for a
+	// match -- a real contributor to that trajectory's DB/disk
+	// divergence and eventual task failure.
+	if dryRun {
+		return dryRunResult(fmt.Sprintf("%s%s: would %s", formatReceiver(d.Receiver), d.Name, action))
+	}
+
+	oldSignature := extractSignature(d.Body)
+	oldBody := d.Body
 	d.Body = newBody
 	d.Signature = extractSignature(newBody)
+	sigStable := oldSignature == d.Signature
+	// See handleEdit's identical guard: extractSignature's *ast.TypeSpec
+	// case collapses to "type <Name>" regardless of shape, so it can't
+	// tell a struct/interface body change from a no-op for a type/
+	// interface-kind target (e.g. a replace-hunk landing directly on an
+	// interface's method list). Only a byte-identical body is provably
+	// safe to fast-path for these two kinds.
+	if d.Kind == "type" || d.Kind == "interface" {
+		sigStable = oldBody == newBody
+	}
 
 	// #12: write and emit-gate through a transaction so a failure leaves
 	// neither the DB nor the file changed -- this was missed when #12
@@ -7226,28 +8065,47 @@ func (s *server) applyEditTerse(session *sdkmcp.ServerSession, d *store.Definiti
 		return errResult(err)
 	}
 
-	// #148: projection ops (all callers of applyEditTerse) are AST-
-	// guaranteed sig-stable — skip the go-build gate to actually deliver
-	// the "faster than native because the index is maintained" thesis.
-	// commitOrRollbackOnEmit preserves that (emit-only, no build) while
-	// still gating commit on the result coming back clean. Set
-	// DEFN_STRICT_BUILD=1 to force the old per-mutation build.
 	var opts emit.Opts
 	if d.SourceFile != "" {
 		opts = emit.Opts{GoimportsFiles: []string{d.SourceFile}, TouchedFiles: []string{d.SourceFile}}
 	}
-	buildResult := s.commitOrRollbackOnEmit(tx, commit, rollback, opts)
-
-	if buildResult == "" {
-		// #160: fire-and-forget summary regeneration. Body changed → any
-		// existing summary is stale. Worker computes async; if the queue
-		// is full or backend unconfigured we drop silently (the summary
-		// is best-effort, next mutation re-enqueues).
-		s.enqueueSummary(d)
-		s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
+	var buildResult string
+	if sigStable {
+		// #148: the common case (insert-precondition/wrap-in-defer
+		// always; replace-hunk/replace-slice/rename-param whenever they
+		// happen not to touch the signature) really is dispatch-safe --
+		// skip the go-build gate to actually deliver the "faster than
+		// native because the index is maintained" thesis.
+		// commitOrRollbackOnEmit preserves the same snapshot/rollback
+		// protection against an emit-level WARNING, and itself still
+		// escalates to a real build when DEFN_STRICT_BUILD=1 is set.
+		buildResult = s.commitOrRollbackOnEmit(tx, commit, rollback, opts)
+	} else {
+		buildResult = s.commitOrRollbackOnBuild(tx, commit, rollback, opts)
 	}
 
 	recv := formatReceiver(d.Receiver)
+	if buildResult != "" {
+		// commitOrRollbackOnEmit/OnBuild's contract: any non-empty result
+		// means the WHOLE transaction was rolled back -- nothing landed.
+		// This used to build the same success-shaped "recv+name: action\n
+		// <snippet>" header regardless, then append "build: FAILED..." --
+		// reading as a success note with a build problem attached, not a
+		// rollback, unlike handleEdit/handleRename/handleFieldRename's
+		// consistent "X rolled back — nothing was saved" framing for the
+		// exact same contract. Match that framing here too instead of
+		// leaving this one write path worded differently for the same
+		// underlying event.
+		return textResult(fmt.Sprintf("%s%s: %s rolled back — nothing was saved\n\n%s", recv, d.Name, action, buildResult)), nil, nil
+	}
+
+	// #160: fire-and-forget summary regeneration. Body changed → any
+	// existing summary is stale. Worker computes async; if the queue
+	// is full or backend unconfigured we drop silently (the summary
+	// is best-effort, next mutation re-enqueues).
+	s.enqueueSummary(d)
+	s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
+
 	var sb strings.Builder
 	sb.WriteString(recv)
 	sb.WriteString(d.Name)
@@ -7264,19 +8122,13 @@ func (s *server) applyEditTerse(session *sdkmcp.ServerSession, d *store.Definiti
 			sb.WriteString("\n")
 		}
 	}
-	if buildResult != "" {
-		firstLine := buildResult
-		if idx := strings.Index(buildResult, "\n"); idx > 0 {
-			firstLine = buildResult[:idx]
-		}
-		sb.WriteString("build: ")
-		sb.WriteString(strings.ToLower(firstLine))
-		sb.WriteString("\n")
-	}
 	// #158: nudge apply-batching after N serial mutations to one file.
 	// hint returns "" when session is nil (Measure* paths) or under threshold.
 	if s.hint != nil {
 		sb.WriteString(s.hint.note(session, d.SourceFile))
+	}
+	if !d.Test {
+		sb.WriteString(s.testCoverageHint(d.ModuleID, d.SourceFile))
 	}
 	return textResult(sb.String()), nil, nil
 }
@@ -7527,21 +8379,36 @@ func (s *server) handleCreateScaffoldFile(args createParam) (*sdkmcp.CallToolRes
 		return errResult(fmt.Errorf("no modules found — run defn ingest first, or pass module: explicitly"))
 	}
 
-	if err := s.backend.SetFileSource(mod.ID, args.File, body); err != nil {
+	// #12-class protection, missed when the rest of the write handlers
+	// got it: this used to write straight to s.backend and emit
+	// unconditionally, so an emit-level WARNING (e.g. a goimports
+	// failure) still left the file_sources row durably committed while
+	// reporting the outcome inline as if it were informational rather
+	// than a rolled-back write, unlike every sibling handler's
+	// "rolled back — nothing was saved" framing for the same contract.
+	tx, commit, rollback, txErr := s.backend.Begin()
+	if txErr != nil {
+		return errResult(txErr)
+	}
+	defer rollback()
+
+	if err := tx.SetFileSource(mod.ID, args.File, body); err != nil {
 		return errResult(fmt.Errorf("write file source: %w", err))
 	}
 
-	// Emit + goimports the touched file. No defs changed, but the
-	// file_sources row is the emit-side truth so a scoped emit lands
-	// this content on disk. Skip build gate — no def graph changed.
-	buildResult := s.autoEmitOnly(args.File)
-	if buildResult == "" {
-		buildResult = "ok"
+	// No defs changed here, only a raw file_sources row -- same
+	// dispatch-safe reasoning autoEmitOnly's callers rely on, so this
+	// only needs the emit-level WARNING guard, not a real build.
+	buildResult := s.commitOrRollbackOnEmit(tx, commit, rollback, emit.Opts{
+		GoimportsFiles: []string{args.File},
+		TouchedFiles:   []string{args.File},
+	})
+	if buildResult != "" {
+		return textResult(fmt.Sprintf("scaffold %s rolled back — nothing was saved\n\n%s", args.File, buildResult)), nil, nil
 	}
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Scaffolded %s (%s) — %d bytes, no defs yet\n", args.File, mod.Path, len(body)))
-	sb.WriteString("emit: " + strings.ToLower(strings.SplitN(buildResult, "\n", 2)[0]) + "\n")
 	sb.WriteString("_add defs with follow-up `code(op:\"create\", file:\"" + args.File + "\", body:\"...\")` calls._\n")
 	return textResult(sb.String()), nil, nil
 }
@@ -7763,7 +8630,14 @@ func (s *server) patchImportOnDisk(moduleID int64, file, importPath, alias strin
 			return false, fmt.Errorf("write %s: %w", file, err)
 		}
 	}
-	_ = s.backend.SetFileSource(moduleID, file, updatedSrc)
+	// Disk is authoritative here (the write above already succeeded),
+	// so a failure updating the DB's secondary file_sources cache
+	// doesn't block the caller -- but silently discarding it broke this
+	// file's own logging discipline (every other "best effort" write
+	// elsewhere here logs on failure).
+	if err := s.backend.SetFileSource(moduleID, file, updatedSrc); err != nil {
+		fmt.Fprintf(os.Stderr, "defn: file_sources update failed after add-import to %s: %v\n", file, err)
+	}
 	return true, nil
 }
 
@@ -8060,7 +8934,7 @@ func (s *server) resolveEditTarget(name, receiver, module, file string) (*store.
 		if err == nil && d != nil {
 			return d, nil
 		}
-		if dotted, derr := s.resolveDottedQualifiedName(name); derr == nil && dotted != nil {
+		if dotted, derr := s.resolveDottedQualifiedName(s.backend, name); derr == nil && dotted != nil {
 			return dotted, nil
 		}
 		return d, err
@@ -8112,7 +8986,32 @@ func (s *server) resolveApplyTarget(backend store.Backend, name, receiver, modul
 		}
 	}
 	if receiver == "" {
-		return backend.GetDefinitionByName(name, modulePath)
+		d, err := backend.GetDefinitionByName(name, modulePath)
+		if err != nil {
+			// #241/#248 parity with resolveEditTarget: a caller using Go's
+			// own "pkg.Symbol" qualified-name convention inside an apply
+			// batch used to get "not found" here even when resolveEditTarget
+			// would have resolved the exact same name outside a batch --
+			// resolveApplyTarget's own doc comment claims parity with
+			// resolveEditTarget's precedence, but this fallback was missing.
+			if dotted, derr := s.resolveDottedQualifiedName(backend, name); derr == nil && dotted != nil {
+				return dotted, nil
+			}
+			return d, err
+		}
+		// #248: same refusal as resolveWriteTarget -- apply's edit/delete/
+		// rename/projection sub-ops all funnel through this one function,
+		// so this is the single place to close the ambiguous-bare-name
+		// write gap for the whole apply surface, not just standalone ops.
+		if module == "" && file == "" {
+			if n, cErr := backend.CountDefinitionsByName(name); cErr == nil && n > 1 {
+				return nil, fmt.Errorf(
+					"%q is ambiguous: %d definitions share this name across different packages -- refusing to guess which one to write. Pass receiver:, module:, or file: to disambiguate, or use search(pattern:%q) to see every candidate",
+					name, n, name,
+				)
+			}
+		}
+		return d, nil
 	}
 	d, err := backend.GetDefinitionByNameAndReceiver(name, modulePath, receiver)
 	if err != nil {
@@ -8226,7 +9125,7 @@ func (s *server) coupledChangeHint(defIDs ...int64) string {
 	if len(names) == 0 {
 		return ""
 	}
-	return fmt.Sprintf("\nTip: %s has a direct caller (%s) -- if this build failure is from a coupled signature change, batch this edit together with a fix to it via op:\"apply\".\n",
+	return fmt.Sprintf("\nTip: this def has %s (%s) -- if this build failure is from a coupled signature change, batch this edit together with a fix to it via op:\"apply\".\n",
 		pluralizeCallers(len(names)), strings.Join(names, ", "))
 }
 
@@ -8245,14 +9144,16 @@ func pluralizeCallers(n int) string {
 // bare name lookup fails -- see resolveEditTarget's doc comment for
 // the full rationale and the real trajectory that motivated it.
 // Returns (nil, nil) when name has no dot or nothing matches, letting
-// the caller fall through to its own not-found error.
-func (s *server) resolveDottedQualifiedName(name string) (*store.Definition, error) {
+// the caller fall through to its own not-found error. Takes backend
+// explicitly (same reason resolveApplyTarget does) so it works for a
+// batch's own uncommitted tx as well as s.backend.
+func (s *server) resolveDottedQualifiedName(backend store.Backend, name string) (*store.Definition, error) {
 	idx := strings.LastIndex(name, ".")
 	if idx <= 0 {
 		return nil, nil
 	}
 	hint, bare := name[:idx], name[idx+1:]
-	files, err := s.backend.DistinctSourceFiles()
+	files, err := backend.DistinctSourceFiles()
 	if err != nil {
 		return nil, nil
 	}
@@ -8263,14 +9164,814 @@ func (s *server) resolveDottedQualifiedName(name string) (*store.Definition, err
 		// FilterDefinitions is metadata-only (its query hardcodes an
 		// empty body column) -- fetch the full definition by ID once it
 		// has located the right one.
-		matches, merr := s.backend.FilterDefinitions(bare, "", f, 1)
+		matches, merr := backend.FilterDefinitions(bare, "", f, 1)
 		if merr != nil || len(matches) == 0 {
 			continue
 		}
-		if full, gerr := s.backend.GetDefinition(matches[0].ID); gerr == nil && full != nil {
+		if full, gerr := backend.GetDefinition(matches[0].ID); gerr == nil && full != nil {
 			return full, nil
 		}
 		return &matches[0], nil
 	}
 	return nil, nil
+}
+
+// testScopeTarget resolves a source-file hint (substring match against
+// DistinctSourceFiles) to a `go test` target, scoping the run to one
+// package instead of the whole repo. A hint resolving to the module
+// root package returns ".", not "./..." -- the naive dir!="." check
+// used to silently skip scoping for root-package tests, falling through
+// to the full-repo default it exists to avoid (#248). Best-effort: an
+// empty or unresolvable hint returns "./...", never an error.
+func (s *server) testScopeTarget(hint string) string {
+	if hint == "" {
+		return "./..."
+	}
+	// hint may be a full Go module/import path rather than a source-file
+	// substring -- the same shape "module:" takes everywhere else in this
+	// API (e.g. code(op:"impact", module:"github.com/x/y/z")), which a
+	// caller reasonably expects to work here too. That never
+	// substring-matches a repo-relative source_file path below, so it
+	// silently fell through to "./..." every time -- confirmed via a real
+	// prometheus-18534 trajectory where an explicit module: hint was
+	// ignored 3 calls in a row, each falling back to a whole-repo `go
+	// test ./...` that exhausted the box's disk compiling every unrelated
+	// cloud-SDK dependency. Try an exact module-path match first, using
+	// the same moduleRoot-stripping emitModule already does for on-disk
+	// paths.
+	if mods, err := s.backend.ListModules(); err == nil {
+		for _, m := range mods {
+			if m.Path != hint {
+				continue
+			}
+			// #253: deriving the on-disk directory by stripping
+			// emit.DetectModuleRoot's guessed common prefix off the
+			// module's import PATH assumes import path == root prefix +
+			// relative directory -- false for any module using semantic
+			// import versioning (etcd's go.etcd.io/etcd/server/v3/embed,
+			// declared from directory "server/", has a "v3" segment in
+			// the import path with no corresponding directory level) or
+			// any nested module whose path doesn't share the repo's
+			// common prefix at all. Both produced a target directory
+			// that doesn't exist on disk, so `go test` silently matched
+			// zero packages. A definition's source_file is already the
+			// real, correct repo-relative path -- use it directly rather
+			// than reconstructing one via import-path arithmetic. Every
+			// definition in a module shares one directory (module =
+			// package = one directory in defn's model), so the first is
+			// as good as any.
+			if defs, dErr := s.backend.GetModuleDefinitions(m.ID); dErr == nil && len(defs) > 0 {
+				dir := filepath.ToSlash(filepath.Dir(defs[0].SourceFile))
+				if dir == "" || dir == "." {
+					return "."
+				}
+				return "./" + dir + "/..."
+			}
+			// No definitions yet (freshly created empty package) --
+			// fall back to the import-path heuristic; still best-effort
+			// per this function's contract.
+			root := emit.DetectModuleRoot(mods)
+			rel := strings.TrimPrefix(m.Path, root)
+			rel = strings.TrimPrefix(rel, "/")
+			if rel == "" {
+				return "."
+			}
+			return "./" + rel + "/..."
+		}
+	}
+	files, err := s.backend.DistinctSourceFiles()
+	if err != nil {
+		return "./..."
+	}
+	// DistinctSourceFiles has no ORDER BY -- picking the first substring
+	// match was picking whichever match SQLite happened to return first,
+	// with no preference for the package the hint actually names. A
+	// short hint like "tsdb" substring-matches every file under it too
+	// (tsdb/encoding/x.go, tsdb/wlog/y.go, ...), so it could resolve to
+	// an arbitrary, wrong subdirectory instead of the tsdb package root
+	// -- confirmed via a real prometheus-19114 trajectory where
+	// module:"tsdb" scoped to "./tsdb/encoding/..." and never found the
+	// target test living in tsdb/db_test.go, burning several dead test
+	// calls before giving up and falling back to guessing more names.
+	// Score every match and keep the best: an exact trailing path
+	// component (dir == hint or dir ends in "/"+hint) beats a mere
+	// substring match, and among equally-exact (or equally-inexact)
+	// matches the shallowest directory wins.
+	bestDir, bestDepth, bestExact, found := "", -1, false, false
+	for _, f := range files {
+		if !strings.Contains(f, hint) {
+			continue
+		}
+		dir := filepath.ToSlash(filepath.Dir(f))
+		if dir == "" {
+			dir = "."
+		}
+		exact := dir == hint || strings.HasSuffix(dir, "/"+hint)
+		depth := strings.Count(dir, "/")
+		if !found || (exact && !bestExact) || (exact == bestExact && depth < bestDepth) {
+			bestDir, bestDepth, bestExact, found = dir, depth, exact, true
+		}
+	}
+	if !found {
+		return "./..."
+	}
+	if bestDir == "." {
+		return "."
+	}
+	return "./" + bestDir + "/..."
+}
+
+// overviewDefsCap bounds code(op:"overview") at directory/module scope --
+// previously uncapped, so a large package's overview could exceed the MCP
+// response token limit outright (a real trajectory hit a hard "268,223
+// characters... exceeds maximum allowed tokens" failure on one call).
+// Matches fileDefsCap's cap value for the sibling file-scoped op.
+const overviewDefsCap = fileDefsCap
+
+// resolveWriteTarget wraps resolveEditTarget for MUTATING ops. #248:
+// a bare (no receiver/module/file) name lookup uses
+// GetDefinitionByName's best-effort blast-radius tiebreak, which is
+// fine for a read (worst case: stale info) but not for a write --
+// live-reproduced this session when code(op:"edit", name:"Backend")
+// with no module qualifier silently targeted the wrong one of two
+// same-named "Backend" interfaces across different packages and
+// overwrote it with the other's body, corrupting a file that was
+// never meant to be touched. Refuse instead of guessing whenever the
+// name is ambiguous and the caller gave no disambiguating qualifier.
+func (s *server) resolveWriteTarget(name, receiver, module, file string) (*store.Definition, error) {
+	d, err := s.resolveEditTarget(name, receiver, module, file)
+	if err != nil {
+		return d, err
+	}
+	if receiver == "" && module == "" && file == "" {
+		if n, cErr := s.backend.CountDefinitionsByName(name); cErr == nil && n > 1 {
+			return nil, fmt.Errorf(
+				"%q is ambiguous: %d definitions share this name across different packages -- refusing to guess which one to write. Pass receiver:, module:, or file: to disambiguate, or use search(pattern:%q) to see every candidate",
+				name, n, name,
+			)
+		}
+	}
+	return d, nil
+}
+
+// ambiguityNote warns when a bare-name lookup (no receiver/module/file
+// qualifier) resolved via GetDefinitionByName's best-effort tiebreak
+// while other same-named definitions exist -- #248: outline/read gave
+// no indication another candidate existed, unlike search which lists
+// every match. Empty qualifiers only: an explicit receiver/module/file
+// is a deliberate disambiguation, not something to second-guess.
+func (s *server) ambiguityNote(name, receiver, module, file string) string {
+	if receiver != "" || module != "" || file != "" || strings.TrimSpace(name) == "" {
+		return ""
+	}
+	n, err := s.backend.CountDefinitionsByName(name)
+	if err != nil || n <= 1 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"[note: %d definitions share the name %q; this resolved to one via a best-effort tiebreak (most production callers). Pass receiver:/module:/file: to target a specific one, or search(pattern:%q) to see every candidate.]\n\n",
+		n, name, name,
+	)
+}
+
+// testMatchedNothing reports whether a `go test -run <pattern>` invocation
+// that exited 0 actually ran zero tests -- Go's own behavior when a -run
+// pattern matches nothing: exit code 0, output just warns "no tests to
+// run". Without this check, handleTest/handleTestByName reported "ALL
+// TESTS PASSED" for a run that verified nothing at all -- confirmed via a
+// real trajectory where a grpctest-suite method (addressed by go test as
+// a subtest, Test/TestFoo, not TestFoo) was targeted by its bare method
+// name, silently matched zero tests, and gave the agent false confidence
+// nothing needed further investigation.
+//
+// A bare substring check on "no tests to run" over-fires whenever the
+// scope target is a recursive "./pkg/..." with siblings: Go prints that
+// warning per-package for every subpackage under pkg that doesn't have a
+// matching test, even when the intended package's test ran and passed
+// fine. Confirmed via a real prometheus-19114 trajectory: `go test -run
+// TestQuerier ./tsdb/...` correctly ran and passed TestQuerier in tsdb
+// itself, but tsdb/encoding (a sibling with no such test) also printed
+// "no tests to run" -- the bare substring check flagged the whole run as
+// "NO TESTS MATCHED", discarding a real pass and sending the agent back
+// to guessing test names. Only report "matched nothing" when literally
+// no test executed anywhere in the combined output.
+func testMatchedNothing(out string) bool {
+	if !strings.Contains(out, "no tests to run") {
+		return false
+	}
+	return !strings.Contains(out, "=== RUN") &&
+		!strings.Contains(out, "--- PASS:") &&
+		!strings.Contains(out, "--- FAIL:")
+}
+
+// testBuildFailed reports whether a `go test` invocation failed because
+// the target package didn't compile (or setup failed), not because any
+// test actually ran and failed. Go's own output distinguishes this with
+// a literal "[build failed]"/"[setup failed]" marker after FAIL, but
+// handleTest/handleTestByName used to fold this into the same generic
+// "SOME TESTS FAILED" as a genuine test failure -- confirmed via a real
+// cli-3997 trajectory where a pre-existing vet error produced exactly
+// this indistinguishable message, even though zero tests ran.
+func testBuildFailed(out string) bool {
+	return strings.Contains(out, "[build failed]") || strings.Contains(out, "[setup failed]")
+}
+
+// testPanicked reports whether a `go test` invocation's output shows the
+// test binary crashed (e.g. a global-registration panic unrelated to the
+// edited def), not that any test made a failing assertion. Confirmed via
+// a real cli-405 trajectory: a duplicate-flag-registration panic in an
+// unrelated shared Cobra command tree got the same generic "SOME TESTS
+// FAILED" label as a genuine assertion failure, inviting a wrong-edit
+// suspicion instead of pointing at the actual crash. Requires both
+// markers (not just "panic: ") to avoid a false positive on a test that
+// merely prints or asserts on the word "panic".
+func testPanicked(out string) bool {
+	return strings.Contains(out, "panic: ") && strings.Contains(out, "goroutine ")
+}
+
+// removedDoltOps names ops that existed under defn's pre-v0.27 Dolt
+// backend (git-style branch/merge/commit/diff on definitions) and were
+// deliberately dropped in the SQLite migration -- see
+// docs/lessons-learned.md's "Key Design Decisions" entry. handleCode
+// checks this before dispatch so these get one clear, specific answer
+// instead of the generic "unknown op" fallthrough.
+var removedDoltOps = map[string]bool{
+	"branch":      true,
+	"checkout":    true,
+	"merge":       true,
+	"commit":      true,
+	"status":      true,
+	"conflicts":   true,
+	"resolve":     true,
+	"merge-abort": true,
+	"diff":        true,
+	"diff-defs":   true,
+	"history":     true,
+}
+
+// impactJSONCap bounds each list in impactJSON's output (direct_callers,
+// interface_dispatch_callers, tests). format:"json" exists specifically
+// as the markdown path's own escape hatch ("... N more production
+// callers omitted; pass format:\"json\" for full list") -- but until
+// this cap existed, the escape hatch had no cap of its own. A real
+// trajectory (prometheus-18652, 2026-08-10) hit a def with 1,314
+// covering tests: impactJSON dumped all of them uncapped, producing a
+// 243,019-character/9,473-line response that exceeded the harness's own
+// tool-result size limit and got redirected to a file the agent never
+// successfully paged through -- the "full list" was less useful than
+// the capped markdown view it was supposed to supplement. Higher than
+// impactCallerCap (15) since JSON is the deliberately-fuller view, but
+// still bounded.
+const impactJSONCap = 200
+
+// opAliases maps common near-miss op-name guesses to the one real op
+// they unambiguously mean, so handleCode accepts them instead of
+// round-tripping an "unknown op" error. Confirmed hitting real
+// trajectories repeatedly (prometheus-17395/18765/18972/18841):
+// "import"/"add_import"/"import_path" for "add-import" -- every other
+// multi-word op name uses hyphens (add-import, replace-hunk,
+// insert-precondition), but underscore is the natural
+// programming-language-convention guess, and "import" alone is the
+// obvious short name for "add an import". Same precedent as this
+// file's other near-miss acceptances (old_fragment/new_fragment on
+// replace-hunk, query: as a pattern alias on search) -- fix the
+// mismatch instead of just explaining it in an error message.
+var opAliases = map[string]string{
+	"import":      "add-import",
+	"add_import":  "add-import",
+	"addimport":   "add-import",
+	"import_path": "add-import",
+}
+
+// testTimeoutFor scales the test timeout for genuinely large runs
+// instead of applying a flat one-size-fits-all default -- confirmed
+// hitting real prometheus trajectories repeatedly (19114/17395/18534
+// in a live rerun): "TIMED OUT after 1m0s" on runs covering 191-1166
+// affected tests, or a whole-repo "./..." scope fallback, wasting a
+// full retry with no path for the caller to recover. The timeout
+// message's own suggested remedy ("set DEFN_TEST_TIMEOUT=<duration>")
+// is structurally unactionable from inside a session -- it's a
+// server-side env var the MCP caller has no way to set mid-call. Only
+// scales the DEFAULT; an operator's explicit DEFN_TEST_TIMEOUT is
+// honored exactly as set, never extended on top of their choice.
+func testTimeoutFor(nTests int, target string) time.Duration {
+	if os.Getenv("DEFN_TEST_TIMEOUT") != "" {
+		return testTimeout
+	}
+	if nTests <= 50 && target != "./..." {
+		return testTimeout
+	}
+	scaled := testTimeout * 3
+	const maxTestTimeout = 5 * time.Minute
+	if scaled > maxTestTimeout {
+		return maxTestTimeout
+	}
+	return scaled
+}
+
+// suggestClosestFragmentHint tries a whitespace-insensitive match of
+// old against body when the byte-exact replace-hunk match failed, and
+// if found, returns a hint showing the ACTUAL bytes at that location so
+// the caller can copy them verbatim instead of guessing narrower
+// fragments blind. Confirmed hitting a real trajectory
+// (prometheus-18712): replace-hunk's success response never shows the
+// resulting body, so an agent making many sequential edits to the same
+// large function has no way to see what changed -- it burned 17 of 34
+// replace-hunk calls on bare "hunk not found in body" errors, each
+// retry narrowing old to a smaller guess rather than converging,
+// almost certainly because its remembered fragment's whitespace/
+// indentation no longer matched the real bytes after prior edits.
+// Joins old's words with \s+ so it matches regardless of exact
+// whitespace differences, then returns the real substring straight
+// from body -- no index-mapping needed.
+func suggestClosestFragmentHint(body, old string) string {
+	fields := strings.Fields(old)
+	if len(fields) == 0 {
+		return ""
+	}
+	quoted := make([]string, len(fields))
+	for i, f := range fields {
+		quoted[i] = regexp.QuoteMeta(f)
+	}
+	re, err := regexp.Compile(strings.Join(quoted, `\s+`))
+	if err != nil {
+		return ""
+	}
+	loc := re.FindStringIndex(body)
+	if loc == nil {
+		return ""
+	}
+	actual := body[loc[0]:loc[1]]
+	if actual == old {
+		return ""
+	}
+	return fmt.Sprintf("\n\nhint: old didn't match exactly, but a whitespace-only-different version was found in the current body -- copy this verbatim as old:\n%s", actual)
+}
+
+// runBuildIn runs `go build` against targets with dir as the working
+// directory, returning combined output and the command's error (nil
+// on a clean build).
+func (s *server) runBuildIn(ctx context.Context, dir string, targets []string) (string, error) {
+	args := append([]string{"build"}, targets...)
+	cmd := exec.CommandContext(ctx, "go", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// runScopedBuild runs `go build` scoped to touchedFiles (repo-relative
+// paths), grouping them by nearest go.mod so files inside a nested
+// module (e.g. etcd's server/, tests/, etcdctl/, each with their own
+// go.mod) build against THEIR OWN module root instead of
+// s.projectDir's. Go's toolchain refuses to build a subtree that
+// declares its own go.mod from an outer module's context -- "main
+// module (X) does not contain package Y" -- which is exactly the
+// build-verification failure real multi-module bench trajectories
+// hit on every create/edit touching such a subtree, even once the
+// definition's own module attribution (see ingest.ModuleForDir) was
+// correct. Empty touchedFiles keeps the original full-tree ./...
+// behavior, scoped to s.projectDir.
+func (s *server) runScopedBuild(ctx context.Context, touchedFiles []string) (string, error) {
+	if len(touchedFiles) == 0 {
+		return s.runBuildIn(ctx, s.projectDir, []string{"./..."})
+	}
+
+	byModDir := map[string][]string{} // nearest module dir -> repo-relative files
+	for _, f := range touchedFiles {
+		absDir := filepath.Join(s.projectDir, filepath.Dir(f))
+		modDir := s.projectDir
+		if _, nearestDir, err := ingest.ModuleForDir(absDir); err == nil {
+			modDir = nearestDir
+		}
+		byModDir[modDir] = append(byModDir[modDir], f)
+	}
+
+	dirs := make([]string, 0, len(byModDir))
+	for d := range byModDir {
+		dirs = append(dirs, d)
+	}
+	sort.Strings(dirs)
+
+	var outputs []string
+	for _, modDir := range dirs {
+		relFiles := make([]string, len(byModDir[modDir]))
+		for i, f := range byModDir[modDir] {
+			absFile := filepath.Join(s.projectDir, f)
+			rel, err := filepath.Rel(modDir, absFile)
+			if err != nil {
+				rel = f
+			}
+			relFiles[i] = rel
+		}
+		targets := buildTargetsForFiles(relFiles)
+		out, err := s.runBuildIn(ctx, modDir, targets)
+		if err != nil {
+			outputs = append(outputs, out)
+			return strings.Join(outputs, "\n\n"), err
+		}
+	}
+	return "", nil
+}
+
+// testCoverageHint fires on a SUCCESSFUL (non-rolled-back) write to a
+// non-test def when the def's package has existing test file(s) that
+// this write didn't touch. Bench trajectories across etcd/traefik/caddy
+// (2026-08 multi-repo investigation) found this the single largest
+// driver of a correctness gap vs plain Edit/Write: agents using defn
+// reliably fixed the source file correctly, then declared done without
+// ever looking at the paired _test.go, while files-mode agents working
+// from the same repos reliably added or updated one. coupledChangeHint
+// already covers the build-failure/rollback path for coupled PRODUCTION
+// callers; this covers the success path for paired TEST files.
+func (s *server) testCoverageHint(moduleID int64, touchedFile string) string {
+	// Filenames only (ListFileSourceNames), not ListFileSources' full raw
+	// file content -- this fires on every successful write, the hottest
+	// path in the system, and only needs to check suffixes.
+	sources, err := s.backend.ListFileSourceNames(moduleID)
+	if err != nil {
+		return ""
+	}
+	var testFiles []string
+	for _, f := range sources {
+		if !strings.HasSuffix(f, "_test.go") || f == touchedFile {
+			continue
+		}
+		testFiles = append(testFiles, f)
+	}
+	if len(testFiles) == 0 {
+		return ""
+	}
+	sort.Strings(testFiles)
+	if len(testFiles) > 3 {
+		testFiles = testFiles[:3]
+	}
+	plural := ""
+	if len(testFiles) > 1 {
+		plural = "s"
+	}
+	return fmt.Sprintf("\nTip: this package has an existing test file%s (%s) this change didn't touch -- consider adding/updating a test case.\n",
+		plural, strings.Join(testFiles, ", "))
+}
+
+// findModuleForRelDir resolves a repo-relative DIRECTORY (not a file
+// within it) to its exact module via the nearest go.mod -- the same
+// filesystem mechanism as findModuleByFile's first branch, factored
+// out so a caller that already has a directory doesn't have to fake up
+// a filename inside it just to reuse the walk. Returns nil when
+// projectDir is unset, the directory is empty/root, or the walk finds
+// no exactly-matching registered module (callers should fall back to
+// their own heuristic in that case, same as findModuleByFile does).
+func (s *server) findModuleForRelDir(mods []store.Module, relDir string) *store.Module {
+	if s.projectDir == "" || relDir == "" || relDir == "." {
+		return nil
+	}
+	absDir := filepath.Join(s.projectDir, relDir)
+	modPrefix, modDir, err := ingest.ModuleForDir(absDir)
+	if err != nil {
+		return nil
+	}
+	expected := modPrefix
+	if relPkgDir, rErr := filepath.Rel(modDir, absDir); rErr == nil && relPkgDir != "." {
+		expected = modPrefix + "/" + filepath.ToSlash(relPkgDir)
+	}
+	for i, m := range mods {
+		if m.Path == expected {
+			return &mods[i]
+		}
+	}
+	return nil
+}
+
+// renameFieldInType renames a single field's name within a TYPE
+// definition's own struct body text -- the emitted source, unlike the
+// field's own (emit-excluded, #11) DB row. Unlike astRename walking a
+// whole caller body, this only touches *ast.Field.Names within THIS
+// struct's own StructType: Go disallows two fields of the same name on
+// one struct, so every match is unambiguously the target field, with
+// none of astRename's same-name-on-an-unrelated-type collision risk.
+func renameFieldInType(typeBody, oldName, newName string) (string, int) {
+	src := "package x\n" + typeBody
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	if err != nil {
+		return typeBody, 0
+	}
+	renamed := 0
+	ast.Inspect(f, func(n ast.Node) bool {
+		st, ok := n.(*ast.StructType)
+		if !ok || st.Fields == nil {
+			return true
+		}
+		for _, field := range st.Fields.List {
+			for _, name := range field.Names {
+				if name.Name == oldName {
+					name.Name = newName
+					renamed++
+				}
+			}
+		}
+		return true
+	})
+	if renamed == 0 {
+		return typeBody, 0
+	}
+	var buf strings.Builder
+	if err := format.Node(&buf, fset, f); err != nil {
+		return typeBody, 0
+	}
+	result := buf.String()
+	if idx := strings.Index(result, "\n"); idx >= 0 {
+		result = strings.TrimLeft(result[idx+1:], "\n")
+	} else {
+		return typeBody, 0
+	}
+	return result, renamed
+}
+
+// handleFieldRename is handleRename's struct-field path. Field defs are
+// excluded from emit by design (#11) -- a field only exists as text
+// inside its struct's body, so the field's own DB row update can never
+// reach the actual source; the enclosing TYPE def's Body (a separate
+// row) has to be rewritten too, via renameFieldInType.
+//
+// Also unlike a normal rename, this pays for a real build validation
+// instead of #148's build-gate skip: astRename's caller-body rewrite
+// can't tell this field's name apart from an unrelated same-named field
+// on some other type referenced in the same caller body -- confirmed
+// live (RangeOptions.Count vs an unrelated RangeResult.Count in the
+// same function). #148's skip is only sound for a name-preserving,
+// dispatch-safe rename; a field rename with a body collision isn't one.
+func (s *server) handleFieldRename(d *store.Definition, args renameParam) (*sdkmcp.CallToolResult, any, error) {
+	mp := s.modulePath(d.ModuleID)
+	parentType, ptErr := s.backend.GetDefinitionByName(d.Receiver, mp)
+	if ptErr != nil || parentType == nil || parentType.Kind != "type" {
+		return errResult(fmt.Errorf("rename of struct field %q: could not find its declaring type %q to update the struct declaration", args.OldName, d.Receiver))
+	}
+	newParentBody, renamedCount := renameFieldInType(parentType.Body, d.Name, args.NewName)
+	if renamedCount == 0 {
+		return errResult(fmt.Errorf("rename of struct field %q: could not locate its declaration inside %s's struct body", args.OldName, d.Receiver))
+	}
+
+	tx, commit, rollback, txErr := s.backend.Begin()
+	if txErr != nil {
+		return errResult(txErr)
+	}
+	defer rollback()
+
+	oldBareName := d.Name
+	newBody, _ := astRename(d.Body, oldBareName, args.NewName)
+	newSig := extractSignature(newBody)
+	exported := len(args.NewName) > 0 && args.NewName[0] >= 'A' && args.NewName[0] <= 'Z'
+	if err := tx.RenameDefinition(d.ID, args.NewName, newBody, newSig, exported); err != nil {
+		return errResult(err)
+	}
+
+	touchedFiles := map[string]bool{}
+	if d.SourceFile != "" {
+		touchedFiles[d.SourceFile] = true
+	}
+
+	callers, err := tx.GetCallers(d.ID)
+	if err != nil {
+		return errResult(fmt.Errorf("get callers for rename: %w", err))
+	}
+	totalSkipped := 0
+	updated := 0
+	for _, caller := range callers {
+		if strings.Contains(caller.Body, oldBareName) {
+			var skipped int
+			caller.Body, skipped = astRename(caller.Body, oldBareName, args.NewName)
+			totalSkipped += skipped
+			caller.Signature = extractSignature(caller.Body)
+			if _, err := tx.UpsertDefinition(&caller); err != nil {
+				return errResult(fmt.Errorf("update caller %s: %w", caller.Name, err))
+			}
+			if caller.SourceFile != "" {
+				touchedFiles[caller.SourceFile] = true
+			}
+			updated++
+		}
+	}
+
+	parentType.Body = newParentBody
+	parentType.Signature = extractSignature(newParentBody)
+	if _, err := tx.UpsertDefinition(parentType); err != nil {
+		return errResult(fmt.Errorf("update struct declaration for %s: %w", d.Receiver, err))
+	}
+	if parentType.SourceFile != "" {
+		touchedFiles[parentType.SourceFile] = true
+	}
+
+	goimportsFiles := make([]string, 0, len(touchedFiles))
+	for f := range touchedFiles {
+		goimportsFiles = append(goimportsFiles, f)
+	}
+
+	buildResult := s.commitOrRollbackOnBuild(tx, commit, rollback, emit.Opts{
+		GoimportsFiles: goimportsFiles,
+		TouchedFiles:   goimportsFiles,
+	})
+
+	var sb strings.Builder
+	if buildResult != "" {
+		sb.WriteString(fmt.Sprintf("rename %s → %s rolled back — nothing was saved\n\n%s", args.OldName, args.NewName, buildResult))
+		return textResult(sb.String()), nil, nil
+	}
+
+	if s.idf != nil {
+		s.idf.Invalidate()
+	}
+	d.Name = args.NewName
+	d.Body = newBody
+	d.Signature = newSig
+	d.Exported = exported
+	s.enqueueSummary(d)
+
+	sb.WriteString(fmt.Sprintf("Renamed %s → %s\n", args.OldName, args.NewName))
+	sb.WriteString(fmt.Sprintf("Updated struct declaration in %s\n", parentType.SourceFile))
+	sb.WriteString(fmt.Sprintf("Updated %d callers\n", updated))
+	if totalSkipped > 0 {
+		sb.WriteString(fmt.Sprintf("\nNote: %d local variable(s) named %q were preserved (not renamed).\n", totalSkipped, args.OldName))
+	}
+	return textResult(sb.String()), nil, nil
+}
+
+// unsupportedFieldOp returns a clear, actionable refusal message when op
+// cannot safely target a struct-field definition, or "" if op is fine.
+// Struct fields are excluded from emit by design (#11) -- a field only
+// exists as text inside its declaring type's Body, not as its own
+// top-level declaration -- so a write op that resolves a field as its
+// target and doesn't specifically know how to rewrite the parent type's
+// Body alongside it silently diverges the DB from the file instead of
+// failing loudly. Confirmed live for delete (DB row vanishes, struct
+// declaration on disk untouched, reports "Deleted" anyway), patch (body
+// text patched in the DB, never reaches disk, reports "Patched" anyway),
+// and move (deletes+reinserts under a different module, same disk gap
+// plus a receiver that no longer resolves in the target package). The
+// edit-shaped ops (edit, fragment edit, insert, and the projection ops
+// funneled through applyEditTerse) already fail safely today via their
+// own "does newBody parse as top-level Go" check -- a bare field
+// snippet essentially never does -- but that protection was incidental,
+// not a decision, so this makes the same refusal explicit and
+// consistent everywhere instead of leaving it to chance. rename is the
+// one op with real support: see handleFieldRename / handleApply's
+// field-rename branch, which rewrite the parent type's Body directly.
+func unsupportedFieldOp(kind, op string) string {
+	if kind != "field" || op == "rename" {
+		return ""
+	}
+	return fmt.Sprintf("code(op:%q) does not support struct fields directly -- a field only exists as text inside its declaring type's body, not as an independent declaration. Use code(op:\"rename\") to rename a field, or target the declaring type to change its shape.", op)
+}
+
+// interfaceDeclaresMethod reports whether an interface definition's
+// stored Body declares a method with the given bare name. Interface
+// methods live inline in the interface's own Body, not as independent
+// rows -- same #11 shape as struct fields -- so this parses the Body
+// the same way methodsFromInterfaceBody does rather than querying a
+// separate row that doesn't exist.
+func interfaceDeclaresMethod(body, name string) bool {
+	src := "package x\n" + body
+	f, err := parser.ParseFile(token.NewFileSet(), "", src, 0)
+	if err != nil || len(f.Decls) == 0 {
+		return false
+	}
+	gen, ok := f.Decls[0].(*ast.GenDecl)
+	if !ok || len(gen.Specs) == 0 {
+		return false
+	}
+	ts, ok := gen.Specs[0].(*ast.TypeSpec)
+	if !ok {
+		return false
+	}
+	iface, ok := ts.Type.(*ast.InterfaceType)
+	if !ok {
+		return false
+	}
+	for _, field := range iface.Methods.List {
+		for _, ident := range field.Names {
+			if ident.Name == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *server) methodRenameRisksInterfaceBreak(tx store.Backend, d *store.Definition, oldName string) bool {
+	if d.Kind != "method" || d.Receiver == "" {
+		return false
+	}
+	// def_external_interfaces: resolve()'s real signal for external
+	// (stdlib/third-party) interface satisfaction -- computed via
+	// types.Implements against every interface reachable through the
+	// method's own package imports (ifacesByPkg widened in resolve.go),
+	// keyed by the concrete method's own def ID since an external
+	// interface has no defn row of its own to hang an "implements" ref
+	// off of. Confirmed live: a type satisfying io.ReaderAt (method
+	// ReadAt) via `func use() io.ReaderAt { return T{} }`, no local
+	// interface anywhere, used to report clean rename success while
+	// shipping a build that no longer compiled -- this closes that gap
+	// for any external interface, not just a hardcoded few.
+	if extIfaces, err := tx.GetExternalInterfaces(d.ID); err == nil && len(extIfaces) > 0 {
+		return true
+	}
+	// commonStdlibInterfaceMethodNames: defensive fallback for a DB that
+	// hasn't been resolved since this method's interface satisfaction
+	// last changed (def_external_interfaces above is only as fresh as
+	// the last resolve()). Deliberately small and conservative -- the
+	// handful of single-method stdlib interfaces most likely to actually
+	// be satisfied by a project type.
+	if commonStdlibInterfaceMethodNames[oldName] {
+		return true
+	}
+	recvName := strings.TrimPrefix(d.Receiver, "*")
+	mp := s.modulePath(d.ModuleID)
+	recvType, err := tx.GetDefinitionByName(recvName, mp)
+	if err != nil || recvType == nil {
+		return false
+	}
+	ifaces, err := tx.Traverse(recvType.ID, "callees", []string{"implements"}, 1)
+	if err != nil {
+		return false
+	}
+	for _, r := range ifaces {
+		// Traverse's query hardcodes an empty string for the body column
+		// (a perf tradeoff for lightweight graph queries) -- r.Definition.Body
+		// is always "" here regardless of the real def, so a full fetch is
+		// required before this can parse the interface's method set.
+		iface, err := tx.GetDefinition(r.Definition.ID)
+		if err != nil || iface == nil {
+			continue
+		}
+		if interfaceDeclaresMethod(iface.Body, oldName) {
+			return true
+		}
+	}
+	return false
+}
+
+// commonStdlibInterfaceMethodNames is the deliberately small,
+// conservative name allowlist methodRenameRisksInterfaceBreak falls
+// back to when no local "implements" edge is found -- see its doc
+// comment for why resolve()'s ref-graph is structurally blind to
+// external/stdlib interfaces. These are the single-method (or
+// small-method-set, checked via the method's own name here) stdlib
+// interfaces most likely in practice to be satisfied by a project
+// type: io.Reader/Writer/Closer, fmt.Stringer, the error interface,
+// sort.Interface, http.Handler, and the common (Un)Marshal family. Not
+// exhaustive by design -- it does not, and cannot, catch a custom
+// interface from a third-party dependency; that needs the real
+// resolve.go-level fix (scanning imported external packages'
+// interfaces too), not a name list.
+var commonStdlibInterfaceMethodNames = map[string]bool{
+	"Read":          true,
+	"Write":         true,
+	"Close":         true,
+	"String":        true,
+	"Error":         true,
+	"Len":           true,
+	"Less":          true,
+	"Swap":          true,
+	"ServeHTTP":     true,
+	"MarshalJSON":   true,
+	"UnmarshalJSON": true,
+	"MarshalText":   true,
+	"UnmarshalText": true,
+}
+
+// dryRunResult is the single formatting/return-shape point for every
+// write op's dry_run:true preview. Centralizing this (instead of each
+// write handler building its own "(dry run — no changes made)" string)
+// means a future write op that forgets to call it produces an
+// obviously-absent dry_run check rather than a subtly-different one --
+// the failure mode that let create and add-import silently perform
+// real writes under dry_run:true despite the field being accepted by
+// the shared codeParam schema. msg should already name what WOULD have
+// happened (e.g. "Foo: would replace hunk #1").
+func dryRunResult(msg string) (*sdkmcp.CallToolResult, any, error) {
+	return textResult(msg + "\n\n(dry run — no changes made)"), nil, nil
+}
+
+// handleVersion reports the running server's build identity: the
+// Version const baked in at compile time, plus the on-disk binary's
+// path and mtime. Exists so an agent can self-check "is the process
+// answering my tool calls actually the binary I just rebuilt" through
+// the SAME channel it already uses for everything else, instead of
+// needing to know the HTTP-transport-only /version endpoint's port
+// (a hash of the project path) or inferring staleness indirectly from
+// a schema-validation failure on a field that was just added. A
+// mismatch between this call's binary mtime and a source file's mtime
+// is the direct, unambiguous version-skew signal; a failed call on a
+// brand-new param is not.
+func (s *server) handleVersion(_ context.Context, _ *sdkmcp.CallToolRequest, _ codeParam) (*sdkmcp.CallToolResult, any, error) {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("defn %s\n", Version))
+	if exe, err := os.Executable(); err == nil {
+		sb.WriteString(fmt.Sprintf("binary: %s\n", exe))
+		if info, statErr := os.Stat(exe); statErr == nil {
+			sb.WriteString(fmt.Sprintf("built: %s\n", info.ModTime().Format(time.RFC3339)))
+		}
+	}
+	sb.WriteString(fmt.Sprintf("pid: %d\n", os.Getpid()))
+	return textResult(sb.String()), nil, nil
 }

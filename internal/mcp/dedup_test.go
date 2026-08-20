@@ -327,10 +327,15 @@ func TestWriteTargets(t *testing.T) {
 			wantOK:    true,
 		},
 		{
-			name:      "rename_scopes_to_old_and_new",
-			args:      codeParam{Op: "rename", OldName: "Foo", NewName: "Bar"},
-			wantNames: []string{"Foo", "Bar"},
-			wantOK:    true,
+			// A rename's real blast radius includes every rewritten
+			// caller's body (and, for a type rename, sibling method
+			// receivers) -- none of that is knowable from OldName/NewName
+			// alone, so it falls back to a full invalidate rather than
+			// under-scoping and leaving a caller's stale bodyServed entry
+			// in place.
+			name:   "rename_is_not_determinable",
+			args:   codeParam{Op: "rename", OldName: "Foo", NewName: "Bar"},
+			wantOK: false,
 		},
 		{
 			name:      "create_scopes_to_file",
@@ -364,6 +369,14 @@ func TestWriteTargets(t *testing.T) {
 			args: codeParam{Op: "apply", Operations: []applyOp{
 				{Op: "edit", Name: "Foo"},
 				{Op: "sync"},
+			}},
+			wantOK: false,
+		},
+		{
+			name: "apply_batch_with_rename_is_not_determinable",
+			args: codeParam{Op: "apply", Operations: []applyOp{
+				{Op: "edit", Name: "Foo"},
+				{Op: "rename", Name: "Baz", NewName: "Qux"},
 			}},
 			wantOK: false,
 		},
@@ -514,5 +527,109 @@ func TestHandleCode_ContextRepeatHitsDedupStub(t *testing.T) {
 	thirdText := resultText(t, third)
 	if strings.Contains(thirdText, "cached: identical") {
 		t.Errorf("a different question should not hit the dedup stub, got:\n%s", thirdText)
+	}
+}
+
+// TestInvalidateNames_ContextAlwaysCleared is the regression for
+// invalidateNames missing a "context|" branch alongside "search|" --
+// context's dedup key is free-text question, modeled explicitly on
+// search's own convention (per dedupOpKey's case comment), but only
+// search actually got the blanket-clear treatment in invalidateNames.
+func TestInvalidateNames_ContextAlwaysCleared(t *testing.T) {
+	c := newRespCache()
+	sess := &sdkmcp.ServerSession{}
+	res := mkPayload("context-bundle")
+
+	c.dedup(sess, "context", "how does auth work", mkText(res))
+	c.invalidateNames(sess, []string{"SomeUnrelatedDef"}, nil)
+
+	if r := c.dedup(sess, "context", "how does auth work", mkText(res)); strings.Contains(r.Content[0].(*sdkmcp.TextContent).Text, "cached") {
+		t.Errorf("context entries should always be cleared by any determinable write, got a cache-hit stub")
+	}
+}
+
+// TestDedupOpKey_ExplainKeyIncludesQuestion is the regression for
+// dedupOpKey's "explain" case ignoring Question/Names: two different
+// questions about the same def used to collide on one dedup key
+// (args.Name alone), silently defeating dedup for the question-driven
+// explain path -- interleaved explain(name:"F", question:"...") calls
+// with different questions never got their own cache slot. Same
+// convention "context" already follows for its own free-text key.
+func TestDedupOpKey_ExplainKeyIncludesQuestion(t *testing.T) {
+	_, key1, ok1 := dedupOpKey(codeParam{Op: "explain", Name: "Foo", Question: "how does it handle errors"})
+	_, key2, ok2 := dedupOpKey(codeParam{Op: "explain", Name: "Foo", Question: "why is this exported"})
+	if !ok1 || !ok2 {
+		t.Fatalf("expected both explain calls to be cacheable, got ok1=%v ok2=%v", ok1, ok2)
+	}
+	if key1 == key2 {
+		t.Errorf("two different questions about the same def collided on one dedup key: %q", key1)
+	}
+
+	_, bareKey, ok := dedupOpKey(codeParam{Op: "explain", Name: "Foo"})
+	if !ok {
+		t.Fatal("expected bare explain(name:) to still be cacheable")
+	}
+	if bareKey != "Foo" {
+		t.Errorf("bare explain(name:) key changed shape: got %q, want %q", bareKey, "Foo")
+	}
+}
+
+// TestMaybeAppendStarterBundle_EmptyQuestionDoesNotConsumeOneShot is
+// the regression for maybeAppendStarterBundle burning its one-shot
+// starterInjected flag before checking whether question was even
+// non-empty: an empty question means there's nothing for handleContext
+// to work with, so it shouldn't cost the session its only starter-
+// bundle opportunity -- a later call with a real question should still
+// get a shot at it.
+func TestMaybeAppendStarterBundle_EmptyQuestionDoesNotConsumeOneShot(t *testing.T) {
+	s := &server{respCache: newRespCache()}
+	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
+
+	if got := s.maybeAppendStarterBundle(req, "   "); got != "" {
+		t.Fatalf("expected empty string for a blank question, got: %q", got)
+	}
+
+	sc := s.respCache.getSession(req.Session)
+	if sc.starterInjected {
+		t.Fatal("a blank-question call should not have consumed the one-shot starterInjected flag")
+	}
+}
+
+// TestDedupOpKey_ReadKeyIncludesQuery is the regression for a real
+// trajectory finding (prometheus-18712, v4 mining round): dedupOpKey's
+// "read" case ignored args.Query, so a full-body read of a large
+// function followed by a query-scoped read of the SAME def collided on
+// one dedup key -- the query-scoped call got served the stale
+// full-body "already served, nothing new" stub instead of the
+// genuinely narrower, different output it asked for.
+func TestDedupOpKey_ReadKeyIncludesQuery(t *testing.T) {
+	_, key1, ok1 := dedupOpKey(codeParam{Op: "read", Name: "main", Full: true})
+	_, key2, ok2 := dedupOpKey(codeParam{Op: "read", Name: "main", Full: true, Query: "memlimit"})
+	if !ok1 || !ok2 {
+		t.Fatalf("expected both read calls to be cacheable, got ok1=%v ok2=%v", ok1, ok2)
+	}
+	if key1 == key2 {
+		t.Errorf("a plain full-body read and a query-scoped read of the same def collided on one dedup key: %q", key1)
+	}
+}
+
+// TestDedupOpKey_ReadKeyIncludesLineRange is the same collision class as
+// TestDedupOpKey_ReadKeyIncludesQuery, but for the line_range param added
+// alongside it: a full-body read of a large function followed by a
+// line-range-scoped read of the SAME def must not collide on one dedup
+// key, or the ranged call would get served the stale full-body stub
+// instead of the narrower range it actually asked for.
+func TestDedupOpKey_ReadKeyIncludesLineRange(t *testing.T) {
+	_, key1, ok1 := dedupOpKey(codeParam{Op: "read", Name: "main", Full: true})
+	_, key2, ok2 := dedupOpKey(codeParam{Op: "read", Name: "main", Full: true, LineRange: "700-820"})
+	_, key3, ok3 := dedupOpKey(codeParam{Op: "read", Name: "main", Full: true, LineRange: "900-950"})
+	if !ok1 || !ok2 || !ok3 {
+		t.Fatalf("expected all three read calls to be cacheable, got ok1=%v ok2=%v ok3=%v", ok1, ok2, ok3)
+	}
+	if key1 == key2 {
+		t.Errorf("a plain full-body read and a line_range-scoped read of the same def collided on one dedup key: %q", key1)
+	}
+	if key2 == key3 {
+		t.Errorf("two different line_range values on the same def collided on one dedup key: %q", key2)
 	}
 }

@@ -84,3 +84,81 @@ func TestHandleGetDefinition_AutoDowngradesLargeBody(t *testing.T) {
 		t.Errorf("full:true must return the full body; got: %s", text3)
 	}
 }
+
+// TestHandleGetDefinition_LineRangeNarrowsBody mirrors the exact shape
+// that motivated the line_range param: a real trajectory (prometheus-
+// 18712 mining) reached for made-up "pick"/"slice"/"line" params trying
+// to narrow a read of a large multi-hundred-line function down to a
+// specific range, and those params were silently ignored (no such
+// fields existed). This locks in that line_range, once it exists,
+// actually narrows the returned body to the requested file-relative
+// range, bypasses the #184 auto-outline-downgrade the same way full:
+// true does, and correctly accounts for the def's leading doc comment
+// when converting file-relative lines to a body-relative slice.
+func TestHandleGetDefinition_LineRangeNarrowsBody(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0o755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0o644)
+	// Line 1: package main
+	// Line 2: (blank)
+	// Line 3: // BigFunc doc comment (one line)
+	// Line 4: func BigFunc(name string) string {
+	// Line 5: result := ""
+	// Lines 6-65: 60 padding lines, "line %d: ..." for i in 0..59
+	// Line 66: return result + name
+	// Line 67: }
+	var body strings.Builder
+	body.WriteString("package main\n\n// BigFunc has a body larger than the auto-outline threshold.\nfunc BigFunc(name string) string {\n\tresult := \"\"\n")
+	for i := 0; i < 60; i++ {
+		body.WriteString(fmt.Sprintf("\tresult += \"line %d: this is padding to push body past 1500 bytes\\n\"\n", i))
+	}
+	body.WriteString("\treturn result + name\n}\n")
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(body.String()), 0o644)
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{backend: db}
+
+	// File lines 10-12 correspond to padding indices 4, 5, 6 (line 6 == i=0).
+	result, _, err := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "BigFunc", LineRange: "10-12"})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	text := resultText(t, result)
+
+	if strings.Contains(text, "Outline shown") {
+		t.Errorf("line_range must bypass the #184 auto-outline-downgrade; got: %s", text)
+	}
+	if !strings.Contains(text, "line_range read") {
+		t.Errorf("expected a line_range hint header; got: %s", text)
+	}
+	for _, want := range []string{"line 4:", "line 5:", "line 6:"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("expected requested range to contain %q; got: %s", want, text)
+		}
+	}
+	for _, unwanted := range []string{"line 0:", "line 59:", "return result + name", "func BigFunc"} {
+		if strings.Contains(text, unwanted) {
+			t.Errorf("line_range leaked content outside the requested range (%q); got: %s", unwanted, text)
+		}
+	}
+
+	// Also accept the "start:end" separator form.
+	result2, _, err := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "BigFunc", LineRange: "10:12"})
+	if err != nil {
+		t.Fatalf("read with ':' separator: %v", err)
+	}
+	text2 := resultText(t, result2)
+	if !strings.Contains(text2, "line 4:") {
+		t.Errorf("':' separator form should behave identically; got: %s", text2)
+	}
+}

@@ -27,7 +27,18 @@ CREATE TABLE IF NOT EXISTS definitions (
     end_line    INTEGER,
     source_file TEXT DEFAULT '',
     hash        TEXT NOT NULL,
-    UNIQUE(module_id, name, kind, receiver, test),
+    -- source_file is part of the natural key, not just module/name/kind/
+    -- receiver/test: Go explicitly permits multiple func init() per
+    -- package (one per file), and it's the single most common source of
+    -- same-named declarations across sibling files in one package (also
+    -- common in generated code: protoc/goyacc output often has more than
+    -- one init() across a package's .pb.go files). Without source_file,
+    -- every file's first (unrenamed) "init" collided on this constraint,
+    -- and "last write wins" silently dropped one file's init() content
+    -- while duplicating the other's onto both files on emit -- corrupting
+    -- real, unrelated packages (proto enum / driver registration panics)
+    -- that were never touched by the edit that triggered a re-ingest.
+    UNIQUE(module_id, name, kind, receiver, test, source_file),
     FOREIGN KEY (module_id) REFERENCES modules(id)
 );
 
@@ -184,6 +195,24 @@ CREATE INDEX IF NOT EXISTS idx_litfield_type_field ON literal_fields(type_name, 
 -- the matching prefix-range rewrite, which is what lets the index be used at
 -- all — SQLite cannot use an index for LIKE while case_sensitive_like is OFF.
 CREATE INDEX IF NOT EXISTS idx_litfield_value ON literal_fields(field_value);
+
+-- def_external_interfaces: per-method record of which EXTERNAL (stdlib or
+-- third-party dependency) interfaces a concrete method satisfies, computed
+-- at resolve() time via types.Implements against every interface reachable
+-- through the method's own package imports. Unlike the `refs` "implements"
+-- kind, iface_name has no def_id to point at -- external packages are never
+-- ingested into this DB, so there's no row for io.Reader to reference. This
+-- is the ID-less sidecar that makes that satisfaction queryable anyway:
+-- methodRenameRisksInterfaceBreak checks it by def_id (the concrete
+-- method's own row) instead of the small commonStdlibInterfaceMethodNames
+-- name-list heuristic it used to be limited to.
+CREATE TABLE IF NOT EXISTS def_external_interfaces (
+    def_id     INTEGER NOT NULL,
+    iface_name TEXT NOT NULL,
+    PRIMARY KEY (def_id, iface_name),
+    FOREIGN KEY (def_id) REFERENCES definitions(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_def_ext_iface_def ON def_external_interfaces(def_id);
 
 CREATE TABLE IF NOT EXISTS defn_meta (
     "key"   TEXT PRIMARY KEY,

@@ -40,13 +40,18 @@ func IngestFile(db store.Backend, modulePath string, filePath string) (int, erro
 		return 0, fmt.Errorf("parse %s: %w", relFile, err)
 	}
 
-	// Determine the package path from go.mod module prefix + relative dir.
-	pkgDir := filepath.Dir(relFile)
+	// Determine the package path from the NEAREST go.mod's module
+	// prefix + the dir's path relative to that go.mod, not
+	// necessarily absModule's go.mod -- see ModuleForDir's doc.
 	isTest := strings.HasSuffix(relFile, "_test.go")
 
-	modPrefix, err := readModulePath(filepath.Join(absModule, "go.mod"))
+	modPrefix, nearestModDir, err := ModuleForDir(filepath.Dir(absFile))
 	if err != nil {
 		return 0, fmt.Errorf("read go.mod: %w", err)
+	}
+	pkgDir, err := filepath.Rel(nearestModDir, filepath.Dir(absFile))
+	if err != nil {
+		return 0, fmt.Errorf("rel pkg dir: %w", err)
 	}
 
 	pkgPath := modPrefix
@@ -132,4 +137,48 @@ func readModulePath(goModPath string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no module directive in %s", goModPath)
+}
+
+// ModuleForDir finds the nearest go.mod at or above dir (walking up
+// the filesystem, crossing into parent directories until one is
+// found) and returns its declared module path together with the
+// directory that go.mod lives in. Callers compute a package's import
+// path as modulePrefix + "/" + relative(modDir, dir).
+//
+// This exists because a subdirectory with its own go.mod is a
+// separate Go module (common in real multi-module repos -- etcd's
+// server/, tests/, etcdctl/ etc. each declare their own module).
+// Blindly using the repo root's go.mod for every file, regardless of
+// which go.mod actually governs it, computes a package path that
+// doesn't exist (root module prefix + relative dir instead of the
+// nested module's own declared name) -- corrupting the module record
+// for that file and breaking every later module:-qualified lookup or
+// `go build`/`go test` invocation against it.
+func ModuleForDir(dir string) (modulePrefix, modDir string, err error) {
+	modDir, err = nearestModuleDir(dir)
+	if err != nil {
+		return "", "", err
+	}
+	modulePrefix, err = readModulePath(filepath.Join(modDir, "go.mod"))
+	if err != nil {
+		return "", "", err
+	}
+	return modulePrefix, modDir, nil
+}
+
+// nearestModuleDir walks up from dir looking for the nearest go.mod,
+// stopping at the filesystem root. Mirrors cmd/defn's findModuleRoot --
+// duplicated rather than shared because that one lives in package main
+// and takes a file path instead of a directory.
+func nearestModuleDir(dir string) (string, error) {
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("no go.mod found above %s", dir)
+		}
+		dir = parent
+	}
 }

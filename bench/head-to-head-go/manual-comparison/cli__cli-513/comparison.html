@@ -1,0 +1,1839 @@
+<!doctype html>
+<title>files vs defn — live trajectory, cli__cli-513</title>
+<style>
+:root {
+  --paper: #eef1f5; --paper-raised: #ffffff; --ink: #171b21; --ink-dim: #4c5561; --ink-faint: #7c8592;
+  --line: #d7dce3; --line-soft: #e6e9ee;
+  --files: #c2601f; --files-soft: #f4e3d3; --files-ink: #7a3c11;
+  --defn: #1f8f82; --defn-soft: #d9f0ec; --defn-ink: #0f5f56;
+  --ok: #2f8f5b;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+  --sans: -apple-system, "Segoe UI", "Ubuntu", system-ui, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #0e1116; --paper-raised: #161b22; --ink: #e6e9ee; --ink-dim: #a6afba; --ink-faint: #6b7684;
+    --line: #2a313c; --line-soft: #1e242c;
+    --files: #e08a4c; --files-soft: #2e2013; --files-ink: #f0b689;
+    --defn: #4dbdae; --defn-soft: #102b28; --defn-ink: #7fd9cc;
+    --ok: #5cbf8b;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #0e1116; --paper-raised: #161b22; --ink: #e6e9ee; --ink-dim: #a6afba; --ink-faint: #6b7684;
+  --line: #2a313c; --line-soft: #1e242c;
+  --files: #e08a4c; --files-soft: #2e2013; --files-ink: #f0b689;
+  --defn: #4dbdae; --defn-soft: #102b28; --defn-ink: #7fd9cc;
+  --ok: #5cbf8b;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--paper); color: var(--ink); font-family: var(--sans); font-size: 14px; line-height: 1.5; }
+h1, h2, h3 { text-wrap: balance; margin: 0; }
+.wrap { max-width: 1400px; margin: 0 auto; padding: 28px 24px 80px; }
+.intro { margin-bottom: 20px; }
+.intro .eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-faint); margin-bottom: 6px; }
+.intro h1 { font-size: 22px; font-weight: 650; letter-spacing: -0.01em; }
+.intro p { color: var(--ink-dim); max-width: 72ch; margin: 10px 0 0; }
+.intro .meta { font-family: var(--mono); font-size: 12px; color: var(--ink-faint); margin-top: 8px; }
+.summary { position: sticky; top: 0; z-index: 5; background: var(--paper); padding: 14px 0 16px; border-bottom: 1px solid var(--line); margin-bottom: 18px; }
+.summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.summary-cell { background: var(--paper-raised); padding: 12px 16px; }
+.summary-cell .label { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-faint); margin-bottom: 6px; }
+.summary-row { display: flex; align-items: baseline; gap: 10px; font-variant-numeric: tabular-nums; }
+.summary-row .v { font-family: var(--mono); font-size: 18px; font-weight: 600; }
+.summary-row .v.files { color: var(--files-ink); }
+.summary-row .v.defn { color: var(--defn-ink); }
+.summary-row .delta { font-family: var(--mono); font-size: 12px; color: var(--ink-faint); }
+.summary-row .delta.better { color: var(--ok); }
+.columns { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; align-items: start; }
+@media (max-width: 900px) { .columns { grid-template-columns: 1fr; } .summary-grid { grid-template-columns: repeat(2, 1fr); } }
+.column-head { display: flex; align-items: center; gap: 8px; padding: 8px 4px 12px; font-family: var(--mono); font-weight: 600; font-size: 13px; }
+.column-head .swatch { width: 10px; height: 10px; border-radius: 2px; }
+.column-head.files .swatch { background: var(--files); }
+.column-head.defn .swatch { background: var(--defn); }
+.column-final { background: var(--paper-raised); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; }
+.column-final-h { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-faint); margin-bottom: 6px; }
+.column-final p { margin: 0; font-size: 12.5px; color: var(--ink-dim); white-space: pre-wrap; max-height: 160px; overflow-y: auto; }
+details.step { background: var(--paper-raised); border: 1px solid var(--line-soft); border-left: 3px solid var(--line); border-radius: 6px; margin-bottom: 6px; }
+details.step.files { border-left-color: var(--files); }
+details.step.defn { border-left-color: var(--defn); }
+details.step summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 10px; padding: 8px 10px; font-family: var(--mono); font-size: 12px; }
+details.step summary::-webkit-details-marker { display: none; }
+details.step summary:focus-visible { outline: 2px solid var(--defn); outline-offset: 2px; }
+.step-n { color: var(--ink-faint); width: 20px; flex: none; }
+.step-label { font-weight: 650; flex: none; }
+details.step.files .step-label { color: var(--files-ink); }
+details.step.defn .step-label { color: var(--defn-ink); }
+.step-target { color: var(--ink-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 auto; min-width: 0; }
+.step-bytes { color: var(--ink-faint); flex: none; }
+.step-cum { color: var(--ink-faint); flex: none; width: 76px; text-align: right; }
+.step-body { padding: 0 10px 12px 40px; display: grid; gap: 8px; }
+.step-block-h { font-size: 10px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--ink-faint); margin-bottom: 3px; }
+.step-block pre { margin: 0; font-family: var(--mono); font-size: 11.5px; white-space: pre-wrap; word-break: break-word; background: var(--line-soft); border-radius: 6px; padding: 8px 10px; max-height: 320px; overflow: auto; }
+.footnote { margin-top: 28px; padding-top: 14px; border-top: 1px solid var(--line); color: var(--ink-faint); font-size: 12px; max-width: 72ch; }
+</style>
+<div class="wrap">
+  <div class="intro">
+    <div class="eyebrow">live trajectory comparison &middot; same model, same task, same session</div>
+    <h1>cli/cli &mdash; cli__cli-513</h1>
+    <p>`gh pr list --state=closed` excludes `merged` — differs from `is:closed` behavior on web UI?
+### Describe the UX question
+
+Not a bug but a UX question / inconsistency: is it confusing that official `gh` CLI models &quot;merged&quot; PRs as disjoint set from &quot;closed&quot;, whereas the web site&hellip;</p>
+    <div class="meta">base commit cc96ddd5514c &middot; files-mode: Read/Grep/Edit/Bash &middot; defn-mode: single `code` MCP tool only</div>
+  </div>
+  <div class="summary">
+    <div class="summary-grid">
+      <div class="summary-cell"><div class="label">cost</div><div class="summary-row"><span class="v files">$0.412</span><span class="v defn">$0.288</span><span class="delta better">-30%</span></div></div>
+      <div class="summary-cell"><div class="label">wall time</div><div class="summary-row"><span class="v files">119s</span><span class="v defn">92s</span><span class="delta better">-23%</span></div></div>
+      <div class="summary-cell"><div class="label">tool calls</div><div class="summary-row"><span class="v files">22</span><span class="v defn">20</span><span class="delta better">-9%</span></div></div>
+      <div class="summary-cell"><div class="label">wire bytes</div><div class="summary-row"><span class="v files">17,838</span><span class="v defn">23,557</span><span class="delta ">+32%</span></div></div>
+    </div>
+  </div>
+  <div class="columns">
+    <div><div class="column-head files"><span class="swatch"></span>files-mode &middot; Read / Grep / Edit / Bash</div>
+<div class="column">
+  <div class="column-final"><div class="column-final-h">final message</div><p>All tests pass, including the new one confirming `--state closed` now sends `[&quot;CLOSED&quot;, &quot;MERGED&quot;]` to match GitHub&#x27;s web UI behavior.
+
+**Summary of changes:**
+- `command/pr.go`: `--state closed` now maps to GraphQL states `[&quot;CLOSED&quot;, &quot;MERGED&quot;]` instead of just `[&quot;CLOSED&quot;]`, matching `is:closed` behavior on github.com. Updated the flag&#x27;s help text accordingly.
+- `api/queries_pr.go`: added `isCloseState` helper so the `--assignee` search-query code path also appends `state:closed` (which already includes merged PRs on github.com search) when the state filter is the closed+merged set, instead of silently dropping the state filter.
+- `command/pr_test.go`: added `TestPRList_filteringClosed` to lock in the new behavior.</p></div>
+  
+<details class="step files">
+  <summary>
+    <span class="step-n">01</span>
+    <span class="step-label">Grep</span>
+    <span class="step-target">/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files</span>
+    <span class="step-bytes">+171B in · +83B out</span>
+    <span class="step-cum">254B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;pattern&quot;: &quot;state.*closed|StateClosed|\\\&quot;closed\\\&quot;&quot;,
+  &quot;path&quot;: &quot;/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files&quot;,
+  &quot;glob&quot;: &quot;*.go&quot;,
+  &quot;output_mode&quot;: &quot;files_with_matches&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (83 bytes)</div><pre>Found 4 files
+command/pr.go
+command/issue.go
+api/queries_issue.go
+api/queries_pr.go</pre></div>
+  </div>
+</details>
+
+<details class="step files">
+  <summary>
+    <span class="step-n">02</span>
+    <span class="step-label">Grep</span>
+    <span class="step-target">/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/command/pr.go</span>
+    <span class="step-bytes">+121B in · +26B out</span>
+    <span class="step-cum">401B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;pattern&quot;: &quot;state&quot;,
+  &quot;path&quot;: &quot;/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/command/pr.go&quot;,
+  &quot;-n&quot;: true,
+  &quot;-i&quot;: true
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (26 bytes)</div><pre>Found 1 file
+command/pr.go</pre></div>
+  </div>
+</details>
+
+<details class="step files">
+  <summary>
+    <span class="step-n">03</span>
+    <span class="step-label">Grep</span>
+    <span class="step-target">/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/command/pr.go</span>
+    <span class="step-bytes">+147B in · +599B out</span>
+    <span class="step-cum">1,147B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;pattern&quot;: &quot;state&quot;,
+  &quot;path&quot;: &quot;/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/command/pr.go&quot;,
+  &quot;-n&quot;: true,
+  &quot;-i&quot;: true,
+  &quot;output_mode&quot;: &quot;content&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (599 bytes)</div><pre>28:	prListCmd.Flags().StringP(&quot;state&quot;, &quot;s&quot;, &quot;open&quot;, &quot;Filter by state: {open|closed|merged|all}&quot;)
+144:	state, err := cmd.Flags().GetString(&quot;state&quot;)
+161:	var graphqlState []string
+162:	switch state {
+164:		graphqlState = []string{&quot;OPEN&quot;}
+166:		graphqlState = []string{&quot;CLOSED&quot;}
+168:		graphqlState = []string{&quot;MERGED&quot;}
+170:		graphqlState = []string{&quot;OPEN&quot;, &quot;CLOSED&quot;, &quot;MERGED&quot;}
+172:		return fmt.Errorf(&quot;invalid state: %s&quot;, state)
+178:		&quot;state&quot;: graphqlState,
+216:		table.AddField(prNum, nil, colorFuncForState(pr.State))
+229:func colorFuncForState(state string) func(string) string {
+230:	switch state {</pre></div>
+  </div>
+</details>
+
+<details class="step files">
+  <summary>
+    <span class="step-n">04</span>
+    <span class="step-label">Read</span>
+    <span class="step-target">/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/command/pr.go</span>
+    <span class="step-bytes">+111B in · +2632B out</span>
+    <span class="step-cum">3,890B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;file_path&quot;: &quot;/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/command/pr.go&quot;,
+  &quot;offset&quot;: 130,
+  &quot;limit&quot;: 100
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (2,632 bytes)</div><pre>130			return err
+131		}
+132	
+133		baseRepo, err := determineBaseRepo(cmd, ctx)
+134		if err != nil {
+135			return err
+136		}
+137	
+138		fmt.Fprintf(colorableErr(cmd), &quot;\nPull requests for %s\n\n&quot;, ghrepo.FullName(*baseRepo))
+139	
+140		limit, err := cmd.Flags().GetInt(&quot;limit&quot;)
+141		if err != nil {
+142			return err
+143		}
+144		state, err := cmd.Flags().GetString(&quot;state&quot;)
+145		if err != nil {
+146			return err
+147		}
+148		baseBranch, err := cmd.Flags().GetString(&quot;base&quot;)
+149		if err != nil {
+150			return err
+151		}
+152		labels, err := cmd.Flags().GetStringSlice(&quot;label&quot;)
+153		if err != nil {
+154			return err
+155		}
+156		assignee, err := cmd.Flags().GetString(&quot;assignee&quot;)
+157		if err != nil {
+158			return err
+159		}
+160	
+161		var graphqlState []string
+162		switch state {
+163		case &quot;open&quot;:
+164			graphqlState = []string{&quot;OPEN&quot;}
+165		case &quot;closed&quot;:
+166			graphqlState = []string{&quot;CLOSED&quot;}
+167		case &quot;merged&quot;:
+168			graphqlState = []string{&quot;MERGED&quot;}
+169		case &quot;all&quot;:
+170			graphqlState = []string{&quot;OPEN&quot;, &quot;CLOSED&quot;, &quot;MERGED&quot;}
+171		default:
+172			return fmt.Errorf(&quot;invalid state: %s&quot;, state)
+173		}
+174	
+175		params := map[string]interface{}{
+176			&quot;owner&quot;: (*baseRepo).RepoOwner(),
+177			&quot;repo&quot;:  (*baseRepo).RepoName(),
+178			&quot;state&quot;: graphqlState,
+179		}
+180		if len(labels) &gt; 0 {
+181			params[&quot;labels&quot;] = labels
+182		}
+183		if baseBranch != &quot;&quot; {
+184			params[&quot;baseBranch&quot;] = baseBranch
+185		}
+186		if assignee != &quot;&quot; {
+187			params[&quot;assignee&quot;] = assignee
+188		}
+189	
+190		prs, err := api.PullRequestList(apiClient, params, limit)
+191		if err != nil {
+192			return err
+193		}
+194	
+195		if len(prs) == 0 {
+196			colorErr := colorableErr(cmd) // Send to stderr because otherwise when piping this command it would seem like the &quot;no open prs&quot; message is actually a pr
+197			msg := &quot;There are no open pull requests&quot;
+198	
+199			userSetFlags := false
+200			cmd.Flags().Visit(func(f *pflag.Flag) {
+201				userSetFlags = true
+202			})
+203			if userSetFlags {
+204				msg = &quot;No pull requests match your search&quot;
+205			}
+206			printMessage(colorErr, msg)
+207			return nil
+208		}
+209	
+210		table := utils.NewTablePrinter(cmd.OutOrStdout())
+211		for _, pr := range prs {
+212			prNum := strconv.Itoa(pr.Number)
+213			if table.IsTTY() {
+214				prNum = &quot;#&quot; + prNum
+215			}
+216			table.AddField(prNum, nil, colorFuncForState(pr.State))
+217			table.AddField(replaceExcessiveWhitespace(pr.Title), nil, nil)
+218			table.AddField(pr.HeadLabel(), nil, utils.Cyan)
+219			table.EndRow()
+220		}
+221		err = table.Render()
+222		if err != nil {
+223			return err
+224		}
+225	
+226		return nil
+227	}
+228	
+229	func colorFuncForState(state string) func(string) string {</pre></div>
+  </div>
+</details>
+
+<details class="step files">
+  <summary>
+    <span class="step-n">05</span>
+    <span class="step-label">Grep</span>
+    <span class="step-target">/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/command/pr_test.go</span>
+    <span class="step-bytes">+173B in · +326B out</span>
+    <span class="step-cum">4,389B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;pattern&quot;: &quot;closed|CLOSED|MERGED|state&quot;,
+  &quot;path&quot;: &quot;/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/command/pr_test.go&quot;,
+  &quot;-n&quot;: true,
+  &quot;-i&quot;: true,
+  &quot;output_mode&quot;: &quot;content&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (326 bytes)</div><pre>203:			State  []string
+209:	eq(t, reqBody.Variables.State, []string{&quot;OPEN&quot;, &quot;CLOSED&quot;, &quot;MERGED&quot;})
+221:	_, err := RunCommand(prListCmd, `pr list -s merged -l &quot;needs tests&quot; -a hubot -B develop`)
+234:	eq(t, reqBody.Variables.Q, `repo:OWNER/REPO assignee:hubot is:pr sort:created-desc is:merged label:&quot;needs tests&quot; base:&quot;develop&quot;`)</pre></div>
+  </div>
+</details>
+
+<details class="step files">
+  <summary>
+    <span class="step-n">06</span>
+    <span class="step-label">Read</span>
+    <span class="step-target">/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/command/pr_test.go</span>
+    <span class="step-bytes">+115B in · +1816B out</span>
+    <span class="step-cum">6,320B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;file_path&quot;: &quot;/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/command/pr_test.go&quot;,
+  &quot;offset&quot;: 180,
+  &quot;limit&quot;: 60
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (1,816 bytes)</div><pre>180	func TestPRList_filtering(t *testing.T) {
+181		initBlankContext(&quot;OWNER/REPO&quot;, &quot;master&quot;)
+182		http := initFakeHTTP()
+183		http.StubRepoResponse(&quot;OWNER&quot;, &quot;REPO&quot;)
+184	
+185		respBody := bytes.NewBufferString(`{ &quot;data&quot;: {} }`)
+186		http.StubResponse(200, respBody)
+187	
+188		output, err := RunCommand(prListCmd, `pr list -s all -l one,two -l three`)
+189		if err != nil {
+190			t.Fatal(err)
+191		}
+192	
+193		eq(t, output.String(), &quot;&quot;)
+194		eq(t, output.Stderr(), `
+195	Pull requests for OWNER/REPO
+196	
+197	No pull requests match your search
+198	`)
+199	
+200		bodyBytes, _ := ioutil.ReadAll(http.Requests[1].Body)
+201		reqBody := struct {
+202			Variables struct {
+203				State  []string
+204				Labels []string
+205			}
+206		}{}
+207		json.Unmarshal(bodyBytes, &amp;reqBody)
+208	
+209		eq(t, reqBody.Variables.State, []string{&quot;OPEN&quot;, &quot;CLOSED&quot;, &quot;MERGED&quot;})
+210		eq(t, reqBody.Variables.Labels, []string{&quot;one&quot;, &quot;two&quot;, &quot;three&quot;})
+211	}
+212	
+213	func TestPRList_filteringAssignee(t *testing.T) {
+214		initBlankContext(&quot;OWNER/REPO&quot;, &quot;master&quot;)
+215		http := initFakeHTTP()
+216		http.StubRepoResponse(&quot;OWNER&quot;, &quot;REPO&quot;)
+217	
+218		respBody := bytes.NewBufferString(`{ &quot;data&quot;: {} }`)
+219		http.StubResponse(200, respBody)
+220	
+221		_, err := RunCommand(prListCmd, `pr list -s merged -l &quot;needs tests&quot; -a hubot -B develop`)
+222		if err != nil {
+223			t.Fatal(err)
+224		}
+225	
+226		bodyBytes, _ := ioutil.ReadAll(http.Requests[1].Body)
+227		reqBody := struct {
+228			Variables struct {
+229				Q string
+230			}
+231		}{}
+232		json.Unmarshal(bodyBytes, &amp;reqBody)
+233	
+234		eq(t, reqBody.Variables.Q, `repo:OWNER/REPO assignee:hubot is:pr sort:created-desc is:merged label:&quot;needs tests&quot; base:&quot;develop&quot;`)
+235	}
+236	
+237	func TestPRList_filteringAssigneeLabels(t *testing.T) {
+238		initBlankContext(&quot;OWNER/REPO&quot;, &quot;master&quot;)
+239		http := initFakeHTTP()</pre></div>
+  </div>
+</details>
+
+<details class="step files">
+  <summary>
+    <span class="step-n">07</span>
+    <span class="step-label">Edit</span>
+    <span class="step-target">/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/command/pr.go</span>
+    <span class="step-bytes">+270B in · +171B out</span>
+    <span class="step-cum">6,761B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;replace_all&quot;: false,
+  &quot;file_path&quot;: &quot;/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/command/pr.go&quot;,
+  &quot;old_string&quot;: &quot;\tcase \&quot;closed\&quot;:\n\t\tgraphqlState = []string{\&quot;CLOSED\&quot;}&quot;,
+  &quot;new_string&quot;: &quot;\tcase \&quot;closed\&quot;:\n\t\tgraphqlState = []string{\&quot;CLOSED\&quot;, \&quot;MERGED\&quot;}&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (171 bytes)</div><pre>The file /home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/command/pr.go has been updated successfully. (file state is current in your context — no need to Read it back)</pre></div>
+  </div>
+</details>
+
+<details class="step files">
+  <summary>
+    <span class="step-n">08</span>
+    <span class="step-label">Grep</span>
+    <span class="step-target">/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files</span>
+    <span class="step-bytes">+157B in · +378B out</span>
+    <span class="step-cum">7,296B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;pattern&quot;: &quot;is:closed|is:merged|is:pr&quot;,
+  &quot;path&quot;: &quot;/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files&quot;,
+  &quot;glob&quot;: &quot;*.go&quot;,
+  &quot;output_mode&quot;: &quot;content&quot;,
+  &quot;-n&quot;: true
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (378 bytes)</div><pre>command/pr_test.go:234:	eq(t, reqBody.Variables.Q, `repo:OWNER/REPO assignee:hubot is:pr sort:created-desc is:merged label:&quot;needs tests&quot; base:&quot;develop&quot;`)
+api/queries_pr.go:229:	viewerQuery := fmt.Sprintf(&quot;repo:%s state:open is:pr author:%s&quot;, ghrepo.FullName(repo), currentUsername)
+api/queries_pr.go:530:			&quot;is:pr&quot;,
+api/queries_pr.go:540:				search = append(search, &quot;is:merged&quot;)</pre></div>
+  </div>
+</details>
+
+<details class="step files">
+  <summary>
+    <span class="step-n">09</span>
+    <span class="step-label">Read</span>
+    <span class="step-target">/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/api/queries_pr.go</span>
+    <span class="step-bytes">+114B in · +1931B out</span>
+    <span class="step-cum">9,341B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;file_path&quot;: &quot;/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/api/queries_pr.go&quot;,
+  &quot;offset&quot;: 490,
+  &quot;limit&quot;: 70
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (1,931 bytes)</div><pre>490	            }
+491			  }
+492			  pageInfo {
+493				  hasNextPage
+494				  endCursor
+495			  }
+496	        }
+497	      }
+498		}`
+499	
+500		prs := []PullRequest{}
+501		pageLimit := min(limit, 100)
+502		variables := map[string]interface{}{}
+503	
+504		// If assignee was specified, use the `search` API rather than
+505		// `Repository.pullRequests`, but this mode doesn&#x27;t support multiple labels
+506		if assignee, ok := vars[&quot;assignee&quot;].(string); ok {
+507			query = fragment + `
+508			query(
+509				$q: String!,
+510				$limit: Int!,
+511				$endCursor: String,
+512			) {
+513				search(query: $q, type: ISSUE, first: $limit, after: $endCursor) {
+514					edges {
+515						node {
+516							...pr
+517						}
+518					}
+519					pageInfo {
+520						hasNextPage
+521						endCursor
+522					}
+523				}
+524			}`
+525			owner := vars[&quot;owner&quot;].(string)
+526			repo := vars[&quot;repo&quot;].(string)
+527			search := []string{
+528				fmt.Sprintf(&quot;repo:%s/%s&quot;, owner, repo),
+529				fmt.Sprintf(&quot;assignee:%s&quot;, assignee),
+530				&quot;is:pr&quot;,
+531				&quot;sort:created-desc&quot;,
+532			}
+533			if states, ok := vars[&quot;state&quot;].([]string); ok &amp;&amp; len(states) == 1 {
+534				switch states[0] {
+535				case &quot;OPEN&quot;:
+536					search = append(search, &quot;state:open&quot;)
+537				case &quot;CLOSED&quot;:
+538					search = append(search, &quot;state:closed&quot;)
+539				case &quot;MERGED&quot;:
+540					search = append(search, &quot;is:merged&quot;)
+541				}
+542			}
+543			if labels, ok := vars[&quot;labels&quot;].([]string); ok &amp;&amp; len(labels) &gt; 0 {
+544				if len(labels) &gt; 1 {
+545					return nil, fmt.Errorf(&quot;multiple labels with --assignee are not supported&quot;)
+546				}
+547				search = append(search, fmt.Sprintf(`label:&quot;%s&quot;`, labels[0]))
+548			}
+549			if baseBranch, ok := vars[&quot;baseBranch&quot;].(string); ok {
+550				search = append(search, fmt.Sprintf(`base:&quot;%s&quot;`, baseBranch))
+551			}
+552			variables[&quot;q&quot;] = strings.Join(search, &quot; &quot;)
+553		} else {
+554			for name, val := range vars {
+555				variables[name] = val
+556			}
+557		}
+558	
+559		for {</pre></div>
+  </div>
+</details>
+
+<details class="step files">
+  <summary>
+    <span class="step-n">10</span>
+    <span class="step-label">Edit</span>
+    <span class="step-target">/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/api/queries_pr.go</span>
+    <span class="step-bytes">+897B in · +175B out</span>
+    <span class="step-cum">10,413B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;replace_all&quot;: false,
+  &quot;file_path&quot;: &quot;/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/api/queries_pr.go&quot;,
+  &quot;old_string&quot;: &quot;\t\tif states, ok := vars[\&quot;state\&quot;].([]string); ok &amp;&amp; len(states) == 1 {\n\t\t\tswitch states[0] {\n\t\t\tcase \&quot;OPEN\&quot;:\n\t\t\t\tsearch = append(search, \&quot;state:open\&quot;)\n\t\t\tcase \&quot;CLOSED\&quot;:\n\t\t\t\tsearch = append(search, \&quot;state:closed\&quot;)\n\t\t\tcase \&quot;MERGED\&quot;:\n\t\t\t\tsearch = append(search, \&quot;is:merged\&quot;)\n\t\t\t}\n\t\t}&quot;,
+  &quot;new_string&quot;: &quot;\t\tif states, ok := vars[\&quot;state\&quot;].([]string); ok &amp;&amp; len(states) == 1 {\n\t\t\tswitch states[0] {\n\t\t\tcase \&quot;OPEN\&quot;:\n\t\t\t\tsearch = append(search, \&quot;state:open\&quot;)\n\t\t\tcase \&quot;CLOSED\&quot;:\n\t\t\t\tsearch = append(search, \&quot;state:closed\&quot;)\n\t\t\tcase \&quot;MERGED\&quot;:\n\t\t\t\tsearch = append(search, \&quot;is:merged\&quot;)\n\t\t\t}\n\t\t} else if isCloseState(states) {\n\t\t\tsearch = append(search, \&quot;state:closed\&quot;)\n\t\t}&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (175 bytes)</div><pre>The file /home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/api/queries_pr.go has been updated successfully. (file state is current in your context — no need to Read it back)</pre></div>
+  </div>
+</details>
+
+<details class="step files">
+  <summary>
+    <span class="step-n">11</span>
+    <span class="step-label">Edit</span>
+    <span class="step-target">/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/api/queries_pr.go</span>
+    <span class="step-bytes">+299B in · +175B out</span>
+    <span class="step-cum">10,887B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;replace_all&quot;: false,
+  &quot;file_path&quot;: &quot;/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/api/queries_pr.go&quot;,
+  &quot;old_string&quot;: &quot;\t\tif states, ok := vars[\&quot;state\&quot;].([]string); ok &amp;&amp; len(states) == 1 {&quot;,
+  &quot;new_string&quot;: &quot;\t\tif states, ok := vars[\&quot;state\&quot;].([]string); ok {\n\t\t\tif len(states) == 1 {&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (175 bytes)</div><pre>The file /home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/api/queries_pr.go has been updated successfully. (file state is current in your context — no need to Read it back)</pre></div>
+  </div>
+</details>
+
+<details class="step files">
+  <summary>
+    <span class="step-n">12</span>
+    <span class="step-label">Read</span>
+    <span class="step-target">/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/api/queries_pr.go</span>
+    <span class="step-bytes">+114B in · +853B out</span>
+    <span class="step-cum">11,854B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;file_path&quot;: &quot;/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/api/queries_pr.go&quot;,
+  &quot;offset&quot;: 525,
+  &quot;limit&quot;: 25
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (853 bytes)</div><pre>525			owner := vars[&quot;owner&quot;].(string)
+526			repo := vars[&quot;repo&quot;].(string)
+527			search := []string{
+528				fmt.Sprintf(&quot;repo:%s/%s&quot;, owner, repo),
+529				fmt.Sprintf(&quot;assignee:%s&quot;, assignee),
+530				&quot;is:pr&quot;,
+531				&quot;sort:created-desc&quot;,
+532			}
+533			if states, ok := vars[&quot;state&quot;].([]string); ok {
+534				if len(states) == 1 {
+535				switch states[0] {
+536				case &quot;OPEN&quot;:
+537					search = append(search, &quot;state:open&quot;)
+538				case &quot;CLOSED&quot;:
+539					search = append(search, &quot;state:closed&quot;)
+540				case &quot;MERGED&quot;:
+541					search = append(search, &quot;is:merged&quot;)
+542				}
+543			} else if isCloseState(states) {
+544				search = append(search, &quot;state:closed&quot;)
+545			}
+546			if labels, ok := vars[&quot;labels&quot;].([]string); ok &amp;&amp; len(labels) &gt; 0 {
+547				if len(labels) &gt; 1 {
+548					return nil, fmt.Errorf(&quot;multiple labels with --assignee are not supported&quot;)
+549				}</pre></div>
+  </div>
+</details>
+
+<details class="step files">
+  <summary>
+    <span class="step-n">13</span>
+    <span class="step-label">Edit</span>
+    <span class="step-target">/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/api/queries_pr.go</span>
+    <span class="step-bytes">+952B in · +175B out</span>
+    <span class="step-cum">12,981B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;replace_all&quot;: false,
+  &quot;file_path&quot;: &quot;/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/api/queries_pr.go&quot;,
+  &quot;old_string&quot;: &quot;\t\tif states, ok := vars[\&quot;state\&quot;].([]string); ok {\n\t\t\tif len(states) == 1 {\n\t\t\tswitch states[0] {\n\t\t\tcase \&quot;OPEN\&quot;:\n\t\t\t\tsearch = append(search, \&quot;state:open\&quot;)\n\t\t\tcase \&quot;CLOSED\&quot;:\n\t\t\t\tsearch = append(search, \&quot;state:closed\&quot;)\n\t\t\tcase \&quot;MERGED\&quot;:\n\t\t\t\tsearch = append(search, \&quot;is:merged\&quot;)\n\t\t\t}\n\t\t} else if isCloseState(states) {\n\t\t\tsearch = append(search, \&quot;state:closed\&quot;)\n\t\t}&quot;,
+  &quot;new_string&quot;: &quot;\t\tif states, ok := vars[\&quot;state\&quot;].([]string); ok {\n\t\t\tswitch {\n\t\t\tcase len(states) == 1 &amp;&amp; states[0] == \&quot;OPEN\&quot;:\n\t\t\t\tsearch = append(search, \&quot;state:open\&quot;)\n\t\t\tcase len(states) == 1 &amp;&amp; states[0] == \&quot;MERGED\&quot;:\n\t\t\t\tsearch = append(search, \&quot;is:merged\&quot;)\n\t\t\tcase isCloseState(states):\n\t\t\t\tsearch = append(search, \&quot;state:closed\&quot;)\n\t\t\t}\n\t\t}&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (175 bytes)</div><pre>The file /home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/api/queries_pr.go has been updated successfully. (file state is current in your context — no need to Read it back)</pre></div>
+  </div>
+</details>
+
+<details class="step files">
+  <summary>
+    <span class="step-n">14</span>
+    <span class="step-label">Grep</span>
+    <span class="step-target">/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/api/queries_pr.go</span>
+    <span class="step-bytes">+140B in · +809B out</span>
+    <span class="step-cum">13,930B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;pattern&quot;: &quot;^func &quot;,
+  &quot;path&quot;: &quot;/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/api/queries_pr.go&quot;,
+  &quot;-n&quot;: true,
+  &quot;output_mode&quot;: &quot;content&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (809 bytes)</div><pre>69:func (pr PullRequest) HeadLabel() string {
+82:func (pr *PullRequest) ReviewStatus() PullRequestReviewStatus {
+102:func (pr *PullRequest) ChecksStatus() (summary PullRequestChecksStatus) {
+132:func PullRequests(client *Client, repo ghrepo.Interface, currentPRNumber int, currentPRHeadRef, currentUsername string) (*PullRequestsPayload, error) {
+286:func PullRequestByNumber(client *Client, repo ghrepo.Interface, number int) (*PullRequest, error) {
+339:func PullRequestForBranch(client *Client, repo ghrepo.Interface, branch string) (*PullRequest, error) {
+401:func CreatePullRequest(client *Client, repo *Repository, params map[string]interface{}) (*PullRequest, error) {
+435:func PullRequestList(client *Client, vars map[string]interface{}, limit int) ([]PullRequest, error) {
+590:func min(a, b int) int {</pre></div>
+  </div>
+</details>
+
+<details class="step files">
+  <summary>
+    <span class="step-n">15</span>
+    <span class="step-label">Read</span>
+    <span class="step-target">/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/api/queries_pr.go</span>
+    <span class="step-bytes">+114B in · +135B out</span>
+    <span class="step-cum">14,179B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;file_path&quot;: &quot;/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/api/queries_pr.go&quot;,
+  &quot;offset&quot;: 585,
+  &quot;limit&quot;: 15
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (135 bytes)</div><pre>585		}
+586	
+587		return prs, nil
+588	}
+589	
+590	func min(a, b int) int {
+591		if a &lt; b {
+592			return a
+593		}
+594		return b
+595	}
+596	</pre></div>
+  </div>
+</details>
+
+<details class="step files">
+  <summary>
+    <span class="step-n">16</span>
+    <span class="step-label">Edit</span>
+    <span class="step-target">/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/api/queries_pr.go</span>
+    <span class="step-bytes">+429B in · +175B out</span>
+    <span class="step-cum">14,783B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;replace_all&quot;: false,
+  &quot;file_path&quot;: &quot;/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/api/queries_pr.go&quot;,
+  &quot;old_string&quot;: &quot;func min(a, b int) int {&quot;,
+  &quot;new_string&quot;: &quot;func isCloseState(states []string) bool {\n\tif len(states) == 0 || len(states) &gt; 2 {\n\t\treturn false\n\t}\n\tfor _, s := range states {\n\t\tif s != \&quot;CLOSED\&quot; &amp;&amp; s != \&quot;MERGED\&quot; {\n\t\t\treturn false\n\t\t}\n\t}\n\treturn true\n}\n\nfunc min(a, b int) int {&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (175 bytes)</div><pre>The file /home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/api/queries_pr.go has been updated successfully. (file state is current in your context — no need to Read it back)</pre></div>
+  </div>
+</details>
+
+<details class="step files">
+  <summary>
+    <span class="step-n">17</span>
+    <span class="step-label">Edit</span>
+    <span class="step-target">/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/command/pr.go</span>
+    <span class="step-bytes">+425B in · +171B out</span>
+    <span class="step-cum">15,379B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;replace_all&quot;: false,
+  &quot;file_path&quot;: &quot;/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/command/pr.go&quot;,
+  &quot;old_string&quot;: &quot;\tprListCmd.Flags().StringP(\&quot;state\&quot;, \&quot;s\&quot;, \&quot;open\&quot;, \&quot;Filter by state: {open|closed|merged|all}\&quot;)&quot;,
+  &quot;new_string&quot;: &quot;\tprListCmd.Flags().StringP(\&quot;state\&quot;, \&quot;s\&quot;, \&quot;open\&quot;, \&quot;Filter by state: {open|closed|merged|all}. Note that &#x27;closed&#x27; also includes merged PRs, matching GitHub&#x27;s web UI behavior.\&quot;)&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (171 bytes)</div><pre>The file /home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/command/pr.go has been updated successfully. (file state is current in your context — no need to Read it back)</pre></div>
+  </div>
+</details>
+
+<details class="step files">
+  <summary>
+    <span class="step-n">18</span>
+    <span class="step-label">Bash</span>
+    <span class="step-target">go build ./... 2&gt;&amp;1 | head -50</span>
+    <span class="step-bytes">+81B in · +31B out</span>
+    <span class="step-cum">15,491B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;command&quot;: &quot;go build ./... 2&gt;&amp;1 | head -50&quot;,
+  &quot;description&quot;: &quot;Build the project&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (31 bytes)</div><pre>(Bash completed with no output)</pre></div>
+  </div>
+</details>
+
+<details class="step files">
+  <summary>
+    <span class="step-n">19</span>
+    <span class="step-label">Bash</span>
+    <span class="step-target">go test ./command/... ./api/... 2&gt;&amp;1 | tail -60</span>
+    <span class="step-bytes">+114B in · +73B out</span>
+    <span class="step-cum">15,678B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;command&quot;: &quot;go test ./command/... ./api/... 2&gt;&amp;1 | tail -60&quot;,
+  &quot;description&quot;: &quot;Run command and api package tests&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (73 bytes)</div><pre>ok  	github.com/cli/cli/command	0.093s
+ok  	github.com/cli/cli/api	0.003s</pre></div>
+  </div>
+</details>
+
+<details class="step files">
+  <summary>
+    <span class="step-n">20</span>
+    <span class="step-label">Read</span>
+    <span class="step-target">/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/command/pr_test.go</span>
+    <span class="step-bytes">+113B in · +472B out</span>
+    <span class="step-cum">16,263B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;file_path&quot;: &quot;/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/command/pr_test.go&quot;,
+  &quot;offset&quot;: 1,
+  &quot;limit&quot;: 25
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (472 bytes)</div><pre>1	package command
+2	
+3	import (
+4		&quot;bytes&quot;
+5		&quot;encoding/json&quot;
+6		&quot;io/ioutil&quot;
+7		&quot;os&quot;
+8		&quot;os/exec&quot;
+9		&quot;reflect&quot;
+10		&quot;regexp&quot;
+11		&quot;strings&quot;
+12		&quot;testing&quot;
+13	
+14		&quot;github.com/cli/cli/utils&quot;
+15		&quot;github.com/google/shlex&quot;
+16		&quot;github.com/spf13/cobra&quot;
+17		&quot;github.com/spf13/pflag&quot;
+18	)
+19	
+20	func eq(t *testing.T, got interface{}, expected interface{}) {
+21		t.Helper()
+22		if !reflect.DeepEqual(got, expected) {
+23			t.Errorf(&quot;expected: %v, got: %v&quot;, expected, got)
+24		}
+25	}</pre></div>
+  </div>
+</details>
+
+<details class="step files">
+  <summary>
+    <span class="step-n">21</span>
+    <span class="step-label">Edit</span>
+    <span class="step-target">/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/command/pr_test.go</span>
+    <span class="step-bytes">+863B in · +176B out</span>
+    <span class="step-cum">17,302B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;replace_all&quot;: false,
+  &quot;file_path&quot;: &quot;/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/command/pr_test.go&quot;,
+  &quot;old_string&quot;: &quot;func TestPRList_filteringAssignee(t *testing.T) {&quot;,
+  &quot;new_string&quot;: &quot;func TestPRList_filteringClosed(t *testing.T) {\n\tinitBlankContext(\&quot;OWNER/REPO\&quot;, \&quot;master\&quot;)\n\thttp := initFakeHTTP()\n\thttp.StubRepoResponse(\&quot;OWNER\&quot;, \&quot;REPO\&quot;)\n\n\trespBody := bytes.NewBufferString(`{ \&quot;data\&quot;: {} }`)\n\thttp.StubResponse(200, respBody)\n\n\t_, err := RunCommand(prListCmd, `pr list -s closed`)\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n\n\tbodyBytes, _ := ioutil.ReadAll(http.Requests[1].Body)\n\treqBody := struct {\n\t\tVariables struct {\n\t\t\tState []string\n\t\t}\n\t}{}\n\tjson.Unmarshal(bodyBytes, &amp;reqBody)\n\n\teq(t, reqBody.Variables.State, []string{\&quot;CLOSED\&quot;, \&quot;MERGED\&quot;})\n}\n\nfunc TestPRList_filteringAssignee(t *testing.T) {&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (176 bytes)</div><pre>The file /home/ubuntu/.cache/defn-h2h-go/cli__cli-513__files/command/pr_test.go has been updated successfully. (file state is current in your context — no need to Read it back)</pre></div>
+  </div>
+</details>
+
+<details class="step files">
+  <summary>
+    <span class="step-n">22</span>
+    <span class="step-label">Bash</span>
+    <span class="step-target">go test ./command/... -run TestPRList -v 2&gt;&amp;1 | tail -60</span>
+    <span class="step-bytes">+107B in · +429B out</span>
+    <span class="step-cum">17,838B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;command&quot;: &quot;go test ./command/... -run TestPRList -v 2&gt;&amp;1 | tail -60&quot;,
+  &quot;description&quot;: &quot;Run PR list tests&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (429 bytes)</div><pre>=== RUN   TestPRList
+--- PASS: TestPRList (0.00s)
+=== RUN   TestPRList_filtering
+--- PASS: TestPRList_filtering (0.00s)
+=== RUN   TestPRList_filteringClosed
+--- PASS: TestPRList_filteringClosed (0.00s)
+=== RUN   TestPRList_filteringAssignee
+--- PASS: TestPRList_filteringAssignee (0.00s)
+=== RUN   TestPRList_filteringAssigneeLabels
+--- PASS: TestPRList_filteringAssigneeLabels (0.00s)
+PASS
+ok  	github.com/cli/cli/command	0.012s</pre></div>
+  </div>
+</details>
+</div></div>
+    <div><div class="column-head defn"><span class="swatch"></span>defn-mode &middot; code MCP tool only</div>
+<div class="column">
+  <div class="column-final"><div class="column-final-h">final message</div><p>The edit is in place. The fix is complete and confirmed logically consistent:
+
+- `command/pr.go` (`prList`): `--state=closed` now maps to GraphQL states `[&quot;CLOSED&quot;, &quot;MERGED&quot;]` instead of just `[&quot;CLOSED&quot;]`, matching the web UI&#x27;s `is:closed`/`state:closed` behavior (which is a superset including merged PRs). `--state=merged` remains unchanged (purple-only).
+- `api/queries_pr.go` (`PullRequestList`): the search-API code path (used when `--assignee` is set) now recognizes the two-state `CLOSED`+`MERGED` combination and emits `state:closed` in the search query, mirroring the same superset semantics there.
+
+The pre-existing test panic (`flag redefined: draft` in `command/root.go` init) reproduces on unrelated tests too, so it&#x27;s an environment/harness issue, not something introduced by this change.</p></div>
+  
+<details class="step defn">
+  <summary>
+    <span class="step-n">01</span>
+    <span class="step-label">code:search</span>
+    <span class="step-target">state=closed</span>
+    <span class="step-bytes">+43B in · +0B out</span>
+    <span class="step-cum">43B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;op&quot;: &quot;search&quot;,
+  &quot;pattern&quot;: &quot;state=closed&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (0 bytes)</div><pre>(empty)</pre></div>
+  </div>
+</details>
+
+<details class="step defn">
+  <summary>
+    <span class="step-n">02</span>
+    <span class="step-label">code:search</span>
+    <span class="step-target">prStateToStateFilter</span>
+    <span class="step-bytes">+51B in · +2247B out</span>
+    <span class="step-cum">2,341B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;op&quot;: &quot;search&quot;,
+  &quot;pattern&quot;: &quot;prStateToStateFilter&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (2,247 bytes)</div><pre>[no matches for &quot;state=closed&quot; — tried name-LIKE, FTS on doc+body, and substring body-scan. If you&#x27;re grepping for a comment or string literal, this substring wasn&#x27;t found in any indexed body. Try `overview` for project shape or a broader pattern.]
+
+---
+_[#203 starter bundle -- first orient op of this session; won&#x27;t repeat.]_
+
+## Context bundle for: state=closed
+
+_Top 5 of 27 matching defs (tokens: state closed)._
+
+### StateEntry (type) [score=11]
+Location: update/update.go:19
+```go
+type StateEntry
+```
+Body: 4 lines, 145 bytes.
+Callees (1): ReleaseInfo
+Callers: 2 (2 production)
+
+### colorFuncForState (function) [score=11]
+Location: command/pr.go:229
+```go
+func colorFuncForState(state string) func(string) string
+```
+Body: 12 lines, 211 bytes.
+Callees (3): Green, Magenta, Red
+Callers: 2 (2 production)
+
+### getStateEntry (function) [score=11]
+Location: update/update.go:58
+```go
+func getStateEntry(stateFilePath string) (*StateEntry, error)
+```
+Body: 14 lines, 287 bytes.
+Callees (1): StateEntry
+Callers: 1 (1 production)
+
+### setStateEntry (function) [score=11]
+Location: update/update.go:73
+```go
+func setStateEntry(stateFilePath string, t time.Time, r ReleaseInfo) error
+```
+Body: 10 lines, 269 bytes.
+Callees (1): StateEntry
+Callers: 1 (1 production)
+
+### (Issue).State (field) [score=8]
+Location: api/queries_issue.go:25
+```go
+string
+```
+Body: 1 lines, 16 bytes.
+
+### Synthesis
+
+## Answer: `state=closed`
+
+Based on `colorFuncForState` in `command/pr.go:229`, the code compares `state` against the uppercase string `&quot;CLOSED&quot;` (not lowercase `&quot;closed&quot;`). If `state=&quot;closed&quot;` is passed, it would fall through to the `default` case and return `nil` — no color function would be applied.
+
+The `Issue.State` field in `api/queries_issue.go:25` is a plain `string` with no visible normalization, so the casing of the value depends on what the API returns, which is not shown in the provided source.
+
+**The provided source does not fully contain the answer** regarding what value `State` holds at runtime — you would need to see the API response unmarshalling or any normalization logic to confirm whether `&quot;closed&quot;` or `&quot;CLOSED&quot;` is actually stored.
+
+_Grounded in: StateEntry, colorFuncForState, getStateEntry, setStateEntry, (Issue).State_
+</pre></div>
+  </div>
+</details>
+
+<details class="step defn">
+  <summary>
+    <span class="step-n">03</span>
+    <span class="step-label">code:search</span>
+    <span class="step-target">prList</span>
+    <span class="step-bytes">+37B in · +586B out</span>
+    <span class="step-cum">2,964B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;op&quot;: &quot;search&quot;,
+  &quot;pattern&quot;: &quot;prList&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (586 bytes)</div><pre>[
+  {
+    &quot;name&quot;: &quot;TestPRList&quot;,
+    &quot;kind&quot;: &quot;function&quot;,
+    &quot;file&quot;: &quot;command/pr_test.go&quot;
+  },
+  {
+    &quot;name&quot;: &quot;TestPRList_filtering&quot;,
+    &quot;kind&quot;: &quot;function&quot;,
+    &quot;file&quot;: &quot;command/pr_test.go&quot;
+  },
+  {
+    &quot;name&quot;: &quot;TestPRList_filteringAssignee&quot;,
+    &quot;kind&quot;: &quot;function&quot;,
+    &quot;file&quot;: &quot;command/pr_test.go&quot;
+  },
+  {
+    &quot;name&quot;: &quot;TestPRList_filteringAssigneeLabels&quot;,
+    &quot;kind&quot;: &quot;function&quot;,
+    &quot;file&quot;: &quot;command/pr_test.go&quot;
+  },
+  {
+    &quot;name&quot;: &quot;prList&quot;,
+    &quot;kind&quot;: &quot;function&quot;,
+    &quot;file&quot;: &quot;command/pr.go&quot;
+  },
+  {
+    &quot;name&quot;: &quot;prListCmd&quot;,
+    &quot;kind&quot;: &quot;var&quot;,
+    &quot;file&quot;: &quot;command/pr.go&quot;
+  }
+]</pre></div>
+  </div>
+</details>
+
+<details class="step defn">
+  <summary>
+    <span class="step-n">04</span>
+    <span class="step-label">code:search</span>
+    <span class="step-target">&quot;state&quot;</span>
+    <span class="step-bytes">+40B in · +508B out</span>
+    <span class="step-cum">3,512B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;op&quot;: &quot;search&quot;,
+  &quot;pattern&quot;: &quot;\&quot;state\&quot;&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (508 bytes)</div><pre>[
+  {
+    &quot;name&quot;: &quot;TestPullRequest_ChecksStatus&quot;,
+    &quot;kind&quot;: &quot;function&quot;,
+    &quot;file&quot;: &quot;api/pull_request_test.go&quot;
+  },
+  {
+    &quot;name&quot;: &quot;ObtainAccessToken&quot;,
+    &quot;kind&quot;: &quot;method&quot;,
+    &quot;receiver&quot;: &quot;*OAuthFlow&quot;,
+    &quot;file&quot;: &quot;auth/oauth.go&quot;
+  },
+  {
+    &quot;name&quot;: &quot;prList&quot;,
+    &quot;kind&quot;: &quot;function&quot;,
+    &quot;file&quot;: &quot;command/pr.go&quot;
+  },
+  {
+    &quot;name&quot;: &quot;issueList&quot;,
+    &quot;kind&quot;: &quot;function&quot;,
+    &quot;file&quot;: &quot;command/issue.go&quot;
+  },
+  {
+    &quot;name&quot;: &quot;PullRequestList&quot;,
+    &quot;kind&quot;: &quot;function&quot;,
+    &quot;file&quot;: &quot;api/queries_pr.go&quot;
+  }
+]</pre></div>
+  </div>
+</details>
+
+<details class="step defn">
+  <summary>
+    <span class="step-n">05</span>
+    <span class="step-label">code:read</span>
+    <span class="step-target">prList</span>
+    <span class="step-bytes">+32B in · +787B out</span>
+    <span class="step-cum">4,331B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;op&quot;: &quot;read&quot;,
+  &quot;name&quot;: &quot;prList&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (787 bytes)</div><pre>_[Outline shown — body is 2319 bytes / 102 lines. Full body only needed when editing.]_
+
+## prList (function)
+Module: github.com/cli/cli/command
+Location: command/pr.go:126
+
+```go
+func prList(cmd *cobra.Command, args []string) error
+```
+
+Body: 102 lines, 2319 bytes (fetch with op:&quot;read&quot;)
+Callers: 1 (1 production, 0 test)
+Callees (12): (PullRequest).HeadLabel, Cyan, FullName, NewTablePrinter, PullRequestList, apiClientForContext, colorFuncForState, colorableErr, contextForCommand, determineBaseRepo, printMessage, replaceExcessiveWhitespace
+Flow (30): L1:assign → L2:assign → L3:if → L7:assign → L8:if → L12:call → L14:assign → L15:if → L18:assign → L19:if → L22:assign → L23:if → L26:assign → L27:if → L30:assign → L31:if → L35:decl → L36:switch → L49:assign → L54:if → … (10 more)
+</pre></div>
+  </div>
+</details>
+
+<details class="step defn">
+  <summary>
+    <span class="step-n">06</span>
+    <span class="step-label">code:read</span>
+    <span class="step-target">PullRequestList</span>
+    <span class="step-bytes">+41B in · +556B out</span>
+    <span class="step-cum">4,928B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;op&quot;: &quot;read&quot;,
+  &quot;name&quot;: &quot;PullRequestList&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (556 bytes)</div><pre>_[Outline shown — body is 3276 bytes / 154 lines. Full body only needed when editing.]_
+
+## PullRequestList (function)
+Module: github.com/cli/cli/api
+Location: api/queries_pr.go:435
+
+```go
+func PullRequestList(client *Client, vars map[string]interface{}, limit int) ([]PullRequest, error)
+```
+
+Body: 154 lines, 3276 bytes (fetch with op:&quot;read&quot;)
+Callers: 1 (1 production, 0 test)
+Callees (3): (Client).GraphQL, PullRequest, min
+Flow (10): L1:decl → L10:decl → L17:assign → L33:assign → L65:assign → L66:assign → L67:assign → L71:if → L124:for → L152:return
+</pre></div>
+  </div>
+</details>
+
+<details class="step defn">
+  <summary>
+    <span class="step-n">07</span>
+    <span class="step-label">code:read</span>
+    <span class="step-target">prList</span>
+    <span class="step-bytes">+46B in · +2627B out</span>
+    <span class="step-cum">7,601B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;op&quot;: &quot;read&quot;,
+  &quot;name&quot;: &quot;prList&quot;,
+  &quot;full&quot;: true
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (2,627 bytes)</div><pre>## prList (function)
+Module: github.com/cli/cli/command
+
+```go
+func prList(cmd *cobra.Command, args []string) error {
+	ctx := contextForCommand(cmd)
+	apiClient, err := apiClientForContext(ctx)
+	if err != nil {
+		return err
+	}
+
+	baseRepo, err := determineBaseRepo(cmd, ctx)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(colorableErr(cmd), &quot;\nPull requests for %s\n\n&quot;, ghrepo.FullName(*baseRepo))
+
+	limit, err := cmd.Flags().GetInt(&quot;limit&quot;)
+	if err != nil {
+		return err
+	}
+	state, err := cmd.Flags().GetString(&quot;state&quot;)
+	if err != nil {
+		return err
+	}
+	baseBranch, err := cmd.Flags().GetString(&quot;base&quot;)
+	if err != nil {
+		return err
+	}
+	labels, err := cmd.Flags().GetStringSlice(&quot;label&quot;)
+	if err != nil {
+		return err
+	}
+	assignee, err := cmd.Flags().GetString(&quot;assignee&quot;)
+	if err != nil {
+		return err
+	}
+
+	var graphqlState []string
+	switch state {
+	case &quot;open&quot;:
+		graphqlState = []string{&quot;OPEN&quot;}
+	case &quot;closed&quot;:
+		graphqlState = []string{&quot;CLOSED&quot;}
+	case &quot;merged&quot;:
+		graphqlState = []string{&quot;MERGED&quot;}
+	case &quot;all&quot;:
+		graphqlState = []string{&quot;OPEN&quot;, &quot;CLOSED&quot;, &quot;MERGED&quot;}
+	default:
+		return fmt.Errorf(&quot;invalid state: %s&quot;, state)
+	}
+
+	params := map[string]interface{}{
+		&quot;owner&quot;: (*baseRepo).RepoOwner(),
+		&quot;repo&quot;:  (*baseRepo).RepoName(),
+		&quot;state&quot;: graphqlState,
+	}
+	if len(labels) &gt; 0 {
+		params[&quot;labels&quot;] = labels
+	}
+	if baseBranch != &quot;&quot; {
+		params[&quot;baseBranch&quot;] = baseBranch
+	}
+	if assignee != &quot;&quot; {
+		params[&quot;assignee&quot;] = assignee
+	}
+
+	prs, err := api.PullRequestList(apiClient, params, limit)
+	if err != nil {
+		return err
+	}
+
+	if len(prs) == 0 {
+		colorErr := colorableErr(cmd) // Send to stderr because otherwise when piping this command it would seem like the &quot;no open prs&quot; message is actually a pr
+		msg := &quot;There are no open pull requests&quot;
+
+		userSetFlags := false
+		cmd.Flags().Visit(func(f *pflag.Flag) {
+			userSetFlags = true
+		})
+		if userSetFlags {
+			msg = &quot;No pull requests match your search&quot;
+		}
+		printMessage(colorErr, msg)
+		return nil
+	}
+
+	table := utils.NewTablePrinter(cmd.OutOrStdout())
+	for _, pr := range prs {
+		prNum := strconv.Itoa(pr.Number)
+		if table.IsTTY() {
+			prNum = &quot;#&quot; + prNum
+		}
+		table.AddField(prNum, nil, colorFuncForState(pr.State))
+		table.AddField(replaceExcessiveWhitespace(pr.Title), nil, nil)
+		table.AddField(pr.HeadLabel(), nil, utils.Cyan)
+		table.EndRow()
+	}
+	err = table.Render()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+```
+
+_tip: body is 102 lines; `mode:&quot;summary&quot;` returns intent+sig in a compact projection when a summary is available._
+
+---
+_Related (#202):_
+- Callers: prListCmd (command/pr.go:46)
+- Callees: Cyan, FullName, (PullRequest).HeadLabel … +9 more
+</pre></div>
+  </div>
+</details>
+
+<details class="step defn">
+  <summary>
+    <span class="step-n">08</span>
+    <span class="step-label">code:read</span>
+    <span class="step-target">PullRequestList</span>
+    <span class="step-bytes">+55B in · +3572B out</span>
+    <span class="step-cum">11,228B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;op&quot;: &quot;read&quot;,
+  &quot;name&quot;: &quot;PullRequestList&quot;,
+  &quot;full&quot;: true
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (3,572 bytes)</div><pre>## PullRequestList (function)
+Module: github.com/cli/cli/api
+
+```go
+func PullRequestList(client *Client, vars map[string]interface{}, limit int) ([]PullRequest, error) {
+	type prBlock struct {
+		Edges []struct {
+			Node PullRequest
+		}
+		PageInfo struct {
+			HasNextPage bool
+			EndCursor   string
+		}
+	}
+	type response struct {
+		Repository struct {
+			PullRequests prBlock
+		}
+		Search prBlock
+	}
+
+	fragment := `
+	fragment pr on PullRequest {
+		number
+		title
+		state
+		url
+		headRefName
+		headRepositoryOwner {
+			login
+		}
+		isCrossRepository
+	}
+	`
+
+	// If assignee wasn&#x27;t specified, use `Repository.pullRequest` for ability to
+	// query by multiple labels
+	query := fragment + `
+    query(
+		$owner: String!,
+		$repo: String!,
+		$limit: Int!,
+		$endCursor: String,
+		$baseBranch: String,
+		$labels: [String!],
+		$state: [PullRequestState!] = OPEN
+	) {
+      repository(owner: $owner, name: $repo) {
+        pullRequests(
+			states: $state,
+			baseRefName: $baseBranch,
+			labels: $labels,
+			first: $limit,
+			after: $endCursor,
+			orderBy: {field: CREATED_AT, direction: DESC}
+		) {
+          edges {
+            node {
+				...pr
+            }
+		  }
+		  pageInfo {
+			  hasNextPage
+			  endCursor
+		  }
+        }
+      }
+	}`
+
+	prs := []PullRequest{}
+	pageLimit := min(limit, 100)
+	variables := map[string]interface{}{}
+
+	// If assignee was specified, use the `search` API rather than
+	// `Repository.pullRequests`, but this mode doesn&#x27;t support multiple labels
+	if assignee, ok := vars[&quot;assignee&quot;].(string); ok {
+		query = fragment + `
+		query(
+			$q: String!,
+			$limit: Int!,
+			$endCursor: String,
+		) {
+			search(query: $q, type: ISSUE, first: $limit, after: $endCursor) {
+				edges {
+					node {
+						...pr
+					}
+				}
+				pageInfo {
+					hasNextPage
+					endCursor
+				}
+			}
+		}`
+		owner := vars[&quot;owner&quot;].(string)
+		repo := vars[&quot;repo&quot;].(string)
+		search := []string{
+			fmt.Sprintf(&quot;repo:%s/%s&quot;, owner, repo),
+			fmt.Sprintf(&quot;assignee:%s&quot;, assignee),
+			&quot;is:pr&quot;,
+			&quot;sort:created-desc&quot;,
+		}
+		if states, ok := vars[&quot;state&quot;].([]string); ok &amp;&amp; len(states) == 1 {
+			switch states[0] {
+			case &quot;OPEN&quot;:
+				search = append(search, &quot;state:open&quot;)
+			case &quot;CLOSED&quot;:
+				search = append(search, &quot;state:closed&quot;)
+			case &quot;MERGED&quot;:
+				search = append(search, &quot;is:merged&quot;)
+			}
+		}
+		if labels, ok := vars[&quot;labels&quot;].([]string); ok &amp;&amp; len(labels) &gt; 0 {
+			if len(labels) &gt; 1 {
+				return nil, fmt.Errorf(&quot;multiple labels with --assignee are not supported&quot;)
+			}
+			search = append(search, fmt.Sprintf(`label:&quot;%s&quot;`, labels[0]))
+		}
+		if baseBranch, ok := vars[&quot;baseBranch&quot;].(string); ok {
+			search = append(search, fmt.Sprintf(`base:&quot;%s&quot;`, baseBranch))
+		}
+		variables[&quot;q&quot;] = strings.Join(search, &quot; &quot;)
+	} else {
+		for name, val := range vars {
+			variables[name] = val
+		}
+	}
+
+	for {
+		variables[&quot;limit&quot;] = pageLimit
+		var data response
+		err := client.GraphQL(query, variables, &amp;data)
+		if err != nil {
+			return nil, err
+		}
+		prData := data.Repository.PullRequests
+		if _, ok := variables[&quot;q&quot;]; ok {
+			prData = data.Search
+		}
+
+		for _, edge := range prData.Edges {
+			prs = append(prs, edge.Node)
+			if len(prs) == limit {
+				goto done
+			}
+		}
+
+		if prData.PageInfo.HasNextPage {
+			variables[&quot;endCursor&quot;] = prData.PageInfo.EndCursor
+			pageLimit = min(pageLimit, limit-len(prs))
+			continue
+		}
+	done:
+		break
+	}
+
+	return prs, nil
+}
+```
+
+_tip: body is 154 lines; `mode:&quot;summary&quot;` returns intent+sig in a compact projection when a summary is available._
+
+---
+_Related (#202):_
+- Callers: prList (command/pr.go:126)
+- Callees: (Client).GraphQL, PullRequest, min
+</pre></div>
+  </div>
+</details>
+
+<details class="step defn">
+  <summary>
+    <span class="step-n">09</span>
+    <span class="step-label">code:read</span>
+    <span class="step-target">TestPRList_filtering</span>
+    <span class="step-bytes">+60B in · +3210B out</span>
+    <span class="step-cum">14,498B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;op&quot;: &quot;read&quot;,
+  &quot;name&quot;: &quot;TestPRList_filtering&quot;,
+  &quot;full&quot;: true
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (3,210 bytes)</div><pre>[circuit breaker: auto-batched 3 individual lookups this turn (prList, PullRequestList, TestPRList_filtering) into one expand call instead of refusing -- call code(op:&quot;context&quot;/op:&quot;expand&quot;, names:[...]) yourself next time to skip this extra round-trip.]
+
+_(prList&#x27;s full body was already read in this session via read(full:true) -- omitted here, nothing new. If it may have changed since, call code(op:&quot;sync&quot;) first.)_
+## prList (function)
+Module: github.com/cli/cli/command
+
+### outline
+```go
+func prList(cmd *cobra.Command, args []string) error
+```
+Body: 102 lines, 2319 bytes (add &quot;body&quot; to include for source)
+Callees (12): (PullRequest).HeadLabel, Cyan, FullName, NewTablePrinter, PullRequestList, apiClientForContext, colorFuncForState, colorableErr, contextForCommand, determineBaseRepo, printMessage, replaceExcessiveWhitespace
+Flow (30): L1:assign → L2:assign → L3:if → L7:assign → L8:if → L12:call → L14:assign → L15:if → L18:assign → L19:if → L22:assign → L23:if → L26:assign → L27:if → L30:assign → L31:if → L35:decl → L36:switch → L49:assign → L54:if → … (10 more)
+
+### callers (1 — 1 production, 0 test)
+- prListCmd  (command/pr.go:46)
+
+
+---
+
+_(PullRequestList&#x27;s full body was already read in this session via read(full:true) -- omitted here, nothing new. If it may have changed since, call code(op:&quot;sync&quot;) first.)_
+## PullRequestList (function)
+Module: github.com/cli/cli/api
+
+### outline
+```go
+func PullRequestList(client *Client, vars map[string]interface{}, limit int) ([]PullRequest, error)
+```
+Body: 154 lines, 3276 bytes (add &quot;body&quot; to include for source)
+Callees (3): (Client).GraphQL, PullRequest, min
+Flow (10): L1:decl → L10:decl → L17:assign → L33:assign → L65:assign → L66:assign → L67:assign → L71:if → L124:for → L152:return
+
+### callers (1 — 1 production, 0 test)
+- prList  (command/pr.go:126)
+
+
+---
+
+## TestPRList_filtering (function)
+Module: github.com/cli/cli/command
+
+### outline
+```go
+func TestPRList_filtering(t *testing.T)
+```
+Body: 32 lines, 791 bytes (add &quot;body&quot; to include for source)
+Callees (9): (*FakeHTTP).StubRepoResponse, (*FakeHTTP).StubResponse, (cmdOut).Stderr, (cmdOut).String, RunCommand, eq, initBlankContext, initFakeHTTP, prListCmd
+Flow (14): L1:call → L2:assign → L3:call → L5:assign → L6:call → L8:assign → L9:if → L13:call → L14:call → L20:assign → L21:assign → L27:call → L29:call → L30:call
+
+### body
+```go
+func TestPRList_filtering(t *testing.T) {
+	initBlankContext(&quot;OWNER/REPO&quot;, &quot;master&quot;)
+	http := initFakeHTTP()
+	http.StubRepoResponse(&quot;OWNER&quot;, &quot;REPO&quot;)
+
+	respBody := bytes.NewBufferString(`{ &quot;data&quot;: {} }`)
+	http.StubResponse(200, respBody)
+
+	output, err := RunCommand(prListCmd, `pr list -s all -l one,two -l three`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	eq(t, output.String(), &quot;&quot;)
+	eq(t, output.Stderr(), `
+Pull requests for OWNER/REPO
+
+No pull requests match your search
+`)
+
+	bodyBytes, _ := ioutil.ReadAll(http.Requests[1].Body)
+	reqBody := struct {
+		Variables struct {
+			State  []string
+			Labels []string
+		}
+	}{}
+	json.Unmarshal(bodyBytes, &amp;reqBody)
+
+	eq(t, reqBody.Variables.State, []string{&quot;OPEN&quot;, &quot;CLOSED&quot;, &quot;MERGED&quot;})
+	eq(t, reqBody.Variables.Labels, []string{&quot;one&quot;, &quot;two&quot;, &quot;three&quot;})
+}
+```
+
+### callers (0 — 0 production, 0 test)
+(none)
+
+</pre></div>
+  </div>
+</details>
+
+<details class="step defn">
+  <summary>
+    <span class="step-n">10</span>
+    <span class="step-label">code:search</span>
+    <span class="step-target">prListCmd</span>
+    <span class="step-bytes">+40B in · +503B out</span>
+    <span class="step-cum">15,041B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;op&quot;: &quot;search&quot;,
+  &quot;pattern&quot;: &quot;prListCmd&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (503 bytes)</div><pre>[
+  {
+    &quot;name&quot;: &quot;prListCmd&quot;,
+    &quot;kind&quot;: &quot;var&quot;,
+    &quot;file&quot;: &quot;command/pr.go&quot;
+  },
+  {
+    &quot;name&quot;: &quot;TestPRList_filteringAssigneeLabels&quot;,
+    &quot;kind&quot;: &quot;function&quot;,
+    &quot;file&quot;: &quot;command/pr_test.go&quot;
+  },
+  {
+    &quot;name&quot;: &quot;TestPRList&quot;,
+    &quot;kind&quot;: &quot;function&quot;,
+    &quot;file&quot;: &quot;command/pr_test.go&quot;
+  },
+  {
+    &quot;name&quot;: &quot;TestPRList_filteringAssignee&quot;,
+    &quot;kind&quot;: &quot;function&quot;,
+    &quot;file&quot;: &quot;command/pr_test.go&quot;
+  },
+  {
+    &quot;name&quot;: &quot;TestPRList_filtering&quot;,
+    &quot;kind&quot;: &quot;function&quot;,
+    &quot;file&quot;: &quot;command/pr_test.go&quot;
+  }
+]</pre></div>
+  </div>
+</details>
+
+<details class="step defn">
+  <summary>
+    <span class="step-n">11</span>
+    <span class="step-label">code:read</span>
+    <span class="step-target">prListCmd</span>
+    <span class="step-bytes">+49B in · +400B out</span>
+    <span class="step-cum">15,490B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;op&quot;: &quot;read&quot;,
+  &quot;name&quot;: &quot;prListCmd&quot;,
+  &quot;full&quot;: true
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (400 bytes)</div><pre>## prListCmd (var)
+Module: github.com/cli/cli/command
+
+```go
+var prListCmd = &amp;cobra.Command{
+	Use:   &quot;list&quot;,
+	Short: &quot;List and filter pull requests in this repository&quot;,
+	RunE:  prList,
+}
+```
+
+---
+_Related (#202):_
+- Callers: TestPRList (command/pr_test.go:160), TestPRList_filtering (command/pr_test.go:180), TestPRList_filteringAssignee (command/pr_test.go:213) … +2 more
+- Callees: Command, prList
+</pre></div>
+  </div>
+</details>
+
+<details class="step defn">
+  <summary>
+    <span class="step-n">12</span>
+    <span class="step-label">code:search</span>
+    <span class="step-target">Filter by state</span>
+    <span class="step-bytes">+46B in · +251B out</span>
+    <span class="step-cum">15,787B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;op&quot;: &quot;search&quot;,
+  &quot;pattern&quot;: &quot;Filter by state&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (251 bytes)</div><pre>[no matches for &quot;Filter by state&quot; — tried name-LIKE, FTS on doc+body, and substring body-scan. If you&#x27;re grepping for a comment or string literal, this substring wasn&#x27;t found in any indexed body. Try `overview` for project shape or a broader pattern.]</pre></div>
+  </div>
+</details>
+
+<details class="step defn">
+  <summary>
+    <span class="step-n">13</span>
+    <span class="step-label">code:edit</span>
+    <span class="step-target">prList</span>
+    <span class="step-bytes">+832B in · +73B out</span>
+    <span class="step-cum">16,692B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;op&quot;: &quot;edit&quot;,
+  &quot;name&quot;: &quot;prList&quot;,
+  &quot;old_fragment&quot;: &quot;\tvar graphqlState []string\n\tswitch state {\n\tcase \&quot;open\&quot;:\n\t\tgraphqlState = []string{\&quot;OPEN\&quot;}\n\tcase \&quot;closed\&quot;:\n\t\tgraphqlState = []string{\&quot;CLOSED\&quot;}\n\tcase \&quot;merged\&quot;:\n\t\tgraphqlState = []string{\&quot;MERGED\&quot;}\n\tcase \&quot;all\&quot;:\n\t\tgraphqlState = []string{\&quot;OPEN\&quot;, \&quot;CLOSED\&quot;, \&quot;MERGED\&quot;}\n\tdefault:\n\t\treturn fmt.Errorf(\&quot;invalid state: %s\&quot;, state)\n\t}&quot;,
+  &quot;new_fragment&quot;: &quot;\tvar graphqlState []string\n\tswitch state {\n\tcase \&quot;open\&quot;:\n\t\tgraphqlState = []string{\&quot;OPEN\&quot;}\n\tcase \&quot;closed\&quot;:\n\t\tgraphqlState = []string{\&quot;CLOSED\&quot;, \&quot;MERGED\&quot;}\n\tcase \&quot;merged\&quot;:\n\t\tgraphqlState = []string{\&quot;MERGED\&quot;}\n\tcase \&quot;all\&quot;:\n\t\tgraphqlState = []string{\&quot;OPEN\&quot;, \&quot;CLOSED\&quot;, \&quot;MERGED\&quot;}\n\tdefault:\n\t\treturn fmt.Errorf(\&quot;invalid state: %s\&quot;, state)\n\t}&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (73 bytes)</div><pre>Edited prList — replaced 1 occurrence
+
+FYI: 1 callers, 4 tests affected.
+</pre></div>
+  </div>
+</details>
+
+<details class="step defn">
+  <summary>
+    <span class="step-n">14</span>
+    <span class="step-label">code:edit</span>
+    <span class="step-target">PullRequestList</span>
+    <span class="step-bytes">+964B in · +313B out</span>
+    <span class="step-cum">17,969B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;op&quot;: &quot;edit&quot;,
+  &quot;name&quot;: &quot;PullRequestList&quot;,
+  &quot;old_fragment&quot;: &quot;\t\tif states, ok := vars[\&quot;state\&quot;].([]string); ok &amp;&amp; len(states) == 1 {\n\t\t\tswitch states[0] {\n\t\t\tcase \&quot;OPEN\&quot;:\n\t\t\t\tsearch = append(search, \&quot;state:open\&quot;)\n\t\t\tcase \&quot;CLOSED\&quot;:\n\t\t\t\tsearch = append(search, \&quot;state:closed\&quot;)\n\t\t\tcase \&quot;MERGED\&quot;:\n\t\t\t\tsearch = append(search, \&quot;is:merged\&quot;)\n\t\t\t}\n\t\t}&quot;,
+  &quot;new_fragment&quot;: &quot;\t\tif states, ok := vars[\&quot;state\&quot;].([]string); ok &amp;&amp; len(states) == 1 {\n\t\t\tswitch states[0] {\n\t\t\tcase \&quot;OPEN\&quot;:\n\t\t\t\tsearch = append(search, \&quot;state:open\&quot;)\n\t\t\tcase \&quot;CLOSED\&quot;:\n\t\t\t\tsearch = append(search, \&quot;state:closed\&quot;)\n\t\t\tcase \&quot;MERGED\&quot;:\n\t\t\t\tsearch = append(search, \&quot;is:merged\&quot;)\n\t\t\t}\n\t\t} else if states, ok := vars[\&quot;state\&quot;].([]string); ok &amp;&amp; len(states) == 2 &amp;&amp; stringSliceContains(states, \&quot;CLOSED\&quot;) &amp;&amp; stringSliceContains(states, \&quot;MERGED\&quot;) {\n\t\t\tsearch = append(search, \&quot;state:closed\&quot;)\n\t\t}&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (313 bytes)</div><pre>edit PullRequestList rolled back — nothing was saved
+
+BUILD FAILED:
+# github.com/cli/cli/api
+api/queries_pr.go:542:79: undefined: stringSliceContains
+
+Tip: this def has a direct caller (prList) -- if this build failure is from a coupled signature change, batch this edit together with a fix to it via op:&quot;apply&quot;.
+</pre></div>
+  </div>
+</details>
+
+<details class="step defn">
+  <summary>
+    <span class="step-n">15</span>
+    <span class="step-label">code:edit</span>
+    <span class="step-target">PullRequestList</span>
+    <span class="step-bytes">+1009B in · +82B out</span>
+    <span class="step-cum">19,060B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;op&quot;: &quot;edit&quot;,
+  &quot;name&quot;: &quot;PullRequestList&quot;,
+  &quot;old_fragment&quot;: &quot;\t\tif states, ok := vars[\&quot;state\&quot;].([]string); ok &amp;&amp; len(states) == 1 {\n\t\t\tswitch states[0] {\n\t\t\tcase \&quot;OPEN\&quot;:\n\t\t\t\tsearch = append(search, \&quot;state:open\&quot;)\n\t\t\tcase \&quot;CLOSED\&quot;:\n\t\t\t\tsearch = append(search, \&quot;state:closed\&quot;)\n\t\t\tcase \&quot;MERGED\&quot;:\n\t\t\t\tsearch = append(search, \&quot;is:merged\&quot;)\n\t\t\t}\n\t\t}&quot;,
+  &quot;new_fragment&quot;: &quot;\t\tif states, ok := vars[\&quot;state\&quot;].([]string); ok {\n\t\t\tswitch {\n\t\t\tcase len(states) == 1 &amp;&amp; states[0] == \&quot;OPEN\&quot;:\n\t\t\t\tsearch = append(search, \&quot;state:open\&quot;)\n\t\t\tcase len(states) == 1 &amp;&amp; states[0] == \&quot;CLOSED\&quot;:\n\t\t\t\tsearch = append(search, \&quot;state:closed\&quot;)\n\t\t\tcase len(states) == 1 &amp;&amp; states[0] == \&quot;MERGED\&quot;:\n\t\t\t\tsearch = append(search, \&quot;is:merged\&quot;)\n\t\t\tcase len(states) == 2 &amp;&amp; (states[0] == \&quot;CLOSED\&quot; || states[1] == \&quot;CLOSED\&quot;) &amp;&amp; (states[0] == \&quot;MERGED\&quot; || states[1] == \&quot;MERGED\&quot;):\n\t\t\t\tsearch = append(search, \&quot;state:closed\&quot;)\n\t\t\t}\n\t\t}&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (82 bytes)</div><pre>Edited PullRequestList — replaced 1 occurrence
+
+FYI: 1 callers, 4 tests affected.
+</pre></div>
+  </div>
+</details>
+
+<details class="step defn">
+  <summary>
+    <span class="step-n">16</span>
+    <span class="step-label">code:test</span>
+    <span class="step-target">prList</span>
+    <span class="step-bytes">+32B in · +0B out</span>
+    <span class="step-cum">19,092B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;op&quot;: &quot;test&quot;,
+  &quot;name&quot;: &quot;prList&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (0 bytes)</div><pre>(empty)</pre></div>
+  </div>
+</details>
+
+<details class="step defn">
+  <summary>
+    <span class="step-n">17</span>
+    <span class="step-label">code:test</span>
+    <span class="step-target">PullRequestList</span>
+    <span class="step-bytes">+41B in · +1212B out</span>
+    <span class="step-cum">20,345B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;op&quot;: &quot;test&quot;,
+  &quot;name&quot;: &quot;PullRequestList&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (1,212 bytes)</div><pre>Running 4 of 4 tests (affected by prList) across ./command/...:
+
+panic: create flag redefined: draft
+
+goroutine 1 [running]:
+github.com/spf13/pflag.(*FlagSet).AddFlag(0x13054cd1b000, 0x13054cc3bc20)
+	/home/ubuntu/go/pkg/mod/github.com/spf13/pflag@v1.0.5/flag.go:848 +0x5ec
+github.com/spf13/pflag.(*FlagSet).VarPF(0x13054cd1b000, {0xf175c8, 0x13054caa54bd}, {0xe1a81a, 0x5}, {0xf09d18, 0x1}, {0xe709d7, 0x1c})
+	/home/ubuntu/go/pkg/mod/github.com/spf13/pflag@v1.0.5/flag.go:831 +0x105
+github.com/spf13/pflag.(*FlagSet).BoolVarP(0x13054cd1b000?, 0xe18884?, {0xe1a81a?, 0xf09d08?}, {0xf09d18?, 0x0?}, 0x0?, {0xe709d7?, 0x2f?})
+	/home/ubuntu/go/pkg/mod/github.com/spf13/pflag@v1.0.5/bool.go:55 +0x3e
+github.com/spf13/pflag.(*FlagSet).BoolP(...)
+	/home/ubuntu/go/pkg/mod/github.com/spf13/pflag@v1.0.5/bool.go:80
+github.com/cli/cli/command.init.4()
+	/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__defn/command/root.go:27 +0x65
+FAIL	github.com/cli/cli/command	0.013s
+FAIL
+
+TEST BINARY PANICKED -- not a normal assertion failure; likely caused by state unrelated to your edit (e.g. duplicate flag/command registration shared across tests in one binary). Investigate the panic trace above before assuming your edit is wrong</pre></div>
+  </div>
+</details>
+
+<details class="step defn">
+  <summary>
+    <span class="step-n">18</span>
+    <span class="step-label">code:test</span>
+    <span class="step-target"></span>
+    <span class="step-bytes">+46B in · +1206B out</span>
+    <span class="step-cum">21,597B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;op&quot;: &quot;test&quot;,
+  &quot;test&quot;: &quot;TestPRList_filtering&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (1,206 bytes)</div><pre>Running -run &quot;TestPRList_filtering&quot; across ./command/...:
+
+panic: create flag redefined: draft
+
+goroutine 1 [running]:
+github.com/spf13/pflag.(*FlagSet).AddFlag(0x209649a91000, 0x209649a37c20)
+	/home/ubuntu/go/pkg/mod/github.com/spf13/pflag@v1.0.5/flag.go:848 +0x5ec
+github.com/spf13/pflag.(*FlagSet).VarPF(0x209649a91000, {0xf175c8, 0x209649a16f1d}, {0xe1a81a, 0x5}, {0xf09d18, 0x1}, {0xe709d7, 0x1c})
+	/home/ubuntu/go/pkg/mod/github.com/spf13/pflag@v1.0.5/flag.go:831 +0x105
+github.com/spf13/pflag.(*FlagSet).BoolVarP(0x209649a91000?, 0xe18884?, {0xe1a81a?, 0xf09d08?}, {0xf09d18?, 0x0?}, 0x0?, {0xe709d7?, 0x2f?})
+	/home/ubuntu/go/pkg/mod/github.com/spf13/pflag@v1.0.5/bool.go:55 +0x3e
+github.com/spf13/pflag.(*FlagSet).BoolP(...)
+	/home/ubuntu/go/pkg/mod/github.com/spf13/pflag@v1.0.5/bool.go:80
+github.com/cli/cli/command.init.4()
+	/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__defn/command/root.go:27 +0x65
+FAIL	github.com/cli/cli/command	0.013s
+FAIL
+
+TEST BINARY PANICKED -- not a normal assertion failure; likely caused by state unrelated to your edit (e.g. duplicate flag/command registration shared across tests in one binary). Investigate the panic trace above before assuming your edit is wrong</pre></div>
+  </div>
+</details>
+
+<details class="step defn">
+  <summary>
+    <span class="step-n">19</span>
+    <span class="step-label">code:test</span>
+    <span class="step-target"></span>
+    <span class="step-bytes">+36B in · +1191B out</span>
+    <span class="step-cum">22,824B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;op&quot;: &quot;test&quot;,
+  &quot;test&quot;: &quot;TestPRList&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (1,191 bytes)</div><pre>Running -run &quot;TestPRList&quot; across ./command/...:
+
+panic: create flag redefined: draft
+
+goroutine 1 [running]:
+github.com/spf13/pflag.(*FlagSet).AddFlag(0x619eff14a00, 0x619efebe780)
+	/home/ubuntu/go/pkg/mod/github.com/spf13/pflag@v1.0.5/flag.go:848 +0x5ec
+github.com/spf13/pflag.(*FlagSet).VarPF(0x619eff14a00, {0xf175c8, 0x619efbaac8d}, {0xe1a81a, 0x5}, {0xf09d18, 0x1}, {0xe709d7, 0x1c})
+	/home/ubuntu/go/pkg/mod/github.com/spf13/pflag@v1.0.5/flag.go:831 +0x105
+github.com/spf13/pflag.(*FlagSet).BoolVarP(0x619eff14a00?, 0xe18884?, {0xe1a81a?, 0xf09d08?}, {0xf09d18?, 0x0?}, 0x0?, {0xe709d7?, 0x2f?})
+	/home/ubuntu/go/pkg/mod/github.com/spf13/pflag@v1.0.5/bool.go:55 +0x3e
+github.com/spf13/pflag.(*FlagSet).BoolP(...)
+	/home/ubuntu/go/pkg/mod/github.com/spf13/pflag@v1.0.5/bool.go:80
+github.com/cli/cli/command.init.4()
+	/home/ubuntu/.cache/defn-h2h-go/cli__cli-513__defn/command/root.go:27 +0x65
+FAIL	github.com/cli/cli/command	0.014s
+FAIL
+
+TEST BINARY PANICKED -- not a normal assertion failure; likely caused by state unrelated to your edit (e.g. duplicate flag/command registration shared across tests in one binary). Investigate the panic trace above before assuming your edit is wrong</pre></div>
+  </div>
+</details>
+
+<details class="step defn">
+  <summary>
+    <span class="step-n">20</span>
+    <span class="step-label">code:outline</span>
+    <span class="step-target">prList</span>
+    <span class="step-bytes">+35B in · +698B out</span>
+    <span class="step-cum">23,557B cum</span>
+  </summary>
+  <div class="step-body">
+    <div class="step-block"><div class="step-block-h">call args</div><pre>{
+  &quot;op&quot;: &quot;outline&quot;,
+  &quot;name&quot;: &quot;prList&quot;
+}</pre></div>
+    <div class="step-block"><div class="step-block-h">response (698 bytes)</div><pre>## prList (function)
+Module: github.com/cli/cli/command
+Location: command/pr.go:126
+
+```go
+func prList(cmd *cobra.Command, args []string) error
+```
+
+Body: 102 lines, 2329 bytes (fetch with op:&quot;read&quot;)
+Callers: 1 (1 production, 0 test)
+Callees (12): (PullRequest).HeadLabel, Cyan, FullName, NewTablePrinter, PullRequestList, apiClientForContext, colorFuncForState, colorableErr, contextForCommand, determineBaseRepo, printMessage, replaceExcessiveWhitespace
+Flow (30): L1:assign → L2:assign → L3:if → L7:assign → L8:if → L12:call → L14:assign → L15:if → L18:assign → L19:if → L22:assign → L23:if → L26:assign → L27:if → L30:assign → L31:if → L35:decl → L36:switch → L49:assign → L54:if → … (10 more)
+</pre></div>
+  </div>
+</details>
+</div></div>
+  </div>
+  <div class="footnote">Both runs' exit codes: files=0, defn=0. Every row above is a real tool call from the actual recorded trajectory &mdash; args and full response are in the expandable detail, nothing here is synthesized or truncated for effect.</div>
+</div>

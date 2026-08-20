@@ -633,3 +633,111 @@ func TestGetDefinitionByNameAndReceiver_ExactModuleMatchOnly(t *testing.T) {
 		t.Fatalf("found Widget in module_id=%d, want %d", d.ModuleID, inner.ID)
 	}
 }
+
+// TestFindDefinitionsByFile_VersionedModulePathDoesNotBreakExactFileMatch
+// is a regression found via etcd bench trajectories: FindDefinitionsByFile
+// required BOTH an exact source_file match AND `m.path LIKE
+// %fileSuffix%`, where fileSuffix is the file's own repo-relative
+// directory. That LIKE filter assumes a module's Go import path is
+// literally a filesystem-path suffix of the file's directory -- true
+// for simple repos, but false for any module using semantic import
+// versioning: go.etcd.io/etcd/client/pkg/v3/transport does NOT end
+// with ".../client/pkg/transport", because "v3" sits in the middle.
+// Real trajectories hit this as code(op:"file-defs") (and overview,
+// read-file, add-import, etc., which share this helper) reporting
+// "0 definitions" for files that had just been synced with dozens of
+// real definitions.
+func TestFindDefinitionsByFile_VersionedModulePathDoesNotBreakExactFileMatch(t *testing.T) {
+	dir := t.TempDir()
+	db, err := OpenSQLite(filepath.Join(dir, "defn.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	mod, err := db.EnsureModule("go.etcd.io/etcd/client/pkg/v3/transport", "transport", "")
+	if err != nil {
+		t.Fatalf("EnsureModule: %v", err)
+	}
+
+	const sourceFile = "client/pkg/transport/listener.go"
+	if _, err := db.UpsertDefinition(&Definition{
+		ModuleID:   mod.ID,
+		Name:       "NewListener",
+		Kind:       "function",
+		SourceFile: sourceFile,
+		StartLine:  10,
+		EndLine:    20,
+	}); err != nil {
+		t.Fatalf("UpsertDefinition: %v", err)
+	}
+
+	defs, err := db.FindDefinitionsByFile("client/pkg/transport", sourceFile, 0)
+	if err != nil {
+		t.Fatalf("FindDefinitionsByFile: %v", err)
+	}
+	if len(defs) != 1 || defs[0].Name != "NewListener" {
+		t.Errorf("expected 1 def (NewListener), got %d: %+v", len(defs), defs)
+	}
+}
+
+// TestSetDefSummaryMinHash_PreservesOneLineAndModel is the regression for
+// SetDefSummaryMinHash's prior INSERT OR REPLACE bug: that statement does
+// a full row DELETE+INSERT, silently resetting one_line/summary_body_hash/
+// summary_model to NULL every time a minhash was (re)computed for a def
+// that already had a real #160 summary -- e.g. every routine edit, since
+// UpsertDefinition's body-hash-changed branch calls this. Confirmed live
+// before the fix: a def with a summary set via SetDefSummary lost its
+// OneLine/Model the instant SetDefSummaryMinHash ran afterward.
+func TestSetDefSummaryMinHash_PreservesOneLineAndModel(t *testing.T) {
+	dir := t.TempDir()
+	db, err := OpenSQLite(filepath.Join(dir, "defn.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	mod, err := db.EnsureModule("example.com/proj", "proj", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defID, err := db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "F", Kind: "function", Exported: true,
+		Body: "func F() {}",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.SetDefSummary(defID, &DefSummary{
+		OneLine: "does F things", BodyHash: "abc", Model: "test-model",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.SetDefSummaryMinHash(defID, []byte{1, 2, 3, 4}); err != nil {
+		t.Fatal(err)
+	}
+
+	sum, err := db.GetDefSummary(defID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum == nil {
+		t.Fatal("expected a summary row to still exist after SetDefSummaryMinHash")
+	}
+	if sum.OneLine != "does F things" {
+		t.Errorf("OneLine was wiped by SetDefSummaryMinHash: got %q", sum.OneLine)
+	}
+	if sum.Model != "test-model" {
+		t.Errorf("Model was wiped by SetDefSummaryMinHash: got %q", sum.Model)
+	}
+
+	all, err := db.AllDefSummaryMinHashes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(all[defID]) != string([]byte{1, 2, 3, 4}) {
+		t.Errorf("minhash not stored correctly: got %v", all[defID])
+	}
+}

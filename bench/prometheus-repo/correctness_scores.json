@@ -1,0 +1,739 @@
+{
+  "arm_defn": [
+    {
+      "id": "prometheus__prometheus-19184",
+      "n_writes": 3,
+      "gold": [
+        "discovery/aws/msk.go",
+        "discovery/aws/msk_test.go",
+        "docs/configuration/configuration.md"
+      ],
+      "touched": [
+        "discovery/aws/msk.go",
+        "discovery/aws/msk_test.go"
+      ],
+      "hit": [
+        "discovery/aws/msk.go",
+        "discovery/aws/msk_test.go"
+      ],
+      "precision": 1.0,
+      "recall": 0.6666666666666666,
+      "f1": 0.8,
+      "cost": 1.32089085,
+      "rc": 0,
+      "elapsed": 494.9808406829834,
+      "unresolved": []
+    },
+    {
+      "id": "prometheus__prometheus-17395",
+      "n_writes": 14,
+      "gold": [
+        "discovery/aws/lightsail.go",
+        "discovery/aws/lightsail_test.go"
+      ],
+      "touched": [
+        "discovery/aws/lightsail_test.go"
+      ],
+      "hit": [
+        "discovery/aws/lightsail_test.go"
+      ],
+      "precision": 1.0,
+      "recall": 0.5,
+      "f1": 0.6666666666666666,
+      "cost": 1.2189322,
+      "rc": 0,
+      "elapsed": 624.4809534549713,
+      "unresolved": [
+        null
+      ]
+    },
+    {
+      "id": "prometheus__prometheus-19338",
+      "n_writes": 8,
+      "gold": [
+        "storage/remote/otlptranslator/prometheusremotewrite/annotations.go",
+        "storage/remote/otlptranslator/prometheusremotewrite/metrics_to_prw.go",
+        "storage/remote/otlptranslator/prometheusremotewrite/metrics_to_prw_test.go",
+        "storage/remote/write_otlp_handler_test.go"
+      ],
+      "touched": [
+        "storage/remote/otlptranslator/prometheusremotewrite/annotations.go",
+        "storage/remote/otlptranslator/prometheusremotewrite/metrics_to_prw.go",
+        "storage/remote/otlptranslator/prometheusremotewrite/metrics_to_prw_test.go",
+        "storage/remote/write_otlp_handler_test.go"
+      ],
+      "hit": [
+        "storage/remote/otlptranslator/prometheusremotewrite/annotations.go",
+        "storage/remote/otlptranslator/prometheusremotewrite/metrics_to_prw.go",
+        "storage/remote/otlptranslator/prometheusremotewrite/metrics_to_prw_test.go",
+        "storage/remote/write_otlp_handler_test.go"
+      ],
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "cost": 1.1196452000000001,
+      "rc": 0,
+      "elapsed": 381.4763276576996,
+      "unresolved": []
+    },
+    {
+      "id": "prometheus__prometheus-12024",
+      "n_writes": 12,
+      "gold": [
+        "docs/configuration/configuration.md",
+        "scrape/scrape.go",
+        "scrape/scrape_test.go",
+        "scrape/target.go",
+        "scrape/target_test.go"
+      ],
+      "touched": [
+        "config/config_test.go",
+        "docs/configuration/configuration.md",
+        "scrape/scrape.go",
+        "scrape/scrape_test.go",
+        "scrape/target.go",
+        "scrape/target_test.go",
+        "scrape/unixsocket.go"
+      ],
+      "hit": [
+        "docs/configuration/configuration.md",
+        "scrape/scrape.go",
+        "scrape/scrape_test.go",
+        "scrape/target.go",
+        "scrape/target_test.go"
+      ],
+      "precision": 0.7142857142857143,
+      "recall": 1.0,
+      "f1": 0.8333333333333333,
+      "cost": 1.6333403,
+      "rc": 0,
+      "elapsed": 637.737297296524,
+      "unresolved": [
+        "CheckTargetAddress",
+        "CheckTargetAddress"
+      ]
+    },
+    {
+      "id": "prometheus__prometheus-18712",
+      "n_writes": 3,
+      "gold": [
+        "cmd/prometheus/main.go",
+        "docs/command-line/prometheus.md"
+      ],
+      "touched": [
+        "cmd/prometheus/main.go"
+      ],
+      "hit": [
+        "cmd/prometheus/main.go"
+      ],
+      "precision": 1.0,
+      "recall": 0.5,
+      "f1": 0.6666666666666666,
+      "cost": 1.0714846999999998,
+      "rc": 1,
+      "elapsed": 374.97321581840515,
+      "unresolved": []
+    },
+    {
+      "id": "prometheus__prometheus-16766",
+      "n_writes": 2,
+      "gold": [
+        "tsdb/head.go"
+      ],
+      "touched": [
+        "tsdb/head.go"
+      ],
+      "hit": [
+        "tsdb/head.go"
+      ],
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "cost": 0.1342988,
+      "rc": 0,
+      "elapsed": 57.934934854507446,
+      "unresolved": []
+    },
+    {
+      "id": "prometheus__prometheus-19017",
+      "n_writes": 4,
+      "gold": [
+        "cmd/prometheus/main.go",
+        "promql/engine_test.go",
+        "promql/query_logger.go",
+        "promql/query_logger_test.go"
+      ],
+      "touched": [
+        "promql/query_logger.go",
+        "promql/query_logger_test.go"
+      ],
+      "hit": [
+        "promql/query_logger.go",
+        "promql/query_logger_test.go"
+      ],
+      "precision": 1.0,
+      "recall": 0.5,
+      "f1": 0.6666666666666666,
+      "cost": 0.6434285,
+      "rc": 0,
+      "elapsed": 262.595725774765,
+      "unresolved": [
+        "Insert",
+        "Delete"
+      ]
+    },
+    {
+      "id": "prometheus__prometheus-18972",
+      "n_writes": 3,
+      "gold": [
+        "docs/configuration/configuration.md",
+        "storage/remote/azuread/azuread.go",
+        "storage/remote/azuread/azuread_test.go"
+      ],
+      "touched": [
+        "storage/remote/azuread/azuread.go",
+        "storage/remote/azuread/azuread_test.go"
+      ],
+      "hit": [
+        "storage/remote/azuread/azuread.go",
+        "storage/remote/azuread/azuread_test.go"
+      ],
+      "precision": 1.0,
+      "recall": 0.6666666666666666,
+      "f1": 0.8,
+      "cost": 0.505253,
+      "rc": 0,
+      "elapsed": 859.2790746688843,
+      "unresolved": []
+    },
+    {
+      "id": "prometheus__prometheus-19236",
+      "n_writes": 2,
+      "gold": [
+        "discovery/moby/docker.go",
+        "discovery/moby/dockerswarm.go",
+        "discovery/moby/moby_test.go"
+      ],
+      "touched": [
+        "discovery/moby/docker.go",
+        "discovery/moby/dockerswarm.go",
+        "discovery/moby/moby_test.go"
+      ],
+      "hit": [
+        "discovery/moby/docker.go",
+        "discovery/moby/dockerswarm.go",
+        "discovery/moby/moby_test.go"
+      ],
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "cost": 0.34787579999999996,
+      "rc": 0,
+      "elapsed": 153.49444222450256,
+      "unresolved": []
+    },
+    {
+      "id": "prometheus__prometheus-19114",
+      "n_writes": 2,
+      "gold": [
+        "tsdb/db.go"
+      ],
+      "touched": [
+        "tsdb/db.go"
+      ],
+      "hit": [
+        "tsdb/db.go"
+      ],
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "cost": 0.23378210000000002,
+      "rc": 0,
+      "elapsed": 177.92992734909058,
+      "unresolved": []
+    },
+    {
+      "id": "prometheus__prometheus-18652",
+      "n_writes": 3,
+      "gold": [
+        "model/relabel/relabel.go",
+        "model/relabel/relabel_test.go"
+      ],
+      "touched": [
+        "model/relabel/relabel.go"
+      ],
+      "hit": [
+        "model/relabel/relabel.go"
+      ],
+      "precision": 1.0,
+      "recall": 0.5,
+      "f1": 0.6666666666666666,
+      "cost": 0.47167139999999996,
+      "rc": 0,
+      "elapsed": 205.06660914421082,
+      "unresolved": [
+        "TestConfig_UnmarshalThenMarshal"
+      ]
+    },
+    {
+      "id": "prometheus__prometheus-18358",
+      "n_writes": 2,
+      "gold": [
+        "cmd/promtool/main.go",
+        "cmd/promtool/metrics.go",
+        "cmd/promtool/metrics_test.go",
+        "docs/command-line/promtool.md"
+      ],
+      "touched": [
+        "cmd/promtool/main.go",
+        "cmd/promtool/metrics.go",
+        "cmd/promtool/metrics_test.go"
+      ],
+      "hit": [
+        "cmd/promtool/main.go",
+        "cmd/promtool/metrics.go",
+        "cmd/promtool/metrics_test.go"
+      ],
+      "precision": 1.0,
+      "recall": 0.75,
+      "f1": 0.8571428571428571,
+      "cost": 0.45564815,
+      "rc": 0,
+      "elapsed": 178.68258213996887,
+      "unresolved": [
+        "TestPushMetrics"
+      ]
+    },
+    {
+      "id": "prometheus__prometheus-18534",
+      "n_writes": 6,
+      "gold": [
+        "promql/functions.go",
+        "promql/promqltest/testdata/start_timestamps.test",
+        "util/annotations/annotations.go",
+        "util/annotations/annotations_test.go"
+      ],
+      "touched": [
+        "promql/functions.go",
+        "util/annotations/annotations.go"
+      ],
+      "hit": [
+        "promql/functions.go",
+        "util/annotations/annotations.go"
+      ],
+      "precision": 1.0,
+      "recall": 0.5,
+      "f1": 0.6666666666666666,
+      "cost": 1.2977028999999998,
+      "rc": 0,
+      "elapsed": 497.57837748527527,
+      "unresolved": [
+        "instantValue",
+        "instantValue",
+        "funcResets",
+        "funcResets",
+        "funcResets",
+        "funcResets"
+      ]
+    },
+    {
+      "id": "prometheus__prometheus-18841",
+      "n_writes": 1,
+      "gold": [
+        "web/api/v1/api.go",
+        "web/api/v1/api_test.go"
+      ],
+      "touched": [
+        "web/api/v1/api.go",
+        "web/api/v1/api_test.go"
+      ],
+      "hit": [
+        "web/api/v1/api.go",
+        "web/api/v1/api_test.go"
+      ],
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "cost": 0.0970437,
+      "rc": 0,
+      "elapsed": 67.43649911880493,
+      "unresolved": []
+    },
+    {
+      "id": "prometheus__prometheus-18765",
+      "n_writes": 11,
+      "gold": [
+        "discovery/scaleway/instance.go",
+        "discovery/scaleway/instance_test.go"
+      ],
+      "touched": [
+        "discovery/scaleway/instance.go",
+        "discovery/scaleway/instance_test.go"
+      ],
+      "hit": [
+        "discovery/scaleway/instance.go",
+        "discovery/scaleway/instance_test.go"
+      ],
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "cost": 1.3464685499999998,
+      "rc": 1,
+      "elapsed": 953.7585144042969,
+      "unresolved": []
+    }
+  ],
+  "arm_files": [
+    {
+      "id": "prometheus__prometheus-19184",
+      "n_writes": 0,
+      "gold": [
+        "discovery/aws/msk.go",
+        "discovery/aws/msk_test.go",
+        "docs/configuration/configuration.md"
+      ],
+      "touched": [
+        "discovery/aws/msk.go",
+        "discovery/aws/msk_test.go"
+      ],
+      "hit": [
+        "discovery/aws/msk.go",
+        "discovery/aws/msk_test.go"
+      ],
+      "precision": 1.0,
+      "recall": 0.6666666666666666,
+      "f1": 0.8,
+      "cost": 0.48988175,
+      "rc": 0,
+      "elapsed": 107.9572024345398,
+      "unresolved": []
+    },
+    {
+      "id": "prometheus__prometheus-17395",
+      "n_writes": 0,
+      "gold": [
+        "discovery/aws/lightsail.go",
+        "discovery/aws/lightsail_test.go"
+      ],
+      "touched": [
+        "discovery/aws/lightsail_test.go"
+      ],
+      "hit": [
+        "discovery/aws/lightsail_test.go"
+      ],
+      "precision": 1.0,
+      "recall": 0.5,
+      "f1": 0.6666666666666666,
+      "cost": 0.3210268,
+      "rc": 0,
+      "elapsed": 90.46373653411865,
+      "unresolved": []
+    },
+    {
+      "id": "prometheus__prometheus-19338",
+      "n_writes": 0,
+      "gold": [
+        "storage/remote/otlptranslator/prometheusremotewrite/annotations.go",
+        "storage/remote/otlptranslator/prometheusremotewrite/metrics_to_prw.go",
+        "storage/remote/otlptranslator/prometheusremotewrite/metrics_to_prw_test.go",
+        "storage/remote/write_otlp_handler_test.go"
+      ],
+      "touched": [
+        "storage/remote/otlptranslator/prometheusremotewrite/annotations.go",
+        "storage/remote/otlptranslator/prometheusremotewrite/metrics_to_prw_test.go"
+      ],
+      "hit": [
+        "storage/remote/otlptranslator/prometheusremotewrite/annotations.go",
+        "storage/remote/otlptranslator/prometheusremotewrite/metrics_to_prw_test.go"
+      ],
+      "precision": 1.0,
+      "recall": 0.5,
+      "f1": 0.6666666666666666,
+      "cost": 0.43399335,
+      "rc": 0,
+      "elapsed": 146.3538453578949,
+      "unresolved": []
+    },
+    {
+      "id": "prometheus__prometheus-12024",
+      "n_writes": 0,
+      "gold": [
+        "docs/configuration/configuration.md",
+        "scrape/scrape.go",
+        "scrape/scrape_test.go",
+        "scrape/target.go",
+        "scrape/target_test.go"
+      ],
+      "touched": [
+        "config/config.go",
+        "notifier/alertmanager.go",
+        "scrape/scrape.go",
+        "scrape/target.go",
+        "t.go",
+        "t2.go"
+      ],
+      "hit": [
+        "scrape/scrape.go",
+        "scrape/target.go"
+      ],
+      "precision": 0.3333333333333333,
+      "recall": 0.4,
+      "f1": 0.3636363636363636,
+      "cost": 1.7350713499999995,
+      "rc": 1,
+      "elapsed": 452.2895040512085,
+      "unresolved": []
+    },
+    {
+      "id": "prometheus__prometheus-18712",
+      "n_writes": 0,
+      "gold": [
+        "cmd/prometheus/main.go",
+        "docs/command-line/prometheus.md"
+      ],
+      "touched": [
+        "cmd/prometheus/main.go"
+      ],
+      "hit": [
+        "cmd/prometheus/main.go"
+      ],
+      "precision": 1.0,
+      "recall": 0.5,
+      "f1": 0.6666666666666666,
+      "cost": 0.31132564999999995,
+      "rc": 0,
+      "elapsed": 233.36750411987305,
+      "unresolved": []
+    },
+    {
+      "id": "prometheus__prometheus-16766",
+      "n_writes": 0,
+      "gold": [
+        "tsdb/head.go"
+      ],
+      "touched": [
+        "durcheck.go",
+        "tsdb/agent/db.go",
+        "tsdb/compact.go",
+        "tsdb/db.go",
+        "tsdb/head.go"
+      ],
+      "hit": [
+        "tsdb/head.go"
+      ],
+      "precision": 0.2,
+      "recall": 1.0,
+      "f1": 0.33333333333333337,
+      "cost": 0.51057805,
+      "rc": 0,
+      "elapsed": 193.28369116783142,
+      "unresolved": []
+    },
+    {
+      "id": "prometheus__prometheus-19017",
+      "n_writes": 0,
+      "gold": [
+        "cmd/prometheus/main.go",
+        "promql/engine_test.go",
+        "promql/query_logger.go",
+        "promql/query_logger_test.go"
+      ],
+      "touched": [],
+      "hit": [],
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "cost": 0.3705559,
+      "rc": 0,
+      "elapsed": 404.96482825279236,
+      "unresolved": []
+    },
+    {
+      "id": "prometheus__prometheus-18972",
+      "n_writes": 0,
+      "gold": [
+        "docs/configuration/configuration.md",
+        "storage/remote/azuread/azuread.go",
+        "storage/remote/azuread/azuread_test.go"
+      ],
+      "touched": [
+        "storage/remote/azuread/azuread.go",
+        "storage/remote/azuread/azuread_test.go"
+      ],
+      "hit": [
+        "storage/remote/azuread/azuread.go",
+        "storage/remote/azuread/azuread_test.go"
+      ],
+      "precision": 1.0,
+      "recall": 0.6666666666666666,
+      "f1": 0.8,
+      "cost": 0.4312938,
+      "rc": 0,
+      "elapsed": 388.89555382728577,
+      "unresolved": []
+    },
+    {
+      "id": "prometheus__prometheus-19236",
+      "n_writes": 0,
+      "gold": [
+        "discovery/moby/docker.go",
+        "discovery/moby/dockerswarm.go",
+        "discovery/moby/moby_test.go"
+      ],
+      "touched": [
+        "discovery/refresh/refresh.go",
+        "discovery/refresh/refresh_test.go"
+      ],
+      "hit": [],
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "cost": 0.6248871500000001,
+      "rc": 0,
+      "elapsed": 792.1485998630524,
+      "unresolved": []
+    },
+    {
+      "id": "prometheus__prometheus-19114",
+      "n_writes": 0,
+      "gold": [
+        "tsdb/db.go"
+      ],
+      "touched": [
+        "tsdb/db.go"
+      ],
+      "hit": [
+        "tsdb/db.go"
+      ],
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "cost": 0.18434625,
+      "rc": 0,
+      "elapsed": 141.98883748054504,
+      "unresolved": []
+    },
+    {
+      "id": "prometheus__prometheus-18652",
+      "n_writes": 0,
+      "gold": [
+        "model/relabel/relabel.go",
+        "model/relabel/relabel_test.go"
+      ],
+      "touched": [
+        "model/relabel/relabel.go",
+        "tmp/repro_test.go"
+      ],
+      "hit": [
+        "model/relabel/relabel.go"
+      ],
+      "precision": 0.5,
+      "recall": 0.5,
+      "f1": 0.5,
+      "cost": 0.8469789000000001,
+      "rc": 0,
+      "elapsed": 516.6051478385925,
+      "unresolved": []
+    },
+    {
+      "id": "prometheus__prometheus-18358",
+      "n_writes": 0,
+      "gold": [
+        "cmd/promtool/main.go",
+        "cmd/promtool/metrics.go",
+        "cmd/promtool/metrics_test.go",
+        "docs/command-line/promtool.md"
+      ],
+      "touched": [
+        "cmd/promtool/main.go",
+        "cmd/promtool/metrics.go",
+        "cmd/promtool/metrics_test.go"
+      ],
+      "hit": [
+        "cmd/promtool/main.go",
+        "cmd/promtool/metrics.go",
+        "cmd/promtool/metrics_test.go"
+      ],
+      "precision": 1.0,
+      "recall": 0.75,
+      "f1": 0.8571428571428571,
+      "cost": 0.70415675,
+      "rc": 0,
+      "elapsed": 408.4220311641693,
+      "unresolved": []
+    },
+    {
+      "id": "prometheus__prometheus-18534",
+      "n_writes": 0,
+      "gold": [
+        "promql/functions.go",
+        "promql/promqltest/testdata/start_timestamps.test",
+        "util/annotations/annotations.go",
+        "util/annotations/annotations_test.go"
+      ],
+      "touched": [
+        "promql/functions.go",
+        "promql/promqltest/testdata/start_timestamps.test",
+        "util/annotations/annotations.go"
+      ],
+      "hit": [
+        "promql/functions.go",
+        "promql/promqltest/testdata/start_timestamps.test",
+        "util/annotations/annotations.go"
+      ],
+      "precision": 1.0,
+      "recall": 0.75,
+      "f1": 0.8571428571428571,
+      "cost": 1.5863361999999999,
+      "rc": 1,
+      "elapsed": 568.5717570781708,
+      "unresolved": []
+    },
+    {
+      "id": "prometheus__prometheus-18841",
+      "n_writes": 0,
+      "gold": [
+        "web/api/v1/api.go",
+        "web/api/v1/api_test.go"
+      ],
+      "touched": [
+        "web/api/v1/api.go"
+      ],
+      "hit": [
+        "web/api/v1/api.go"
+      ],
+      "precision": 1.0,
+      "recall": 0.5,
+      "f1": 0.6666666666666666,
+      "cost": 0.17282009999999998,
+      "rc": 0,
+      "elapsed": 210.52663898468018,
+      "unresolved": []
+    },
+    {
+      "id": "prometheus__prometheus-18765",
+      "n_writes": 0,
+      "gold": [
+        "discovery/scaleway/instance.go",
+        "discovery/scaleway/instance_test.go"
+      ],
+      "touched": [
+        "discovery/scaleway/instance.go",
+        "discovery/scaleway/instance_test.go",
+        "discovery/scaleway/testdata/instance.json",
+        "discovery/scaleway/testdata/ipam_ips.json"
+      ],
+      "hit": [
+        "discovery/scaleway/instance.go",
+        "discovery/scaleway/instance_test.go"
+      ],
+      "precision": 0.5,
+      "recall": 1.0,
+      "f1": 0.6666666666666666,
+      "cost": 1.1552529999999996,
+      "rc": 0,
+      "elapsed": 306.8155286312103,
+      "unresolved": []
+    }
+  ]
+}

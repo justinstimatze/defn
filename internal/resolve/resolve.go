@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/justinstimatze/defn/internal/astutil"
 	"github.com/justinstimatze/defn/internal/goload"
 	"github.com/justinstimatze/defn/internal/store"
 	"golang.org/x/tools/go/packages"
@@ -159,22 +160,67 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 			pkgPath = strings.TrimSuffix(pkgPath, "_test")
 		}
 		pkgScope := pkg.Types.Scope()
+
+		// Struct fields never satisfy isPackageLevelOrMethod below --
+		// obj.Parent() is nil for a field, same as a param or local var,
+		// so the object alone can't distinguish them. A companion AST
+		// walk maps each field's declaring *ast.Ident to its struct
+		// type's name, mirroring how ingestStructFields assigns
+		// Receiver: typeName when it stores the field's own DB row --
+		// letting the receiver-qualified lookup below find that same
+		// row. Without this, a field's *types.Var object never enters
+		// objToDef, so collectRefs can never resolve a selector
+		// expression (ro.Count) or keyed composite literal (T{Count:...})
+		// back to the field's def ID -- GetCallers on a renamed struct
+		// field always reports 0 callers, forcing callers to be found
+		// and fixed by hand even though go/types resolves both those use
+		// forms to the same object identity the field's own Defs entry
+		// has (confirmed empirically: Info.Uses IS populated for both).
+		fieldOwners := map[types.Object]string{}
+		for _, file := range pkg.Syntax {
+			ast.Inspect(file, func(n ast.Node) bool {
+				ts, ok := n.(*ast.TypeSpec)
+				if !ok {
+					return true
+				}
+				st, ok := ts.Type.(*ast.StructType)
+				if !ok || st.Fields == nil {
+					return true
+				}
+				for _, field := range st.Fields.List {
+					for _, name := range field.Names {
+						if obj := pkg.TypesInfo.Defs[name]; obj != nil {
+							fieldOwners[obj] = ts.Name.Name
+						}
+					}
+				}
+				return true
+			})
+		}
+
 		for ident, obj := range pkg.TypesInfo.Defs {
 			if obj == nil || ident.Name == "_" {
 				continue
 			}
 			// #107: skip identifiers that can't map to a top-level def
-			// in the DB — params, local vars, struct fields, etc. Without
-			// this filter every local var in the file triggers a
-			// GetDefinitionByName miss (7s on cli/cli's command package).
-			// A method is scoped to its receiver, not the package, so we
-			// keep those explicitly.
-			if !isPackageLevelOrMethod(obj, pkgScope) {
+			// in the DB — params, local vars, etc. Without this filter
+			// every local var in the file triggers a GetDefinitionByName
+			// miss (7s on cli/cli's command package). A method is scoped
+			// to its receiver, not the package, so we keep those
+			// explicitly; struct fields are handled below via
+			// fieldOwners since they need the same receiver-qualified
+			// lookup but aren't identifiable from the object alone.
+			if isPackageLevelOrMethod(obj, pkgScope) {
+				defID := lookupDefID(db, pkgPath, ident, obj, cache)
+				if defID > 0 {
+					objToDef[obj] = defID
+				}
 				continue
 			}
-			defID := lookupDefID(db, pkgPath, ident, obj, cache)
-			if defID > 0 {
-				objToDef[obj] = defID
+			if owner, ok := fieldOwners[obj]; ok {
+				if id := lookupFieldDefID(db, pkgPath, ident.Name, owner, cache); id > 0 {
+					objToDef[obj] = id
+				}
 			}
 		}
 	}
@@ -245,15 +291,92 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 		}
 	}
 
-	ifaceMethodToImpls := map[types.Object][]int64{}
+	// Widen ifacesByPkg to also cover EXTERNAL (stdlib/third-party)
+	// packages reachable via any filtered package's direct imports.
+	// go/packages' NeedDeps mode already loads full go/types info for
+	// these (that's required for the importing package to type-check at
+	// all), so no extra package load is needed -- pkg.Imports[path].Types
+	// is already populated. This is what turns the candidateIfaces lookup
+	// below from "project interfaces only" into "project + every
+	// interface a project package can see", closing the gap
+	// methodRenameRisksInterfaceBreak used to paper over with a small
+	// hardcoded name list (io.Reader/Writer/Closer, fmt.Stringer, ...) --
+	// confirmed live: a type satisfying io.ReaderAt (method ReadAt, not on
+	// that list) via `func use() io.ReaderAt { return T{} }` with no local
+	// interface anywhere let a rename of T.ReadAt ship a build that no
+	// longer compiled, reported as a clean success.
+	scannedIfacePkgs := map[string]bool{}
+	for _, pkg := range filtered {
+		for importPath, impPkg := range pkg.Imports {
+			if _, already := ifacesByPkg[importPath]; already {
+				continue
+			}
+			if scannedIfacePkgs[importPath] {
+				continue
+			}
+			scannedIfacePkgs[importPath] = true
+			if impPkg == nil || impPkg.Types == nil {
+				continue
+			}
+			scope := impPkg.Types.Scope()
+			if scope == nil {
+				continue
+			}
+			for _, name := range scope.Names() {
+				obj := scope.Lookup(name)
+				tn, ok := obj.(*types.TypeName)
+				if !ok {
+					continue
+				}
+				named, ok := tn.Type().(*types.Named)
+				if !ok {
+					continue
+				}
+				if types.IsInterface(named) {
+					ifacesByPkg[importPath] = append(ifacesByPkg[importPath], named)
+				}
+			}
+		}
+	}
 
+	// defExternalIfaces accumulates, per concrete method def ID, the
+	// external interfaces (no local defn ID, so no "implements" ref is
+	// possible) it satisfies -- flushed via SetManyExternalInterfaces
+	// below and read back by methodRenameRisksInterfaceBreak.
+	defExternalIfaces := map[int64][]string{}
+
+	ifaceMethodToImpls := map[string][]int64{}
+
+	// #253: this loop must NOT skip packages outside onlyModule the way
+	// pass 3 does. ifaceMethodToImpls is rebuilt from scratch on every
+	// resolve() call (never cached across calls) and is the ONLY thing
+	// collectRefs has to resolve an interface dispatch call site anywhere
+	// in the scoped module -- if the implementer lives in a DIFFERENT
+	// module than onlyModule (the overwhelmingly common shape: an
+	// interface's sole implementer is typically declared once, in its own
+	// package, while callers scattered across many other packages/modules
+	// invoke it through the interface), skipping that implementer's
+	// package here means ifaceMethodToImpls never gets an entry for it in
+	// THIS call. Pass 3 then finds nothing for the caller's dispatch call
+	// site, and SetManyReferences -- a full delete+reinsert per fromID --
+	// silently WIPES a previously-correct interface_dispatch ref a prior
+	// full Resolve had computed, the instant that caller's OWN module is
+	// what triggers a scoped resolve (i.e. on every edit to the calling
+	// code, which is normal and frequent). Confirmed via a real
+	// dogfooding session where op:"impact"/op:"traverse" on defn's own
+	// store.Backend methods reported near-zero callers despite dozens of
+	// real cross-package call sites in internal/mcp, because internal/mcp
+	// had been through many incremental per-file/per-module resolves
+	// since the codebase's last full one.
+	//
+	// The "implements" edge staged into defRefs below stays scoped to
+	// onlyModule, though (see the inline check) -- that write only
+	// belongs to defs actually being re-resolved this call; the ONLY
+	// thing that needs unscoped visibility is the dispatch map itself.
 	for _, pkg := range filtered {
 		pkgPath := pkg.PkgPath
 		if strings.HasSuffix(pkg.Name, "_test") {
 			pkgPath = strings.TrimSuffix(pkgPath, "_test")
-		}
-		if onlyModule != "" && pkgPath != onlyModule {
-			continue
 		}
 
 		scope := pkg.Types.Scope()
@@ -283,9 +406,10 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 
 		// Candidate interfaces: this package's own, plus every directly
 		// imported package's (map keys in pkg.Imports already dedup by
-		// path). Interfaces from packages outside `filtered` (e.g. stdlib)
-		// never resolve to a defn ID below anyway, so it's harmless that
-		// they're absent from ifacesByPkg.
+		// path) -- including external/stdlib packages now that ifacesByPkg
+		// is widened above. An external interface never resolves to a defn
+		// ID (lookupTypeDefID below), so it can never gain an "implements"
+		// ref; it's staged into defExternalIfaces instead.
 		candidateIfaces := append([]*types.Named{}, ifacesByPkg[pkgPath]...)
 		for importPath := range pkg.Imports {
 			candidateIfaces = append(candidateIfaces, ifacesByPkg[importPath]...)
@@ -325,16 +449,36 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 				// at the end with all the other refs for concreteID so a
 				// later TypeSpec pass cannot wipe it (and so multiple
 				// interfaces don't overwrite each other within this loop).
-				if concreteID > 0 && ifaceID > 0 {
+				// Unlike ifaceMethodToImpls above, this write DOES stay
+				// scoped to onlyModule -- it only belongs to defs actually
+				// being re-resolved this call, not every package this now
+				// -unscoped loop happens to visit while building the
+				// dispatch map.
+				if concreteID > 0 && ifaceID > 0 && (onlyModule == "" || pkgPath == onlyModule) {
 					defRefs[concreteID] = append(defRefs[concreteID], store.Reference{ToDef: ifaceID, Kind: "implements"})
 				}
 
-				// Map interface method objects → concrete method def IDs.
+				// Map interface method identity (as a canonical string, not
+				// a types.Object -- see collectRefs's doc comment on the
+				// lookup side for why) → concrete method def IDs.
 				for ifaceMethod := range ifaceType.Methods() {
-					ifaceMethod := ifaceMethod
 					concreteMethodID := lookupMethodDefID(db, pkgPath, concrete.Obj().Name(), ifaceMethod.Name(), cache)
 					if concreteMethodID > 0 {
-						ifaceMethodToImpls[ifaceMethod] = append(ifaceMethodToImpls[ifaceMethod], concreteMethodID)
+						key := ifaceMethodKey(ifacePkgPath, iface.Obj().Name(), ifaceMethod.Name())
+						ifaceMethodToImpls[key] = append(ifaceMethodToImpls[key], concreteMethodID)
+						// ifaceID == 0 means this interface has no defn row --
+						// it's external (stdlib/third-party), never ingested.
+						// Record the satisfaction directly on the concrete
+						// method's own def ID instead, scoped the same way the
+						// "implements" edge above is: only for defs actually
+						// being re-resolved this call.
+						if ifaceID == 0 && (onlyModule == "" || pkgPath == onlyModule) {
+							qualified := iface.Obj().Name()
+							if ifacePkgPath != "" {
+								qualified = ifacePkgPath + "." + qualified
+							}
+							defExternalIfaces[concreteMethodID] = append(defExternalIfaces[concreteMethodID], qualified)
+						}
 					}
 				}
 			}
@@ -357,19 +501,38 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 			for _, decl := range file.Decls {
 				switch d := decl.(type) {
 				case *ast.FuncDecl:
-					if d.Body == nil {
-						continue
-					}
 					fromID := lookupFuncDefID(db, pkgPath, d, cache)
 					if fromID <= 0 {
 						continue
 					}
-					refs, litFields := collectRefs(d.Body, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls)
-					if len(refs) > 0 {
-						defRefs[fromID] = append(defRefs[fromID], refs...)
+					// Collect refs from the signature (parameter/return
+					// types) AND the body. Both contribute to the same
+					// fromID; accumulate and flush once so the second
+					// collectRefs call doesn't wipe the first -- same
+					// pattern ValueSpec already uses for its value+type.
+					// Without this, a type used ONLY in a parameter or
+					// return type (never instantiated inside the body)
+					// was entirely invisible to GetCallers/impact --
+					// confirmed live via the mutation fuzzer: renaming an
+					// interface used only as `func F(g Greeter) ...`'s
+					// parameter type reported "Updated 0 callers" and
+					// left the now-undefined old name behind in F's
+					// signature, silently shipping a broken build.
+					var nodes []ast.Node
+					if d.Type != nil {
+						nodes = append(nodes, d.Type)
 					}
-					if len(litFields) > 0 {
-						defLitFields[fromID] = append(defLitFields[fromID], litFields...)
+					if d.Body != nil {
+						nodes = append(nodes, d.Body)
+					}
+					for _, node := range nodes {
+						refs, litFields := collectRefs(node, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls, db, cache)
+						if len(refs) > 0 {
+							defRefs[fromID] = append(defRefs[fromID], refs...)
+						}
+						if len(litFields) > 0 {
+							defLitFields[fromID] = append(defLitFields[fromID], litFields...)
+						}
 					}
 
 				case *ast.GenDecl:
@@ -398,7 +561,7 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 									nodes = append(nodes, s.Type)
 								}
 								for _, node := range nodes {
-									refs, litFields := collectRefs(node, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls)
+									refs, litFields := collectRefs(node, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls, db, cache)
 									if len(refs) > 0 {
 										defRefs[fromID] = append(defRefs[fromID], refs...)
 									}
@@ -414,7 +577,7 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 							if fromID <= 0 {
 								continue
 							}
-							refs, litFields := collectRefs(s.Type, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls)
+							refs, litFields := collectRefs(s.Type, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls, db, cache)
 							if len(refs) > 0 {
 								defRefs[fromID] = append(defRefs[fromID], refs...)
 							}
@@ -430,6 +593,43 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 
 	timeIt("pass3 body-refs", tPass)
 	tPass = time.Now()
+
+	// #253 part 2: ResolveFile's narrow load (preloaded != nil &&
+	// onlyModule != "") cannot see an interface's implementer at all if
+	// it lives in a package outside the single one loaded -- so
+	// ifaceMethodToImpls can never gain an entry for it here even with
+	// the pass-2 fix above, collectRefs finds nothing for that dispatch
+	// call site, and the flush below would silently drop a
+	// previously-correct interface_dispatch ref the same way the pass-2
+	// bug did, just via a different mechanism (missing data, not a
+	// scoping filter). Preserve existing interface_dispatch edges for
+	// every def this call is about to flush new refs for by merging them
+	// in -- mirrors the tradeoff ResolveFile's own doc comment already
+	// accepts for incoming cross-package refs ("those still flow from
+	// the prior full Resolve"), extended to outgoing dispatch edges.
+	// Best-effort and deduped against whatever collectRefs DID find (the
+	// implementer can legitimately be in the one loaded package too).
+	if preloaded != nil && onlyModule != "" {
+		for fromID, refs := range defRefs {
+			have := map[int64]bool{}
+			for _, r := range refs {
+				if r.Kind == "interface_dispatch" {
+					have[r.ToDef] = true
+				}
+			}
+			existing, err := db.Traverse(fromID, "callees", []string{"interface_dispatch"}, 1)
+			if err != nil {
+				continue
+			}
+			for _, r := range existing {
+				if have[r.Definition.ID] {
+					continue
+				}
+				have[r.Definition.ID] = true
+				defRefs[fromID] = append(defRefs[fromID], store.Reference{ToDef: r.Definition.ID, Kind: "interface_dispatch"})
+			}
+		}
+	}
 
 	// #108 (winze finding): wrap the entire flush in ONE transaction
 	// instead of letting Dolt autocommit each write call. On a 1.2GB
@@ -474,6 +674,14 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 		return err
 	}
 	timeIt("flush SetManyLiteralFields", tLit)
+	tExtIfaces := time.Now()
+	if err := flushDB.SetManyExternalInterfaces(defExternalIfaces); err != nil {
+		if txWrapped {
+			rollback()
+		}
+		return err
+	}
+	timeIt("flush SetManyExternalInterfaces", tExtIfaces)
 	if txWrapped {
 		tCommit := time.Now()
 		if err := commit(); err != nil {
@@ -617,7 +825,29 @@ func lookupVarDefID(db store.Backend, pkgPath, name string, cache pkgIndexCache)
 	return d.ID
 }
 
-func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef map[types.Object]int64, ifaceMethodToImpls map[types.Object][]int64) ([]store.Reference, []store.LiteralField) {
+// collectRefs walks node's AST and returns every reference it makes to a
+// definition in objToDef/ifaceMethodToImpls, plus struct-literal field data.
+//
+// db/cache: fallback for when the "to" side of a reference belongs to a
+// package that wasn't part of THIS resolve call's own package set (e.g.
+// ResolveFile loads only the touched file's own package, so objToDef only
+// has entries for defs declared in that one package -- a call to a func in
+// any other package always misses objToDef here). Without this fallback,
+// ResolveFile doesn't just fail to ADD cross-package outgoing refs, it
+// actively ERASES previously-correct ones: resolve()'s caller flushes via
+// SetManyReferences, which deletes-then-reinserts the touched def's whole
+// ref set, so a miss here is indistinguishable from "this def no longer
+// calls that". db may be nil (unit tests exercising collectRefs directly
+// without a backend) -- the fallback is skipped in that case, same as a
+// permanent miss.
+//
+// Guarded by isPackageLevelOrMethod (the same filter pass1 uses to decide
+// what goes into objToDef in the first place) so this can't bind a local
+// var/param to an unrelated same-named top-level def elsewhere in the DB --
+// it only fires for objects that are themselves plausibly a top-level def
+// or a concrete (non-interface) method, using each object's OWN home
+// package scope rather than the caller's.
+func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef map[types.Object]int64, ifaceMethodToImpls map[string][]int64, db store.Backend, cache pkgIndexCache) ([]store.Reference, []store.LiteralField) {
 	seen := make(map[int64]string)
 	var refs []store.Reference
 	var litFields []store.LiteralField
@@ -627,6 +857,17 @@ func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef 
 			seen[toID] = kind
 			refs = append(refs, store.Reference{ToDef: toID, Kind: kind})
 		}
+	}
+
+	// crossPkgTypeFallback resolves a *types.TypeName that missed objToDef
+	// via the DB-backed cache, scoped to the type's own package. Shared by
+	// the CompositeLit and new(Type) constructor cases below.
+	crossPkgTypeFallback := func(tn *types.TypeName) int64 {
+		pkg := tn.Pkg()
+		if pkg == nil || db == nil || tn.Parent() != pkg.Scope() {
+			return 0
+		}
+		return lookupTypeDefID(db, pkg.Path(), tn.Name(), cache)
 	}
 
 	// Pre-scan: collect idents of embedded struct fields so we can
@@ -660,6 +901,8 @@ func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef 
 					if named, ok := typ.(*types.Named); ok {
 						if toID, ok := objToDef[named.Obj()]; ok {
 							addRef(toID, "constructor")
+						} else if toID := crossPkgTypeFallback(named.Obj()); toID > 0 {
+							addRef(toID, "constructor")
 						}
 						// Extract field-level data from keyed composite literals.
 						typeName := named.Obj().Name()
@@ -674,6 +917,20 @@ func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef 
 							ident, ok := kv.Key.(*ast.Ident)
 							if !ok {
 								continue
+							}
+							// Resolve the keyed field itself as a
+							// reference via the DB, not objToDef/object
+							// identity: FilterPackages prefers the test
+							// variant of any package with _test.go
+							// files, so a field declared there has a
+							// different types.Object identity than what
+							// an ordinary (non-test) importer's own
+							// TypesInfo resolves the same field key to
+							// -- see lookupFieldDefID's doc comment.
+							if fieldPkg := named.Obj().Pkg(); fieldPkg != nil {
+								if toID := lookupFieldDefID(db, fieldPkg.Path(), ident.Name, named.Obj().Name(), cache); toID > 0 {
+									addRef(toID, "field_ref")
+								}
 							}
 							fieldValue, ok := evalStringLiteral(kv.Value)
 							if !ok {
@@ -694,6 +951,33 @@ func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef 
 				}
 			}
 			return true
+		case *ast.SelectorExpr:
+			// Direct field access: x.Field. Resolved via the DB, not
+			// objToDef/object identity -- same rationale as the keyed
+			// composite-literal case above (see lookupFieldDefID's doc
+			// comment on the test-variant identity mismatch). Only
+			// len(Index())==1 (a field declared directly on x's own
+			// static type, not promoted through an embedded field) --
+			// sel.Recv() is x's OWN type, which is the wrong owner to
+			// look up a promoted field's def under; skipping those
+			// is a silent miss, same as today's behavior, not a
+			// regression.
+			if sel, ok := info.Selections[x]; ok && sel.Kind() == types.FieldVal && len(sel.Index()) == 1 {
+				if v, ok := sel.Obj().(*types.Var); ok && v.IsField() {
+					recvType := sel.Recv()
+					if ptr, ok := recvType.(*types.Pointer); ok {
+						recvType = ptr.Elem()
+					}
+					if named, ok := recvType.(*types.Named); ok {
+						if fieldPkg := named.Obj().Pkg(); fieldPkg != nil {
+							if toID := lookupFieldDefID(db, fieldPkg.Path(), v.Name(), named.Obj().Name(), cache); toID > 0 {
+								addRef(toID, "field_ref")
+							}
+						}
+					}
+				}
+			}
+			return true
 		case *ast.CallExpr:
 			// new(Type) builtin.
 			if ident, ok := x.Fun.(*ast.Ident); ok {
@@ -701,6 +985,8 @@ func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef 
 					if tv, ok := info.Types[x.Args[0]]; ok {
 						if named, ok := tv.Type.(*types.Named); ok {
 							if toID, ok := objToDef[named.Obj()]; ok {
+								addRef(toID, "constructor")
+							} else if toID := crossPkgTypeFallback(named.Obj()); toID > 0 {
 								addRef(toID, "constructor")
 							}
 						}
@@ -730,11 +1016,55 @@ func collectRefs(node ast.Node, info *types.Info, fset *token.FileSet, objToDef 
 			return true
 		}
 
-		// Interface method dispatch: obj is an interface method not in objToDef.
-		// Connect to all concrete implementations.
-		if implIDs, ok := ifaceMethodToImpls[obj]; ok {
-			for _, implID := range implIDs {
-				addRef(implID, "interface_dispatch")
+		// Interface method dispatch: obj is an interface method not in
+		// objToDef. Connect to all concrete implementations.
+		//
+		// Keyed by a canonical STRING (package path + interface name +
+		// method name), NOT by obj itself. Confirmed via direct diagnostic
+		// against defn's own repo: packages.Load(Tests:true) gives
+		// internal/store.Backend.GetImpact's method object TWO DIFFERENT
+		// *types.Object pointers with IDENTICAL String() representation --
+		// one from internal/store's own type-checking session (the
+		// "test variant" FilterPackages prefers when iterating that
+		// package directly in pass 2, since it bundles _test.go files),
+		// and a different one from internal/mcp's session (which imports
+		// the PLAIN, non-test variant, per normal Go import rules -- a
+		// non-test package can never import another package's test
+		// variant). A types.Object-keyed map built from one session's
+		// pointers can never match a lookup using the other session's --
+		// silently breaking cross-package interface dispatch for every
+		// call into any package that has its own _test.go files, which is
+		// nearly every real package. String identity is immune to this:
+		// pkgPath/name strings are equal regardless of which
+		// type-checking session produced the Object.
+		//
+		// obj's own receiver type (not sel.X) reliably gives a
+		// *types.Named for the interface, confirmed empirically -- no
+		// need to inspect the enclosing selector expression separately.
+		if fn, ok := obj.(*types.Func); ok {
+			if sig := fn.Type().(*types.Signature); sig.Recv() != nil {
+				if named, ok := sig.Recv().Type().(*types.Named); ok && types.IsInterface(named) {
+					if ifacePkg := named.Obj().Pkg(); ifacePkg != nil {
+						key := ifaceMethodKey(ifacePkg.Path(), named.Obj().Name(), fn.Name())
+						if implIDs, ok := ifaceMethodToImpls[key]; ok {
+							for _, implID := range implIDs {
+								addRef(implID, "interface_dispatch")
+							}
+							return true
+						}
+					}
+				}
+			}
+		}
+
+		// Cross-package fallback -- see the doc comment above.
+		if pkg := obj.Pkg(); pkg != nil && db != nil && isPackageLevelOrMethod(obj, pkg.Scope()) {
+			if toID := lookupDefID(db, pkg.Path(), ident, obj, cache); toID > 0 {
+				kind := classifyRef(obj)
+				if kind == "type_ref" && embeddedIdents[ident] {
+					kind = "embed"
+				}
+				addRef(toID, kind)
 			}
 		}
 		return true
@@ -870,7 +1200,7 @@ func lookupDefID(db store.Backend, pkgPath string, ident *ast.Ident, obj types.O
 func lookupFuncDefID(db store.Backend, pkgPath string, fn *ast.FuncDecl, cache pkgIndexCache) int64 {
 	// For methods, include receiver in lookup.
 	if fn.Recv != nil && len(fn.Recv.List) > 0 {
-		recv := types.ExprString(fn.Recv.List[0].Type)
+		recv := astutil.BareReceiverName(fn.Recv.List[0].Type)
 		if id := cache.get(db, pkgPath).lookupMethod(fn.Name.Name, recv); id > 0 {
 			return id
 		}
@@ -892,19 +1222,58 @@ func lookupFuncDefID(db store.Backend, pkgPath string, fn *ast.FuncDecl, cache p
 // receiverName extracts a short receiver name from a types.Type.
 // e.g., *Context, JSON, *node
 func receiverName(t types.Type) string {
+	// A method receiver is always a named type or a pointer to one --
+	// unwrap structurally via types.Named.Obj().Name() instead of
+	// string-splitting t.String() on ".". The old string-split approach
+	// never stripped a generic instantiation's bracket suffix ("*Context"
+	// vs "*Pair[K,V]"), and for a package-qualified type ARGUMENT inside
+	// the brackets (e.g. Pair[K, sql.NullString]) it could find the wrong
+	// "." entirely -- both silently produced a receiver key that never
+	// matched the bare name Definition.Receiver is stored under,
+	// confirmed live: two generic types sharing a method name in one
+	// package (Stack[T].Len / Queue[T].Len) had their callers merged
+	// onto a single def via the receiver-agnostic fallback lookup.
+	prefix := ""
+	if ptr, ok := t.(*types.Pointer); ok {
+		prefix = "*"
+		t = ptr.Elem()
+	}
+	if named, ok := t.(*types.Named); ok {
+		return prefix + named.Obj().Name()
+	}
+	// Fallback for anything structurally unexpected for a receiver.
 	s := t.String()
-	// Strip package path: "github.com/gin-gonic/gin.*Context" → "*Context"
 	if idx := strings.LastIndex(s, "."); idx >= 0 {
-		prefix := ""
-		// Check if it's a pointer.
-		if strings.Contains(s[:idx], "*") {
-			prefix = "*"
-			s = strings.Replace(s, "*", "", 1)
-			if idx2 := strings.LastIndex(s, "."); idx2 >= 0 {
-				return prefix + s[idx2+1:]
-			}
-		}
 		return prefix + s[idx+1:]
 	}
-	return s
+	return prefix + s
+}
+
+// ifaceMethodKey builds the canonical string key ifaceMethodToImpls is
+// keyed by: package path + interface name + method name. NOT keyed by
+// types.Object pointer identity -- see the doc comment where this is
+// populated (resolve's pass 2) for why pointer identity is unsafe here.
+func ifaceMethodKey(pkgPath, ifaceName, methodName string) string {
+	return pkgPath + "\x00" + ifaceName + "\x00" + methodName
+}
+
+// lookupFieldDefID resolves a struct field's def ID by (package, field
+// name, declaring type name) -- the same receiver-qualified shape methods
+// use, since ingestStructFields stores each field's Receiver as its
+// declaring type's bare name. Deliberately DB-backed rather than
+// object-identity-backed (unlike the objToDef fast path): FilterPackages
+// prefers the test variant of any package with _test.go files, so a
+// field declared in such a package has a different types.Object identity
+// than what an ordinary (non-test) importer's own TypesInfo resolves the
+// same field access to -- object identity alone silently misses every
+// cross-package reference to a field in a tested package.
+func lookupFieldDefID(db store.Backend, pkgPath, fieldName, owner string, cache pkgIndexCache) int64 {
+	if id := cache.get(db, pkgPath).lookupMethod(fieldName, owner); id > 0 {
+		return id
+	}
+	d, err := db.GetDefinitionByNameAndReceiver(fieldName, pkgPath, owner)
+	if err != nil {
+		return 0
+	}
+	return d.ID
 }

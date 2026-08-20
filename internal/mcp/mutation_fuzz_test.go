@@ -76,14 +76,10 @@ func insertNoOpStatement(body string) string {
 	return body[:idx+1] + "\n\t_ = 0" + body[idx+1:]
 }
 
-// pickMutation generates one real code(op:...) mutation targeting a
-// known-live def (rename/edit/delete) or adding a new one (create).
-// Returns the op, a label used to know how to update live[] afterward,
-// and the live[] index it targets (-1 for create, which has none).
 func pickMutation(r *rand.Rand, live []liveDef, seq int, db store.Backend) (codeParam, string, int) {
-	choice := r.IntN(4)
+	choice := r.IntN(5)
 	if len(live) == 0 {
-		choice = 3 // create
+		choice = 4 // create
 	}
 	switch choice {
 	case 0: // rename
@@ -98,11 +94,39 @@ func pickMutation(r *rand.Rand, live []liveDef, seq int, db store.Backend) (code
 	case 2: // edit
 		idx := r.IntN(len(live))
 		d := live[idx]
-		body := "func " + d.Name + "() {\n\t_ = 0\n}\n"
-		if def, err := db.GetDefinitionByName(d.Name, ""); err == nil {
-			body = insertNoOpStatement(def.Body)
+		var body string
+		switch d.Kind {
+		case "type", "interface":
+			if r.IntN(2) == 0 {
+				// Shape-changing mutation -- the exact class of bug a
+				// prior defn session found uncaught: extractSignature's
+				// TypeSpec case collapsed to "type X" for ANY shape, so a
+				// struct-to-int rewrite was treated as signature-stable
+				// and skipped the real build gate.
+				body = fmt.Sprintf("type %s int", d.Name)
+			} else {
+				body = fmt.Sprintf("type %s struct {\n\tFuzzField%d int\n}\n", d.Name, seq)
+			}
+		default:
+			body = "func " + d.Name + "() {\n\t_ = 0\n}\n"
+			if def, err := db.GetDefinitionByName(d.Name, ""); err == nil {
+				body = insertNoOpStatement(def.Body)
+			}
 		}
 		return codeParam{Op: "edit", Name: d.Name, Receiver: d.Receiver, NewBody: body}, "edit", idx
+	case 3: // move
+		idx := r.IntN(len(live))
+		d := live[idx]
+		mods, _ := db.ListModules()
+		if len(mods) == 0 {
+			// No known module -- shouldn't happen (d was ingested from
+			// one), but fall back to a harmless, kind-agnostic rename
+			// rather than emitting an invalid move.
+			newName := fmt.Sprintf("%sR%d", d.Name, seq)
+			return codeParam{Op: "rename", OldName: d.Name, NewName: newName}, "rename", idx
+		}
+		target := mods[r.IntN(len(mods))].Path
+		return codeParam{Op: "move", Name: d.Name, Receiver: d.Receiver, Module: target}, "move", idx
 	default: // create
 		name := fmt.Sprintf("FuzzGen%d", seq)
 		file := fmt.Sprintf("extra/fuzz%d.go", seq)
@@ -152,10 +176,28 @@ func runMutationSequence(t *testing.T, synth *fuzzgen.SyntheticModule, seed uint
 	live := seedLiveDefs(t, db)
 	r := rand.New(rand.NewPCG(seed, seed))
 
+	// #253-class fuzzer-harness gap: force:true is a documented,
+	// intentional "may leave a broken build" escape hatch (see
+	// seedLiveDefs's "main" comment). Once one fires and actually
+	// breaks the build, the project STAYS broken for the rest of the
+	// sequence -- every later step's own build check is correctly
+	// SCOPED to just the files/package IT touched, so a later step
+	// reports success from its own narrow perspective even though the
+	// project as a whole still doesn't build. Before this flag, the
+	// unconditional assertBuildStillPasses after that later "successful"
+	// step caught the pre-existing breakage and misattributed it to the
+	// wrong mutation -- confirmed live: seed=2 step 8 force-deletes Level
+	// out from under a grouped const/iota block that still references
+	// it (an acknowledged, expected consequence of force:true), and step
+	// 9's unrelated, correctly-scoped rename got blamed for it.
+	brokenByForce := false
 	for i := 0; i < steps && len(live) > 0; i++ {
 		op, label, idx := pickMutation(r, live, i, db)
 		result, _, _ := s.handleCode(context.Background(), nil, op)
 		text := resultText(t, result)
+		if op.Force && strings.Contains(text, "BUILD FAILED") && !strings.Contains(text, "rolled back") {
+			brokenByForce = true
+		}
 		// BUILD FAILED (without "rolled back") is force:true delete's
 		// documented, intentional shape: force explicitly skips the
 		// build-rollback gate, so a build failure is reported but the
@@ -175,7 +217,7 @@ func runMutationSequence(t *testing.T, synth *fuzzgen.SyntheticModule, seed uint
 			live = append(live, liveDef{Name: fmt.Sprintf("FuzzGen%d", i), Kind: "function"})
 		}
 
-		if !failed {
+		if !failed && !brokenByForce {
 			assertBuildStillPasses(t, projDir)
 		}
 	}
@@ -203,7 +245,14 @@ func seedLiveDefs(t *testing.T, db store.Backend) []liveDef {
 		if d.Name == "main" {
 			continue
 		}
-		if d.Kind == "function" || d.Kind == "method" {
+		// type/interface kinds are included alongside function/method --
+		// a real defn session found several bugs specifically in how
+		// TypeSpec-kind writes (edit, replace-hunk, replace-slice, move)
+		// detect signature stability and interface satisfaction. Field
+		// kind stays excluded: unsupportedFieldOp refuses almost every
+		// write op on it by design, so mutating it here would mostly
+		// generate expected-refusal noise rather than real signal.
+		if d.Kind == "function" || d.Kind == "method" || d.Kind == "type" || d.Kind == "interface" {
 			live = append(live, liveDef{Name: d.Name, Kind: d.Kind, Receiver: d.Receiver})
 		}
 	}

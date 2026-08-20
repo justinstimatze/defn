@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/justinstimatze/defn/internal/ingest"
+	"github.com/justinstimatze/defn/internal/resolve"
+	"github.com/justinstimatze/defn/internal/store"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -365,5 +367,75 @@ func TestHandleCode_SliceRedirectsToExpandWhenBodyServeIsStale(t *testing.T) {
 	}
 	if !strings.Contains(text, "total++") {
 		t.Errorf("expected the expand redirect to include the actual body, got:\n%s", text)
+	}
+}
+
+// TestHandleCode_RenameInvalidatesCallerBodyServedState is the
+// regression for writeTargets' rename case under-scoping invalidation:
+// handleRename rewrites every caller's body (astRename +
+// UpsertDefinition) via tx.GetCallers, but writeTargets only ever
+// returned {OldName, NewName} -- the caller's own name was never part
+// of the scoped invalidate. Since the bodyServed short-circuit isn't
+// hash-gated, a caller's full body served BEFORE a rename, then read
+// again (without full:true) AFTER a rename that rewrote that caller's
+// source, used to return the "already read... nothing new" stub even
+// though the caller's actual source text just changed to use the new
+// callee name.
+func TestHandleCode_RenameInvalidatesCallerBodyServedState(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "proj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module proj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package main
+
+func Helper() int { return 1 }
+
+func Caller() int { return Helper() }
+
+func main() {}
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+	req := &sdkmcp.CallToolRequest{}
+
+	// Establish bodyServed state for Caller via a full-body read.
+	if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "Caller", Full: true}); err != nil {
+		t.Fatalf("read Caller full:true: %v", err)
+	}
+
+	renameResult, _, err := s.handleCode(context.Background(), req, codeParam{Op: "rename", OldName: "Helper", NewName: "HelperX"})
+	if err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	renameText := resultText(t, renameResult)
+	if strings.Contains(renameText, "rolled back") {
+		t.Fatalf("rename was refused: %s", renameText)
+	}
+
+	readResult, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "Caller"})
+	if err != nil {
+		t.Fatalf("read Caller after rename: %v", err)
+	}
+	readText := resultText(t, readResult)
+	if strings.Contains(readText, "already read") {
+		t.Fatalf("stale bodyServed stub served after a rename that rewrote Caller's own body: %s", readText)
+	}
+	if !strings.Contains(readText, "HelperX") {
+		t.Errorf("expected Caller's post-rename body (calling HelperX) to actually be returned, got: %s", readText)
 	}
 }

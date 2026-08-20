@@ -35,6 +35,11 @@ type Backend interface {
 	// Definitions — reads
 	GetDefinition(id int64) (*Definition, error)
 	GetDefinitionByName(name, modulePath string) (*Definition, error)
+	// CountDefinitionsByName returns how many definitions share name,
+	// regardless of module/package -- used to detect when a bare-name
+	// lookup's best-effort tiebreak (GetDefinitionByName's blast-radius
+	// ORDER BY) silently picked one of several candidates.
+	CountDefinitionsByName(name string) (int, error)
 	GetDefinitionByNameAndReceiver(name, modulePath, receiver string) (*Definition, error)
 	FilterDefinitions(name, kind, file string, limit int) ([]Definition, error)
 	FindDefinitions(namePattern string) ([]Definition, error)
@@ -51,7 +56,30 @@ type Backend interface {
 	UpsertDefinitionsBulk(defs []*Definition) ([]int64, error)
 	DeleteDefinition(id int64) error
 	RenameDefinition(id int64, newName, newBody, newSignature string, exported bool) error
+	// UpdateDefinitionReceiver rewrites a method's receiver clause (plus
+	// the body/signature an AST rename of the old receiver identifier
+	// necessarily also touches) by ID. UpsertDefinition can't be reused
+	// for this: receiver is part of the natural key (module_id, name,
+	// kind, receiver, test, source_file) -- writing a Definition whose
+	// Receiver field already changed just INSERTS a second row under the
+	// new key instead of updating the existing one in place, silently
+	// orphaning the original (confirmed live: a type rename that also
+	// tried to repoint its methods' receivers via UpsertDefinition left
+	// both the stale-receiver and new-receiver rows in the DB at once).
+	UpdateDefinitionReceiver(id int64, newReceiver, newBody, newSignature string) error
 	PruneStaleDefinitions(liveIDs map[int64]bool) (int, error)
+
+	// SetManyExternalInterfaces replaces, per def_id key present in the
+	// map, the full set of external-interface names that method
+	// satisfies (delete-then-insert, mirroring SetManyReferences). A
+	// def_id absent from the map is left untouched -- callers only
+	// include def_ids they actually recomputed this call, same scoping
+	// contract SetManyReferences already follows for defRefs.
+	SetManyExternalInterfaces(namesByDef map[int64][]string) error
+	// GetExternalInterfaces returns the external interface names (e.g.
+	// "io.Reader") the method at defID is known to satisfy, or nil if
+	// none/not yet resolved.
+	GetExternalInterfaces(defID int64) ([]string, error)
 
 	// References / call graph
 	QueryRefs(fromName, toName, kind string, limit int) ([]Reference, error)
@@ -87,6 +115,11 @@ type Backend interface {
 	SetFileSource(moduleID int64, sourceFile, raw string) error
 	GetFileSource(moduleID int64, sourceFile string) (string, error)
 	ListFileSources(moduleID int64) (map[string]string, error)
+	// ListFileSourceNames is the metadata-only sibling of ListFileSources --
+	// same scope, but filenames only, no raw file content. Use this when a
+	// caller only needs to know WHICH files exist (e.g. checking for a
+	// sibling _test.go), not their content.
+	ListFileSourceNames(moduleID int64) ([]string, error)
 	DistinctSourceFiles() ([]string, error)
 	PruneStaleFileSources(live map[int64]map[string]bool) (int, error)
 	DeleteFile(sourceFile string) error
