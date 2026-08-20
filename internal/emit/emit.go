@@ -264,14 +264,28 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, []
 				// skip: goimports has nothing to do for a file that isn't there,
 				// and correctness is preserved (the file was never written by
 				// this emit).
+				// #304 followup: GoimportsFiles can be over-broadened by
+				// a caller's directory-prefix scoping (handleTestByName
+				// matches "pkg/sub" as within scope "pkg", but Go
+				// packages don't nest that way) and end up naming a
+				// generated file nobody touched this pass. Apply the
+				// same generated-file skip as the unscoped branch below,
+				// unless the caller explicitly named it as touched.
+				relSlash := filepath.ToSlash(clean)
 				joined := filepath.Join(outDir, clean)
 				if _, err := os.Stat(joined); err == nil {
+					if !touchedSet[relSlash] && isGeneratedFile(joined) {
+						continue
+					}
 					args = append(args, joined)
 					continue
 				}
 				// Fallback: emit may have written the basename at outDir root.
 				baseJoined := filepath.Join(outDir, filepath.Base(clean))
 				if _, err := os.Stat(baseJoined); err == nil {
+					if !touchedSet[relSlash] && isGeneratedFile(baseJoined) {
+						continue
+					}
 					args = append(args, baseJoined)
 				}
 			}
