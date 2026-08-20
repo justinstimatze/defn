@@ -16,7 +16,12 @@ echo "-> vet"
 go vet ./...
 
 echo "-> unit tests"
-CGO_ENABLED=1 go test ./... -count=1 -timeout 5m
+# 10m, not 5m: internal/mcp's suite alone now runs ~5m46s after the
+# wip-snapshot merge added its fuzz/differential tests (confirmed live
+# 2026-08-20 -- 5m was cutting it close enough to fail outright under
+# ordinary load variance, not hung, just genuinely slower). ci.yml
+# needs the same bump or CI starts flaking at the same boundary.
+CGO_ENABLED=1 go test ./... -count=1 -timeout 10m
 
 echo "-> self-hosting round-trip"
 # Isolated tempdir DB, not the repo's own .defn -- that one is
