@@ -274,7 +274,7 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, []
 				relSlash := filepath.ToSlash(clean)
 				joined := filepath.Join(outDir, clean)
 				if _, err := os.Stat(joined); err == nil {
-					if !touchedSet[relSlash] && isGeneratedFile(joined) {
+					if !touchedSet[relSlash] && IsGeneratedFile(joined) {
 						continue
 					}
 					args = append(args, joined)
@@ -283,7 +283,7 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, []
 				// Fallback: emit may have written the basename at outDir root.
 				baseJoined := filepath.Join(outDir, filepath.Base(clean))
 				if _, err := os.Stat(baseJoined); err == nil {
-					if !touchedSet[relSlash] && isGeneratedFile(baseJoined) {
+					if !touchedSet[relSlash] && IsGeneratedFile(baseJoined) {
 						continue
 					}
 					args = append(args, baseJoined)
@@ -308,7 +308,7 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, []
 					args = append(args, p)
 					return nil
 				}
-				if isGeneratedFile(p) {
+				if IsGeneratedFile(p) {
 					return nil
 				}
 				args = append(args, p)

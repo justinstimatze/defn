@@ -5518,9 +5518,34 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 			}
 		}
 		if len(scopedFiles) > 0 {
+			// #311 followup: TouchedFiles legitimately needs the whole
+			// recursive build target -- a file under a resolved
+			// package's subdirectory still needs to be fresh for
+			// `go test ./pkg/...` to build correctly, so scopedFiles
+			// can't just be narrowed to one exact directory. But
+			// goimports's own canonicalization pass doesn't care
+			// whether a file's content actually changed, so putting
+			// every in-scope file into GoimportsFiles reformats a
+			// generated file's import block on every test call that
+			// happens to resolve to its parent directory, even though
+			// nothing about it is stale. commit 9cc5175's generated-
+			// file skip in emitWithOpts is keyed on TouchedFiles, which
+			// is deliberately broad here (see above) and so never
+			// actually excludes it -- confirmed still reproducing live
+			// on prometheus-18534's promql/parser/generated_parser.y.go.
+			// Exclude generated files from GoimportsFiles at the
+			// source instead of trying to thread a second, narrower
+			// "genuinely touched" signal through Opts.
+			goimportsFiles := make([]string, 0, len(scopedFiles))
+			for _, f := range scopedFiles {
+				if emit.IsGeneratedFile(filepath.Join(s.projectDir, f)) {
+					continue
+				}
+				goimportsFiles = append(goimportsFiles, f)
+			}
 			if _, err := emit.EmitWithOpts(s.backend, s.projectDir, emit.Opts{
 				TouchedFiles:   scopedFiles,
-				GoimportsFiles: scopedFiles,
+				GoimportsFiles: goimportsFiles,
 			}); err != nil {
 				return errResult(fmt.Errorf("emit: %w", err))
 			}
