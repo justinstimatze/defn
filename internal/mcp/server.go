@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.81"
+const Version = "0.26.82"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -1157,6 +1157,21 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		nameForTracking := args.Name
 		if args.Op == "expand" && len(args.Names) == 1 {
 			nameForTracking = args.Names[0]
+		}
+		// A receiver-qualified call means the caller deliberately
+		// disambiguated an ambiguous bare name (traefik-13303: read(name:
+		// "ServeHTTP", receiver:"SNICheck") to get the SNICheck method,
+		// not one of 50 other same-named methods across the repo). If the
+		// circuit breaker later auto-batches this name through expand, it
+		// previously dropped the receiver and re-resolved the bare name
+		// from scratch via the generic best-effort tiebreak -- silently
+		// landing on a DIFFERENT, unrelated def with no signal anything
+		// changed. Folding receiver into the tracked name as Go's own
+		// "Recv.Method" qualified form (GetDefinitionByName/
+		// splitReceiverQualifiedName already parse this) makes the later
+		// resolution find the SAME def instead of re-guessing.
+		if args.Receiver != "" && !strings.Contains(nameForTracking, ".") {
+			nameForTracking = args.Receiver + "." + nameForTracking
 		}
 		s.trackReadShapedName(sc, args.Op, nameForTracking)
 		breakerMsg := s.circuitBreakerCheck(sc, args.Op, isBatch)
@@ -5153,7 +5168,12 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// Update the definition name in its own body using AST rename.
 	// Only renames identifiers — preserves comments and string literals.
 	totalSkipped := 0
-	newBody, _ := astRename(d.Body, oldBareName, args.NewName)
+	newBody, defSkipped := astRename(d.Body, oldBareName, args.NewName)
+	// Surface a skip on the def's OWN body the same way a skipped caller
+	// reference already is below -- silently leaving the very identifier
+	// being renamed unchanged would otherwise report success with no
+	// signal anything was wrong.
+	totalSkipped += defSkipped
 	newSig := extractSignature(newBody)
 	exported := len(args.NewName) > 0 && args.NewName[0] >= 'A' && args.NewName[0] <= 'Z'
 
@@ -6290,6 +6310,32 @@ func astRename(body, oldName, newName string) (string, int) {
 		return strings.ReplaceAll(body, oldName, newName), 0
 	}
 
+	// Package-level var/const ValueSpecs (direct children of a top-level
+	// GenDecl) are NOT local declarations -- they're exactly the kind of
+	// declaration a package-level rename targets (a single-var body like
+	// "var Foo = ..." parses to one top-level ValueSpec). Only a
+	// ValueSpec nested inside a function body (a genuine local var/const)
+	// should shadow and get skipped. Collect the top-level ones up front
+	// so the blanket ast.Inspect below -- which sees both shapes as the
+	// same *ast.ValueSpec node type and can't tell nesting apart on its
+	// own -- can exclude them. Without this, renaming a bare package-level
+	// var/const silently renamed everything BUT the declaration itself:
+	// the DB's Name column changed and every caller updated, but the
+	// var's own body text never did, since its own identifier got
+	// classified as "local" and skipped.
+	topLevelValueSpecs := map[*ast.ValueSpec]bool{}
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || (gd.Tok != token.VAR && gd.Tok != token.CONST) {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			if vs, ok := spec.(*ast.ValueSpec); ok {
+				topLevelValueSpecs[vs] = true
+			}
+		}
+	}
+
 	// Collect locally-declared identifiers so we don't rename them.
 	// A local var/param named "Render" shouldn't be renamed when we're
 	// renaming the package-level "Render" definition.
@@ -6328,6 +6374,9 @@ func astRename(body, oldName, newName string) (string, int) {
 				}
 			}
 		case *ast.ValueSpec: // var/const inside function
+			if topLevelValueSpecs[d] {
+				break
+			}
 			for _, name := range d.Names {
 				localDecls[name] = true
 			}
