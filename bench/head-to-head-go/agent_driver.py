@@ -264,7 +264,7 @@ def load_task(instance_id, corpus_dir=DEFAULT_CORPUS_DIR):
     raise KeyError(f"{instance_id} not found in {tasks_path}")
 
 
-def setup_workspace(task, arm="defn"):
+def setup_workspace(task, arm="defn", corpus_dir=DEFAULT_CORPUS_DIR):
     """Clone repo at base_commit, run defn init + ingest. Returns workdir.
 
     Workdir is arm-scoped (inst__arm, not just inst) -- running both arms
@@ -274,9 +274,20 @@ def setup_workspace(task, arm="defn"):
     failed outright (dir already existed non-empty), and cache/ingest
     interleaving under concurrent load caused a second, separate failure
     mode. Arm-scoping the workdir removes the collision entirely.
+
+    Also corpus-scoped (corpus_label__inst__arm) since 2026-08-20: two
+    corpus dirs (e.g. a v5/v6 rerun pair) can legitimately reuse the same
+    instance_ids, and this workdir is exactly what score_gitdiff.py diffs
+    against base_commit_sha to compute precision/recall/F1. Without the
+    corpus label, launching a second corpus over the same instance_ids
+    silently overwrote the first corpus's final git state (and its
+    .claude-stream.jsonl raw trace) in place -- found 2026-08-20 when a
+    v6 rerun made v5's "rescoring" come back byte-identical to v6's own
+    results, because both were reading the same clobbered directory.
     """
     inst = task["instance_id"]
-    workdir = os.path.join(WORKDIR_ROOT, f"{inst}__{arm}")
+    corpus_label = os.path.basename(os.path.normpath(corpus_dir))
+    workdir = os.path.join(WORKDIR_ROOT, f"{corpus_label}__{inst}__{arm}")
     os.makedirs(WORKDIR_ROOT, exist_ok=True)
     print(f"[setup] instance {inst} (arm={arm})", file=sys.stderr)
 
@@ -697,7 +708,7 @@ def run_one(
 
     _ensure_disk_space()
     task = load_task(instance_id, corpus_dir)
-    workdir = setup_workspace(task, arm=arm)
+    workdir = setup_workspace(task, arm=arm, corpus_dir=corpus_dir)
     prompt = build_prompt(task)
     events, rc, elapsed = run_claude(
         workdir, prompt, budget_usd, max_turns, arm=arm, model=model

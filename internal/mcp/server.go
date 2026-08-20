@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.82"
+const Version = "0.26.83"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -2026,37 +2026,34 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 		if req != nil && s.respCache != nil {
 			s.respCache.markReadDowngraded(req.Session, args.Name)
 		}
-		if outlineR, _, oErr := s.handleOutline(nil, nil, args); oErr == nil && outlineR != nil && !outlineR.IsError {
-			text := resultTextRaw(outlineR)
-			// Note intentionally does NOT enumerate the full:true/mode:"body"
-			// escape hatches. Post-#184 chi bench showed the model
-			// reflexively retries with full:true when the hint reads like a
-			// menu. They still work; they're documented in the tool
-			// description, not advertised inline.
-			note := fmt.Sprintf(
-				"_[Outline shown — body is %d bytes / %d lines. Full body only needed when editing.]_\n\n",
-				len(d.Body), strings.Count(d.Body, "\n")+1,
-			)
-			// #313 followup: mention a fresh cached summary as an explicit
-			// OPTION here, rather than the old #174 default that silently
-			// substituted it -- outline stays the safe, ground-truth
-			// default; a paraphrase is offered, not imposed.
-			if sum, sErr := s.backend.GetDefSummary(d.ID); sErr == nil && sum != nil {
-				if sum.BodyHash == store.HashBodyStructural(d.Body) && sum.Model != summary.StubModelName {
-					note += fmt.Sprintf(
-						"_[A cached summary is also available — pass mode:\"summary\" for a one-line paraphrase (%s) instead of this outline.]_\n\n",
-						sum.Model,
-					)
-				}
+		text := s.renderAutoOutlineCompact(d, modulePath)
+		// Note intentionally does NOT enumerate the full:true/mode:"body"
+		// escape hatches. Post-#184 chi bench showed the model
+		// reflexively retries with full:true when the hint reads like a
+		// menu. They still work; they're documented in the tool
+		// description, not advertised inline.
+		note := fmt.Sprintf(
+			"_[Outline shown — body is %d bytes / %d lines. Full body only needed when editing.]_\n\n",
+			len(d.Body), strings.Count(d.Body, "\n")+1,
+		)
+		// #313 followup: mention a fresh cached summary as an explicit
+		// OPTION here, rather than the old #174 default that silently
+		// substituted it -- outline stays the safe, ground-truth
+		// default; a paraphrase is offered, not imposed.
+		if sum, sErr := s.backend.GetDefSummary(d.ID); sErr == nil && sum != nil {
+			if sum.BodyHash == store.HashBodyStructural(d.Body) && sum.Model != summary.StubModelName {
+				note += fmt.Sprintf(
+					"_[A cached summary is also available — pass mode:\"summary\" for a one-line paraphrase (%s) instead of this outline.]_\n\n",
+					sum.Model,
+				)
 			}
-			out := note + text
-			return withUsage(textResult(out), usageStats{
-				Op:            "read",
-				BytesReturned: len(out),
-				BytesAltRead:  s.fileAltBytes(d),
-			}), nil, nil
 		}
-		// Outline failed for some reason; fall through to full body.
+		out := note + text
+		return withUsage(textResult(out), usageStats{
+			Op:            "read",
+			BytesReturned: len(out),
+			BytesAltRead:  s.fileAltBytes(d),
+		}), nil, nil
 	}
 
 	// #153: query-adaptive read. When args.Query is set, filter body
@@ -10815,4 +10812,54 @@ func CommitInfo() string {
 		revision += "-dirty"
 	}
 	return revision
+}
+
+// renderAutoOutlineCompact builds a smaller ground-truth projection
+// for the #184 auto-downgrade path specifically -- distinct from the
+// explicit op:"outline" projection (handleOutline), which callers who
+// actually ask for outline detail still get in full. Omits callee
+// names and the flow breakdown, reporting callers/callees as counts
+// only.
+//
+// Measured motivation: a v6 prometheus bench rerun found mode:"summary"
+// usage at zero -- once summary stopped being a silent default (#313),
+// models never opted into it, so EVERY large-def bare read paid the
+// full outline's callee-name-list + flow-step cost as the new floor,
+// widening the defn-vs-files cost gap from ~29% to ~45%. This keeps
+// the auto-downgrade default ground-truth (no inference, unlike
+// summary) while bringing its cost back down near what the removed
+// summary default used to cost.
+func (s *server) renderAutoOutlineCompact(d *store.Definition, modulePath string) string {
+	callers, _ := s.backend.GetCallers(d.ID)
+	callees, _ := s.backend.GetCallees(d.ID)
+	var prodCallers, testCallers int
+	for _, c := range callers {
+		if c.Test {
+			testCallers++
+		} else {
+			prodCallers++
+		}
+	}
+	bodyLines := strings.Count(d.Body, "\n") + 1
+
+	var sb strings.Builder
+	recv := formatReceiver(d.Receiver)
+	sb.WriteString(fmt.Sprintf("## %s%s (%s)\n", recv, d.Name, d.Kind))
+	sb.WriteString(fmt.Sprintf("Module: %s\n", modulePath))
+	if d.SourceFile != "" && d.StartLine > 0 {
+		sb.WriteString(fmt.Sprintf("Location: %s:%d\n", d.SourceFile, d.StartLine))
+	}
+	sb.WriteString("\n")
+	switch {
+	case d.Signature != "":
+		sb.WriteString("```go\n")
+		sb.WriteString(d.Signature)
+		sb.WriteString("\n```\n\n")
+	case d.Doc != "":
+		sb.WriteString(d.Doc + "\n\n")
+	}
+	sb.WriteString(fmt.Sprintf("Body: %d lines, %d bytes (fetch with op:\"read\")\n", bodyLines, len(d.Body)))
+	sb.WriteString(fmt.Sprintf("Callers: %d (%d production, %d test)\n", len(callers), prodCallers, testCallers))
+	sb.WriteString(fmt.Sprintf("Callees: %d (pass op:\"outline\" for names, or op:\"expand\" for names + flow)\n", len(callees)))
+	return sb.String()
 }

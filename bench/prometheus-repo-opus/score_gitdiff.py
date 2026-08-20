@@ -10,6 +10,7 @@ uniformly and correctly, for both arms.
 
 Usage: score_gitdiff.py <repo_dir> <tasks_file> <arm_defn_dir> <arm_files_dir> [label]
 """
+
 import json
 import os
 import re
@@ -45,14 +46,16 @@ def gold_files(fix_patch):
     return files
 
 
-def workdir_touched_files(instance_id, arm, base_sha):
-    wd = os.path.join(WORKDIR_ROOT, f"{instance_id}__{arm}")
+def workdir_touched_files(instance_id, arm, base_sha, corpus_label):
+    wd = os.path.join(WORKDIR_ROOT, f"{corpus_label}__{instance_id}__{arm}")
     if not os.path.isdir(wd):
         return None, f"workdir missing: {wd}"
     try:
         out = subprocess.check_output(
             ["git", "-C", wd, "diff", "--name-only", base_sha],
-            stderr=subprocess.STDOUT, text=True, timeout=30,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=30,
         )
     except subprocess.CalledProcessError as e:
         return None, f"git diff failed: {e.output[:200]}"
@@ -62,7 +65,8 @@ def workdir_touched_files(instance_id, arm, base_sha):
     try:
         untracked = subprocess.check_output(
             ["git", "-C", wd, "ls-files", "--others", "--exclude-standard"],
-            text=True, timeout=30,
+            text=True,
+            timeout=30,
         )
         for l in untracked.splitlines():
             l = l.strip()
@@ -73,15 +77,19 @@ def workdir_touched_files(instance_id, arm, base_sha):
     return touched, None
 
 
-def score_arm(tasks_by_id, arm_dir_name, arm_key):
+def score_arm(tasks_by_id, arm_dir_name, arm_key, corpus_label):
     rows = []
     for inst_id, task in tasks_by_id.items():
-        arm_json = os.path.join(os.path.expanduser(f"~/{arm_dir_name}"), f"{inst_id}.json")
+        arm_json = os.path.join(
+            os.path.expanduser(f"~/{arm_dir_name}"), f"{inst_id}.json"
+        )
         if not os.path.exists(arm_json):
             continue
         arm = json.load(open(arm_json))
         gold = gold_files(task.get("fix_patch") or "")
-        touched, err = workdir_touched_files(inst_id, arm_key, task["base_commit_sha"])
+        touched, err = workdir_touched_files(
+            inst_id, arm_key, task["base_commit_sha"], corpus_label
+        )
         if touched is None:
             rows.append({"id": inst_id, "error": err, "gold": sorted(gold)})
             continue
@@ -89,11 +97,20 @@ def score_arm(tasks_by_id, arm_dir_name, arm_key):
         prec = len(hit) / len(touched) if touched else 0.0
         rec = len(hit) / len(gold) if gold else 0.0
         f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
-        rows.append({
-            "id": inst_id, "gold": sorted(gold), "touched": sorted(touched), "hit": sorted(hit),
-            "precision": prec, "recall": rec, "f1": f1,
-            "cost": arm.get("cost_usd"), "rc": arm.get("claude_rc"), "msgs": len(arm.get("fncall_messages", [])),
-        })
+        rows.append(
+            {
+                "id": inst_id,
+                "gold": sorted(gold),
+                "touched": sorted(touched),
+                "hit": sorted(hit),
+                "precision": prec,
+                "recall": rec,
+                "f1": f1,
+                "cost": arm.get("cost_usd"),
+                "rc": arm.get("claude_rc"),
+                "msgs": len(arm.get("fncall_messages", [])),
+            }
+        )
     return rows
 
 
@@ -105,15 +122,21 @@ def print_rows(label, rows):
             print(f"  {r['id']:30s}  ERROR: {r['error']}")
             continue
         cost = f"${r['cost']:.3f}" if r["cost"] else "-"
-        print(f"  {r['id']:30s}  P={r['precision']:.2f} R={r['recall']:.2f} F1={r['f1']:.2f}  "
-              f"gold={len(r['gold'])} touched={len(r['touched'])} hit={len(r['hit'])} "
-              f"msgs={r['msgs']} rc={r['rc']}  {cost}")
+        print(
+            f"  {r['id']:30s}  P={r['precision']:.2f} R={r['recall']:.2f} F1={r['f1']:.2f}  "
+            f"gold={len(r['gold'])} touched={len(r['touched'])} hit={len(r['hit'])} "
+            f"msgs={r['msgs']} rc={r['rc']}  {cost}"
+        )
     if ok_rows:
-        print(f"  mean F1: {statistics.mean(r['f1'] for r in ok_rows):.3f}  "
-              f"mean P: {statistics.mean(r['precision'] for r in ok_rows):.3f}  "
-              f"mean R: {statistics.mean(r['recall'] for r in ok_rows):.3f}")
+        print(
+            f"  mean F1: {statistics.mean(r['f1'] for r in ok_rows):.3f}  "
+            f"mean P: {statistics.mean(r['precision'] for r in ok_rows):.3f}  "
+            f"mean R: {statistics.mean(r['recall'] for r in ok_rows):.3f}"
+        )
         total_cost = sum(r["cost"] or 0 for r in ok_rows)
-        print(f"  total cost: ${total_cost:.2f}  mean ${total_cost/len(ok_rows):.3f}/task")
+        print(
+            f"  total cost: ${total_cost:.2f}  mean ${total_cost / len(ok_rows):.3f}/task"
+        )
 
 
 def main():
@@ -122,6 +145,12 @@ def main():
     arm_defn_dir = sys.argv[3]
     arm_files_dir = sys.argv[4]
     label = sys.argv[5] if len(sys.argv) > 5 else os.path.basename(repo_dir)
+    # Must match agent_driver.py's setup_workspace corpus_label exactly
+    # (os.path.basename of its --corpus-dir) -- that's the other half of
+    # the workdir key these scores are read from. Derived from the
+    # arm dir's parent, not from `label` above, since `label` is just a
+    # display string and the two can differ.
+    corpus_label = os.path.basename(os.path.dirname(arm_defn_dir.rstrip("/")))
 
     tasks_by_id = {}
     with open(tasks_file) as f:
@@ -129,8 +158,10 @@ def main():
             r = json.loads(line)
             tasks_by_id[r["instance_id"]] = r
 
-    defn_rows = score_arm(tasks_by_id, arm_defn_dir.lstrip("~/"), "defn")
-    files_rows = score_arm(tasks_by_id, arm_files_dir.lstrip("~/"), "files")
+    defn_rows = score_arm(tasks_by_id, arm_defn_dir.lstrip("~/"), "defn", corpus_label)
+    files_rows = score_arm(
+        tasks_by_id, arm_files_dir.lstrip("~/"), "files", corpus_label
+    )
     print_rows(f"{label} — defn arm", defn_rows)
     print_rows(f"{label} — files arm", files_rows)
 
@@ -141,7 +172,11 @@ def main():
         if "error" in r or not fr or "error" in fr:
             continue
         delta = r["f1"] - fr["f1"]
-        flag = "  <-- defn worse" if delta < -0.01 else ("  <-- defn better" if delta > 0.01 else "  (tie)")
+        flag = (
+            "  <-- defn worse"
+            if delta < -0.01
+            else ("  <-- defn better" if delta > 0.01 else "  (tie)")
+        )
         print(f"  {r['id']:30s} defn F1={r['f1']:.2f}  files F1={fr['f1']:.2f}{flag}")
 
 
