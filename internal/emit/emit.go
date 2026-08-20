@@ -965,7 +965,7 @@ func safeWriteGoFile(path string, content []byte, allowedRemovals []string) (wro
 	existing, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return true, nil, os.WriteFile(path, content, 0644)
+			return true, nil, atomicWriteFile(path, content, 0644)
 		}
 		return false, nil, err
 	}
@@ -999,7 +999,7 @@ func safeWriteGoFile(path string, content []byte, allowedRemovals []string) (wro
 	if len(lost) > 0 {
 		return false, lost, nil
 	}
-	return true, nil, os.WriteFile(path, content, 0644)
+	return true, nil, atomicWriteFile(path, content, 0644)
 }
 
 // topLevelDeclNames returns the qualified names of every top-level
@@ -1745,4 +1745,52 @@ func firstNonBlankValueSpecName(names []*ast.Ident) string {
 		}
 	}
 	return ""
+}
+
+// atomicWriteFile writes content to path atomically via a temp file in
+// the same directory followed by os.Rename, instead of the plain
+// open+O_TRUNC+write+close os.WriteFile does. #311: two MCP tool calls
+// issued in parallel by an agent in one turn (op:"test" scoped to the
+// same package unconditionally re-emits its files before running `go
+// test`) can both reach a write for the SAME path at nearly the same
+// time. Confirmed live: a real prometheus-19017 trajectory hit exactly
+// this -- the on-disk file ended up missing a function's closing brace,
+// and the DB's stored body matched the truncated disk content after a
+// later sync. os.Rename within a single filesystem is atomic on every
+// platform Go supports (POSIX rename(2); Windows MoveFileEx with the
+// replace flag) -- a concurrent reader/writer either sees the old file
+// or the new one in full, never a partial mix of both, closing the
+// exact interleaving window that produced the corruption. The temp file
+// MUST live in the same directory as path -- a cross-directory (and so,
+// often, cross-filesystem) rename is not guaranteed atomic and can fail
+// outright with EXDEV.
+func atomicWriteFile(path string, content []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmp.Write(content); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpPath, perm); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	succeeded = true
+	return nil
 }

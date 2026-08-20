@@ -2,6 +2,7 @@ package emit
 
 import (
 	"bytes"
+	"fmt"
 	"go/parser"
 	"go/token"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/justinstimatze/defn/internal/ingest"
@@ -2421,5 +2423,60 @@ func TestEmitScopedGoimportsSkipsGeneratedFileNotInTouchedSet(t *testing.T) {
 	}
 	if !strings.Contains(string(genData), `"strings"`) {
 		t.Fatalf("generated.go's unused import was stripped -- the scoped goimports pass touched a generated file it shouldn't have:\n%s", genData)
+	}
+}
+
+// TestSafeWriteGoFile_ConcurrentWritesToSameFileNeverProduceUnparseableContent
+// is a direct repro for a real prometheus-19017 bench trajectory: the
+// agent issued two parallel MCP tool calls (op:"test", test:"...") and
+// (op:"test", name:"getMMappedFile") in the same turn, both scoped to
+// the same package -- handleTestByName/handleTest unconditionally
+// re-emit their scope's files before running `go test`, so both calls
+// raced to write the same on-disk file via safeWriteGoFile's plain
+// os.WriteFile, which is NOT atomic (open+O_TRUNC+write+close). A
+// follow-up op:"read" showed the edited function's stored body missing
+// its trailing closing brace, and the next emit's safety check failed
+// with a parse error blaming an unrelated, adjacent function -- exactly
+// the symptom of one writer's os.WriteFile getting truncated mid-flight
+// by another concurrent writer's O_TRUNC open on the same path.
+func TestSafeWriteGoFile_ConcurrentWritesToSameFileNeverProduceUnparseableContent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "race.go")
+
+	if err := os.WriteFile(path, []byte("package race\n\nfunc F() int { return 0 }\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 24
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			var b strings.Builder
+			b.WriteString("package race\n\nfunc F() int {\n")
+			for j := 0; j < 300+i*11; j++ {
+				fmt.Fprintf(&b, "\t_ = %d\n", j)
+			}
+			b.WriteString("\treturn 0\n}\n")
+			_, _, err := safeWriteGoFile(path, []byte(b.String()), nil)
+			errs[i] = err
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d: safeWriteGoFile error: %v", i, err)
+		}
+	}
+
+	final, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, perr := parser.ParseFile(token.NewFileSet(), "", final, 0); perr != nil {
+		t.Fatalf("concurrent writes to the same file produced unparseable content (non-atomic write race in safeWriteGoFile): %v\n\n--- final content (%d bytes) ---\n%s", perr, len(final), final)
 	}
 }
