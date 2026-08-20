@@ -3392,6 +3392,16 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		return errResult(fmt.Errorf("couldn't infer definition name from body — make sure it starts with func/type/const/var"))
 	}
 
+	// #313: capture pre-write disk state before anything below can create
+	// the file, so the success message can tell a genuinely brand-new file
+	// apart from an existing one gaining one more decl.
+	fileIsNew := args.File != ""
+	if fileIsNew {
+		if _, statErr := os.Stat(filepath.Join(s.projectDir, args.File)); statErr == nil {
+			fileIsNew = false
+		}
+	}
+
 	// Find module: file: param wins (most specific), then module:, then first.
 	var mod *store.Module
 	fileResolvedDirectly := false
@@ -3574,6 +3584,7 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		fmt.Fprintf(&sb, "create %s%s rolled back — nothing was saved\n\n%s", recv, name, buildResult)
 	} else {
 		sb.WriteString(fmt.Sprintf("Created %s (id=%d, kind=%s) in %s\n", name, id, kind, loc))
+		sb.WriteString(s.newFileHint(args.File, fileIsNew))
 		if !isTest {
 			sb.WriteString(s.testCoverageHint(mod.ID, args.File))
 		}
@@ -3729,6 +3740,13 @@ func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult
 		return errResult(fmt.Errorf("multi-decl parse: %v", err))
 	}
 
+	// #313: same pre-write existence check as handleCreate/
+	// handleCreateScaffoldFile, for the same insert-header nudge.
+	fileIsNew := true
+	if _, statErr := os.Stat(filepath.Join(s.projectDir, args.File)); statErr == nil {
+		fileIsNew = false
+	}
+
 	mod := s.findModuleByFile(args.File)
 	fileResolvedDirectly := mod != nil
 	if mod == nil && args.Module != "" {
@@ -3837,6 +3855,7 @@ func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult
 	if buildResult != "" {
 		sb.WriteString("\n" + buildResult)
 	}
+	sb.WriteString(s.newFileHint(args.File, fileIsNew))
 	return textResult(sb.String()), nil, nil
 }
 
@@ -5104,7 +5123,19 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	sb.WriteString(fmt.Sprintf("Deleted %s%s (id=%d)\n", recv, d.Name, d.ID))
 	if buildResult != "" {
 		sb.WriteString("\n" + buildResult)
-		return textResult(sb.String()), nil, nil
+		if !args.Force {
+			// Non-force path: a non-empty buildResult here means the
+			// whole transaction was rolled back -- the delete never
+			// landed, so remove_file has nothing to act on.
+			return textResult(sb.String()), nil, nil
+		}
+		// #313 followup (review-caught): force:true already committed
+		// the delete unconditionally above regardless of this build
+		// WARNING (see the branch that computed buildResult) -- the def
+		// really is gone. Returning early here silently skipped
+		// remove_file with no signal at all, reintroducing exactly the
+		// silence #310 was written to eliminate, just for this narrower
+		// force+warning trigger. Fall through instead.
 	}
 	// #310: remove_file was previously only honored by handleDeleteFile's
 	// file:-only bulk path -- a name-scoped delete of the LAST def in a
@@ -5117,7 +5148,16 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		if idx := strings.LastIndex(d.SourceFile, "/"); idx >= 0 {
 			dir = d.SourceFile[:idx]
 		}
-		if remaining, rerr := s.backend.FindDefinitionsByFile(dir, d.SourceFile, 0); rerr == nil && len(remaining) == 0 {
+		remaining, rerr := s.backend.FindDefinitionsByFile(dir, d.SourceFile, 0)
+		switch {
+		case rerr != nil:
+			// #313 followup (review-caught): a lookup failure here was
+			// silently swallowed (the surrounding "if ... rerr == nil &&
+			// ..." condition just fell through with no message at all),
+			// indistinguishable from remove_file never having been
+			// requested. Surface it instead.
+			sb.WriteString(fmt.Sprintf("remove_file:true was set, but checking for remaining definitions in %s failed: %v\n", d.SourceFile, rerr))
+		case len(remaining) == 0:
 			diskPath := filepath.Join(s.projectDir, d.SourceFile)
 			if rmErr := os.Remove(diskPath); rmErr != nil && !os.IsNotExist(rmErr) {
 				sb.WriteString(fmt.Sprintf("remove_file:true was set, but removing %s failed: %v\n", d.SourceFile, rmErr))
@@ -8707,6 +8747,13 @@ func (s *server) handleCreateScaffoldFile(args createParam) (*sdkmcp.CallToolRes
 		body += "\n"
 	}
 
+	// #313: same pre-write existence check as handleCreate, for the same
+	// insert-header nudge.
+	fileIsNew := true
+	if _, statErr := os.Stat(filepath.Join(s.projectDir, args.File)); statErr == nil {
+		fileIsNew = false
+	}
+
 	// Resolve module by file, then by explicit --module, then shortest
 	// path. Same as handleCreateMultiDecl's new-package fallback.
 	mod := s.findModuleByFile(args.File)
@@ -8756,6 +8803,7 @@ func (s *server) handleCreateScaffoldFile(args createParam) (*sdkmcp.CallToolRes
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Scaffolded %s (%s) — %d bytes, no defs yet\n", args.File, mod.Path, len(body)))
 	sb.WriteString("_add defs with follow-up `code(op:\"create\", file:\"" + args.File + "\", body:\"...\")` calls._\n")
+	sb.WriteString(s.newFileHint(args.File, fileIsNew))
 	return textResult(sb.String()), nil, nil
 }
 
@@ -10677,3 +10725,21 @@ func (s *server) patchInsertHeaderOnDisk(moduleID int64, file, body string) (cha
 // and most other Go tooling -- reusing it here rather than inventing a
 // new convention.
 var generatedCodeMarker = regexp.MustCompile(`^// Code generated .* DO NOT EDIT\.$`)
+
+// newFileHint returns a one-line nudge toward insert-header when a
+// create call produced a genuinely NEW file (didn't exist on disk
+// before this write) -- #313: models repeatedly don't know
+// insert-header exists -- one real trajectory's own persisted
+// cross-session memory note stated as fact "new .go files it creates
+// get no Apache license header, and there is no way to add one", even
+// on a binary where the op had existed for a while (prometheus-19236).
+// Discovering it only by hitting an "unknown op" error, or not at all,
+// is too indirect a signal for something this cheap to surface
+// proactively. wasNew is the caller's own pre-write os.Stat result --
+// this function makes no filesystem calls itself.
+func (s *server) newFileHint(file string, wasNew bool) string {
+	if file == "" || !wasNew {
+		return ""
+	}
+	return fmt.Sprintf("_new file -- if this project requires a license/copyright header, add one with code(op:\"insert-header\", file:%q, body:\"...\") before this file is considered complete._\n", file)
+}

@@ -12287,3 +12287,125 @@ func TestHandleTestByName_NestedGeneratedFileNotReformattedByParentScope(t *test
 		t.Errorf("generated file in a nested subdirectory of the resolved package was reformatted by a test call that never referenced it:\nbefore:\n%s\nafter:\n%s", before, after)
 	}
 }
+
+// TestHandleCreateScaffoldFile_GetsInsertHeaderHint mirrors
+// TestHandleCreate_NewFileGetsInsertHeaderHint for the scaffold-file
+// path (body is imports/package-only, no decls yet) -- always a
+// brand-new file by construction.
+func TestHandleCreateScaffoldFile_GetsInsertHeaderHint(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op: "create", File: "scaffolded.go",
+		Body: "package main\n\nimport \"fmt\"\n",
+	})
+	if err != nil {
+		t.Fatalf("handleCode create: %v", err)
+	}
+	text := resultText(t, result)
+	if result.IsError {
+		t.Fatalf("scaffold create failed: %s", text)
+	}
+	if !strings.Contains(text, "insert-header") {
+		t.Errorf("expected a scaffolded new file to hint at insert-header, got: %s", text)
+	}
+}
+
+// TestHandleCreate_ExistingFileGetsNoInsertHeaderHint confirms the hint
+// is scoped to genuinely new files -- adding one more def to a file
+// that already exists on disk shouldn't suggest re-adding a header.
+func TestHandleCreate_ExistingFileGetsNoInsertHeaderHint(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op: "create", File: "main.go",
+		Body: "func AnotherThing() int { return 2 }",
+	})
+	if err != nil {
+		t.Fatalf("handleCode create: %v", err)
+	}
+	text := resultText(t, result)
+	if result.IsError {
+		t.Fatalf("create failed: %s", text)
+	}
+	if strings.Contains(text, "insert-header") {
+		t.Errorf("did not expect an insert-header hint when adding to an existing file, got: %s", text)
+	}
+}
+
+// TestHandleCreate_NewFileGetsInsertHeaderHint guards #313: models
+// repeatedly didn't know code(op:"insert-header") exists, still writing
+// stale "no way to add a header" memory notes even on a binary where
+// the op had existed for a while (prometheus-19236). A brand-new file
+// created via op:"create" now gets a one-line nudge toward
+// insert-header in the success message.
+func TestHandleCreate_NewFileGetsInsertHeaderHint(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op: "create", File: "brandnew.go",
+		Body: "func NewThing() int { return 1 }",
+	})
+	if err != nil {
+		t.Fatalf("handleCode create: %v", err)
+	}
+	text := resultText(t, result)
+	if result.IsError {
+		t.Fatalf("create failed: %s", text)
+	}
+	if !strings.Contains(text, "insert-header") {
+		t.Errorf("expected a new-file create to hint at insert-header, got: %s", text)
+	}
+}
+
+func TestHandleDelete_RemoveFileStillRunsWhenForcedDeleteLeavesBuildWarning(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	if _, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op: "create", File: "solo.go", Body: "func Solo() int { return 42 }",
+	}); err != nil {
+		t.Fatalf("seed create: %v", err)
+	}
+
+	// An unrelated, already-broken file written directly to disk
+	// (bypassing defn edits, which would otherwise gate on a successful
+	// build). solo.go's own deletion leaves zero defs in that file --
+	// emit's zero-def policy never touches such a file, so its on-disk
+	// content (and thus the build) would otherwise stay clean regardless
+	// of the delete. This unrelated compile error is what forces
+	// emitAndBuildAgainst's real `go build` to return a non-empty
+	// buildResult even though force:true already committed the delete.
+	brokenPath := filepath.Join(projDir, "broken.go")
+	if err := os.WriteFile(brokenPath, []byte("package main\n\nfunc Broken() int {\n\treturn undefinedThing\n}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op: "delete", Name: "Solo", Force: true, RemoveFile: true,
+	})
+	if err != nil {
+		t.Fatalf("handleCode delete: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "undefinedThing") {
+		t.Fatalf("expected the pre-existing unrelated build failure to surface in buildResult, got: %s", text)
+	}
+	if !strings.Contains(text, "Also removed solo.go from disk") {
+		t.Fatalf("expected remove_file to still run despite the unrelated build failure, got: %s", text)
+	}
+	if _, statErr := os.Stat(filepath.Join(projDir, "solo.go")); !os.IsNotExist(statErr) {
+		t.Errorf("expected solo.go to be removed from disk, stat err: %v", statErr)
+	}
+}
