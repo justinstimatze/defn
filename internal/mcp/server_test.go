@@ -3272,118 +3272,6 @@ func TestHandleOverview_MultiFileSectionsSortedDeterministically(t *testing.T) {
 	}
 }
 
-// TestHandleGetDefinition_SummaryModeDefaultFallsBackWithoutSummary
-// confirms the #174 default flip is safe even at zero backfill
-// coverage: with no def_summaries row at all, a plain read (default
-// env, no mode: param) still returns the full body -- unbackfilled
-// defs are completely unaffected by the new default.
-func TestHandleGetDefinition_SummaryModeDefaultFallsBackWithoutSummary(t *testing.T) {
-	os.Unsetenv("DEFN_SUMMARY_READ_DEFAULT")
-	db, _ := setupTestDB(t)
-	defer db.Close()
-	s := &server{backend: db}
-
-	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Greet"})
-	text := resultText(t, result)
-	if !strings.Contains(text, "Hello, ") {
-		t.Errorf("expected the full body when no summary exists yet, got:\n%s", text)
-	}
-}
-
-// TestHandleGetDefinition_SummaryModeIsDefaultWhenFreshSummaryExists is
-// a #174 regression test: summary mode is now the DEFAULT for read
-// (previously opt-in via DEFN_SUMMARY_READ_DEFAULT=1, now opt-out via
-// DEFN_SUMMARY_READ_DEFAULT=0). With no env var set and a fresh
-// (non-stale) summary on record, a plain read (no mode: param) must
-// return the compact summary rendering, not the full body.
-func TestHandleGetDefinition_SummaryModeIsDefaultWhenFreshSummaryExists(t *testing.T) {
-	os.Unsetenv("DEFN_SUMMARY_READ_DEFAULT")
-	db, _ := setupTestDB(t)
-	defer db.Close()
-	s := &server{backend: db}
-
-	d, err := db.GetDefinitionByName("Greet", "")
-	if err != nil {
-		t.Fatalf("setup: Greet not found: %v", err)
-	}
-	if err := db.SetDefSummary(d.ID, &store.DefSummary{
-		OneLine:  "Returns a greeting for the given name.",
-		BodyHash: store.HashBodyStructural(d.Body),
-		Model:    "test",
-	}); err != nil {
-		t.Fatalf("SetDefSummary: %v", err)
-	}
-
-	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Greet"})
-	text := resultText(t, result)
-	if !strings.Contains(text, "summary") || !strings.Contains(text, "Returns a greeting for the given name.") {
-		t.Errorf("expected default read to return the summary rendering, got:\n%s", text)
-	}
-	if strings.Contains(text, "return \"Hello, \"") {
-		t.Errorf("expected the full body NOT to be present in the default (summary-mode) response, got:\n%s", text)
-	}
-}
-
-// TestHandleGetDefinition_SummaryModeOptOutReturnsFullBody verifies the
-// #174 opt-out escape hatch: DEFN_SUMMARY_READ_DEFAULT=0 must still
-// yield the full body even when a fresh summary is on record.
-func TestHandleGetDefinition_SummaryModeOptOutReturnsFullBody(t *testing.T) {
-	t.Setenv("DEFN_SUMMARY_READ_DEFAULT", "0")
-	db, _ := setupTestDB(t)
-	defer db.Close()
-	s := &server{backend: db}
-
-	d, err := db.GetDefinitionByName("Greet", "")
-	if err != nil {
-		t.Fatalf("setup: Greet not found: %v", err)
-	}
-	if err := db.SetDefSummary(d.ID, &store.DefSummary{
-		OneLine:  "Returns a greeting for the given name.",
-		BodyHash: store.HashBodyStructural(d.Body),
-		Model:    "test",
-	}); err != nil {
-		t.Fatalf("SetDefSummary: %v", err)
-	}
-
-	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Greet"})
-	text := resultText(t, result)
-	if !strings.Contains(text, "Hello, ") {
-		t.Errorf("expected DEFN_SUMMARY_READ_DEFAULT=0 to return the full body, got:\n%s", text)
-	}
-}
-
-// TestHandleGetDefinition_FullTrueOverridesSummaryDefault is a
-// regression test for a bug introduced (and caught) alongside the
-// #174 default flip: since summary-mode is now the implicit default
-// whenever args.Mode == "", passing full:true without also clearing
-// Mode used to be silently ignored -- the mode=="summary" branch fired
-// unconditionally, before args.Full was ever consulted. full:true must
-// win over the implicit default.
-func TestHandleGetDefinition_FullTrueOverridesSummaryDefault(t *testing.T) {
-	os.Unsetenv("DEFN_SUMMARY_READ_DEFAULT")
-	db, _ := setupTestDB(t)
-	defer db.Close()
-	s := &server{backend: db}
-
-	d, err := db.GetDefinitionByName("Greet", "")
-	if err != nil {
-		t.Fatalf("setup: Greet not found: %v", err)
-	}
-	if err := db.SetDefSummary(d.ID, &store.DefSummary{
-		OneLine:  "Returns a greeting for the given name.",
-		BodyHash: store.HashBodyStructural(d.Body),
-		Model:    "test",
-	}); err != nil {
-		t.Fatalf("SetDefSummary: %v", err)
-	}
-
-	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Greet", Full: true})
-	text := resultText(t, result)
-	if !strings.Contains(text, "Hello, ") {
-		t.Errorf("expected full:true to return the full body even with a fresh summary present, got:\n%s", text)
-	}
-}
-
 // TestHandleSearch_MergesNameMatchAndFTSMatch is a #216 regression
 // test: a Stage 1 (name/signature LIKE) hit must not suppress Stage 2
 // (FTS body/doc) results. Creates two defs for a needle that appears
@@ -4066,47 +3954,6 @@ func TestSuggestMissingImportFixes_SamePackageNoHint(t *testing.T) {
 	hint := s.suggestMissingImportFixes("./main.go:12:2: undefined: Greet\n")
 	if hint != "" {
 		t.Errorf("expected no hint for same-package undefined, got: %q", hint)
-	}
-}
-
-// TestHandleGetDefinition_JustMutatedSkipsSummaryDefault pins the fix
-// for the mutation-bench gap where a read immediately following a
-// mutation cost an extra call: it must return the full body even
-// though a fresh, non-stale summary exists, because the caller is
-// verifying an edit, not asking "what does this do." The flag is
-// one-shot -- a second read of the same name falls back to summary.
-func TestHandleGetDefinition_JustMutatedSkipsSummaryDefault(t *testing.T) {
-	os.Unsetenv("DEFN_SUMMARY_READ_DEFAULT")
-	db, _ := setupTestDB(t)
-	defer db.Close()
-	s := &server{backend: db, respCache: newRespCache()}
-
-	d, err := db.GetDefinitionByName("Greet", "")
-	if err != nil {
-		t.Fatalf("setup: Greet not found: %v", err)
-	}
-	if err := db.SetDefSummary(d.ID, &store.DefSummary{
-		OneLine:  "Returns a greeting for the given name.",
-		BodyHash: store.HashBodyStructural(d.Body),
-		Model:    "test",
-	}); err != nil {
-		t.Fatalf("SetDefSummary: %v", err)
-	}
-
-	sess := &sdkmcp.ServerSession{}
-	s.respCache.markMutated(sess, "Greet")
-	req := &sdkmcp.CallToolRequest{Session: sess}
-
-	result, _, _ := s.handleGetDefinition(context.Background(), req, nameParam{Name: "Greet"})
-	text := resultText(t, result)
-	if !strings.Contains(text, "Hello, ") {
-		t.Errorf("expected justMutated read to return the full body even with a fresh summary present, got:\n%s", text)
-	}
-
-	result2, _, _ := s.handleGetDefinition(context.Background(), req, nameParam{Name: "Greet"})
-	text2 := resultText(t, result2)
-	if strings.Contains(text2, "Hello, ") {
-		t.Errorf("expected the justMutated flag to be consumed after one read, got full body again:\n%s", text2)
 	}
 }
 
@@ -6967,13 +6814,12 @@ func TestHandleCode_SearchQueryAliasesToPattern(t *testing.T) {
 }
 
 // TestHandleGetDefinition_SummaryModeSkipsStubPlaceholder is the #248
-// regression: a Stub-backend placeholder ("TODO: <Name>") isn't a
-// real summary, but handleGetDefinition's summary-mode-by-default
-// check only compared BodyHash, not Model -- serving the literal stub
-// text as if it were a genuine intent line, contradicting
-// enqueueSummary's own documented fallback-to-full-body contract.
+// regression, now exercised via explicit mode:"summary" (#313 made
+// summary opt-in, no longer a silent default): a Stub-backend
+// placeholder ("TODO: <Name>") isn't a real summary, and must still
+// fall back to the full body rather than being surfaced as if it
+// were a genuine intent line.
 func TestHandleGetDefinition_SummaryModeSkipsStubPlaceholder(t *testing.T) {
-	os.Unsetenv("DEFN_SUMMARY_READ_DEFAULT")
 	db, _ := setupTestDB(t)
 	defer db.Close()
 	s := &server{backend: db}
@@ -6990,7 +6836,9 @@ func TestHandleGetDefinition_SummaryModeSkipsStubPlaceholder(t *testing.T) {
 		t.Fatalf("SetDefSummary: %v", err)
 	}
 
-	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Greet"})
+	// #313: mode:"summary" is now explicit opt-in (no longer a silent
+	// default) -- pass it directly to exercise the #248 stub-skip path.
+	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Greet", Mode: "summary"})
 	text := resultText(t, result)
 	if strings.Contains(text, "TODO: Greet") {
 		t.Errorf("expected the stub placeholder NOT to be surfaced anywhere, got:\n%s", text)
@@ -12426,5 +12274,120 @@ func TestCommitInfo_ReturnsRevisionWhenBuiltInAGitCheckout(t *testing.T) {
 	}
 	if got == "unknown" {
 		t.Skip("VCS info not stamped -- built with -buildvcs=false or outside a git checkout")
+	}
+}
+
+// TestHandleGetDefinition_OutlineDowngradeMentionsFreshSummaryAsOption
+// is the #313 followup regression: #174 used to make a fresh cached
+// summary the silent DEFAULT for a bare read, substituting an LLM
+// paraphrase for a code request without being asked. Outline and
+// summary aren't the same kind of "compact" -- outline is ground
+// truth (just less transcribed), summary is an inference that can be
+// subtly wrong even when hash-fresh. A bare read on a large def must
+// still show the outline (ground truth, the safe default), but now
+// mentions a fresh summary as an explicit OPTION the caller can reach
+// for, rather than silently receiving one instead of what they asked
+// for.
+func TestHandleGetDefinition_OutlineDowngradeMentionsFreshSummaryAsOption(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0o755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0o644)
+	var body strings.Builder
+	body.WriteString("package main\n\nfunc BigFunc(name string) string {\n\tresult := \"\"\n")
+	for i := 0; i < 60; i++ {
+		body.WriteString(fmt.Sprintf("\tresult += \"line %d: padding to push body past 1500 bytes\\n\"\n", i))
+	}
+	body.WriteString("\treturn result + name\n}\n")
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(body.String()), 0o644)
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal(err)
+	}
+	d, err := db.GetDefinitionByName("BigFunc", "")
+	if err != nil {
+		t.Fatalf("setup: BigFunc not found: %v", err)
+	}
+	if err := db.SetDefSummary(d.ID, &store.DefSummary{
+		OneLine:  "Builds a padded greeting string.",
+		BodyHash: store.HashBodyStructural(d.Body),
+		Model:    "test",
+	}); err != nil {
+		t.Fatalf("SetDefSummary: %v", err)
+	}
+	s := &server{backend: db, projectDir: projDir}
+
+	result, _, err := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "BigFunc"})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Outline shown") {
+		t.Errorf("expected outline (ground truth) to remain the default even with a fresh summary present, got: %s", text)
+	}
+	if strings.Contains(text, "padding to push body") {
+		t.Errorf("body must not leak into the outline-downgraded response, got: %s", text)
+	}
+	if strings.Contains(text, "Builds a padded greeting string.") {
+		t.Errorf("summary text must NOT be silently substituted for the outline, got: %s", text)
+	}
+	if !strings.Contains(text, `mode:"summary"`) {
+		t.Errorf("expected the response to mention mode:\"summary\" as an available option since a fresh summary exists, got: %s", text)
+	}
+}
+
+// TestHandleGetDefinition_ExplicitSummaryModeReturnsSummary confirms
+// the #313 opt-in path itself still works: passing mode:"summary"
+// explicitly on a def with a fresh cached summary returns the compact
+// summary rendering, not the full body -- summary is no longer a
+// silent default, but it's still a real, working choice when asked
+// for directly.
+func TestHandleGetDefinition_ExplicitSummaryModeReturnsSummary(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	d, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatalf("setup: Greet not found: %v", err)
+	}
+	if err := db.SetDefSummary(d.ID, &store.DefSummary{
+		OneLine:  "Returns a greeting for the given name.",
+		BodyHash: store.HashBodyStructural(d.Body),
+		Model:    "test",
+	}); err != nil {
+		t.Fatalf("SetDefSummary: %v", err)
+	}
+
+	result, _, err := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Greet", Mode: "summary"})
+	if err != nil {
+		t.Fatalf("read mode:summary: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Returns a greeting for the given name.") {
+		t.Errorf("expected explicit mode:\"summary\" to return the summary rendering, got:\n%s", text)
+	}
+	if strings.Contains(text, "return \"Hello, \"") {
+		t.Errorf("expected the full body NOT to be present in an explicit summary-mode response, got:\n%s", text)
+	}
+
+	// A bare read (no mode:) on the SAME def must NOT return the
+	// summary -- confirming summary really is opt-in only now, not a
+	// silent default that just happened to be masked by the outline
+	// threshold in the other test (Greet's body is small).
+	bare, _, err := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Greet"})
+	if err != nil {
+		t.Fatalf("bare read: %v", err)
+	}
+	bareText := resultText(t, bare)
+	if !strings.Contains(bareText, "return \"Hello, \"") {
+		t.Errorf("expected a bare read to return the full body (summary is opt-in only), got:\n%s", bareText)
 	}
 }

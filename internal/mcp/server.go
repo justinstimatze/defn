@@ -870,13 +870,6 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 			if s.reach != nil {
 				s.reach.invalidate()
 			}
-			if err == nil && result != nil && !result.IsError && args.Name != "" {
-				// A read right after a mutation is almost always "show me
-				// what I just did" -- mark it so the next read of this
-				// name skips the summary-mode default. Only meaningful
-				// on a genuine success.
-				s.respCache.markMutated(req.Session, args.Name)
-			}
 		}
 		if err != nil || result == nil || result.IsError {
 			return
@@ -1918,17 +1911,22 @@ func resultTextRaw(r *sdkmcp.CallToolResult) string {
 }
 
 func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
-	// #174: summary-mode is now the default for read (opt-out via
-	// DEFN_SUMMARY_READ_DEFAULT=0), not opt-in. Safe regardless of
-	// backfill coverage -- the mode=="summary" branch below falls
-	// through to the full body whenever no summary exists yet or it's
-	// stale, so an unbackfilled def behaves identically to before this
-	// flip. !args.Full guards the escape hatch: an explicit full:true
-	// must win over the implicit default -- without this, full:true
-	// would be silently ignored on every def with a fresh summary,
-	// since args.Mode == "" is now no longer a reliable signal that
-	// the caller wants the body.
-	justMutated := req != nil && s.respCache != nil && s.respCache.takeMutated(req.Session, args.Name)
+	// #313 followup: summary and outline aren't the same kind of
+	// "compact" -- outline is ground truth (signature/doc/refs), just
+	// less transcribed; summary is an LLM paraphrase, which can be
+	// subtly wrong even when hash-fresh (freshness only proves the code
+	// didn't change, not that the paraphrase was ever accurate). #174
+	// used to make summary the silent default for every bare read, but
+	// enqueueSummary only ever fires from write-path handlers -- on any
+	// def this session hasn't already edited (the dominant case: a
+	// fresh ingest, or a real user's first look at unfamiliar code) the
+	// silent check was a guaranteed miss that fell straight through to
+	// the outline-auto-downgrade below anyway, while creating a real
+	// risk that when it DID hit, an inference silently stood in for a
+	// code read the caller never asked to trade away. mode:"summary" is
+	// now purely an explicit, opt-in choice -- see the outline-downgrade
+	// branch below, which mentions it as an option (only when a fresh
+	// one actually exists) instead of silently substituting it.
 	// #313: a bare read(name) already downgraded to a compact form once
 	// this session is a strong signal the caller wants the real body --
 	// far stronger than a first-ever read, which is often just exploring
@@ -1956,9 +1954,6 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 	// a previously-downgraded name (alreadyDowngraded) joins that list --
 	// see its own comment above.
 	wantsBody := args.Full || strings.TrimSpace(args.LineRange) != "" || alreadyDowngraded
-	if args.Mode == "" && !wantsBody && !justMutated && os.Getenv("DEFN_SUMMARY_READ_DEFAULT") != "0" {
-		args.Mode = "summary"
-	}
 	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
@@ -2033,15 +2028,27 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 		}
 		if outlineR, _, oErr := s.handleOutline(nil, nil, args); oErr == nil && outlineR != nil && !outlineR.IsError {
 			text := resultTextRaw(outlineR)
-			// Note intentionally does NOT enumerate the escape hatches.
-			// Post-#184 chi bench showed the model reflexively retries
-			// with full:true when the hint reads like a menu. Escape
-			// hatches (full:true, mode:"body") still work; they're
-			// documented in the tool description, not advertised inline.
+			// Note intentionally does NOT enumerate the full:true/mode:"body"
+			// escape hatches. Post-#184 chi bench showed the model
+			// reflexively retries with full:true when the hint reads like a
+			// menu. They still work; they're documented in the tool
+			// description, not advertised inline.
 			note := fmt.Sprintf(
 				"_[Outline shown — body is %d bytes / %d lines. Full body only needed when editing.]_\n\n",
 				len(d.Body), strings.Count(d.Body, "\n")+1,
 			)
+			// #313 followup: mention a fresh cached summary as an explicit
+			// OPTION here, rather than the old #174 default that silently
+			// substituted it -- outline stays the safe, ground-truth
+			// default; a paraphrase is offered, not imposed.
+			if sum, sErr := s.backend.GetDefSummary(d.ID); sErr == nil && sum != nil {
+				if sum.BodyHash == store.HashBodyStructural(d.Body) && sum.Model != summary.StubModelName {
+					note += fmt.Sprintf(
+						"_[A cached summary is also available — pass mode:\"summary\" for a one-line paraphrase (%s) instead of this outline.]_\n\n",
+						sum.Model,
+					)
+				}
+			}
 			out := note + text
 			return withUsage(textResult(out), usageStats{
 				Op:            "read",

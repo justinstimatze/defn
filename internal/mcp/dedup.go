@@ -52,7 +52,6 @@ type sessionCache struct {
 	// server-side cache entry survives untouched.
 	compactionEpoch int64
 	bodyServed      map[string]int64 // #176/#227: name -> compaction epoch when its full body (read full:true) was served this session
-	justMutated     map[string]bool  // names changed by the most recent write op; consumed once by the next read to force full body instead of the summary-mode default
 	// pendingReadNames accumulates the resolved name of every nameable
 	// read-shaped call (see nameableReadOps) since the last reset, so a
 	// circuit-breaker block can auto-batch them via expand instead of
@@ -84,14 +83,16 @@ type sessionCache struct {
 	// determinable-or-not write invalidates every pending test result.
 	lastTestRun map[string]string
 	// readDowngraded records name -> compaction epoch when a bare
-	// read(name) (no full:true) was auto-downgraded to a compact form
-	// (summary-mode default, or #184's auto-outline-on-large-body) this
-	// session. A later bare read of the SAME name is a strong signal the
-	// caller actually wants the body -- unlike the first read, which is
-	// far more often exploratory (see readAutoOutlineThreshold's #174
+	// read(name) (no full:true) was auto-downgraded to the outline
+	// projection (#184's auto-outline-on-large-body) this session. A
+	// later bare read of the SAME name is a strong signal the caller
+	// actually wants the body -- unlike the first read, which is far
+	// more often exploratory (see readAutoOutlineThreshold's #174
 	// receipt), a repeat ask for a def already shown to be large/complex
 	// is not idle curiosity. See readDowngradedEpochsAgo/markReadDowngraded
-	// and their use in handleGetDefinition.
+	// and their use in handleGetDefinition. (#313: mode:"summary" is a
+	// separate, explicit opt-in path -- no longer folded into this
+	// silent-downgrade tracking.)
 	readDowngraded map[string]int64
 }
 
@@ -341,41 +342,6 @@ func (c *respCache) markBodyServed(sess *sdkmcp.ServerSession, name string) {
 		sc.bodyServed = map[string]int64{}
 	}
 	sc.bodyServed[name] = sc.compactionEpoch
-}
-
-// markMutated records that name was just changed by a write op this
-// session. Consumed once by takeMutated -- the very next read of name
-// gets the full body instead of the summary-mode default, since a read
-// immediately following a mutation is almost always "show me what I
-// just did," not "what does this do."
-func (c *respCache) markMutated(sess *sdkmcp.ServerSession, name string) {
-	if sess == nil || name == "" {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	sc := c.getSession(sess)
-	if sc.justMutated == nil {
-		sc.justMutated = map[string]bool{}
-	}
-	sc.justMutated[name] = true
-}
-
-// takeMutated reports whether name was just mutated this session and
-// clears the flag -- a one-shot signal so only the immediate follow-up
-// read is affected, not every future read of name.
-func (c *respCache) takeMutated(sess *sdkmcp.ServerSession, name string) bool {
-	if sess == nil {
-		return false
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	sc := c.sessions[sess]
-	if sc == nil || !sc.justMutated[name] {
-		return false
-	}
-	delete(sc.justMutated, name)
-	return true
 }
 
 // invalidateNames clears only the dedup and bodyServed entries anchored
