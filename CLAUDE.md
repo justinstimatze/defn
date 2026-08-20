@@ -95,7 +95,7 @@ This project is indexed in defn (`.defn/`). For any `.go` file, use the `code` M
 
 **Do not `ls` and `Read` files by hand.** Start any Go task with `code(op:"overview")` to see the project shape, then drill in with `search` / `outline` / `impact`.
 
-**Reach for `outline` before `read`.** `outline` returns the signature, doc, refs, and control-flow of a def — 5-10× smaller than the full body. It's enough to answer almost every "what does X do / how does Y work / where does Z fit" question. Only escalate to `read` (full body) when you're about to edit the def, or when outline was genuinely insufficient. A follow-up `read` costs nothing you haven't already committed to.
+**Reach for `outline` before `read`.** `outline` returns the signature, doc, refs, and control-flow of a def — 5-10× smaller than the full body. It's enough to answer almost every "what does X do / how does Y work / where does Z fit" question. Only escalate to `read` (full body) when you're about to edit the def, or when outline was genuinely insufficient. Note this has a real cost, not a free one: a bare `read` on a large/complex def returns a compact outline/summary rather than the body (by design — most reads in a session are exploratory, not edit-bound), and getting the actual body then takes a second call. If you already know from context that you're about to edit, pass `full:true` on the first call to skip that round-trip. If you don't add it, asking again with a second plain `read` of the same def also now serves the full body directly — a repeat ask for the same def is itself a strong enough signal — but that's still one extra call, not a free one.
 
 ### By intent
 

@@ -83,6 +83,16 @@ type sessionCache struct {
 	// the way invalidateNames does for reads isn't safe here -- any
 	// determinable-or-not write invalidates every pending test result.
 	lastTestRun map[string]string
+	// readDowngraded records name -> compaction epoch when a bare
+	// read(name) (no full:true) was auto-downgraded to a compact form
+	// (summary-mode default, or #184's auto-outline-on-large-body) this
+	// session. A later bare read of the SAME name is a strong signal the
+	// caller actually wants the body -- unlike the first read, which is
+	// far more often exploratory (see readAutoOutlineThreshold's #174
+	// receipt), a repeat ask for a def already shown to be large/complex
+	// is not idle curiosity. See readDowngradedEpochsAgo/markReadDowngraded
+	// and their use in handleGetDefinition.
+	readDowngraded map[string]int64
 }
 
 type cacheEntry struct {
@@ -236,6 +246,7 @@ func (c *respCache) invalidate(sess *sdkmcp.ServerSession) {
 	if sc, ok := c.sessions[sess]; ok {
 		sc.entries = map[string]cacheEntry{}
 		sc.bodyServed = nil
+		sc.readDowngraded = nil
 		sc.lastTestRun = nil
 	}
 }
@@ -420,6 +431,7 @@ func (c *respCache) invalidateNames(sess *sdkmcp.ServerSession, names, files []s
 	}
 	for _, name := range names {
 		delete(sc.bodyServed, name)
+		delete(sc.readDowngraded, name)
 	}
 	// A test's pass/fail depends on an unbounded surface of code it
 	// exercises, not just the names/files this write's blast radius
@@ -605,4 +617,42 @@ func testDedupKey(args codeParam) string {
 		return fmt.Sprintf("test:%s|%s|%s", args.Test, args.Module, args.File)
 	}
 	return fmt.Sprintf("name:%s|%s|%s|%s", args.Name, args.Receiver, args.Module, args.File)
+}
+
+// markReadDowngraded records that a bare read(name) was downgraded to
+// a compact form (summary or auto-outline) this session. Mirrors
+// markBodyServed's shape exactly -- see readDowngraded's doc comment
+// on sessionCache for the rationale.
+func (c *respCache) markReadDowngraded(sess *sdkmcp.ServerSession, name string) {
+	if sess == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sc := c.getSession(sess)
+	if sc.readDowngraded == nil {
+		sc.readDowngraded = map[string]int64{}
+	}
+	sc.readDowngraded[name] = sc.compactionEpoch
+}
+
+// readDowngradedEpochsAgo reports how many compactions have happened
+// since name's bare read was last downgraded this session, and
+// whether it was ever downgraded at all. Mirrors bodyServedEpochsAgo's
+// shape exactly.
+func (c *respCache) readDowngradedEpochsAgo(sess *sdkmcp.ServerSession, name string) (epochsAgo int64, ok bool) {
+	if sess == nil {
+		return 0, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sc := c.sessions[sess]
+	if sc == nil || sc.readDowngraded == nil {
+		return 0, false
+	}
+	epoch, hit := sc.readDowngraded[name]
+	if !hit {
+		return 0, false
+	}
+	return sc.compactionEpoch - epoch, true
 }

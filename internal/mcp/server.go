@@ -1929,12 +1929,33 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 	// since args.Mode == "" is now no longer a reliable signal that
 	// the caller wants the body.
 	justMutated := req != nil && s.respCache != nil && s.respCache.takeMutated(req.Session, args.Name)
+	// #313: a bare read(name) already downgraded to a compact form once
+	// this session is a strong signal the caller wants the real body --
+	// far stronger than a first-ever read, which is often just exploring
+	// structure (see readAutoOutlineThreshold's #174 receipt for why the
+	// FIRST read still defaults to compact). Measured motivation: a
+	// prometheus bench cost-gap dig found this exact shape -- read(name)
+	// downgraded to outline, then the very next call was read(name,
+	// full:true) for the SAME def, paying a full extra tool round-trip
+	// (and a several-KB-larger response) for something the caller had
+	// already shown clear intent to obtain. Treating the repeat as an
+	// implicit full:true collapses that into the one call it should
+	// always have been, without touching the first-read threshold that
+	// #174 already proved necessary.
+	alreadyDowngraded := false
+	if req != nil && s.respCache != nil {
+		if epochsAgo, ok := s.respCache.readDowngradedEpochsAgo(req.Session, args.Name); ok && epochsAgo <= staleEpochThreshold {
+			alreadyDowngraded = true
+		}
+	}
 	// wantsBody mirrors what args.Full already means to every gate below:
 	// an explicit line_range request is just as unambiguous an "I want
 	// body text" signal as full:true -- both should bypass summary-mode-
 	// by-default, the upstream-match/diverged-from-upstream projections,
-	// and the #184 auto-outline-downgrade the same way.
-	wantsBody := args.Full || strings.TrimSpace(args.LineRange) != ""
+	// and the #184 auto-outline-downgrade the same way. A repeat read of
+	// a previously-downgraded name (alreadyDowngraded) joins that list --
+	// see its own comment above.
+	wantsBody := args.Full || strings.TrimSpace(args.LineRange) != "" || alreadyDowngraded
 	if args.Mode == "" && !wantsBody && !justMutated && os.Getenv("DEFN_SUMMARY_READ_DEFAULT") != "0" {
 		args.Mode = "summary"
 	}
@@ -1957,6 +1978,9 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 			// but this check was missing, so summary-mode-by-default served
 			// the literal stub text as if it were a genuine intent line.
 			if sum.BodyHash == currentHash && sum.Model != summary.StubModelName {
+				if req != nil && s.respCache != nil {
+					s.respCache.markReadDowngraded(req.Session, args.Name)
+				}
 				return renderSummaryOnly(d, sum), nil, nil
 			}
 			// Stale or stub — fall through to body but signal it.
@@ -2004,6 +2028,9 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 		args.Mode != "body" &&
 		strings.TrimSpace(args.Query) == "" &&
 		len(d.Body) > readAutoOutlineThreshold {
+		if req != nil && s.respCache != nil {
+			s.respCache.markReadDowngraded(req.Session, args.Name)
+		}
 		if outlineR, _, oErr := s.handleOutline(nil, nil, args); oErr == nil && outlineR != nil && !outlineR.IsError {
 			text := resultTextRaw(outlineR)
 			// Note intentionally does NOT enumerate the escape hatches.

@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -437,5 +438,136 @@ func main() {}
 	}
 	if !strings.Contains(readText, "HelperX") {
 		t.Errorf("expected Caller's post-rename body (calling HelperX) to actually be returned, got: %s", readText)
+	}
+}
+
+func TestHandleCode_ReadDowngradeTrackingInvalidatedByEdit(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0o755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0o644)
+	bigBody := func(marker string) string {
+		var body strings.Builder
+		body.WriteString(fmt.Sprintf("package main\n\nfunc BigFunc(name string) string {\n\tresult := \"%s\"\n", marker))
+		for i := 0; i < 60; i++ {
+			body.WriteString(fmt.Sprintf("\tresult += \"line %d: padding to push body past 1500 bytes\\n\"\n", i))
+		}
+		body.WriteString("\treturn result + name\n}\n")
+		return body.String()
+	}
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(bigBody("v1")), 0o644)
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+	sess := &sdkmcp.ServerSession{}
+	req := &sdkmcp.CallToolRequest{Session: sess}
+
+	first, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "BigFunc"})
+	if err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	if !strings.Contains(resultText(t, first), "Outline shown") {
+		t.Fatalf("expected first bare read to auto-downgrade to outline, got: %s", resultText(t, first))
+	}
+
+	// Edit to a DIFFERENT body that is STILL large (>1500 bytes) --
+	// this isolates the #313 tracking-invalidation question from the
+	// unrelated "body just got small" case: if invalidation did NOT
+	// clear readDowngraded, this next read would wrongly skip straight
+	// to full body (treating a fresh, never-yet-downgraded-since-edit
+	// def as if it were a repeat), instead of re-evaluating and
+	// downgrading again like any other first read of a large body.
+	newBody, _, err := s.handleCode(context.Background(), req, codeParam{
+		Op: "edit", Name: "BigFunc", NewBody: bigBody("v2"),
+	})
+	if err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	if strings.Contains(resultText(t, newBody), "BUILD FAILED") {
+		t.Fatalf("edit unexpectedly failed: %s", resultText(t, newBody))
+	}
+
+	afterEdit, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "BigFunc"})
+	if err != nil {
+		t.Fatalf("read after edit: %v", err)
+	}
+	afterEditText := resultText(t, afterEdit)
+	if !strings.Contains(afterEditText, "Outline shown") {
+		t.Errorf("expected the first read after an edit to re-downgrade (stale readDowngraded tracking must be invalidated), got: %s", afterEditText)
+	}
+	if strings.Contains(afterEditText, "padding to push body") {
+		t.Errorf("body leaked into what should be a downgraded response: %s", afterEditText)
+	}
+}
+
+// TestHandleCode_RepeatBareReadAfterOutlineDowngradeServesFullBody is
+// the #313 regression: a bare read(name) on a large def correctly
+// downgrades to outline (#184) the FIRST time, but a real prometheus
+// bench cost-gap dig found the model then had to pay a full extra
+// round-trip (read again with full:true) on almost every large def it
+// actually intended to edit -- a repeat bare read of the SAME name is
+// a strong enough intent signal that the second call should just
+// serve the full body directly, without requiring the caller to know
+// to add full:true.
+func TestHandleCode_RepeatBareReadAfterOutlineDowngradeServesFullBody(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0o755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0o644)
+	var body strings.Builder
+	body.WriteString("package main\n\nfunc BigFunc(name string) string {\n\tresult := \"\"\n")
+	for i := 0; i < 60; i++ {
+		body.WriteString(fmt.Sprintf("\tresult += \"line %d: padding to push body past 1500 bytes\\n\"\n", i))
+	}
+	body.WriteString("\treturn result + name\n}\n")
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(body.String()), 0o644)
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+	sess := &sdkmcp.ServerSession{}
+	req := &sdkmcp.CallToolRequest{Session: sess}
+
+	first, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "BigFunc"})
+	if err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	firstText := resultText(t, first)
+	if !strings.Contains(firstText, "Outline shown") {
+		t.Fatalf("expected first bare read to auto-downgrade to outline, got: %s", firstText)
+	}
+	if strings.Contains(firstText, "padding to push body") {
+		t.Fatalf("body leaked into first (downgraded) response: %s", firstText)
+	}
+
+	second, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "BigFunc"})
+	if err != nil {
+		t.Fatalf("second read: %v", err)
+	}
+	secondText := resultText(t, second)
+	if strings.Contains(secondText, "Outline shown") {
+		t.Errorf("expected second bare read of the SAME name to serve the full body, got another outline downgrade: %s", secondText)
+	}
+	if !strings.Contains(secondText, "padding to push body") {
+		t.Errorf("expected second bare read to contain the full body, got: %s", secondText)
 	}
 }
