@@ -12125,3 +12125,81 @@ func TestHandleCode_CircuitBreakerAutoBatchPreservesReceiverDisambiguation(t *te
 		t.Errorf("auto-batch re-resolved ServeHTTP to the WRONG (unrelated Handler) receiver, got: %s", text)
 	}
 }
+
+// TestHandleDelete_RemoveFileKeepsFileWhenDefinitionsRemain guards the
+// #310 fix from the other direction: remove_file:true on a name-scoped
+// delete must NOT remove the file while sibling definitions still live
+// in it.
+func TestHandleDelete_RemoveFileKeepsFileWhenDefinitionsRemain(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op: "delete", Name: "TestFarewell", RemoveFile: true,
+	})
+	if err != nil {
+		t.Fatalf("handleCode delete: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "removed") {
+		t.Errorf("should not report removal while TestGreet remains in the file: %s", text)
+	}
+	if _, statErr := os.Stat(filepath.Join(projDir, "main_test.go")); statErr != nil {
+		t.Errorf("main_test.go should still exist (TestGreet remains): %v", statErr)
+	}
+}
+
+// TestHandleDelete_RemoveFileRemovesFileWhenLastDefinitionDeleted guards
+// the #310 fix: op:"delete", name:"X", remove_file:true previously
+// silently dropped remove_file on the name-scoped path (only
+// handleDeleteFile's file:-only bulk mode honored it) -- a real
+// trajectory (prometheus-19236) deleted the last def in a throwaway test
+// file expecting the file to go with it, and burned ~8 extra tool calls
+// discovering it had to reissue the delete as file:-only instead.
+func TestHandleDelete_RemoveFileRemovesFileWhenLastDefinitionDeleted(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	if _, _, err := s.handleCode(context.Background(), nil, codeParam{Op: "delete", Name: "TestGreet"}); err != nil {
+		t.Fatalf("handleCode delete TestGreet: %v", err)
+	}
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op: "delete", Name: "TestFarewell", RemoveFile: true,
+	})
+	if err != nil {
+		t.Fatalf("handleCode delete TestFarewell: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Also removed main_test.go from disk") {
+		t.Errorf("expected confirmation the file was removed, got: %s", text)
+	}
+	if _, statErr := os.Stat(filepath.Join(projDir, "main_test.go")); !os.IsNotExist(statErr) {
+		t.Errorf("expected main_test.go to be removed from disk, stat err: %v", statErr)
+	}
+}
+
+// TestHandleDelete_WithoutRemoveFileKeepsEmptiedFileOnDisk confirms
+// default behavior is unchanged: deleting every def in a file via the
+// name-scoped path without remove_file:true leaves the (now defless)
+// file on disk, same as before the #310 fix.
+func TestHandleDelete_WithoutRemoveFileKeepsEmptiedFileOnDisk(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	if _, _, err := s.handleCode(context.Background(), nil, codeParam{Op: "delete", Name: "TestGreet"}); err != nil {
+		t.Fatalf("handleCode delete TestGreet: %v", err)
+	}
+	if _, _, err := s.handleCode(context.Background(), nil, codeParam{Op: "delete", Name: "TestFarewell"}); err != nil {
+		t.Fatalf("handleCode delete TestFarewell: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(projDir, "main_test.go")); statErr != nil {
+		t.Errorf("without remove_file, the emptied stub file should remain on disk: %v", statErr)
+	}
+}

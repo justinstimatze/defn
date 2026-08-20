@@ -557,6 +557,14 @@ type nameParam struct {
 	// auto-outline-downgrade the same way Full does -- an explicit
 	// range request means the caller wants body text, not a projection.
 	LineRange string `json:"line_range,omitempty"`
+	// RemoveFile mirrors handleDeleteFile's flag of the same name: after
+	// this delete, if the file this def lived in has zero definitions
+	// left, also remove it from disk. Ignored by every other
+	// nameParam-shaped op. #310: previously only wired into the
+	// file:-only bulk delete path -- a name-scoped delete of the LAST
+	// def in a file silently dropped this flag with no error, leaving a
+	// defless stub file (prometheus-19236).
+	RemoveFile bool `json:"remove_file,omitempty"`
 }
 
 type editParam struct {
@@ -1374,7 +1382,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if strings.TrimSpace(args.Name) == "" && strings.TrimSpace(args.File) != "" {
 			return s.handleDeleteFile(ctx, req, args)
 		}
-		return s.handleDelete(ctx, req, nameParam{Name: args.Name, Force: args.Force, DryRun: args.DryRun, Receiver: args.Receiver, Module: args.Module, File: args.File})
+		return s.handleDelete(ctx, req, nameParam{Name: args.Name, Force: args.Force, DryRun: args.DryRun, Receiver: args.Receiver, Module: args.Module, File: args.File, RemoveFile: args.RemoveFile})
 	case "rename":
 		return s.handleRename(ctx, req, renameParam{OldName: args.OldName, NewName: args.NewName, Receiver: args.Receiver, Module: args.Module, File: args.File})
 	case "move":
@@ -5021,7 +5029,11 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	recv := formatReceiver(d.Receiver)
 
 	if args.DryRun {
-		return dryRunResult(fmt.Sprintf("- would delete %s%s (id=%d)", recv, d.Name, d.ID))
+		suffix := ""
+		if args.RemoveFile && d.SourceFile != "" {
+			suffix = fmt.Sprintf(" — if %s has no definitions left afterward, it would also be removed (remove_file:true)", d.SourceFile)
+		}
+		return dryRunResult(fmt.Sprintf("- would delete %s%s (id=%d)%s", recv, d.Name, d.ID, suffix))
 	}
 
 	// #12: delete + build-gate through a transaction so a build failure
@@ -5092,6 +5104,27 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	sb.WriteString(fmt.Sprintf("Deleted %s%s (id=%d)\n", recv, d.Name, d.ID))
 	if buildResult != "" {
 		sb.WriteString("\n" + buildResult)
+		return textResult(sb.String()), nil, nil
+	}
+	// #310: remove_file was previously only honored by handleDeleteFile's
+	// file:-only bulk path -- a name-scoped delete of the LAST def in a
+	// file silently dropped this flag, leaving a defless stub file
+	// nothing else in the API would clean up (prometheus-19236 hit this
+	// exact wall, burning ~8 calls before reissuing as a file:-only
+	// delete). Mirror handleDeleteFile's zero-remaining-defs removal.
+	if args.RemoveFile && d.SourceFile != "" && s.projectDir != "" {
+		dir := ""
+		if idx := strings.LastIndex(d.SourceFile, "/"); idx >= 0 {
+			dir = d.SourceFile[:idx]
+		}
+		if remaining, rerr := s.backend.FindDefinitionsByFile(dir, d.SourceFile, 0); rerr == nil && len(remaining) == 0 {
+			diskPath := filepath.Join(s.projectDir, d.SourceFile)
+			if rmErr := os.Remove(diskPath); rmErr != nil && !os.IsNotExist(rmErr) {
+				sb.WriteString(fmt.Sprintf("remove_file:true was set, but removing %s failed: %v\n", d.SourceFile, rmErr))
+			} else {
+				sb.WriteString(fmt.Sprintf("Also removed %s from disk (no definitions remained).\n", d.SourceFile))
+			}
+		}
 	}
 	return textResult(sb.String()), nil, nil
 }
