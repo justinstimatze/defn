@@ -769,10 +769,13 @@ func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import,
 		fset := token.NewFileSet()
 		if _, perr := parser.ParseFile(fset, "", data, parser.SkipObjectResolution); perr == nil {
 			existingSrc = data
+		} else {
+			emitDebugf("writeFile %s: on-disk file doesn't parse (%v) -- falling back to file_sources", path, perr)
 		}
 	}
 	if len(existingSrc) == 0 {
 		existingSrc = rawFromDB
+		emitDebugf("writeFile %s: using file_sources fallback (%d bytes) as merge base", path, len(rawFromDB))
 	}
 
 	// AST-merge path: if we have a base file that parses, patch the
@@ -781,6 +784,7 @@ func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import,
 	// constraints, per-file imports, init() names, floating comments).
 	if len(existingSrc) > 0 {
 		if merged, ok, unmatched := mergeDeclsIntoSource(existingSrc, defs, allowedRemovals, allowedAdds); ok {
+			emitDebugf("writeFile %s: AST-merge path (defs=%d, unmatched=%d)", path, len(defs), len(unmatched))
 			wrote, lost, err := safeWriteGoFile(path, merged, allowedRemovals)
 			if err != nil {
 				return nil, "", err
@@ -924,10 +928,21 @@ func writeFile(path, pkgName, modulePath, pkgDoc string, imports []store.Import,
 
 	// Format with go/format for canonical output. format.Source handles
 	// parsing internally — no need to parse separately.
+	emitDebugf("writeFile %s: regenerate path (defs=%d)", path, len(defs))
 	formatted, err := format.Source([]byte(src.String()))
 	if err != nil {
 		// format.Source failed (invalid Go in body) — write raw source.
-		// go build will catch syntax errors.
+		// go build will catch syntax errors. This used to be completely
+		// silent, even at DEFN_EMIT_DEBUG=1 -- the ONE point in the
+		// regenerate path where a concatenation of otherwise-individually-
+		// valid def bodies turned out not to parse as a whole file, with
+		// no trace of why, deferring the only visible signal to whatever
+		// safeWriteGoFile's own re-parse below reports (a real
+		// prometheus-12024 trajectory hit exactly this: two edits each
+		// reported clean success, then an unrelated later `test` call's
+		// own emit failed with a bare "generated content doesn't parse",
+		// no indication which def or which combination was responsible).
+		emitDebugf("writeFile %s: format.Source failed on regenerated content (%d defs, %d bytes): %v -- writing raw source, relying on safeWriteGoFile's re-parse as the last check", path, len(defs), src.Len(), err)
 		formatted = []byte(src.String())
 	}
 	wrote, lost, err := safeWriteGoFile(path, formatted, allowedRemovals)
@@ -1142,6 +1157,7 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "", existing, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
+		emitDebugf("mergeDeclsIntoSource: existing source doesn't parse: %v -- falling back to regenerate", err)
 		return nil, false, nil
 	}
 
@@ -1184,6 +1200,7 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 	totalWants := len(wantFuncs) + len(wantTypes) +
 		len(wantConsts) + len(wantVars) + len(wantGrouped)
 	if totalWants == 0 {
+		emitDebugf("mergeDeclsIntoSource: defs (n=%d) contained nothing splice-able (no function/method/type/interface/const/var) -- falling back to regenerate", len(defs))
 		return nil, false, nil
 	}
 
@@ -1362,6 +1379,7 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 	}
 
 	if len(reps) == 0 {
+		emitDebugf("mergeDeclsIntoSource: none of %d wanted def(s) matched any on-disk decl -- falling back to regenerate", totalWants)
 		return nil, false, nil
 	}
 
@@ -1461,11 +1479,29 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 
 	// Apply in reverse offset order so earlier splices don't invalidate
 	// later offsets. Byte ranges for distinct decls never overlap (Go
-	// syntax forbids it), so ordering by start offset is total.
+	// syntax forbids it), so ordering by start offset is total --
+	// UNLESS `defs` itself contains a duplicate entry for the same
+	// on-disk decl (e.g. a stale/duplicate DB row surfacing at a
+	// broader multi-def emit scope that a narrower single-def emit
+	// would never hit): two reps entries would then share the same
+	// original-coordinate start/end, and applying both sequentially
+	// against a buffer that already shifted after the first splice
+	// reads/writes the WRONG bytes the second time -- a real,
+	// unconfirmed hypothesis for a prometheus-12024 mystery (see
+	// docs/lessons-learned.md). Trace it explicitly rather than let it
+	// silently corrupt: this is exactly the kind of bug the final parse
+	// validation below is the last line of defense against, but by then
+	// the specific cause is lost.
+	for i := 1; i < len(reps); i++ {
+		if reps[i].start == reps[i-1].start && reps[i].end == reps[i-1].end {
+			emitDebugf("mergeDeclsIntoSource: DUPLICATE replacement at byte range [%d,%d) -- defs likely contains two rows for the same on-disk decl; applying both against a shifting buffer can corrupt content", reps[i].start, reps[i].end)
+		}
+	}
 	sort.Slice(reps, func(i, j int) bool { return reps[i].start > reps[j].start })
 	result := append([]byte{}, existing...)
 	for _, r := range reps {
 		if r.start < 0 || r.end > len(result) || r.start > r.end {
+			emitDebugf("mergeDeclsIntoSource: invalid byte range [%d,%d) against a %d-byte buffer -- falling back to regenerate", r.start, r.end, len(result))
 			return nil, false, nil
 		}
 		var buf bytes.Buffer
@@ -1500,6 +1536,7 @@ func mergeDeclsIntoSource(existing []byte, defs []store.Definition, allowedRemov
 	// than write invalid Go to disk.
 	if _, err := parser.ParseFile(token.NewFileSet(), "", result,
 		parser.ParseComments|parser.SkipObjectResolution); err != nil {
+		emitDebugf("mergeDeclsIntoSource: spliced result (%d reps, %d bytes) doesn't parse: %v -- falling back to regenerate", len(reps), len(result), err)
 		return nil, false, nil
 	}
 	return result, true, unmatched
