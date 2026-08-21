@@ -13021,3 +13021,85 @@ func TestHandleApply_DeleteDryRunRefusesWhenCallersExist(t *testing.T) {
 		t.Errorf("dry-run should not claim it would delete Greet when refused, got: %s", text)
 	}
 }
+
+func TestLooksLikeExactIdentifier(t *testing.T) {
+	tests := []struct {
+		pattern string
+		want    bool
+	}{
+		{"NewRoundTripperFromConfig", true},
+		{"DoRequest", true},
+		{"lowercaseStart", false},
+		{"%Auth%", false},
+		{"has space", false},
+		{"pkg/path", false},
+		{"a.b.c", false},
+		{"", false},
+		{"_Underscore", false},
+	}
+	for _, tc := range tests {
+		if got := looksLikeExactIdentifier(tc.pattern); got != tc.want {
+			t.Errorf("looksLikeExactIdentifier(%q) = %v, want %v", tc.pattern, got, tc.want)
+		}
+	}
+}
+
+// TestHandleSearch_ExternalSymbolHintWhenNameMismatchButFTSNoise guards
+// #299 followup: bodyScanResult's go-doc hint only fired on a hard
+// zero-match, but a real prometheus-12024 trajectory hit the same
+// external-dependency confusion behind NON-zero, name-mismatched FTS
+// noise -- an exact PascalCase symbol from a vendored package returned
+// unrelated body-text-coincidence hits with no indication those weren't
+// a real answer, burning 9 blind Glob/Grep round-trips.
+func TestHandleSearch_ExternalSymbolHintWhenNameMismatchButFTSNoise(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "extsym")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module extsym\n\ngo 1.26\n"), 0644)
+	const src = `package extsym
+
+// DoRequest builds a client, similar in spirit to NewRoundTripperFromConfig
+// upstream, but implemented locally instead of importing it.
+func DoRequest() error {
+	return nil
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleSearch(context.Background(), nil, codeParam{Pattern: "NewRoundTripperFromConfig"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "go doc") {
+		t.Fatalf("expected the external-dependency hint since DoRequest's own name doesn't match the pattern, got: %s", text)
+	}
+
+	// Sanity: a pattern that DOES match a real def's name must not get
+	// the external-dependency hint -- it's a genuine project-local hit.
+	clean, _, err := s.handleSearch(context.Background(), nil, codeParam{Pattern: "DoRequest"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanText := resultText(t, clean)
+	if strings.Contains(cleanText, "go doc") {
+		t.Errorf("did not expect the external-dependency hint for a genuine name match, got: %s", cleanText)
+	}
+}

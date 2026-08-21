@@ -2396,6 +2396,30 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		defs = filtered
 	}
 
+	// #299 followup: bodyScanResult's go-doc hint only fires on a hard
+	// zero-match, but a real prometheus-12024 trajectory showed the same
+	// external-symbol problem hiding behind NON-zero results -- an exact
+	// PascalCase symbol from a vendored dependency (NewRoundTripperFromConfig)
+	// got 6.4KB of FTS body-text noise (unrelated defs that happen to
+	// mention similar words) with nothing to say the noise wasn't a real
+	// answer, burning 9 blind Glob/Grep round-trips before giving up. If
+	// every returned def's NAME misses the pattern entirely -- meaning
+	// every "hit" here is an FTS coincidence, not a name match -- and the
+	// pattern itself reads like a literal identifier (not a fuzzy term),
+	// surface the same external-dependency hint alongside the noise.
+	if len(defs) > 0 && looksLikeExactIdentifier(args.Pattern) {
+		anyNameMatch := false
+		for _, d := range defs {
+			if strings.Contains(d.Name, args.Pattern) {
+				anyNameMatch = true
+				break
+			}
+		}
+		if !anyNameMatch {
+			includeNote += fmt.Sprintf("_note: none of these %d result(s) actually match %q by NAME -- they're FTS body-text coincidences, not name matches. If %q is a symbol from an imported dependency (not this project's own code), search only covers this project's OWN source; `go doc <import/path> %s` resolves it via the module cache instead._\n\n", len(defs), args.Pattern, args.Pattern, args.Pattern)
+		}
+	}
+
 	limit := maxSearchResults
 	if args.Limit > 0 {
 		limit = args.Limit
@@ -11257,4 +11281,20 @@ func switchCaseLabels(s ast.Stmt, fset *token.FileSet, bodyStart int) []string {
 		out = append(out, fmt.Sprintf("L%d:case %s", line, label))
 	}
 	return out
+}
+
+// looksLikeExactIdentifier reports whether pattern reads like a literal
+// Go identifier a caller might paste from an import (PascalCase/camelCase,
+// no wildcards, no spaces, no path separators) rather than a fuzzy or
+// partial search term.
+func looksLikeExactIdentifier(pattern string) bool {
+	if pattern == "" || strings.ContainsAny(pattern, "%/. \t") {
+		return false
+	}
+	for _, r := range pattern {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' {
+			return false
+		}
+	}
+	return unicode.IsUpper([]rune(pattern)[0])
 }
