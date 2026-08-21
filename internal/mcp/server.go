@@ -7856,6 +7856,9 @@ func topLevelFlow(body string) []string {
 		}
 		line := fset.Position(stmt.Pos()).Line - bodyStart
 		out = append(out, fmt.Sprintf("L%d:%s", line, kind))
+		if kind == "switch" || kind == "typeswitch" {
+			out = append(out, switchCaseLabels(stmt, fset, bodyStart)...)
+		}
 	}
 	return out
 }
@@ -11166,4 +11169,47 @@ func topLevelTestName(seg string) string {
 		return ""
 	}
 	return seg
+}
+
+// switchCaseLabels returns one "L<line>:case <label>" entry per case
+// clause of a top-level switch/type-switch statement, so a large
+// dispatch function doesn't collapse into a single opaque "switch"/
+// "typeswitch" token in the flow summary -- exactly the shape that made
+// outline useless on prometheus-18534's (*evaluator).eval, a 560-line
+// single-type-switch dispatcher, forcing the agent to abandon defn for
+// a raw Grep+byte-offset Read to find its target case. bodyStart is the
+// function body's starting line, matching topLevelFlow's own
+// line-offset convention. Returns nil for any other statement kind.
+func switchCaseLabels(s ast.Stmt, fset *token.FileSet, bodyStart int) []string {
+	var clauses []*ast.CaseClause
+	switch x := s.(type) {
+	case *ast.SwitchStmt:
+		for _, c := range x.Body.List {
+			if cc, ok := c.(*ast.CaseClause); ok {
+				clauses = append(clauses, cc)
+			}
+		}
+	case *ast.TypeSwitchStmt:
+		for _, c := range x.Body.List {
+			if cc, ok := c.(*ast.CaseClause); ok {
+				clauses = append(clauses, cc)
+			}
+		}
+	default:
+		return nil
+	}
+	out := make([]string, 0, len(clauses))
+	for _, cc := range clauses {
+		line := fset.Position(cc.Pos()).Line - bodyStart
+		label := "default"
+		if len(cc.List) > 0 {
+			parts := make([]string, len(cc.List))
+			for i, e := range cc.List {
+				parts[i] = types.ExprString(e)
+			}
+			label = strings.Join(parts, ", ")
+		}
+		out = append(out, fmt.Sprintf("L%d:case %s", line, label))
+	}
+	return out
 }

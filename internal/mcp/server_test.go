@@ -2084,6 +2084,35 @@ func TestTopLevelFlow(t *testing.T) {
 }`,
 			want: []string{"L1:defer", "L2:go", "L3:for", "L6:select"},
 		},
+		{
+			// #299: guards against a large dispatch switch collapsing into
+			// one opaque token -- see switchCaseLabels' doc comment for the
+			// prometheus-18534 motivation.
+			name: "switch surfaces case labels",
+			body: `func F(x int) {
+	switch x {
+	case 1:
+		a()
+	case 2, 3:
+		b()
+	default:
+		c()
+	}
+}`,
+			want: []string{"L1:switch", "L2:case 1", "L4:case 2, 3", "L6:case default"},
+		},
+		{
+			name: "type switch surfaces case labels",
+			body: `func F(x interface{}) {
+	switch v := x.(type) {
+	case *Foo:
+		useFoo(v)
+	case *Bar:
+		useBar(v)
+	}
+}`,
+			want: []string{"L1:typeswitch", "L2:case *Foo", "L4:case *Bar"},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
