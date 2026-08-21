@@ -13103,3 +13103,129 @@ func DoRequest() error {
 		t.Errorf("did not expect the external-dependency hint for a genuine name match, got: %s", cleanText)
 	}
 }
+
+// TestHandleGetDefinition_SurfacesSiblingConstsInSameBlock guards #300:
+// reading one member of a grouped const block (an enum-like family) used
+// to show only that one value, with no indication siblings existed --
+// a real prometheus-19338 trajectory pattern reused a generic existing
+// constant instead of adding a new sibling matching house style, because
+// nothing surfaced the family it belonged to.
+func TestHandleGetDefinition_SurfacesSiblingConstsInSameBlock(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "constproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module constproj\n\ngo 1.26\n"), 0644)
+	const src = `package constproj
+
+type WarningCategory string
+
+const (
+	WarningCategoryOther WarningCategory = "other"
+	WarningCategoryLabelNameCollision WarningCategory = "label_name_collision"
+	WarningCategoryHistogramZeroCountNonZeroSum WarningCategory = "histogram_zero_count_non_zero_sum"
+)
+
+// Standalone, unrelated to the block above.
+const StandaloneThing = "standalone"
+
+func Use() WarningCategory {
+	return WarningCategoryOther
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{Op: "read", Name: "WarningCategoryOther"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Siblings in this block") {
+		t.Fatalf("expected a siblings line, got: %s", text)
+	}
+	for _, want := range []string{"WarningCategoryLabelNameCollision", "WarningCategoryHistogramZeroCountNonZeroSum"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("expected sibling %s in output, got: %s", want, text)
+		}
+	}
+	if strings.Contains(text, "StandaloneThing") {
+		t.Errorf("standalone const outside the block must not appear as a sibling, got: %s", text)
+	}
+
+	// The standalone const itself must NOT report any siblings.
+	standalone, _, err := s.handleCode(context.Background(), nil, codeParam{Op: "read", Name: "StandaloneThing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	standaloneText := resultText(t, standalone)
+	if strings.Contains(standaloneText, "Siblings in this block") {
+		t.Errorf("standalone const should not report siblings, got: %s", standaloneText)
+	}
+}
+
+// TestHandleCode_SiblingSpecsWorkForVarBlockAndOutlineOp checks the
+// sibling-spec fix also covers grouped var blocks (not just const) and
+// that op:"outline" (which redirects small bodies to the read view)
+// surfaces the same siblings line.
+func TestHandleCode_SiblingSpecsWorkForVarBlockAndOutlineOp(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "varproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module varproj\n\ngo 1.26\n"), 0644)
+	const src = `package varproj
+
+var (
+	ErrNotFound = "not found"
+	ErrTimeout  = "timeout"
+)
+
+func Use() string {
+	return ErrNotFound
+}
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	for _, op := range []string{"read", "outline"} {
+		result, _, err := s.handleCode(context.Background(), nil, codeParam{Op: op, Name: "ErrNotFound"})
+		if err != nil {
+			t.Fatalf("op=%s: %v", op, err)
+		}
+		text := resultText(t, result)
+		if !strings.Contains(text, "Siblings in this block") || !strings.Contains(text, "ErrTimeout") {
+			t.Errorf("op=%s: expected ErrTimeout as a sibling, got: %s", op, text)
+		}
+	}
+}

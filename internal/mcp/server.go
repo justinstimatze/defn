@@ -2215,6 +2215,21 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 	sb.WriteString(body)
 	sb.WriteString("\n```\n")
 
+	// #300: a const/var read is often the ONE example an agent finds of
+	// an enum-like family (e.g. WarningCategoryOther) -- without seeing
+	// its siblings, the natural move is reusing that one generic value
+	// instead of adding a new one matching house style (a real
+	// prometheus-19338 trajectory pattern across two bench runs: read
+	// WarningCategoryOther, reuse it, never see the real siblings sitting
+	// right next to it in the same block). Gated the same as the
+	// neighborhood footer below -- a query/line_range read is already
+	// narrower on purpose.
+	if strings.TrimSpace(args.Query) == "" && strings.TrimSpace(args.LineRange) == "" {
+		if siblings := s.siblingSpecNames(*d); len(siblings) > 0 {
+			sb.WriteString(fmt.Sprintf("\nSiblings in this block (%d): %s\n", len(siblings), truncateList(siblings, outlineCalleeCap)))
+		}
+	}
+
 	// #160 nudge: when the body is large and no compact projection is
 	// active (summary/query/upstream-match), point at mode:"summary".
 	if args.Mode != "summary" && strings.Count(body, "\n") > summaryHintLineThreshold {
@@ -11297,4 +11312,83 @@ func looksLikeExactIdentifier(pattern string) bool {
 		}
 	}
 	return unicode.IsUpper([]rune(pattern)[0])
+}
+
+// looksLikeGroupedSpecBody reports whether body is a spec extracted from
+// inside a "const (...)"/"var (...)" block (just the bare spec, e.g.
+// "X = 1") rather than a standalone declaration that carries its own
+// keyword ("const X = 1"). Mirrors internal/emit's isGroupedSpec
+// heuristic independently -- kept local since callers here have already
+// narrowed to const/var, a much smaller surface than that package's
+// const/var/type/interface check.
+func looksLikeGroupedSpecBody(body string) bool {
+	for line := range strings.SplitSeq(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "const ") || strings.HasPrefix(trimmed, "var ") {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *server) siblingSpecNames(d store.Definition) []string {
+	if d.Kind != "const" && d.Kind != "var" {
+		return nil
+	}
+	if !looksLikeGroupedSpecBody(d.Body) {
+		return nil
+	}
+	dir := ""
+	if idx := strings.LastIndex(d.SourceFile, "/"); idx >= 0 {
+		dir = d.SourceFile[:idx]
+	}
+	defs, err := s.backend.FindDefinitionsByFile(dir, d.SourceFile, 0)
+	if err != nil || len(defs) == 0 {
+		return nil
+	}
+	// defs is already ordered by start_line (FindDefinitionsByFile's own
+	// query). Locate d's position, then walk both directions while
+	// neighbors are same-kind, adjacent, AND themselves grouped specs.
+	idx := -1
+	for i, other := range defs {
+		if other.ID == d.ID {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return nil
+	}
+	// FindDefinitionsByFile doesn't select Body (a heavier column many
+	// bulk-listing callers don't need, and Signature is a synthesized
+	// "const X string"-shaped projection for EVERY const regardless of
+	// source form, so it can't substitute here) -- fetch each same-kind
+	// neighbor's real body individually by ID (not GetDefinitionByName,
+	// which does module-fuzzy/blast-radius tiebreaking on a bare name and
+	// could resolve to an unrelated same-named def elsewhere -- we already
+	// have the exact row's ID from FindDefinitionsByFile, no ambiguity
+	// needed) to check whether IT is also a grouped spec. A standalone
+	// same-kind declaration sitting directly adjacent to this block (e.g.
+	// `const Standalone = "x"` right after this block's closing paren)
+	// must stop the walk even though its Kind matches -- it isn't a
+	// member of THIS block. Block sizes are always small, so the extra
+	// lookups are cheap.
+	isSibling := func(cand store.Definition) bool {
+		if cand.Kind != d.Kind {
+			return false
+		}
+		full, ferr := s.backend.GetDefinition(cand.ID)
+		if ferr != nil || full == nil {
+			return false
+		}
+		return looksLikeGroupedSpecBody(full.Body)
+	}
+	var names []string
+	for i := idx - 1; i >= 0 && isSibling(defs[i]); i-- {
+		names = append([]string{defs[i].Name}, names...)
+	}
+	for i := idx + 1; i < len(defs) && isSibling(defs[i]); i++ {
+		names = append(names, defs[i].Name)
+	}
+	return names
 }
