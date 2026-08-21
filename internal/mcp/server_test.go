@@ -13229,3 +13229,60 @@ func Use() string {
 		}
 	}
 }
+
+// TestHandleGetDefinition_SiblingsDoNotCrossIntoAdjacentBlock guards a
+// real bug found reviewing the first version of this feature: inferring
+// block membership from adjacent DB rows (same Kind + bare-spec body
+// shape) couldn't distinguish two separate "const (...)" blocks of the
+// same kind declared back-to-back -- a very ordinary Go pattern, not a
+// contrived edge case -- and merged both blocks' names into one false
+// family. The AST-based rewrite parses the real file to find the exact
+// enclosing GenDecl instead of inferring it.
+func TestHandleGetDefinition_SiblingsDoNotCrossIntoAdjacentBlock(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "twoblocks")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module twoblocks\n\ngo 1.26\n"), 0644)
+	const src = `package twoblocks
+
+const (
+	StatusOK       = 200
+	StatusNotFound = 404
+)
+
+const (
+	Debug = "debug"
+	Info  = "info"
+)
+`
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(src), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{Op: "read", Name: "StatusNotFound"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "StatusOK") {
+		t.Errorf("expected StatusOK (same block) as a sibling, got: %s", text)
+	}
+	if strings.Contains(text, "Debug") || strings.Contains(text, "Info") {
+		t.Errorf("Debug/Info belong to a SEPARATE adjacent block and must not appear, got: %s", text)
+	}
+}

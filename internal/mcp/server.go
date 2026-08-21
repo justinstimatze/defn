@@ -11314,81 +11314,60 @@ func looksLikeExactIdentifier(pattern string) bool {
 	return unicode.IsUpper([]rune(pattern)[0])
 }
 
-// looksLikeGroupedSpecBody reports whether body is a spec extracted from
-// inside a "const (...)"/"var (...)" block (just the bare spec, e.g.
-// "X = 1") rather than a standalone declaration that carries its own
-// keyword ("const X = 1"). Mirrors internal/emit's isGroupedSpec
-// heuristic independently -- kept local since callers here have already
-// narrowed to const/var, a much smaller surface than that package's
-// const/var/type/interface check.
-func looksLikeGroupedSpecBody(body string) bool {
-	for line := range strings.SplitSeq(body, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "const ") || strings.HasPrefix(trimmed, "var ") {
-			return false
-		}
-	}
-	return true
-}
-
 func (s *server) siblingSpecNames(d store.Definition) []string {
 	if d.Kind != "const" && d.Kind != "var" {
 		return nil
 	}
-	if !looksLikeGroupedSpecBody(d.Body) {
+	if d.SourceFile == "" || d.StartLine <= 0 {
 		return nil
 	}
-	dir := ""
-	if idx := strings.LastIndex(d.SourceFile, "/"); idx >= 0 {
-		dir = d.SourceFile[:idx]
-	}
-	defs, err := s.backend.FindDefinitionsByFile(dir, d.SourceFile, 0)
-	if err != nil || len(defs) == 0 {
+	// #301: an earlier version of this inferred block membership from
+	// adjacent DB rows (same Kind + bare-spec body shape), which cannot
+	// distinguish two separate "const (...)" blocks of the same kind
+	// declared back-to-back -- a very ordinary Go pattern, not an edge
+	// case, confirmed to merge both blocks' names into one false family.
+	// Parsing the real file's AST and asking "which GenDecl actually
+	// encloses this line" is syntactically exact instead of inferred --
+	// a standalone `const X = 1` has Lparen invalid (no parens were
+	// written) and is correctly excluded without any separate body-shape
+	// check.
+	data, err := os.ReadFile(filepath.Join(s.projectDir, d.SourceFile))
+	if err != nil {
 		return nil
 	}
-	// defs is already ordered by start_line (FindDefinitionsByFile's own
-	// query). Locate d's position, then walk both directions while
-	// neighbors are same-kind, adjacent, AND themselves grouped specs.
-	idx := -1
-	for i, other := range defs {
-		if other.ID == d.ID {
-			idx = i
-			break
-		}
-	}
-	if idx < 0 {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, d.SourceFile, data, 0)
+	if err != nil {
 		return nil
 	}
-	// FindDefinitionsByFile doesn't select Body (a heavier column many
-	// bulk-listing callers don't need, and Signature is a synthesized
-	// "const X string"-shaped projection for EVERY const regardless of
-	// source form, so it can't substitute here) -- fetch each same-kind
-	// neighbor's real body individually by ID (not GetDefinitionByName,
-	// which does module-fuzzy/blast-radius tiebreaking on a bare name and
-	// could resolve to an unrelated same-named def elsewhere -- we already
-	// have the exact row's ID from FindDefinitionsByFile, no ambiguity
-	// needed) to check whether IT is also a grouped spec. A standalone
-	// same-kind declaration sitting directly adjacent to this block (e.g.
-	// `const Standalone = "x"` right after this block's closing paren)
-	// must stop the walk even though its Kind matches -- it isn't a
-	// member of THIS block. Block sizes are always small, so the extra
-	// lookups are cheap.
-	isSibling := func(cand store.Definition) bool {
-		if cand.Kind != d.Kind {
-			return false
+	wantTok := token.CONST
+	if d.Kind == "var" {
+		wantTok = token.VAR
+	}
+	for _, decl := range f.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != wantTok || !gen.Lparen.IsValid() {
+			continue
 		}
-		full, ferr := s.backend.GetDefinition(cand.ID)
-		if ferr != nil || full == nil {
-			return false
+		declStart := fset.Position(gen.Pos()).Line
+		declEnd := fset.Position(gen.End()).Line
+		if d.StartLine < declStart || d.StartLine > declEnd {
+			continue
 		}
-		return looksLikeGroupedSpecBody(full.Body)
+		var names []string
+		for _, spec := range gen.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for _, name := range vs.Names {
+				if name.Name == d.Name || name.Name == "_" {
+					continue
+				}
+				names = append(names, name.Name)
+			}
+		}
+		return names
 	}
-	var names []string
-	for i := idx - 1; i >= 0 && isSibling(defs[i]); i-- {
-		names = append([]string{defs[i].Name}, names...)
-	}
-	for i := idx + 1; i < len(defs) && isSibling(defs[i]); i++ {
-		names = append(names, defs[i].Name)
-	}
-	return names
+	return nil
 }
