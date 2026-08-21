@@ -27,6 +27,18 @@ own without also cutting call *count*, not just call size — richer
 per-call content only pays for itself when it replaces multiple cheaper
 calls, and the aggregate call counts here came out roughly even.
 
+**Status update (2026-08-21): all 4 of the above root causes are now fixed**
+— `truncateTestOutput` strips `=== RUN`/`=== PAUSE`/`=== CONT` unconditionally
+(not just above the size cap); the starter bundle's header truncates via
+`truncateForHeader`/`truncateList`; `read` with `line_range` and no `name`
+redirects to `op:"read-file"` instead of erroring blind; `emitAndBuildAgainst`
+now checks `ctx.Err() == context.DeadlineExceeded` and reports "BUILD TIMED
+OUT" distinctly from a real compile failure (test:
+`TestEmitAndBuildAgainst_TimeoutReportsTimedOutNotEmptyBuildFailed`). Don't
+re-investigate these four — if a future bench run still shows one of these
+symptoms, that's a regression in the fix, not an unfixed root cause; check
+the referenced function/test first before re-diagnosing from scratch.
+
 v10 sonnet re-run (2026-08-21, same 15-task Prometheus corpus, after 4 more
 targeted bug fixes) quantified where that call count actually goes, and it is
 NOT primarily an edit-batching problem: of arm_defn's 567 calls, edit-class
