@@ -502,7 +502,7 @@ type applyOp struct {
 	Index      int    `json:"index,omitempty"`                                                                                                                                                                                                                         // replace-slice / replace-hunk
 	New        string `json:"new,omitempty" jsonschema:"replace-slice/replace-hunk: replacement text. If multi-line, escape every literal newline as \\n and tab as \\t consistently -- do not mix raw and escaped control characters in the same JSON string value."` // replace-slice / replace-hunk
 	Old        string `json:"old,omitempty" jsonschema:"replace-hunk: text to match verbatim. If multi-line, escape every literal newline as \\n and tab as \\t consistently -- do not mix raw and escaped control characters in the same JSON string value."`         // replace-hunk
-	Force      bool   `json:"force,omitempty"`                                                                                                                                                                                                                         // replace-slice
+	Force      bool   `json:"force,omitempty"`                                                                                                                                                                                                                         // replace-slice / delete (skips the #105 caller-safety refusal)
 	DeferBody  string `json:"defer_body,omitempty"`                                                                                                                                                                                                                    // wrap-in-defer
 	StmtIndex  int    `json:"stmt_index,omitempty"`                                                                                                                                                                                                                    // wrap-in-defer
 	OldParam   string `json:"old_param,omitempty"`                                                                                                                                                                                                                     // rename-param
@@ -4165,6 +4165,23 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 					errors = append(errors, fmt.Sprintf("delete %s: not found", op.Name))
 				} else if msg := unsupportedFieldOp(d.Kind, "delete"); msg != "" {
 					errors = append(errors, fmt.Sprintf("delete %s: %s", op.Name, msg))
+				} else if !op.Force {
+					// #105 safe-delete, same check as the singleton handleDelete --
+					// this apply-batch path had NO caller-safety check at all,
+					// silently behaving as if force:true were always set.
+					if callers, cerr := s.backend.GetCallers(d.ID); cerr == nil && len(callers) > 0 {
+						var names []string
+						for i, c := range callers {
+							if i >= 8 {
+								names = append(names, fmt.Sprintf("… (%d more)", len(callers)-i))
+								break
+							}
+							names = append(names, formatReceiver(c.Receiver)+c.Name)
+						}
+						errors = append(errors, fmt.Sprintf("delete %s: refused — %d caller(s) still reference this def: %s. Rewrite or delete callers first, or pass force:true to delete anyway", op.Name, len(callers), strings.Join(names, ", ")))
+					} else {
+						sb.WriteString(fmt.Sprintf("- would delete %s\n", op.Name))
+					}
 				} else {
 					sb.WriteString(fmt.Sprintf("- would delete %s\n", op.Name))
 				}
@@ -4584,6 +4601,25 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			if msg := unsupportedFieldOp(d.Kind, "delete"); msg != "" {
 				errors = append(errors, fmt.Sprintf("delete %s: %s", op.Name, msg))
 				continue
+			}
+			if !op.Force {
+				// #105 safe-delete, same check as the singleton handleDelete --
+				// this apply-batch path had NO caller-safety check at all,
+				// silently behaving as if force:true were always set regardless
+				// of what the caller actually passed. A real trajectory could
+				// batch-delete a def with live callers with zero warning.
+				if callers, cerr := tx.GetCallers(d.ID); cerr == nil && len(callers) > 0 {
+					var names []string
+					for i, c := range callers {
+						if i >= 8 {
+							names = append(names, fmt.Sprintf("… (%d more)", len(callers)-i))
+							break
+						}
+						names = append(names, formatReceiver(c.Receiver)+c.Name)
+					}
+					errors = append(errors, fmt.Sprintf("delete %s: refused — %d caller(s) still reference this def: %s. Rewrite or delete callers first, or pass force:true to delete anyway", op.Name, len(callers), strings.Join(names, ", ")))
+					continue
+				}
 			}
 			if err := tx.DeleteDefinition(d.ID); err != nil {
 				errors = append(errors, fmt.Sprintf("delete %s: %v", op.Name, err))

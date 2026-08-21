@@ -12950,3 +12950,74 @@ func TestBodyScanResult_EmptyMentionsGoDocForExternalDeps(t *testing.T) {
 		t.Errorf("expected a `go doc` hint for external/third-party symbols; got %q", text)
 	}
 }
+
+// TestHandleApply_DeleteRefusesWhenCallersExist guards a real safety gap
+// found auditing the same silent-drop bug class as import_path/alias:
+// handleApply's "delete" case had NO #105 safe-delete check at all --
+// unlike the singleton handleDelete, it deleted unconditionally
+// regardless of live callers or the force field's value, silently
+// behaving as if force:true were always set.
+func TestHandleApply_DeleteRefusesWhenCallersExist(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	// Greet has a real caller (Farewell calls Greet) in setupTestDB's fixture.
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{{Op: "delete", Name: "Greet"}},
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "refused") || !strings.Contains(text, "Farewell") {
+		t.Fatalf("expected a caller-safety refusal naming Farewell, got: %s", text)
+	}
+
+	read, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "read", Name: "Greet"})
+	if strings.Contains(resultText(t, read), "not found") {
+		t.Errorf("Greet should still exist after the refused batch delete, got: %s", resultText(t, read))
+	}
+}
+
+func TestHandleApply_DeleteForceOverridesCallerSafety(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{{Op: "delete", Name: "Greet", Force: true}},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "refused") {
+		t.Fatalf("force:true should bypass the caller-safety refusal, got: %s", text)
+	}
+	// Greet's own caller (Farewell) still references it in source, so the
+	// batch legitimately fails to BUILD afterward (a genuine compile
+	// error, not the safety check this test targets) and rolls back --
+	// that's expected apply-batch semantics, not a regression in this fix.
+	if !strings.Contains(text, "undefined: Greet") {
+		t.Fatalf("expected the deletion to proceed past the safety check into a real build failure (Farewell still calls Greet), got: %s", text)
+	}
+}
+
+// TestHandleApply_DeleteDryRunRefusesWhenCallersExist is the dry-run
+// counterpart -- the preview loop had the same missing check, so
+// "- would delete Greet" never warned about Farewell's dependency.
+func TestHandleApply_DeleteDryRunRefusesWhenCallersExist(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		DryRun:     true,
+		Operations: []applyOp{{Op: "delete", Name: "Greet"}},
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "refused") || !strings.Contains(text, "Farewell") {
+		t.Fatalf("expected dry-run to also surface the caller-safety refusal naming Farewell, got: %s", text)
+	}
+	if strings.Contains(text, "would delete Greet") {
+		t.Errorf("dry-run should not claim it would delete Greet when refused, got: %s", text)
+	}
+}
