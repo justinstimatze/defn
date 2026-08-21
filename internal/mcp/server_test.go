@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -13376,5 +13377,145 @@ func TestHandleCode_StarterBundleDoesNotPoisonDedupHash(t *testing.T) {
 	secondText := resultText(t, second)
 	if !strings.Contains(secondText, "cached") {
 		t.Fatalf("expected an identical repeat read to hit the dedup stub, got: %s", secondText)
+	}
+}
+
+// TestHandleApply_RenameTypeUpdatesMethodReceiversAcrossFiles is the
+// apply-batched counterpart to TestHandleRename_TypeWithMethodsSplitAcrossFiles
+// -- handleApply's own "rename" case never had the #148-class
+// sibling-method-receiver fix ported to it, so an apply-batch rename of
+// any type with methods declared in other files left stale receiver
+// clauses behind. Since apply always builds when a file is touched,
+// those stale receivers are a compile error that rolls back the WHOLE
+// batch -- an apply-batch rename of any type with methods failed
+// unconditionally, where the singleton path succeeded correctly.
+func TestHandleApply_RenameTypeUpdatesMethodReceiversAcrossFiles(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "proj")
+	os.MkdirAll(filepath.Join(projDir, "splitm"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module proj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nimport \"proj/splitm\"\n\nfunc main() {\n\tw := splitm.Widget{N: 1}\n\t_ = w.MethodA()\n}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "splitm", "types.go"), []byte("package splitm\n\ntype Widget struct {\n\tN int\n}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "splitm", "a.go"), []byte("package splitm\n\nfunc (w *Widget) MethodA() int {\n\treturn w.N\n}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "splitm", "b.go"), []byte("package splitm\n\nfunc (w *Widget) MethodB() int {\n\treturn w.N * 2\n}\n"), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{{Op: "rename", Name: "Widget", NewName: "WidgetR0"}},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "rolled back") {
+		t.Fatalf("apply rename failed: %s", text)
+	}
+	if !strings.Contains(text, "method receiver") {
+		t.Errorf("expected the report to mention updating method receivers, got: %s", text)
+	}
+
+	for _, f := range []string{"a.go", "b.go"} {
+		src, err := os.ReadFile(filepath.Join(projDir, "splitm", f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(src), "Widget)") && !strings.Contains(string(src), "WidgetR0)") {
+			t.Errorf("%s still has a stale receiver clause after apply rename:\n%s", f, src)
+		}
+		if !strings.Contains(string(src), "WidgetR0") {
+			t.Errorf("%s missing the renamed receiver:\n%s", f, src)
+		}
+	}
+
+	cmd := exec.Command("go", "build", "./...")
+	cmd.Dir = projDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build ./... failed after apply rename:\n%s", out)
+	}
+}
+
+// TestHandleApply_RenameQualifiedOldNameActuallyRewritesBodyAndCallers
+// guards #305: handleApply's rename case used op.Name (which may be the
+// receiver-qualified "(*T).Method" form resolveApplyTarget/
+// GetDefinitionByName accept) directly in astRename calls instead of
+// the resolved bare d.Name -- astRename never matches a real *ast.Ident
+// against that qualified string, so the def's own body and every
+// caller's body silently kept the OLD identifier even though
+// RenameDefinition updated the DB's Name column to the new one. Same
+// bug class handleRename's own oldBareName fix guards against.
+func TestHandleApply_RenameQualifiedOldNameActuallyRewritesBodyAndCallers(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "qualproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module qualproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package qualproj
+
+type Widget struct{ N int }
+
+func (w *Widget) OldMethod() int {
+	return w.N
+}
+
+func Use(w *Widget) int {
+	return w.OldMethod()
+}
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	// Qualified "(*Widget).OldMethod" form, no receiver: set separately --
+	// resolveApplyTarget/GetDefinitionByName accept this convention.
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{{Op: "rename", Name: "(*Widget).OldMethod", NewName: "NewMethod"}},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "rolled back") {
+		t.Fatalf("apply rename failed: %s", text)
+	}
+
+	src, err := os.ReadFile(filepath.Join(projDir, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(src)
+	if strings.Contains(got, "OldMethod") {
+		t.Errorf("OldMethod should be fully renamed (def body + caller), got:\n%s", got)
+	}
+	if !strings.Contains(got, "func (w *Widget) NewMethod() int") || !strings.Contains(got, "w.NewMethod()") {
+		t.Errorf("expected both the method decl and its caller to use NewMethod, got:\n%s", got)
+	}
+
+	cmd := exec.Command("go", "build", "./...")
+	cmd.Dir = projDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build ./... failed after apply rename:\n%s", out)
 	}
 }

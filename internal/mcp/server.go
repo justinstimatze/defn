@@ -4702,6 +4702,14 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				errors = append(errors, fmt.Sprintf("rename %s: not found", op.Name))
 				continue
 			}
+			// #305: oldBareName, not op.Name -- op.Name may be the
+			// receiver-qualified "(*T).method" form that resolveApplyTarget/
+			// GetDefinitionByName accept but that never matches a real
+			// *ast.Ident in a body. Using op.Name directly here silently
+			// no-oped every astRename call below while RenameDefinition
+			// still updated the DB's Name column -- same bug class as
+			// handleRename's own oldBareName fix, see its comment.
+			oldBareName := d.Name
 			// Struct fields are excluded from emit by design (#11) -- the
 			// enclosing TYPE's own Body (a separate row) is what's really
 			// emitted, so it has to be rewritten too, via renameFieldInType
@@ -4743,7 +4751,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			qualifiedOld := emit.FuncIdentity(d.Name, d.Receiver)
 			allowedRemovals = append(allowedRemovals, qualifiedOld)
 			addTouched(d.SourceFile)
-			newBody, _ := astRename(d.Body, op.Name, op.NewName)
+			newBody, _ := astRename(d.Body, oldBareName, op.NewName)
 			newSig := extractSignature(newBody)
 			exported := len(op.NewName) > 0 && op.NewName[0] >= 'A' && op.NewName[0] <= 'Z'
 			// RenameDefinition updates BY ID, preserving row identity --
@@ -4772,8 +4780,8 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			callers, _ := tx.GetCallers(d.ID)
 			callerCount := 0
 			for _, caller := range callers {
-				if strings.Contains(caller.Body, op.Name) {
-					caller.Body, _ = astRename(caller.Body, op.Name, op.NewName)
+				if strings.Contains(caller.Body, oldBareName) {
+					caller.Body, _ = astRename(caller.Body, oldBareName, op.NewName)
 					caller.Signature = extractSignature(caller.Body)
 					if _, err := tx.UpsertDefinition(&caller); err != nil {
 						errors = append(errors, fmt.Sprintf("rename caller %s: %v", caller.Name, err))
@@ -4783,11 +4791,57 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 					}
 				}
 			}
+			// #305: a type's methods are declared elsewhere as their OWN
+			// top-level definitions with the type name stored as a
+			// free-text Receiver string ("*Widget"), not as a refs-graph
+			// edge into the type's def -- GetCallers above never surfaces
+			// them. Renaming the type without also rewriting every
+			// method's receiver clause left them pointing at a type name
+			// that no longer existed, in a file this op never even
+			// touched -- and since apply always builds when any file is
+			// touched, this made an apply-batch rename of any type WITH
+			// methods unconditionally fail (the stale receivers are a
+			// compile error, rolling back the whole batch). Ported from
+			// handleRename's identical fix, see its comment for the full
+			// story -- singleton and apply are meant to be the same
+			// operation and had silently diverged.
+			updatedReceivers := 0
+			if d.Kind == "type" {
+				siblings, sErr := tx.GetModuleDefinitions(d.ModuleID)
+				if sErr == nil {
+					for _, m := range siblings {
+						if m.Kind != "method" || m.ID == d.ID {
+							continue
+						}
+						if strings.TrimPrefix(m.Receiver, "*") != oldBareName {
+							continue
+						}
+						oldRecv := m.Receiver
+						newRecv := op.NewName
+						if strings.HasPrefix(oldRecv, "*") {
+							newRecv = "*" + op.NewName
+						}
+						newMethodBody, _ := astRename(m.Body, oldBareName, op.NewName)
+						newMethodSig := extractSignature(newMethodBody)
+						if err := tx.UpdateDefinitionReceiver(m.ID, newRecv, newMethodBody, newMethodSig); err != nil {
+							errors = append(errors, fmt.Sprintf("rename %s: update method %s%s receiver: %v", op.Name, oldRecv, m.Name, err))
+							continue
+						}
+						allowedRemovals = append(allowedRemovals, emit.FuncIdentity(m.Name, oldRecv))
+						allowedAdds = append(allowedAdds, emit.FuncIdentity(m.Name, newRecv))
+						addTouched(m.SourceFile)
+						updatedReceivers++
+					}
+				}
+			}
 			// #109: rename is ID-preserving semantic transform — refs edges
 			// unchanged. Skip adding to resolveSet.
-			if parentType != nil {
+			switch {
+			case parentType != nil:
 				sb.WriteString(fmt.Sprintf("→ renamed %s → %s (struct declaration + %d callers updated)\n", op.Name, op.NewName, callerCount))
-			} else {
+			case updatedReceivers > 0:
+				sb.WriteString(fmt.Sprintf("→ renamed %s → %s (%d callers, %d method receiver(s) updated)\n", op.Name, op.NewName, callerCount, updatedReceivers))
+			default:
 				sb.WriteString(fmt.Sprintf("→ renamed %s → %s (%d callers updated)\n", op.Name, op.NewName, callerCount))
 			}
 
