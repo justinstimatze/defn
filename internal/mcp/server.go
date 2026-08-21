@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.87"
+const Version = "0.26.88"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -2110,7 +2110,7 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 	if queryHint != "" {
 		sb.WriteString(queryHint)
 	}
-	if d.Doc != "" {
+	if d.Doc != "" && !bodyAlreadyShowsDoc(d.Doc, body) {
 		sb.WriteString(d.Doc + "\n\n")
 	}
 	sb.WriteString("```go\n")
@@ -7001,7 +7001,7 @@ func (s *server) renderExpandSection(sb *strings.Builder, d *store.Definition, m
 
 	if want["body"] {
 		sb.WriteString("### body\n")
-		if d.Doc != "" {
+		if d.Doc != "" && !bodyAlreadyShowsDoc(d.Doc, d.Body) {
 			sb.WriteString(d.Doc + "\n\n")
 		}
 		sb.WriteString("```go\n")

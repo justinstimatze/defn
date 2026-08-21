@@ -152,3 +152,53 @@ func TestPrioritizeByBodyReference_OrdersReferencedByBodyPositionNotAlphabetical
 		t.Fatalf("expected body-position order (ZzzCalledFirst, AaaCalledLast) despite reverse alphabetical order, got: %s, %s", got[0].Name, got[1].Name)
 	}
 }
+
+// TestBodyAlreadyShowsDoc locks in the exact-match safety property:
+// only skip the redundant doc echo when body's leading comment
+// reconstructs doc byte-for-byte after stripping "// " markers.
+func TestBodyAlreadyShowsDoc(t *testing.T) {
+	cases := []struct {
+		name string
+		doc  string
+		body string
+		want bool
+	}{
+		{
+			name: "exact match, single line",
+			doc:  "Widget does a thing.",
+			body: "// Widget does a thing.\nfunc Widget() {}",
+			want: true,
+		},
+		{
+			name: "exact match, multi-line",
+			doc:  "Widget does a thing.\nAnd another thing.",
+			body: "// Widget does a thing.\n// And another thing.\nfunc Widget() {}",
+			want: true,
+		},
+		{
+			name: "body has no comment at all",
+			doc:  "Widget does a thing.",
+			body: "func Widget() {}",
+			want: false,
+		},
+		{
+			name: "doc differs from body's comment",
+			doc:  "Widget does a thing, edited separately.",
+			body: "// Widget does a thing.\nfunc Widget() {}",
+			want: false,
+		},
+		{
+			name: "empty doc never matches",
+			doc:  "",
+			body: "// Widget does a thing.\nfunc Widget() {}",
+			want: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := bodyAlreadyShowsDoc(c.doc, c.body); got != c.want {
+				t.Errorf("bodyAlreadyShowsDoc(%q, %q) = %v, want %v", c.doc, c.body, got, c.want)
+			}
+		})
+	}
+}

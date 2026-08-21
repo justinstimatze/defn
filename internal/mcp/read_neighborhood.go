@@ -220,3 +220,39 @@ func firstCallPosition(body, name string) (int, bool) {
 		start = idx + 1
 	}
 }
+
+// bodyAlreadyShowsDoc reports whether doc's text is already visible
+// inside body -- true when body's own leading "// "-prefixed comment
+// lines, stripped of their comment markers, exactly reconstruct doc.
+// defn's body span includes a definition's own doc comment as literal
+// source (round-trip losslessness), so a render that shows both `doc`
+// as separate prose AND the raw body right after it duplicates the
+// same text verbatim -- confirmed on a real prometheus-19338
+// trajectory (auto-batched expand, but the same body-render helper is
+// shared with an explicit expand(include:["body"]) call): every
+// entry's doc appeared once as prose, then again inside the ```go
+// block as its own leading comment.
+//
+// Deliberately an EXACT match, not a fuzzy substring test -- this only
+// skips the redundant prose echo when the two are PROVABLY identical
+// after normalizing away comment markers and whitespace. Any
+// discrepancy (edited doc, unusual formatting, a body span that
+// doesn't include the comment for some kind) falls back to showing
+// doc separately, same as before this existed -- never lossy, only a
+// missed optimization in the uncommon case.
+func bodyAlreadyShowsDoc(doc, body string) bool {
+	doc = strings.TrimSpace(doc)
+	if doc == "" {
+		return false
+	}
+	var stripped []string
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "//") {
+			break
+		}
+		stripped = append(stripped, strings.TrimSpace(strings.TrimPrefix(trimmed, "//")))
+	}
+	reconstructed := strings.TrimSpace(strings.Join(stripped, "\n"))
+	return reconstructed == doc
+}

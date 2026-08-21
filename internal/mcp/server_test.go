@@ -12589,3 +12589,44 @@ type Config struct {
 		}
 	}
 }
+
+// TestHandleGetDefinition_DoesNotDuplicateDocAlreadyInBody guards the
+// #313 fix: a definition's doc comment is part of its own body span
+// (round-trip losslessness), so showing d.Doc as separate prose AND
+// the raw body right after it duplicated the same text verbatim.
+// Confirmed on a real prometheus-19338 trajectory across every
+// full-body read/expand call in the corpus.
+func TestHandleGetDefinition_DoesNotDuplicateDocAlreadyInBody(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	body := `package main
+
+// Widget does a thing, verified by callers.
+func Widget() string { return "widget" }
+`
+	if err := os.WriteFile(filepath.Join(projDir, "widget.go"), []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ingest.IngestFile(db, projDir, filepath.Join(projDir, "widget.go")); err != nil {
+		t.Fatal("ingest widget.go:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	result, _, err := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Widget"})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	text := resultText(t, result)
+
+	if strings.Count(text, "Widget does a thing, verified by callers.") != 1 {
+		t.Errorf("expected the doc text to appear exactly once (in the body's own comment), got %d times in:\n%s",
+			strings.Count(text, "Widget does a thing, verified by callers."), text)
+	}
+	if !strings.Contains(text, "// Widget does a thing") {
+		t.Errorf("expected the doc comment still visible inside the code block, got:\n%s", text)
+	}
+}
