@@ -12391,3 +12391,149 @@ func TestHandleGetDefinition_ExplicitSummaryModeReturnsSummary(t *testing.T) {
 		t.Errorf("expected a bare read to return the full body (summary is opt-in only), got:\n%s", bareText)
 	}
 }
+
+// TestHandleTestByName_AlternationOfSamePackageTestsNarrowsScope guards
+// the #313 fix: test:"TestA|TestB" already resolved each segment to a
+// source file for emit-scoping purposes, but never used that
+// resolution to narrow the actual `go test` target -- it stayed
+// "./..." even when every resolved test lived in the same package.
+// Confirmed via a real prometheus-19017 trajectory (four alternated
+// test names, all in promql/, still ran across the whole repo).
+func TestHandleTestByName_AlternationOfSamePackageTestsNarrowsScope(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "alpha"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "alpha.go"), []byte(`package alpha
+
+func Widget() bool { return true }
+func Gadget() bool { return true }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "alpha_test.go"), []byte(`package alpha
+
+import "testing"
+
+func TestWidget(t *testing.T) {
+	if !Widget() {
+		t.Fatal("false")
+	}
+}
+
+func TestGadget(t *testing.T) {
+	if !Gadget() {
+		t.Fatal("false")
+	}
+}
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+
+	result, _, err := s.handleTestByName(context.Background(), nil, "TestWidget|TestGadget", "", "")
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "./alpha/...") {
+		t.Errorf("expected the go test target to narrow to ./alpha/... since both alternated tests live there, got: %s", text)
+	}
+	if strings.Contains(text, "across ./...") {
+		t.Errorf("expected scoping to avoid the whole-repo ./... fallback, got: %s", text)
+	}
+	if !strings.Contains(text, "ALL TESTS PASSED") {
+		t.Errorf("expected both tests to pass, got: %s", text)
+	}
+}
+
+// TestHandleTestByName_SubtestPatternInfersScopeFromTopLevelName guards
+// the #313 fix: test:"TestWidget/some_subtest" (Go's -run syntax for
+// targeting a t.Run subtest) failed testNamePattern's bare-identifier
+// match (contains "/") and fell straight to the "./..." whole-repo
+// scope even though "TestWidget" alone is a real, resolvable top-level
+// test -- confirmed via a real prometheus-19017 trajectory
+// (test:"TestEvaluations/testdata/start_timestamps.test").
+func TestHandleTestByName_SubtestPatternInfersScopeFromTopLevelName(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "alpha"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "alpha.go"), []byte(`package alpha
+
+func Widget() bool { return true }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "alpha", "alpha_test.go"), []byte(`package alpha
+
+import "testing"
+
+func TestWidget(t *testing.T) {
+	t.Run("some_subtest", func(t *testing.T) {
+		if !Widget() {
+			t.Fatal("false")
+		}
+	})
+}
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+
+	result, _, err := s.handleTestByName(context.Background(), nil, "TestWidget/some_subtest", "", "")
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "./alpha/...") {
+		t.Errorf("expected the go test target to be inferred as ./alpha/... from the subtest's top-level name, got: %s", text)
+	}
+	if !strings.Contains(text, "ALL TESTS PASSED") {
+		t.Errorf("expected the subtest to pass, got: %s", text)
+	}
+}
+
+func TestTruncateTestOutput_CollapsesNoTestsToRunEvenWhenItFillsTheHead(t *testing.T) {
+	var out strings.Builder
+	for i := 0; i < 100; i++ {
+		out.WriteString("testing: warning: no tests to run\n")
+		out.WriteString("PASS\n")
+		out.WriteString(fmt.Sprintf("ok  \tgithub.com/example/pkg%d\t0.010s [no tests to run]\n", i))
+	}
+	out.WriteString("=== RUN   TestReal\n--- PASS: TestReal (0.00s)\nPASS\nok  \tgithub.com/example/real\t0.020s\n")
+	if len(out.String()) <= testOutputCap {
+		t.Fatalf("test fixture must exceed testOutputCap (%d) to exercise truncation; got %d bytes", testOutputCap, len(out.String()))
+	}
+
+	got := truncateTestOutput(out.String())
+	if !strings.Contains(got, "TestReal") {
+		t.Errorf("expected the real test's own output to survive truncation despite 100 leading noise blocks, got:\n%s", got)
+	}
+	if !strings.Contains(got, "100 other package(s) matched nothing") {
+		t.Errorf("expected the noise blocks collapsed into a single count, got:\n%s", got)
+	}
+	if strings.Count(got, "no tests to run") > 1 {
+		t.Errorf("expected \"no tests to run\" to appear at most once (in the collapsed summary), got %d times in:\n%s", strings.Count(got, "no tests to run"), got)
+	}
+}

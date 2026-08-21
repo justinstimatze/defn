@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.85"
+const Version = "0.26.86"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -5472,7 +5472,7 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 	// need one target string, it just needs the union of files that
 	// might be stale, so it can stay scoped even when target can't.
 	var emitHints []string
-	if hint == "" && testNamePattern.MatchString(pattern) {
+	if top := topLevelTestName(pattern); hint == "" && top != "" {
 		// No explicit scope, but pattern is very often the literal test
 		// name being targeted (the documented, common case: reproduce an
 		// issue's named failing test in one call). Real trajectory
@@ -5489,9 +5489,9 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 		// actually edited. ambiguityNote discloses the tiebreak below
 		// instead of staying silent about it, same precedent as #248's
 		// read/outline fix.
-		if d, err := s.backend.GetDefinitionByName(pattern, ""); err == nil && d != nil {
+		if d, err := s.backend.GetDefinitionByName(top, ""); err == nil && d != nil {
 			hint = d.SourceFile
-			ambiguityMsg = s.ambiguityNote(pattern, "", "", "")
+			ambiguityMsg = s.ambiguityNote(top, "", "", "")
 		} else {
 			// pattern looks like a literal test name (no regex
 			// metachars) and matches NO definition anywhere in the
@@ -5504,9 +5504,13 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 			// 120.8s running -run "TestTargetScraper" across the whole
 			// repo only to report "no tests to run" -- that name was
 			// never a real function anywhere in the codebase.
+			subject := pattern
+			if top != pattern {
+				subject = fmt.Sprintf("%s (top-level name of %q)", top, pattern)
+			}
 			return textResult(fmt.Sprintf(
-				"No test named %q found anywhere in the project's index -- go test's -run only matches real function names, so no scope could match this either. If you just created it, run code(op:\"sync\") first; otherwise check the spelling.",
-				pattern,
+				"No test named %s found anywhere in the project's index -- go test's -run only matches real function names, so no scope could match this either. If you just created it, run code(op:\"sync\") first; otherwise check the spelling.",
+				subject,
 			)), nil, nil
 		}
 	} else if hint == "" {
@@ -5527,11 +5531,12 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 		allResolved := true
 		for _, seg := range strings.Split(pattern, "|") {
 			seg = strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(seg), "^"), "$")
-			if !testNamePattern.MatchString(seg) {
+			top := topLevelTestName(seg)
+			if top == "" {
 				allResolved = false
 				break
 			}
-			d, err := s.backend.GetDefinitionByName(seg, "")
+			d, err := s.backend.GetDefinitionByName(top, "")
 			if err != nil || d == nil || d.SourceFile == "" {
 				allResolved = false
 				break
@@ -5540,6 +5545,30 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 		}
 		if !allResolved {
 			emitHints = nil
+		} else if len(emitHints) > 0 {
+			// #313: every segment resolved to a real test, and emitHints
+			// already carries their source files for emit-scoping -- the
+			// common real shape (verifying several just-created/edited
+			// tests together) has them all in ONE package, so the actual
+			// `go test` invocation can be scoped the same way instead of
+			// falling back to "./..." unconditionally. Confirmed via a real
+			// prometheus-19017 trajectory: test:"A|B|C|D" for four tests
+			// all living in promql/ still ran `go test ./...`, printing a
+			// "no tests to run" line for every unrelated package in the
+			// repo. Only narrow when every hint's own testScopeTarget
+			// agrees on a single directory; a genuine cross-package
+			// alternation (rarer) still gets the safe "./..." fallback.
+			scopeSet := map[string]bool{}
+			for _, h := range emitHints {
+				scopeSet[s.testScopeTarget(h)] = true
+			}
+			if len(scopeSet) == 1 {
+				for scope := range scopeSet {
+					if scope != "./..." {
+						hint = emitHints[0]
+					}
+				}
+			}
 		}
 	}
 	target := s.testScopeTarget(hint)
@@ -5746,17 +5775,47 @@ func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args n
 const testOutputCap = 6000
 
 // truncateTestOutput compresses `go test -v` output that exceeds the cap.
-// Preserves head (first N lines — first failure's context), all `--- FAIL:`
-// lines (which subtests broke), all package-level `FAIL`/`ok` lines (which
-// packages ran), and tail (last N lines — summary). Emits a marker showing
-// how many lines were dropped so the model can widen the search if needed.
+// Preserves head (first N lines of SUBSTANTIVE output — first failure's
+// context), all `--- FAIL:` lines (which subtests broke), package-level
+// `FAIL`/`ok` lines, and tail (last N lines — summary).
+//
+// "no tests to run" lines (the 3-line "testing: warning: no tests to
+// run" / "PASS" / "ok ... [no tests to run]" block Go prints for every
+// package a `-run` pattern doesn't match) are filtered out BEFORE head/
+// tail windowing, not just from the middle band -- confirmed via a real
+// prometheus-19017 trajectory where a whole-repo `./...` scope printed
+// 40+ of these blocks, alphabetically BEFORE the actually-relevant
+// package (many repo package names sort earlier than the target), so
+// the raw first-40-lines head was 100% noise with zero of the actual
+// test's own output visible even after "truncation". Collapsed into a
+// single count instead of enumerated or silently eaten by the window.
 func truncateTestOutput(out string) string {
 	if len(out) <= testOutputCap {
 		return out
 	}
-	lines := strings.Split(out, "\n")
+	rawLines := strings.Split(out, "\n")
+
+	var lines []string
+	noTestsToRun := 0
+	for i := 0; i < len(rawLines); i++ {
+		t := strings.TrimSpace(rawLines[i])
+		if t == "testing: warning: no tests to run" &&
+			i+2 < len(rawLines) &&
+			strings.TrimSpace(rawLines[i+1]) == "PASS" &&
+			strings.HasSuffix(strings.TrimSpace(rawLines[i+2]), "[no tests to run]") {
+			noTestsToRun++
+			i += 2
+			continue
+		}
+		lines = append(lines, rawLines[i])
+	}
+
 	const headN, tailN = 40, 20
 	if len(lines) <= headN+tailN {
+		out := strings.Join(lines, "\n")
+		if noTestsToRun > 0 {
+			out += fmt.Sprintf("\n(%d other package(s) matched nothing -- \"no tests to run\", omitted)\n", noTestsToRun)
+		}
 		return out
 	}
 	head := lines[:headN]
@@ -5793,6 +5852,9 @@ func truncateTestOutput(out string) string {
 		sb.WriteString("\n")
 		sb.WriteString(strings.Join(pkgResults, "\n"))
 		sb.WriteString("\n")
+	}
+	if noTestsToRun > 0 {
+		sb.WriteString(fmt.Sprintf("\n(%d other package(s) matched nothing -- \"no tests to run\", omitted)\n", noTestsToRun))
 	}
 	sb.WriteString("\n... [tail] ...\n")
 	sb.WriteString(strings.Join(tail, "\n"))
@@ -10862,4 +10924,27 @@ func (s *server) renderAutoOutlineCompact(d *store.Definition, modulePath string
 	sb.WriteString(fmt.Sprintf("Callers: %d (%d production, %d test)\n", len(callers), prodCallers, testCallers))
 	sb.WriteString(fmt.Sprintf("Callees: %d (pass op:\"outline\" for names, or op:\"expand\" for names + flow)\n", len(callees)))
 	return sb.String()
+}
+
+// topLevelTestName strips a "/subtest/path" suffix from a `-run`
+// pattern segment (Go's -run supports "TestName/subtest" to target a
+// t.Run subtest) and returns the top-level test function name, so it
+// can be resolved via GetDefinitionByName the same way a bare name is
+// -- the subtest path itself was never a real top-level definition,
+// only the function before the first "/" is. Empty if what's left
+// isn't a bare identifier (testNamePattern).
+//
+// Confirmed via a real prometheus-19017 trajectory: test:
+// "TestEvaluations/testdata/start_timestamps.test" failed
+// testNamePattern's full-string match (contains "/" and ".") and fell
+// straight to the "./..."  whole-repo scope, even though
+// "TestEvaluations" alone is a real, resolvable top-level test.
+func topLevelTestName(seg string) string {
+	if idx := strings.Index(seg, "/"); idx != -1 {
+		seg = seg[:idx]
+	}
+	if !testNamePattern.MatchString(seg) {
+		return ""
+	}
+	return seg
 }
