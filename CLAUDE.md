@@ -1,13 +1,31 @@
 # defn — Claude Code Instructions
 
-## Product rule — parity is the floor
+## Product rule — beat native significantly, parity is only the floor
 
-**Every defn feature must be at least as efficient as not-using-defn** on total
-weighted session cost (tokens + wall-clock). Measure vs the *real* native
-baseline (AST splice + `go build .`, not `go build ./...`), not vs
-defn-on-defn benches. Perf work is judged by real-workload numbers, not
-synthetic sweep curves — ask winze (or another external user) to run
-their shape before claiming a win.
+**Every defn feature must be meaningfully cheaper than not-using-defn** on
+total weighted session cost (tokens + wall-clock) — matching native is not
+good enough to ship, it's the minimum bar below which a feature is a
+regression. Measure vs the *real* native baseline (AST splice + `go build .`,
+not `go build ./...`), not vs defn-on-defn benches. Perf work is judged by
+real-workload numbers, not synthetic sweep curves — ask winze (or another
+external user) to run their shape before claiming a win.
+
+v8 head-to-head (2026-08-20, 15-task Prometheus corpus) found defn losing on
+both axes it's supposed to win: 14.4% more expensive per task than files-mode
+(worse than v7's 3.9% gap), and triggering the Go toolchain (build/test) 82%
+more often (178 vs 98 invocations, +5.3/task average, consistent in 14/15
+tasks) — every edit-class op auto-emits+builds, where a files-mode agent
+batches edits and checks on its own schedule. Confirmed root causes so far:
+`test` op returns unfiltered `-v` PASS/RUN noise below its 6KB summarization
+cap (66% pure noise); the one-shot starter bundle echoes the full captured
+question back into its own header; `read` rejects `line_range` and forces a
+retry (hit in 40% of tasks); a build-timeout is misreported as an empty
+"BUILD FAILED:" indistinguishable from a real compile error (the same
+`ctx.Err() == context.DeadlineExceeded` handling `handleTest` already has is
+missing from `emitAndBuildAgainst`/`runBuildIn`). None of this closes on its
+own without also cutting call *count*, not just call size — richer
+per-call content only pays for itself when it replaces multiple cheaper
+calls, and the aggregate call counts here came out roughly even.
 
 ## Code Navigation and Editing
 

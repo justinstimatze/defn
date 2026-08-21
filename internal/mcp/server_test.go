@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/justinstimatze/defn/internal/emit"
 	"github.com/justinstimatze/defn/internal/goload"
 	"github.com/justinstimatze/defn/internal/ingest"
 	"github.com/justinstimatze/defn/internal/planformat"
@@ -2563,10 +2564,12 @@ func RunB(x int) int {
 }
 
 func TestTruncateTestOutput(t *testing.T) {
-	// Small output passes through untouched.
+	// Small output has RUN-announcement noise stripped but keeps
+	// --- PASS/summary lines (which still name which test ran).
 	small := "=== RUN   TestFoo\n--- PASS: TestFoo (0.00s)\nPASS\nok  \tpkg\t0.001s\n"
-	if got := truncateTestOutput(small); got != small {
-		t.Errorf("small output should pass through; got altered")
+	wantSmall := "--- PASS: TestFoo (0.00s)\nPASS\nok  \tpkg\t0.001s\n"
+	if got := truncateTestOutput(small); got != wantSmall {
+		t.Errorf("small output should have RUN-line noise stripped; got %q, want %q", got, wantSmall)
 	}
 
 	// Large output gets summarized: head + failures preserved, middle dropped.
@@ -2597,8 +2600,12 @@ func TestTruncateTestOutput(t *testing.T) {
 	}
 
 	// All-pass large output still gets summarized but marker says no failures.
+	// 400 iterations, not 200: the RUN lines are stripped unconditionally
+	// now, so 200 --- PASS lines alone (~5.8KB) would land under
+	// testOutputCap and skip windowing entirely -- this needs to stay
+	// above the cap to keep exercising the windowed-summary path.
 	var allPass strings.Builder
-	for i := 0; i < 200; i++ {
+	for i := 0; i < 400; i++ {
 		allPass.WriteString(fmt.Sprintf("=== RUN   TestFoo_%d\n--- PASS: TestFoo_%d (0.00s)\n", i, i))
 	}
 	allPass.WriteString("PASS\nok  \tpkg\t0.500s\n")
@@ -12628,5 +12635,74 @@ func Widget() string { return "widget" }
 	}
 	if !strings.Contains(text, "// Widget does a thing") {
 		t.Errorf("expected the doc comment still visible inside the code block, got:\n%s", text)
+	}
+}
+
+// TestHandleCode_ReadWithLineRangeNoNameSuggestsReadFile guards a real
+// bench finding: an agent tried op:"read", file:, line_range: with no
+// name (wanting a line-range slice of a file, not one specific def) and
+// got the generic "use op:\"overview\"" suggestion, which doesn't support
+// line ranges -- a wasted retry, hit in 6 of 15 tasks in a real v8
+// head-to-head run. read-file already supports exactly this; the error
+// should point there instead.
+func TestHandleCode_ReadWithLineRangeNoNameSuggestsReadFile(t *testing.T) {
+	s := &server{backend: nil}
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op:        "read",
+		File:      "promql/query_logger.go",
+		LineRange: "25-50",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, `op:"read-file"`) {
+		t.Errorf("expected a pointer to op:\"read-file\", got: %s", text)
+	}
+	if !strings.Contains(text, "promql/query_logger.go") || !strings.Contains(text, "25-50") {
+		t.Errorf("expected the file and line_range echoed back, got: %s", text)
+	}
+}
+
+// TestEmitAndBuildAgainst_TimeoutReportsTimedOutNotEmptyBuildFailed guards
+// the fix for a real v8 bench finding: a build killed by buildTimeout
+// returned an empty "BUILD FAILED:\n" with no diagnostic (out hadn't been
+// written yet when the process was killed) -- indistinguishable from a
+// real compile error, so the agent had no way to tell "this is slow" from
+// "your edit is wrong" and burned repeated blind retries on the same edit
+// (confirmed on a real prometheus-18712 trajectory: 3 empty BUILD FAILED
+// messages in a row on cmd/prometheus/main.go). Mirrors
+// TestHandleTestByName_GenuineTimeoutStillReportsTimedOut's pattern of
+// overriding the package-level timeout var to force a fast, deterministic
+// repro instead of relying on a genuinely slow build.
+func TestEmitAndBuildAgainst_TimeoutReportsTimedOutNotEmptyBuildFailed(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+
+	orig := buildTimeout
+	buildTimeout = 1 * time.Nanosecond
+	t.Cleanup(func() { buildTimeout = orig })
+
+	got := s.emitAndBuildAgainst(db, emit.Opts{TouchedFiles: []string{"main.go"}})
+	if strings.Contains(got, "BUILD FAILED:\n\n") || strings.Contains(got, "BUILD FAILED:\n\n\n") {
+		t.Errorf("expected the timeout to be distinguished from an empty BUILD FAILED, got:\n%q", got)
+	}
+	if !strings.Contains(got, "BUILD TIMED OUT") {
+		t.Errorf("expected a killed-by-deadline build to report BUILD TIMED OUT, got:\n%q", got)
+	}
+	if !strings.Contains(got, "DEFN_BUILD_TIMEOUT") {
+		t.Errorf("expected the timeout message to point at DEFN_BUILD_TIMEOUT, got:\n%q", got)
 	}
 }

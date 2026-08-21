@@ -878,6 +878,22 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 			if s.reach != nil {
 				s.reach.invalidate()
 			}
+			// v8 bench finding: an individual apply-batchable write call
+			// auto-emits+builds regardless of whether it succeeds, so the
+			// nudge toward batching fires here -- before the error/nil
+			// early-return just below -- rather than being gated on
+			// success like the dedup/markBodyServed bookkeeping is.
+			if req != nil && s.respCache != nil {
+				s.respCache.mu.Lock()
+				sc := s.respCache.getSession(req.Session)
+				note := s.writeBatchNudge(sc, args.Op)
+				s.respCache.mu.Unlock()
+				if note != "" && result != nil && len(result.Content) > 0 {
+					if tc, ok := result.Content[0].(*sdkmcp.TextContent); ok {
+						tc.Text += note
+					}
+				}
+			}
 		}
 		if err != nil || result == nil || result.IsError {
 			return
@@ -925,6 +941,17 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	switch args.Op {
 	case "read", "outline", "impact", "similar":
 		if strings.TrimSpace(args.Name) == "" {
+			// A real bench pattern (hit in 6/15 tasks of a v8 head-to-head
+			// run): an agent wants a line-range slice of a file and reaches
+			// for read(file:, line_range:) with no name -- read-file
+			// already supports exactly this, but the generic "use
+			// op:overview" suggestion below doesn't mention it, so the
+			// agent burns a retry finding it by trial and error. Only
+			// applies to "read" -- outline/impact/similar have no
+			// line_range-driven use case to redirect.
+			if args.Op == "read" && strings.TrimSpace(args.LineRange) != "" && strings.TrimSpace(args.File) != "" {
+				return errResult(fmt.Errorf("read: name is required for a single definition — for a line-range slice of a whole file with no specific def in mind, use op:\"read-file\", file:%q, line_range:%q instead", args.File, args.LineRange))
+			}
 			if strings.TrimSpace(args.File) != "" {
 				return errResult(fmt.Errorf("%s: name is required — pass name:\"<def>\" for one definition, or use op:\"overview\", file:%q to see every def in that file", args.Op, args.File))
 			}
@@ -3149,8 +3176,23 @@ func (s *server) emitAndBuildAgainst(backend store.Backend, opts emit.Opts) stri
 		if sb.Len() > 0 {
 			sb.WriteString("\n\n")
 		}
-		sb.WriteString(fmt.Sprintf("BUILD FAILED:\n%s", out))
-		sb.WriteString(s.suggestMissingImportFixes(out))
+		// A killed-by-deadline build reports the exact same non-nil err as
+		// a real compile failure, but `out` is often empty -- the compiler
+		// hadn't printed anything yet when it was killed. Left
+		// undistinguished, this looked identical to "your edit broke the
+		// build" with zero diagnostic to act on, so the only recourse was
+		// blind retry (confirmed on a real prometheus-18712 trajectory:
+		// the same edit to cmd/prometheus/main.go -- the single most
+		// dependency-heavy package in the repo -- hit this 3 times in a
+		// row). handleTest already makes this exact distinction for its
+		// own ctx.Err() == DeadlineExceeded case; the build path never got
+		// the same treatment.
+		if ctx.Err() == context.DeadlineExceeded {
+			sb.WriteString(fmt.Sprintf("BUILD TIMED OUT after %s -- this is NOT a build failure; the compiler was killed before finishing, so there is no diagnostic output to show. This can happen on a large/dependency-heavy package (e.g. a main binary importing most of the repo) under load -- set DEFN_BUILD_TIMEOUT=<duration> (e.g. \"2m\") to allow more time before assuming your edit broke something", buildTimeout))
+		} else {
+			sb.WriteString(fmt.Sprintf("BUILD FAILED:\n%s", out))
+			sb.WriteString(s.suggestMissingImportFixes(out))
+		}
 	}
 	return sb.String()
 }
@@ -5789,10 +5831,22 @@ func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args n
 // can reach 100+ KB; we cap that hard.
 const testOutputCap = 6000
 
-// truncateTestOutput compresses `go test -v` output that exceeds the cap.
-// Preserves head (first N lines of SUBSTANTIVE output — first failure's
-// context), all `--- FAIL:` lines (which subtests broke), package-level
-// `FAIL`/`ok` lines, and tail (last N lines — summary).
+// truncateTestOutput compresses `go test -v` output. `-v` unconditionally
+// prints an "=== RUN"/"=== PAUSE"/"=== CONT" announcement line for every
+// subtest regardless of outcome; those carry no information beyond "this
+// test started" that the paired --- PASS/--- FAIL line doesn't already
+// state, so they're stripped unconditionally, not just above
+// testOutputCap -- most real test runs land under the cap and used to
+// pass this noise through verbatim (confirmed via a real v8 bench run:
+// 66% of `test`-op bytes were exactly this RUN/PASS announcement noise,
+// only 3.3% was actual failure signal). --- PASS: lines are kept (they're
+// compact and name which specific tests ran, which handleTest's own
+// caller relies on for traceability).
+//
+// Above testOutputCap, further compresses by preserving head (first N
+// lines of substantive output -- first failure's context), all
+// `--- FAIL:` lines (which subtests broke), package-level `FAIL`/`ok`
+// lines, and tail (last N lines -- summary).
 //
 // "no tests to run" lines (the 3-line "testing: warning: no tests to
 // run" / "PASS" / "ok ... [no tests to run]" block Go prints for every
@@ -5805,9 +5859,6 @@ const testOutputCap = 6000
 // test's own output visible even after "truncation". Collapsed into a
 // single count instead of enumerated or silently eaten by the window.
 func truncateTestOutput(out string) string {
-	if len(out) <= testOutputCap {
-		return out
-	}
 	rawLines := strings.Split(out, "\n")
 
 	var lines []string
@@ -5822,58 +5873,63 @@ func truncateTestOutput(out string) string {
 			i += 2
 			continue
 		}
+		if strings.HasPrefix(t, "=== RUN") || strings.HasPrefix(t, "=== PAUSE") || strings.HasPrefix(t, "=== CONT") {
+			continue
+		}
 		lines = append(lines, rawLines[i])
 	}
 
 	const headN, tailN = 40, 20
-	if len(lines) <= headN+tailN {
-		out := strings.Join(lines, "\n")
-		if noTestsToRun > 0 {
-			out += fmt.Sprintf("\n(%d other package(s) matched nothing -- \"no tests to run\", omitted)\n", noTestsToRun)
-		}
-		return out
-	}
-	head := lines[:headN]
-	tail := lines[len(lines)-tailN:]
+	joined := strings.Join(lines, "\n")
 
-	// Collect failures and package-level results from the middle band.
-	var failures, pkgResults []string
-	seen := make(map[string]bool)
-	for _, l := range lines[headN : len(lines)-tailN] {
-		t := strings.TrimSpace(l)
-		switch {
-		case strings.HasPrefix(t, "--- FAIL:"):
-			if !seen[t] {
-				failures = append(failures, l)
-				seen[t] = true
-			}
-		case strings.HasPrefix(t, "FAIL\t"), strings.HasPrefix(t, "ok  \t"):
-			pkgResults = append(pkgResults, l)
-		}
-	}
-
-	var sb strings.Builder
-	sb.WriteString(strings.Join(head, "\n"))
-	sb.WriteString("\n")
-	dropped := len(lines) - headN - tailN - len(failures) - len(pkgResults)
-	if len(failures) > 0 {
-		sb.WriteString(fmt.Sprintf("\n... [%d lines truncated; failed subtests below] ...\n", dropped))
-		sb.WriteString(strings.Join(failures, "\n"))
-		sb.WriteString("\n")
+	var body string
+	if len(joined) <= testOutputCap || len(lines) <= headN+tailN {
+		body = joined
 	} else {
-		sb.WriteString(fmt.Sprintf("\n... [%d lines truncated; no failures in the middle] ...\n", dropped))
-	}
-	if len(pkgResults) > 0 {
+		head := lines[:headN]
+		tail := lines[len(lines)-tailN:]
+
+		// Collect failures and package-level results from the middle band.
+		var failures, pkgResults []string
+		seen := make(map[string]bool)
+		for _, l := range lines[headN : len(lines)-tailN] {
+			t := strings.TrimSpace(l)
+			switch {
+			case strings.HasPrefix(t, "--- FAIL:"):
+				if !seen[t] {
+					failures = append(failures, l)
+					seen[t] = true
+				}
+			case strings.HasPrefix(t, "FAIL\t"), strings.HasPrefix(t, "ok  \t"):
+				pkgResults = append(pkgResults, l)
+			}
+		}
+
+		var sb strings.Builder
+		sb.WriteString(strings.Join(head, "\n"))
 		sb.WriteString("\n")
-		sb.WriteString(strings.Join(pkgResults, "\n"))
-		sb.WriteString("\n")
+		dropped := len(lines) - headN - tailN - len(failures) - len(pkgResults)
+		if len(failures) > 0 {
+			sb.WriteString(fmt.Sprintf("\n... [%d lines truncated; failed subtests below] ...\n", dropped))
+			sb.WriteString(strings.Join(failures, "\n"))
+			sb.WriteString("\n")
+		} else {
+			sb.WriteString(fmt.Sprintf("\n... [%d lines truncated; no failures in the middle] ...\n", dropped))
+		}
+		if len(pkgResults) > 0 {
+			sb.WriteString("\n")
+			sb.WriteString(strings.Join(pkgResults, "\n"))
+			sb.WriteString("\n")
+		}
+		sb.WriteString("\n... [tail] ...\n")
+		sb.WriteString(strings.Join(tail, "\n"))
+		body = sb.String()
 	}
+
 	if noTestsToRun > 0 {
-		sb.WriteString(fmt.Sprintf("\n(%d other package(s) matched nothing -- \"no tests to run\", omitted)\n", noTestsToRun))
+		body += fmt.Sprintf("\n(%d other package(s) matched nothing -- \"no tests to run\", omitted)\n", noTestsToRun)
 	}
-	sb.WriteString("\n... [tail] ...\n")
-	sb.WriteString(strings.Join(tail, "\n"))
-	return sb.String()
+	return body
 }
 
 var (
@@ -8639,11 +8695,11 @@ func (s *server) applyEditTerse(session *sdkmcp.ServerSession, d *store.Definiti
 			sb.WriteString("\n")
 		}
 	}
-	// #158: nudge apply-batching after N serial mutations to one file.
-	// hint returns "" when session is nil (Measure* paths) or under threshold.
-	if s.hint != nil {
-		sb.WriteString(s.hint.note(session, d.SourceFile))
-	}
+	// #158's per-file mutation-count nudge lived here; superseded by the
+	// per-turn writeBatchNudge wired into handleCode's defer, which
+	// covers this op plus edit/create/delete/rename (#158 only ever
+	// reached the projection ops that funnel through this function).
+	// Keeping both would double-nudge on every one of these ops.
 	if !d.Test {
 		sb.WriteString(s.testCoverageHint(d.ModuleID, d.SourceFile))
 	}

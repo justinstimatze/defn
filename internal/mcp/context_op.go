@@ -189,7 +189,14 @@ func (s *server) handleContext(ctx context.Context, _ *sdkmcp.CallToolRequest, a
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("## Context bundle for: %s\n\n", question))
+	// #209's starter bundle passes the full captured user prompt as
+	// `question` (needed for search relevance, right above) -- for a
+	// GitHub-issue-shaped prompt that's thousands of chars the model
+	// already has verbatim in its own conversation history. Echoing all
+	// of it back here just to label the bundle cost ~34KB of pure
+	// duplication across a real 15-task bench corpus for zero new
+	// information. The header only needs to name what this is for.
+	sb.WriteString(fmt.Sprintf("## Context bundle for: %s\n\n", truncateForHeader(question, 200)))
 	sb.WriteString(fmt.Sprintf("_Top %d of %d matching defs (tokens: %s)._\n\n",
 		len(top), len(scored), strings.Join(tokens, " ")))
 
@@ -415,4 +422,17 @@ func (s *server) gatherContextCandidates(question string) ([]contextCandidate, [
 		cands = append(cands, c)
 	}
 	return contextRank(cands, tokens), tokens, nil
+}
+
+// truncateForHeader caps a display label to maxLen runes, appending an
+// ellipsis marker with the omitted count when it's cut. Used for echoing
+// a caller-supplied question back into a header line -- the label just
+// needs to identify the bundle, not reproduce a multi-KB prompt the
+// model already has in its own context.
+func truncateForHeader(s string, maxLen int) string {
+	r := []rune(s)
+	if len(r) <= maxLen {
+		return s
+	}
+	return string(r[:maxLen]) + fmt.Sprintf("… (%d more chars)", len(r)-maxLen)
 }

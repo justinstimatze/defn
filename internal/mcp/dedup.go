@@ -43,6 +43,14 @@ type sessionCache struct {
 	starterInjected bool   // #203: true after first orient op has appended the starter bundle
 	turnToken       string // #209: last-seen turn-token; a change means a new turn started
 	readShapedCount int    // #209: individual read-shaped calls made so far this turn
+	// writeShapedCount tracks individual apply-batchable write calls (see
+	// writeShapedOps) made so far this turn since the last reset --
+	// drives writeBatchNudge's one-time suggestion to batch remaining
+	// edits via op:"apply" instead of paying N separate auto-build costs.
+	// Real v8 bench finding: defn invoked the Go toolchain (build/test)
+	// 82% more often than files-mode across a 15-task corpus (178 vs 98)
+	// because every individual write call auto-emits+builds on its own.
+	writeShapedCount int
 	// compactionEpoch is the last-seen value of .defn/.compaction-epoch,
 	// bumped once per PreCompact hook fire (see checkCompactionEpoch).
 	// cacheEntry.epoch and bodyServed's values are stamped with whatever

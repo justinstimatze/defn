@@ -98,3 +98,36 @@ func TestHandleContext_LimitFileModuleScopeResults(t *testing.T) {
 		t.Errorf("file:\"nonexistent.go\" should have excluded every def, got: %s", text)
 	}
 }
+
+// TestHandleContext_LongQuestionTruncatedInHeader guards the fix for a
+// real v8 bench finding: the starter bundle passes the entire captured
+// user prompt (up to thousands of chars for a GitHub-issue-shaped
+// question) as `question`, and the header used to echo it back in full
+// even though the model already has that text in its own conversation
+// history -- pure duplication, confirmed at ~34KB across a 15-task
+// corpus. The header should label the bundle, not reproduce the prompt.
+func TestHandleContext_LongQuestionTruncatedInHeader(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, explainClient: nil}
+
+	longQuestion := "greet farewell " + strings.Repeat("padding filler text ", 40)
+	result, _, err := s.handleContext(context.Background(), nil, codeParam{
+		Op:       "context",
+		Question: longQuestion,
+	})
+	if err != nil {
+		t.Fatalf("context: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, longQuestion) {
+		t.Errorf("expected the long question to be truncated in the header, but it appeared in full:\n%s", text)
+	}
+	if !strings.Contains(text, "more chars") {
+		t.Errorf("expected a truncation marker noting the omitted chars, got: %s", text)
+	}
+	if !strings.Contains(text, "### Greet") {
+		t.Errorf("expected the actual search (unaffected by header truncation) to still find Greet, got: %s", text)
+	}
+}
+

@@ -46,6 +46,7 @@ func (s *server) checkTurnBoundary(sc *sessionCache) {
 		sc.turnToken = token
 		sc.readShapedCount = 0
 		sc.pendingReadNames = nil
+		sc.writeShapedCount = 0
 	}
 }
 
@@ -212,4 +213,73 @@ func (s *server) trackReadShapedName(sc *sessionCache, op, name string) {
 		}
 	}
 	sc.pendingReadNames = append(sc.pendingReadNames, name)
+}
+
+// defnWriteShapedCircuitBreakerThreshold is how many individual
+// apply-batchable write calls (see writeShapedOps) a turn gets before
+// being nudged toward op:"apply" instead of continuing one at a time.
+// Lower than the read threshold (8): unlike a read-shaped call, each of
+// these independently auto-emits+builds, and a real v8 bench run found
+// defn invoking the Go toolchain 82% more often than files-mode across
+// a 15-task corpus (178 vs 98 calls) because of exactly this pattern.
+// Tunable via DEFN_WRITE_CIRCUIT_BREAKER without a rebuild.
+const defnWriteShapedCircuitBreakerThreshold = 3
+
+// writeBatchNudge is a NON-blocking counterpart to circuitBreakerCheck.
+// Unlike the read-shaped breaker, it never refuses a write -- the build
+// gate's compile-and-rollback-on-failure check has to keep running on
+// every single write regardless, so weakening THAT to save toolchain
+// invocations would trade away the exact guarantee that makes defn's
+// writes trustworthy. Instead, once a turn crosses the threshold on
+// individual apply-batchable write calls without ever calling apply
+// itself, it returns one informational note (appended to that call's
+// own already-successful result) suggesting apply for any remaining
+// edits this turn -- pure information, zero change to what actually got
+// built. Fires once per crossing, not on every subsequent call, since
+// unlike the read breaker it isn't blocking and doesn't need to keep
+// redirecting.
+func (s *server) writeBatchNudge(sc *sessionCache, op string) string {
+	if stripped("write-batch-nudge") {
+		return ""
+	}
+	if op == "apply" {
+		sc.writeShapedCount = 0
+		return ""
+	}
+	if !writeShapedOps[op] {
+		return ""
+	}
+	sc.writeShapedCount++
+	if sc.writeShapedCount != writeCircuitBreakerThreshold() {
+		return ""
+	}
+	return fmt.Sprintf(
+		"\n\n[%d individual write calls this turn, each paying its own build cost. "+
+			"If you have more edits queued for this turn, code(op:\"apply\", "+
+			"operations:[...]) batches them into one build instead of separate ones.]",
+		sc.writeShapedCount,
+	)
+}
+
+// writeShapedOps is the subset of write ops that op:"apply" can batch
+// into a single build -- create, edit, delete, rename, plus the 6
+// projection ops (insert-precondition, replace-slice, replace-hunk,
+// wrap-in-defer, rename-param, add-import) and insert-header. Confirmed
+// against handleApply's own switch, not assumed from documentation --
+// move, insert, and retarget-field-value are NOT apply-batchable and
+// are deliberately excluded here (nudging toward apply for those would
+// send the model to a batch call that rejects them with "unknown op").
+var writeShapedOps = map[string]bool{
+	"edit": true, "create": true, "delete": true, "rename": true,
+	"insert-precondition": true, "replace-slice": true, "replace-hunk": true,
+	"wrap-in-defer": true, "rename-param": true, "add-import": true, "insert-header": true,
+}
+
+func writeCircuitBreakerThreshold() int {
+	if v := os.Getenv("DEFN_WRITE_CIRCUIT_BREAKER"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defnWriteShapedCircuitBreakerThreshold
 }

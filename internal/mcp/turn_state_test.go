@@ -334,3 +334,92 @@ func TestHandleCode_CircuitBreakerAutoBatchesInsteadOfRefusing(t *testing.T) {
 		t.Fatalf("expected fresh budget after auto-batch reset, got: %s", resultText(t, fourth))
 	}
 }
+
+// TestWriteBatchNudge_FiresOnceAtThreshold guards the fix for a v8
+// bench finding: defn invoked the Go toolchain 82% more often than
+// files-mode (178 vs 98 calls across a 15-task corpus) because every
+// individual apply-batchable write call auto-builds on its own. Unlike
+// the read-shaped breaker, this must never refuse (the build gate has
+// to run on every write regardless) -- it only appends a suggestion,
+// exactly once at the threshold crossing, not on every call after.
+func TestWriteBatchNudge_FiresOnceAtThreshold(t *testing.T) {
+	sc := &sessionCache{entries: map[string]cacheEntry{}}
+	s := &server{}
+	for i := 1; i < defnWriteShapedCircuitBreakerThreshold; i++ {
+		if msg := s.writeBatchNudge(sc, "edit"); msg != "" {
+			t.Fatalf("call %d: expected no nudge below threshold, got %q", i, msg)
+		}
+	}
+	msg := s.writeBatchNudge(sc, "edit")
+	if msg == "" {
+		t.Fatal("expected a nudge exactly at the threshold crossing")
+	}
+	if !strings.Contains(msg, `op:"apply"`) {
+		t.Errorf("nudge should point at op:\"apply\", got %q", msg)
+	}
+	// One call past the crossing: must NOT fire again (non-blocking, so
+	// it shouldn't nag on every subsequent call the way a refusal would).
+	if msg := s.writeBatchNudge(sc, "edit"); msg != "" {
+		t.Errorf("expected no repeat nudge past the crossing, got %q", msg)
+	}
+}
+
+// TestWriteBatchNudge_IgnoresNonBatchableWriteOps guards move/insert/
+// retarget-field-value being excluded from writeShapedOps -- these
+// mutate the DB but handleApply's own switch rejects them with
+// "unknown op", so nudging toward apply for them would send the model
+// to a batch call that can't actually accept what it's holding.
+func TestWriteBatchNudge_IgnoresNonBatchableWriteOps(t *testing.T) {
+	sc := &sessionCache{entries: map[string]cacheEntry{}}
+	s := &server{}
+	for _, op := range []string{"move", "insert", "retarget-field-value", "read", "test"} {
+		for i := 0; i < defnWriteShapedCircuitBreakerThreshold+5; i++ {
+			if msg := s.writeBatchNudge(sc, op); msg != "" {
+				t.Fatalf("op %q must never get the apply-batch nudge, got %q", op, msg)
+			}
+		}
+	}
+	if sc.writeShapedCount != 0 {
+		t.Errorf("non-apply-batchable ops should not increment the counter, got %d", sc.writeShapedCount)
+	}
+}
+
+func TestWriteBatchNudge_ApplyResetsCounter(t *testing.T) {
+	sc := &sessionCache{entries: map[string]cacheEntry{}}
+	s := &server{}
+	for i := 0; i < defnWriteShapedCircuitBreakerThreshold-1; i++ {
+		s.writeBatchNudge(sc, "edit")
+	}
+	if msg := s.writeBatchNudge(sc, "apply"); msg != "" {
+		t.Fatalf("apply itself should never get a nudge, got %q", msg)
+	}
+	if sc.writeShapedCount != 0 {
+		t.Fatalf("apply should reset the counter, got %d", sc.writeShapedCount)
+	}
+	for i := 1; i < defnWriteShapedCircuitBreakerThreshold; i++ {
+		if msg := s.writeBatchNudge(sc, "edit"); msg != "" {
+			t.Fatalf("expected fresh budget after apply reset, got nudge %q", msg)
+		}
+	}
+}
+
+func TestWriteBatchNudge_EnvOverride(t *testing.T) {
+	t.Setenv("DEFN_WRITE_CIRCUIT_BREAKER", "2")
+	sc := &sessionCache{entries: map[string]cacheEntry{}}
+	s := &server{}
+	s.writeBatchNudge(sc, "edit")
+	if msg := s.writeBatchNudge(sc, "edit"); msg == "" {
+		t.Fatal("expected a nudge at lowered threshold=2")
+	}
+}
+
+func TestWriteBatchNudge_StrippedDisablesEntirely(t *testing.T) {
+	t.Setenv("DEFN_STRIP", "write-batch-nudge")
+	sc := &sessionCache{entries: map[string]cacheEntry{}}
+	s := &server{}
+	for i := 0; i < defnWriteShapedCircuitBreakerThreshold+10; i++ {
+		if msg := s.writeBatchNudge(sc, "edit"); msg != "" {
+			t.Fatalf("call %d: DEFN_STRIP=write-batch-nudge should disable the nudge entirely, got %q", i, msg)
+		}
+	}
+}
