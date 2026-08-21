@@ -191,7 +191,7 @@ This project is indexed in defn (` + "`.defn/`" + `). For any ` + "`.go`" + ` fi
 
 - **outline first, read only if you're editing** (or if outline genuinely wasn't enough — but check first). This is the single biggest lever for session cost.
 - Run ` + "`code(op:\"impact\", name:\"F\")`" + ` before modifying an existing def; skip it for brand-new ones.
-- If you must edit a ` + "`.go`" + ` file with a built-in tool, follow up with ` + "`code(op:\"sync\", file:\"path\")`" + ` so the graph stays correct.
+- If you must edit a ` + "`.go`" + ` file with a built-in tool, follow up IMMEDIATELY with ` + "`code(op:\"sync\", file:\"path\")`" + ` — before any other ` + "`code`" + ` call. Skipping this is not just "stale": the next op that triggers an emit (` + "`edit`" + `, ` + "`apply`" + `, ` + "`test`" + `, ...) can silently overwrite your built-in edit with defn's still-outdated copy of that def's body — no error, no warning.
 <!-- defn:end -->
 `
 }

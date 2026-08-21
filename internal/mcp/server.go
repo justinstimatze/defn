@@ -2533,8 +2533,17 @@ func (s *server) bodyScanResult(pattern string, limit int, file string) (*sdkmcp
 		if strings.Contains(pattern, "|") {
 			regexHint = " Note: pattern is a plain substring/LIKE match, not regex — \"|\" is searched for as a literal character, not alternation. Call search once per term instead."
 		}
+		// search only ever indexes THIS project's own ingested source --
+		// never third-party dependencies under the module cache. A real
+		// prometheus-17395/12024/18765/19236 pattern: an agent needing to
+		// check a symbol from an imported SDK (not this project's code)
+		// got "no matches" here with no indication search couldn't have
+		// found it regardless, and instead burned 5-8 blind Glob guesses
+		// against ~/go/pkg/mod hand-locating the dependency's on-disk
+		// path. `go doc` resolves an import path + symbol directly via
+		// the module cache with no path-guessing at all.
 		msg := fmt.Sprintf(
-			"[no matches for %q%s — tried name-LIKE, FTS on doc+body, and substring body-scan.%s If you're grepping for a comment or string literal, this substring wasn't found in any indexed body. Try `overview` for project shape or a broader pattern.]",
+			"[no matches for %q%s — tried name-LIKE, FTS on doc+body, and substring body-scan.%s If you're grepping for a comment or string literal, this substring wasn't found in any indexed body. Try `overview` for project shape or a broader pattern. Note: search only covers this project's OWN source, never imported dependencies -- for a symbol from a third-party package, `go doc <import/path> [Symbol]` resolves it via the module cache without needing its on-disk path.]",
 			pattern, scope, regexHint,
 		)
 		return textResult(msg), nil, nil

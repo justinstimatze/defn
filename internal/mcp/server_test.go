@@ -12928,3 +12928,25 @@ func TestHandleApply_EditRejectsImportPathAlias(t *testing.T) {
 		t.Fatalf("expected dry-run to also reject import_path/alias, got: %s", dryText)
 	}
 }
+
+// TestBodyScanResult_EmptyMentionsGoDocForExternalDeps guards the fix
+// for a repeated real bench pattern (prometheus-17395/12024/18765/19236):
+// search only ever covers THIS project's own ingested source, never a
+// third-party dependency's -- agents needing to check an imported SDK's
+// symbol got a bare "no matches" and burned 5-8 blind Glob guesses
+// against ~/go/pkg/mod. The empty-result message should point at
+// `go doc` as the path-free way to resolve an external symbol instead.
+func TestBodyScanResult_EmptyMentionsGoDocForExternalDeps(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.bodyScanResult("no-such-string-anywhere", 100, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "go doc") {
+		t.Errorf("expected a `go doc` hint for external/third-party symbols; got %q", text)
+	}
+}
