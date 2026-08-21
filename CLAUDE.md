@@ -27,6 +27,30 @@ own without also cutting call *count*, not just call size — richer
 per-call content only pays for itself when it replaces multiple cheaper
 calls, and the aggregate call counts here came out roughly even.
 
+v10 sonnet re-run (2026-08-21, same 15-task Prometheus corpus, after 4 more
+targeted bug fixes) quantified where that call count actually goes, and it is
+NOT primarily an edit-batching problem: of arm_defn's 567 calls, edit-class
+ops (edit/create/delete/replace-hunk/apply/add-import/insert-header) are only
+10.4%, `test` is 9.9%, defn read-class ops (read/search/outline/overview/
+context/impact) are 51.5%, and non-defn Read/Grep/Glob add another 25.6% —
+**~77% combined read-shaped**. `context`/`expand`, the ops built specifically
+to consolidate reads into one call, were used 4 times in 567 calls (0.7%)
+despite being the documented biggest lever. Both existing in-band nudges show
+near-zero observed follow-through: `writeBatchNudge` fired 7 times, 0/7
+followed by an actual `apply` call; the read-side circuit breaker's
+auto-batch rescue fired 19 times, but 0/19 were followed by the model
+proactively reaching for `context`/`expand` on its own afterward — it just
+resumes singleton calls, so the rescue only recovers cost *after* 6-8 wasted
+round-trips already happened. Conclusion: further `apply`-batching investment
+caps out near ~7% of total call-count reduction (and ~29% of single edits are
+structurally unbatchable in advance — the need for a second edit often isn't
+known until after the first lands); reactive in-band text nudges are a dead
+lever regardless of threshold tuning. Untried, highest-estimated-leverage
+direction: proactive consolidation BEFORE the first singleton read is even
+possible — e.g. auto-injecting a `context(question:<task>)`-shaped bundle as
+the first tool response of a task/turn — rather than a nudge that only fires
+after the cost is already paid.
+
 ## Code Navigation and Editing
 
 **The database is authoritative. Files are an I/O projection.** For Go code, use the `code` MCP tool — not Edit/Write/Read. Edit/Write are for non-Go files (YAML, JSON, Markdown, shell scripts).
