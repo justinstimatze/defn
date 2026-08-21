@@ -61,7 +61,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.86"
+const Version = "0.26.87"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -6402,7 +6402,27 @@ func (s *server) handleOverview(ctx context.Context, _ *sdkmcp.CallToolRequest, 
 			continue
 		}
 
+		// #313: a struct field is just a name+type, no logic -- it
+		// carries no standalone information an orientation view needs.
+		// Confirmed on a real prometheus-19184 trajectory: MSKSDConfig
+		// alone contributed a dozen near-identical "(MSKSDConfig).X
+		// (field) — N callers, 0 callees" bullets to one overview call,
+		// most of the 50-def cap's budget spent on structurally
+		// uninteresting bulk. Same "individually reachable via
+		// search/read, just not enumerated here" philosophy as the
+		// generated-file collapse above -- roll fields into their
+		// parent type's own line as a count instead of one bullet each.
+		fieldCountByReceiver := map[string]int{}
 		for _, d := range fileDefs {
+			if d.Kind == "field" && d.Receiver != "" {
+				fieldCountByReceiver[d.Receiver]++
+			}
+		}
+
+		for _, d := range fileDefs {
+			if d.Kind == "field" {
+				continue // rolled into its parent type's line below
+			}
 			recv := formatReceiver(d.Receiver)
 			sb.WriteString(fmt.Sprintf("- %s%s (%s)", recv, d.Name, d.Kind))
 
@@ -6422,6 +6442,9 @@ func (s *server) handleOverview(ctx context.Context, _ *sdkmcp.CallToolRequest, 
 			}
 			if prodCallers > 0 || len(callees) > 0 {
 				sb.WriteString(fmt.Sprintf(" — %d callers, %d callees", prodCallers, len(callees)))
+			}
+			if n := fieldCountByReceiver[d.Name]; n > 0 {
+				sb.WriteString(fmt.Sprintf(", %d fields", n))
 			}
 			sb.WriteString("\n")
 		}

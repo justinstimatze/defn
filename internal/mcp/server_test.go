@@ -12537,3 +12537,55 @@ func TestTruncateTestOutput_CollapsesNoTestsToRunEvenWhenItFillsTheHead(t *testi
 		t.Errorf("expected \"no tests to run\" to appear at most once (in the collapsed summary), got %d times in:\n%s", strings.Count(got, "no tests to run"), got)
 	}
 }
+
+// TestHandleOverview_CollapsesStructFieldsIntoParentTypeCount guards
+// the #313 fix: a struct field is just a name+type, no logic -- it
+// carries no standalone information an orientation view needs, yet
+// each got its own full bullet line. Confirmed on a real
+// prometheus-19184 trajectory: a config struct's dozen fields each
+// produced a near-identical "(Config).X (field) — N callers, 0
+// callees" bullet, consuming most of a single overview call's
+// definition-cap budget on structurally uninteresting bulk. Fields
+// now roll into their parent type's own line as a count instead.
+func TestHandleOverview_CollapsesStructFieldsIntoParentTypeCount(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	body := `package main
+
+type Config struct {
+	Region     string
+	AccessKey  string
+	SecretKey  string
+	RoleARN    string
+	ExternalID string
+}
+`
+	if err := os.WriteFile(filepath.Join(projDir, "config.go"), []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ingest.IngestFile(db, projDir, filepath.Join(projDir, "config.go")); err != nil {
+		t.Fatal("ingest config.go:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleOverview(context.Background(), nil, codeParam{File: "config.go"})
+	if err != nil {
+		t.Fatalf("overview: %v", err)
+	}
+	text := resultText(t, result)
+
+	if !strings.Contains(text, "Config (type)") {
+		t.Errorf("expected Config's own line present, got:\n%s", text)
+	}
+	if !strings.Contains(text, "5 fields") {
+		t.Errorf("expected Config's line to show a collapsed \"5 fields\" count, got:\n%s", text)
+	}
+	for _, field := range []string{"Region", "AccessKey", "SecretKey", "RoleARN", "ExternalID"} {
+		if strings.Contains(text, "(Config)."+field+" (field)") {
+			t.Errorf("expected field %q NOT individually listed, got:\n%s", field, text)
+		}
+	}
+}
