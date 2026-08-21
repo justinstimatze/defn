@@ -911,6 +911,33 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if op, argKey, ok := dedupOpKey(args); ok {
 			result = s.respCache.dedup(req.Session, op, argKey, result)
 		}
+		// #303: the one-shot starter bundle used to be appended inline,
+		// per-op, BEFORE dedup ran -- which meant dedup's sha256 hash of
+		// the response text included whatever bundle got appended to
+		// THIS particular call. Since the bundle never repeats (one-shot
+		// per session), any later identical call (e.g. re-reading the
+		// same def after an unrelated edit, exactly the case dedup exists
+		// to catch) hashed to something different from the poisoned
+		// first-call baseline and permanently missed its own dedup entry
+		// for the rest of the session. Appending the bundle HERE, after
+		// dedup has already hashed the undecorated content, fixes this
+		// for every op that can trigger the bundle (read/outline/impact/
+		// expand/search/overview), not just the two some earlier code
+		// happened to already wire up.
+		if q, ok := starterQuestionForOp(args); ok {
+			question := q
+			if real := s.lastUserQuestion(); real != "" {
+				question = real
+			}
+			if starter := s.maybeAppendStarterBundle(req, question); starter != "" {
+				for _, block := range result.Content {
+					if tc, ok := block.(*sdkmcp.TextContent); ok {
+						tc.Text += starter
+						break
+					}
+				}
+			}
+		}
 	}()
 
 	// Validate required params per op (fail fast with clear error).
@@ -1424,8 +1451,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if args.Pattern == "" {
 			args.Pattern = args.Query
 		}
-		r, o, e := wrapStale(s.handleSearch(ctx, req, args))
-		return s.appendStarter(r, o, e, req, args.Pattern)
+		return wrapStale(s.handleSearch(ctx, req, args))
 	case "impact":
 		r, o, e := wrapStale(s.handleImpact(ctx, req, args))
 		if note := s.ambiguityNote(args.Name, args.Receiver, args.Module, args.File); note != "" {
@@ -1532,12 +1558,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "find":
 		return wrapStale(s.handleFind(ctx, req, findParam{File: args.File, Line: args.Line}))
 	case "overview":
-		r, o, e := wrapStale(s.handleOverview(ctx, req, args))
-		q := args.File
-		if q == "" {
-			q = "project structure"
-		}
-		return s.appendStarter(r, o, e, req, q)
+		return wrapStale(s.handleOverview(ctx, req, args))
 	case "methods":
 		return wrapStale(s.handleMethods(ctx, req, nameParam{Name: args.Name, Query: args.Query, Module: args.Module, File: args.File}))
 	case "patch":
@@ -11370,4 +11391,30 @@ func (s *server) siblingSpecNames(d store.Definition) []string {
 		return names
 	}
 	return nil
+}
+
+// starterQuestionForOp returns the fallback starter-bundle question for
+// ops eligible to trigger the one-shot starter bundle, and whether args.Op
+// is one of them. See handleCode's deferred starter-bundle append for why
+// this must run AFTER dedup rather than being appended inline per-op.
+func starterQuestionForOp(args codeParam) (string, bool) {
+	switch args.Op {
+	case "read", "outline", "impact":
+		return args.Name, true
+	case "expand":
+		q := args.Name
+		if q == "" && len(args.Names) > 0 {
+			q = strings.Join(args.Names, ", ")
+		}
+		return q, true
+	case "search":
+		return args.Pattern, true
+	case "overview":
+		q := args.File
+		if q == "" {
+			q = "project structure"
+		}
+		return q, true
+	}
+	return "", false
 }

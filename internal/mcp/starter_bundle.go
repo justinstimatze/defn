@@ -50,29 +50,3 @@ func (s *server) maybeAppendStarterBundle(req *sdkmcp.CallToolRequest, question 
 	}
 	return "\n\n---\n_[#203 starter bundle -- first orient op of this session; won't repeat.]_\n\n" + body
 }
-
-func (s *server) appendStarter(r *sdkmcp.CallToolResult, o any, err error, req *sdkmcp.CallToolRequest, question string) (*sdkmcp.CallToolResult, any, error) {
-	if err != nil || r == nil || r.IsError {
-		return r, o, err
-	}
-	// #209: prefer the real user question (stashed by
-	// hooks/defn-capture-question.sh on UserPromptSubmit) over the
-	// op-specific fallback -- an intent-blind bundle (e.g. overview's
-	// literal "project structure" placeholder) returns content
-	// unrelated to what's actually being asked, wasting the one
-	// starter-bundle shot this session gets.
-	if real := s.lastUserQuestion(); real != "" {
-		question = real
-	}
-	starter := s.maybeAppendStarterBundle(req, question)
-	if starter == "" {
-		return r, o, err
-	}
-	for _, block := range r.Content {
-		if tc, ok := block.(*sdkmcp.TextContent); ok {
-			tc.Text += starter
-			break
-		}
-	}
-	return r, o, err
-}

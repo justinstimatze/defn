@@ -13286,3 +13286,95 @@ const (
 		t.Errorf("Debug/Info belong to a SEPARATE adjacent block and must not appear, got: %s", text)
 	}
 }
+
+// TestHandleCode_StarterBundleFiresOnFirstReadNotJustSearchOrOverview
+// guards #302: the one-shot starter bundle (a context()-shaped orient
+// bundle, #203) was only wired to search/overview's dispatch cases.
+// Measured across v10-v12 bench trajectories: it still fired 44/45
+// tasks overall (a later search/overview call usually triggers it
+// eventually), but for the ~29% of tasks whose FIRST move is read/
+// outline/impact/expand instead, the bundle arrived a beat late --
+// after those solo calls already happened. Widening the wiring costs
+// nothing on later calls (appendStarter's own one-shot flag no-ops
+// them) and lets it fire on whichever op genuinely comes first.
+func TestHandleCode_StarterBundleFiresOnFirstReadNotJustSearchOrOverview(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
+
+	for _, tc := range []struct {
+		op   string
+		args codeParam
+	}{
+		{"read", codeParam{Op: "read", Name: "Greet"}},
+		{"outline", codeParam{Op: "outline", Name: "main"}},
+		{"impact", codeParam{Op: "impact", Name: "Farewell"}},
+		{"expand", codeParam{Op: "expand", Name: "Greet"}},
+	} {
+		t.Run(tc.op, func(t *testing.T) {
+			s2 := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+			s2.ready.Store(true)
+			req2 := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
+			r, _, err := s2.handleCode(context.Background(), req2, tc.args)
+			if err != nil {
+				t.Fatalf("op=%s: %v", tc.op, err)
+			}
+			text := resultText(t, r)
+			if !strings.Contains(text, "starter bundle") {
+				t.Errorf("op=%s: expected the one-shot starter bundle to fire on the FIRST call, got: %s", tc.op, text)
+			}
+		})
+	}
+
+	// Sanity: a second call of any kind in the SAME session must not
+	// fire it again (the one-shot flag is per-session, not per-op).
+	first, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "Greet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resultText(t, first), "starter bundle") {
+		t.Fatalf("expected the bundle on the first call of this session, got: %s", resultText(t, first))
+	}
+	second, _, err := s.handleCode(context.Background(), req, codeParam{Op: "outline", Name: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(resultText(t, second), "starter bundle") {
+		t.Errorf("the one-shot bundle must not fire twice in one session, got: %s", resultText(t, second))
+	}
+}
+
+// TestHandleCode_StarterBundleDoesNotPoisonDedupHash guards #303: the
+// one-shot starter bundle used to be appended BEFORE dedup hashed the
+// response text, so the very first call of a session (which is exactly
+// when the bundle fires) stored a hash that included bundle text no
+// later call would ever reproduce -- permanently missing its own dedup
+// entry for the rest of the session. A second identical read of the
+// SAME def, later, must still hit the dedup stub.
+func TestHandleCode_StarterBundleDoesNotPoisonDedupHash(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
+
+	first, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "Greet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstText := resultText(t, first)
+	if !strings.Contains(firstText, "starter bundle") {
+		t.Fatalf("expected the starter bundle on the session's first call, got: %s", firstText)
+	}
+
+	second, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "Greet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondText := resultText(t, second)
+	if !strings.Contains(secondText, "cached") {
+		t.Fatalf("expected an identical repeat read to hit the dedup stub, got: %s", secondText)
+	}
+}
