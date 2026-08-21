@@ -12720,3 +12720,76 @@ func TestEmitAndBuildAgainst_TimeoutReportsTimedOutNotEmptyBuildFailed(t *testin
 		t.Errorf("expected the timeout message to point at DEFN_BUILD_TIMEOUT, got:\n%q", got)
 	}
 }
+
+// TestHandleExpand_AutoBatchBodyOverrideRespectsSizeThreshold guards a v9
+// (sonnet) bench finding: BodyNames (used by the circuit-breaker
+// auto-batch redirect) forced a name's FULL body regardless of size,
+// even when a solo `read` on that same name would have auto-downgraded
+// to outline via readAutoOutlineThreshold. trackReadShapedName tracks a
+// name as "body wanted" on every op:"read" call, with no visibility into
+// whether that read actually served full body or got downgraded -- so a
+// large def read once (and correctly downgraded) got its full body
+// forced back in by a later auto-batch purely because the name had been
+// seen via op:"read". A real trajectory showed this balloon a single
+// auto-batch response by ~24KB. The auto-batch path (bodyOverride) must
+// respect the same size threshold a solo read would; a direct explicit
+// expand(include:["body"]) call is a different, unaffected code path
+// (bodyOverride is nil there) and should still force the full body
+// regardless of size, since that's an explicit ask.
+func TestHandleExpand_AutoBatchBodyOverrideRespectsSizeThreshold(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0o755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0o644)
+	var body strings.Builder
+	body.WriteString("package main\n\n// BigFunc has a body larger than the auto-outline threshold.\nfunc BigFunc(name string) string {\n\tresult := \"\"\n")
+	for i := 0; i < 60; i++ {
+		body.WriteString(fmt.Sprintf("\tresult += \"line %d: this is padding to push body past 1500 bytes\\n\"\n", i))
+	}
+	body.WriteString("\treturn result + name\n}\n")
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(body.String()), 0o644)
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{backend: db}
+
+	// Auto-batch shape: Include is outline+callers (no "body"), BodyNames
+	// restricts which of the batched names get body forced in -- this is
+	// exactly the shape handleCode's circuit-breaker redirect uses.
+	autoBatch, _, err := s.handleExpand(context.Background(), nil, codeParam{
+		Names:     []string{"BigFunc"},
+		Include:   []string{"outline", "callers"},
+		BodyNames: []string{"BigFunc"},
+	})
+	if err != nil {
+		t.Fatalf("expand (auto-batch shape): %v", err)
+	}
+	autoText := resultText(t, autoBatch)
+	if strings.Contains(autoText, "this is padding") {
+		t.Errorf("auto-batch BodyNames override should respect the size threshold and NOT force full body for an oversized def; got: %s", autoText)
+	}
+
+	// Direct explicit expand(include:["body"]) call -- no BodyNames
+	// override (bodyOverride is nil) -- must still force full body
+	// regardless of size, since this is an explicit ask.
+	direct, _, err := s.handleExpand(context.Background(), nil, codeParam{
+		Name:    "BigFunc",
+		Include: []string{"body"},
+	})
+	if err != nil {
+		t.Fatalf("expand (direct explicit body): %v", err)
+	}
+	directText := resultText(t, direct)
+	if !strings.Contains(directText, "this is padding") {
+		t.Errorf("direct explicit expand(include:[\"body\"]) must still return full body regardless of size; got: %s", directText)
+	}
+}

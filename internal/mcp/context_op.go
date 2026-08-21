@@ -198,7 +198,7 @@ func (s *server) handleContext(ctx context.Context, _ *sdkmcp.CallToolRequest, a
 	// information. The header only needs to name what this is for.
 	sb.WriteString(fmt.Sprintf("## Context bundle for: %s\n\n", truncateForHeader(question, 200)))
 	sb.WriteString(fmt.Sprintf("_Top %d of %d matching defs (tokens: %s)._\n\n",
-		len(top), len(scored), strings.Join(tokens, " ")))
+		len(top), len(scored), truncateList(tokens, 30)))
 
 	// Outline projection of each top hit. Reload each via
 	// GetDefinition to pull the body — search results carry

@@ -1223,7 +1223,14 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		// model's compliance.
 		var autoNames []string
 		var autoBodyNames []string
-		if breakerMsg != "" && nameableReadOps[args.Op] && len(sc.pendingReadNames) > 0 {
+		// Gate on accumulated names, not on whether THIS call's op is
+		// itself nameable: search is pattern-based and can't resolve a
+		// target for itself, but if earlier read/outline/impact calls
+		// this turn already built up pendingReadNames, a search that
+		// trips the breaker can still be rescued with that backlog
+		// instead of a zero-info refusal (v9 bench: 22% of fires were
+		// exactly this — search tripped with a non-empty backlog).
+		if breakerMsg != "" && len(sc.pendingReadNames) > 0 {
 			autoNames = append([]string(nil), sc.pendingReadNames...)
 			autoBodyNames = append([]string(nil), sc.pendingBodyNames...)
 			sc.pendingReadNames = nil
@@ -6993,7 +7000,23 @@ func (s *server) handleExpand(_ context.Context, req *sdkmcp.CallToolRequest, ar
 			for k, v := range want {
 				clone[k] = v
 			}
-			clone["body"] = bodyOverride[name]
+			// A name folded into BodyNames only means "this was read via
+			// op:read at some point this turn" -- trackReadShapedName
+			// can't see whether that read actually returned full body or
+			// got auto-downgraded to outline by readAutoOutlineThreshold.
+			// Forcing full body here regardless of size bypasses that
+			// downgrade, but only on this auto-batch path (v9 bench: a
+			// 390-byte outline-downgraded read had its full 17.6KB body
+			// forced back in 35 calls later purely because the name had
+			// been seen once via op:"read"). Respect the same threshold a
+			// solo read would have applied; a direct explicit
+			// expand(include:["body"]) call is unaffected since
+			// bodyOverride is only ever non-nil on the auto-batch path.
+			wantBody := bodyOverride[name]
+			if wantBody && len(d.Body) > readAutoOutlineThreshold {
+				wantBody = false
+			}
+			clone["body"] = wantBody
 			sectionWant = clone
 		}
 		if sectionWant["body"] && req != nil && s.respCache != nil {

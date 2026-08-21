@@ -423,3 +423,50 @@ func TestWriteBatchNudge_StrippedDisablesEntirely(t *testing.T) {
 		}
 	}
 }
+
+// TestHandleCode_CircuitBreakerRescuesNonNameableTrigger guards a v9
+// (sonnet) bench finding: the auto-batch rescue only fired when the
+// call that TRIPPED the breaker was itself nameable (read/outline/
+// impact/methods/expand), gated via nameableReadOps[args.Op]. But
+// pendingReadNames accumulates across ANY read-shaped call, so a
+// "search" that trips the breaker after earlier reads already built up
+// a backlog got a bare zero-info refusal even though there was real
+// content to rescue with -- 22% of all breaker fires in that run were
+// exactly this shape (search tripping with a non-empty backlog). The
+// rescue should key off "is there a backlog to serve", not "is this
+// call's own op nameable".
+func TestHandleCode_CircuitBreakerRescuesNonNameableTrigger(t *testing.T) {
+	t.Setenv("DEFN_CIRCUIT_BREAKER", "2")
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
+
+	for _, name := range []string{"Greet", "Farewell"} {
+		r, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: name})
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if strings.Contains(resultText(t, r), "circuit breaker") {
+			t.Fatalf("read %s should be within threshold, got: %s", name, resultText(t, r))
+		}
+	}
+
+	// Third call is past threshold=2, but it's a SEARCH (not nameable) --
+	// must still auto-batch the Greet+Farewell backlog via expand
+	// instead of a bare, zero-info refusal.
+	third, _, err := s.handleCode(context.Background(), req, codeParam{Op: "search", Pattern: "nonexistentxyz"})
+	if err != nil {
+		t.Fatalf("third call (search): %v", err)
+	}
+	text := resultText(t, third)
+	if !strings.Contains(text, "auto-batched") {
+		t.Fatalf("expected search to be rescued with an auto-batch note, got a bare refusal instead: %s", text)
+	}
+	for _, name := range []string{"Greet", "Farewell"} {
+		if !strings.Contains(text, name) {
+			t.Errorf("auto-batched rescue missing %s: %s", name, text)
+		}
+	}
+}

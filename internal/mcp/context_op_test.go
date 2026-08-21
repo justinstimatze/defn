@@ -131,3 +131,43 @@ func TestHandleContext_LongQuestionTruncatedInHeader(t *testing.T) {
 	}
 }
 
+// TestHandleContext_TokensTruncatedInHeader guards a second, previously
+// unfixed echo found in a v9 (sonnet) bench dig: the fix for the
+// question-echo in the header (see
+// TestHandleContext_LongQuestionTruncatedInHeader) only capped the
+// question text itself, but the very next line echoes the FULL
+// tokenized/filtered token set used for scoring -- uncapped, ~27KB
+// across a 15-task corpus, the same class of problem in a different
+// shape. Tokens should be capped like any other name list (truncateList),
+// not dumped in full.
+func TestHandleContext_TokensTruncatedInHeader(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, explainClient: nil}
+
+	uniqueWords := []string{
+		"alderaan", "bespin", "coruscant", "dagobah", "endor", "felucia",
+		"geonosis", "hoth", "ilum", "jakku", "kamino", "lothal", "mustafar",
+		"naboo", "onderon", "polis", "quarren", "rodia", "sullust", "tatooine",
+		"utapau", "vjun", "wobani", "xarath", "yavin", "zephyr", "anoat",
+		"batuu", "cato", "dantooine", "eadu", "florrum", "garel", "hosnian", "iego",
+	}
+	question := "greet farewell " + strings.Join(uniqueWords, " ")
+	result, _, err := s.handleContext(context.Background(), nil, codeParam{
+		Op:       "context",
+		Question: question,
+	})
+	if err != nil {
+		t.Fatalf("context: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "more)") {
+		t.Errorf("expected the tokens list to be truncated with a '(N more)' marker, got: %s", text)
+	}
+	if !strings.Contains(text, "alderaan") {
+		t.Errorf("expected the first unique token to still appear (sanity check tokenization ran), got: %s", text)
+	}
+	if strings.Contains(text, "iego") {
+		t.Errorf("expected the last of 37 unique tokens to be truncated out of the header, but it appeared: %s", text)
+	}
+}
