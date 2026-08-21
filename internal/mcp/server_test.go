@@ -12793,3 +12793,36 @@ func TestHandleExpand_AutoBatchBodyOverrideRespectsSizeThreshold(t *testing.T) {
 		t.Errorf("direct explicit expand(include:[\"body\"]) must still return full body regardless of size; got: %s", directText)
 	}
 }
+
+// TestHandleTest_OnTestFunctionActuallyRunsIt tightens
+// TestHandleTest_OnTestFunctionSuggestsTestParam: a v9 (sonnet) bench dig
+// found this exact shape still costs one full wasted round-trip every
+// time (4/4 sampled occurrences) -- the corrective note pointed at
+// test:"X" but made the caller ask again instead of just running it,
+// since the target IS the test the caller almost certainly wants. This
+// asserts op:"test", name:"X" on a test function now actually executes
+// it in the same call, not just describes how to.
+func TestHandleTest_OnTestFunctionActuallyRunsIt(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	create, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op:   "create",
+		File: "main_test.go",
+		Body: "func TestSomethingNewRuns(t *testing.T) {}",
+	})
+	if strings.Contains(resultText(t, create), "rolled back") {
+		t.Fatalf("setup create failed: %s", resultText(t, create))
+	}
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "test", Name: "TestSomethingNewRuns"})
+	text := resultText(t, result)
+	if !strings.Contains(text, "ran it directly") {
+		t.Errorf("expected the note to say it ran the test directly, got: %s", text)
+	}
+	if !strings.Contains(text, "ALL TESTS PASSED") {
+		t.Errorf("expected the test to have actually executed and passed, got: %s", text)
+	}
+}

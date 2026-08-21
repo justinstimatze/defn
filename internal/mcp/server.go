@@ -426,8 +426,8 @@ type codeParam struct {
 	Mutations   []store.Mutation `json:"mutations,omitempty"`
 	Depth       int              `json:"depth,omitempty"`
 	Receiver    string           `json:"receiver,omitempty"`
-	OldFragment string           `json:"old_fragment,omitempty"`
-	NewFragment string           `json:"new_fragment,omitempty"`
+	OldFragment string           `json:"old_fragment,omitempty" jsonschema:"Fragment to match verbatim within the def's body. If it spans multiple lines, escape every literal newline as \\n and tab as \\t consistently -- do not mix raw and escaped control characters in the same JSON string value."`
+	NewFragment string           `json:"new_fragment,omitempty" jsonschema:"Replacement text for old_fragment. If it spans multiple lines, escape every literal newline as \\n and tab as \\t consistently -- do not mix raw and escaped control characters in the same JSON string value."`
 	After       string           `json:"after,omitempty"`
 	ReplaceAll  bool             `json:"replace_all,omitempty"`
 	Operations  []applyOp        `json:"operations,omitempty"`
@@ -448,8 +448,8 @@ type codeParam struct {
 	Condition   string           `json:"condition,omitempty"`
 	Ret         string           `json:"ret,omitempty"`
 	Index       int              `json:"index,omitempty"`
-	New         string           `json:"new,omitempty"`
-	Old         string           `json:"old,omitempty"` // replace-hunk
+	New         string           `json:"new,omitempty" jsonschema:"replace-slice/replace-hunk: replacement text. If multi-line, escape every literal newline as \\n and tab as \\t consistently -- do not mix raw and escaped control characters in the same JSON string value."`
+	Old         string           `json:"old,omitempty" jsonschema:"replace-hunk: text to match verbatim. If multi-line, escape every literal newline as \\n and tab as \\t consistently -- do not mix raw and escaped control characters in the same JSON string value."` // replace-hunk
 	ImportPath  string           `json:"import_path,omitempty"`
 	Alias       string           `json:"alias,omitempty"`
 	OldParam    string           `json:"old_param,omitempty"`
@@ -457,17 +457,17 @@ type codeParam struct {
 	StmtIndex   int              `json:"stmt_index,omitempty"`
 	DeferBody   string           `json:"defer_body,omitempty"`
 	Full        bool             `json:"full,omitempty"`
-	Include     []string         `json:"include,omitempty"`     // expand op: which graph hops to fold in
-	BodyNames   []string         `json:"body_names,omitempty"`  // expand op, internal circuit-breaker redirect only: restrict "body" inclusion to these specific names within Names, instead of applying Include's body flag to every name uniformly (see #279)
-	RemoveFile  bool             `json:"remove_file,omitempty"` // delete op, file:-only bulk-delete mode: after purging every def in the file, also physically remove the file from disk (default false -- defn never removes a file just because it has zero defs, unless explicitly asked). See #301.
-	Test        string           `json:"test,omitempty"`        // L11: op:test named-test reproduction (`-run <regex>` verbatim)
-	Field       string           `json:"field,omitempty"`       // retarget-field-value: composite-literal field name
-	Query       string           `json:"query,omitempty"`       // #153: query-adaptive read — keep only body branches touching the query
-	Mode        string           `json:"mode,omitempty"`        // #160: "summary" returns model-generated one-line intent instead of body
-	Question    string           `json:"question,omitempty"`    // #186: natural-language question for op:"explain" co-processor
-	Plan        string           `json:"plan,omitempty"`        // #187/#188/#189: trajectory plan text for op:"plan-dsl" / op:"plan-sexpr"
-	Intent      string           `json:"intent,omitempty"`      // #186: natural-language exploration goal for op:"plan" (co-processor-generated trajectory)
-	LineRange   string           `json:"line_range,omitempty"`  // read/read-file: file-relative 1-indexed inclusive range, "700-820" or "700:820" -- narrows the returned body to just those lines (read) or to the definitions overlapping that span (read-file), bypassing summary-mode/outline-downgrade the same way full:true does
+	Include     []string         `json:"include,omitempty"`                                                                                                                                                                                                              // expand op: which graph hops to fold in
+	BodyNames   []string         `json:"body_names,omitempty"`                                                                                                                                                                                                           // expand op, internal circuit-breaker redirect only: restrict "body" inclusion to these specific names within Names, instead of applying Include's body flag to every name uniformly (see #279)
+	RemoveFile  bool             `json:"remove_file,omitempty"`                                                                                                                                                                                                          // delete op, file:-only bulk-delete mode: after purging every def in the file, also physically remove the file from disk (default false -- defn never removes a file just because it has zero defs, unless explicitly asked). See #301.
+	Test        string           `json:"test,omitempty" jsonschema:"op 'test' only: runs a test by name/regex via go test -run -- use this to RUN a test. Do not confuse with name:, which only looks up which tests cover a definition and does not execute anything."` // L11: op:test named-test reproduction (-run <regex> verbatim)
+	Field       string           `json:"field,omitempty"`                                                                                                                                                                                                                // retarget-field-value: composite-literal field name
+	Query       string           `json:"query,omitempty"`                                                                                                                                                                                                                // #153: query-adaptive read — keep only body branches touching the query
+	Mode        string           `json:"mode,omitempty"`                                                                                                                                                                                                                 // #160: "summary" returns model-generated one-line intent instead of body
+	Question    string           `json:"question,omitempty"`                                                                                                                                                                                                             // #186: natural-language question for op:"explain" co-processor
+	Plan        string           `json:"plan,omitempty"`                                                                                                                                                                                                                 // #187/#188/#189: trajectory plan text for op:"plan-dsl" / op:"plan-sexpr"
+	Intent      string           `json:"intent,omitempty"`                                                                                                                                                                                                               // #186: natural-language exploration goal for op:"plan" (co-processor-generated trajectory)
+	LineRange   string           `json:"line_range,omitempty"`                                                                                                                                                                                                           // read/read-file: file-relative 1-indexed inclusive range, "700-820" or "700:820" -- narrows the returned body to just those lines (read) or to the definitions overlapping that span (read-file), bypassing summary-mode/outline-downgrade the same way full:true does
 }
 
 // applyOp is one operation inside an apply batch. Only Op is
@@ -489,26 +489,26 @@ type applyOp struct {
 	NewBody     string `json:"new_body,omitempty"`
 	Module      string `json:"module,omitempty"`
 	File        string `json:"file,omitempty"`
-	OldFragment string `json:"old_fragment,omitempty"`
-	NewFragment string `json:"new_fragment,omitempty"`
+	OldFragment string `json:"old_fragment,omitempty" jsonschema:"Fragment to match verbatim within the def's body. If it spans multiple lines, escape every literal newline as \\n and tab as \\t consistently -- do not mix raw and escaped control characters in the same JSON string value."`
+	NewFragment string `json:"new_fragment,omitempty" jsonschema:"Replacement text for old_fragment. If it spans multiple lines, escape every literal newline as \\n and tab as \\t consistently -- do not mix raw and escaped control characters in the same JSON string value."`
 	After       string `json:"after,omitempty"`
 	ReplaceAll  bool   `json:"replace_all,omitempty"`
 
 	// Projection-op fields. Not all ops use every field; the op tag
 	// picks which apply. See internal/projection for the pure functions.
-	Condition  string `json:"condition,omitempty"`   // insert-precondition
-	Ret        string `json:"ret,omitempty"`         // insert-precondition
-	Slice      string `json:"slice,omitempty"`       // replace-slice
-	Index      int    `json:"index,omitempty"`       // replace-slice / replace-hunk
-	New        string `json:"new,omitempty"`         // replace-slice / replace-hunk
-	Old        string `json:"old,omitempty"`         // replace-hunk
-	Force      bool   `json:"force,omitempty"`       // replace-slice
-	DeferBody  string `json:"defer_body,omitempty"`  // wrap-in-defer
-	StmtIndex  int    `json:"stmt_index,omitempty"`  // wrap-in-defer
-	OldParam   string `json:"old_param,omitempty"`   // rename-param
-	NewParam   string `json:"new_param,omitempty"`   // rename-param
-	ImportPath string `json:"import_path,omitempty"` // add-import
-	Alias      string `json:"alias,omitempty"`       // add-import
+	Condition  string `json:"condition,omitempty"`                                                                                                                                                                                                                     // insert-precondition
+	Ret        string `json:"ret,omitempty"`                                                                                                                                                                                                                           // insert-precondition
+	Slice      string `json:"slice,omitempty"`                                                                                                                                                                                                                         // replace-slice
+	Index      int    `json:"index,omitempty"`                                                                                                                                                                                                                         // replace-slice / replace-hunk
+	New        string `json:"new,omitempty" jsonschema:"replace-slice/replace-hunk: replacement text. If multi-line, escape every literal newline as \\n and tab as \\t consistently -- do not mix raw and escaped control characters in the same JSON string value."` // replace-slice / replace-hunk
+	Old        string `json:"old,omitempty" jsonschema:"replace-hunk: text to match verbatim. If multi-line, escape every literal newline as \\n and tab as \\t consistently -- do not mix raw and escaped control characters in the same JSON string value."`         // replace-hunk
+	Force      bool   `json:"force,omitempty"`                                                                                                                                                                                                                         // replace-slice
+	DeferBody  string `json:"defer_body,omitempty"`                                                                                                                                                                                                                    // wrap-in-defer
+	StmtIndex  int    `json:"stmt_index,omitempty"`                                                                                                                                                                                                                    // wrap-in-defer
+	OldParam   string `json:"old_param,omitempty"`                                                                                                                                                                                                                     // rename-param
+	NewParam   string `json:"new_param,omitempty"`                                                                                                                                                                                                                     // rename-param
+	ImportPath string `json:"import_path,omitempty"`                                                                                                                                                                                                                   // add-import
+	Alias      string `json:"alias,omitempty"`                                                                                                                                                                                                                         // add-import
 }
 
 // Legacy param types used by internal handlers.
@@ -5765,7 +5765,7 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 	return prependNote(textResult(sb.String()), ambiguityMsg), nil, nil
 }
 
-func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) handleTest(ctx context.Context, req *sdkmcp.CallToolRequest, args nameParam) (*sdkmcp.CallToolResult, any, error) {
 	d, err := s.resolveEditTarget(args.Name, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.Name, err)
@@ -5778,7 +5778,16 @@ func (s *server) handleTest(_ context.Context, _ *sdkmcp.CallToolRequest, args n
 
 	if len(impact.Tests) == 0 {
 		if d.Test {
-			return textResult(fmt.Sprintf("%s is itself a test function, not something other tests cover — run it directly with test:%q (the `test` param runs a test by name; `name` looks up coverage).", args.Name, args.Name)), nil, nil
+			// v9 bench: this shape is 100% reproducible after code(op:"create")
+			// makes a new Test* function -- the agent immediately calls
+			// test(name:"TestFoo") (coverage lookup) instead of
+			// test(test:"TestFoo") (run by name), burning a full round-trip
+			// on the corrective text every single time before retrying
+			// correctly. Since the target IS the test the caller wants,
+			// just run it instead of only describing how to.
+			r, o, e := s.handleTestByName(ctx, req, args.Name, args.Module, args.File)
+			note := fmt.Sprintf("[%s is itself a test function, not something other tests cover -- ran it directly via test:%q instead of just describing how to; pass test:%q next time to skip this note.]\n\n", args.Name, args.Name, args.Name)
+			return prependNote(r, note), o, e
 		}
 		return textResult(fmt.Sprintf("No tests cover %s. Nothing to run.", args.Name)), nil, nil
 	}
