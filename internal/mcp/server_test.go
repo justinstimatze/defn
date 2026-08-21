@@ -4251,41 +4251,44 @@ func TestHandleApply_BuildFailureRollsBackBothDBAndFile(t *testing.T) {
 	}
 }
 
-// TestHandleCreate_BuildFailureRollsBackBothDBAndFile is the #12
-// regression test for handleCreate: previously this wrote straight to
+// TestHandleCreate_BuildFailureRollsBackBothDBAndFile was the #12
+// regression test for handleCreate's original bug: it wrote straight to
 // s.backend with no transaction at all, so a build failure left a
-// phantom def in the DB with no corresponding on-disk content.
+// phantom def in the DB with no corresponding on-disk content -- DB and
+// file diverged from each other. That divergence guarantee still holds
+// (this test now proves it), but the specific case it originally used to
+// force a failure (an undefined-reference call) no longer fails at all:
+// create's default now skips the real go build (deliberate tradeoff,
+// 2026-08-20 -- see handleCreate's own comment), so DB and file land
+// together, in sync, with the new (semantically broken until the next
+// test/apply) function. What still MUST hold is that they never diverge
+// from each other, which this proves by checking both got the new def.
 func TestHandleCreate_BuildFailureRollsBackBothDBAndFile(t *testing.T) {
 	db, projDir := setupTestDB(t)
 	defer db.Close()
 	s := &server{backend: db, projectDir: projDir}
 	s.ready.Store(true)
 
-	mainPath := filepath.Join(projDir, "main.go")
-	originalFile, err := os.ReadFile(mainPath)
-	if err != nil {
-		t.Fatalf("read main.go: %v", err)
-	}
-
 	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
 		Body: "func BrokenNewFunc() string { return undefinedHelperFunc() }",
 		File: "main.go",
 	})
 	text := resultText(t, result)
-	if !strings.Contains(text, "BUILD FAILED") {
-		t.Fatalf("expected a build failure (undefinedHelperFunc doesn't exist), got: %s", text)
+	if strings.Contains(text, "rolled back") {
+		t.Fatalf("create's default now defers the real build -- an undefined-reference body should land, not roll back, got: %s", text)
 	}
 
-	if _, err := db.GetDefinitionByName("BrokenNewFunc", ""); err == nil {
-		t.Error("#12: BrokenNewFunc exists in the DB despite the build failing -- create was not rolled back")
+	if _, err := db.GetDefinitionByName("BrokenNewFunc", ""); err != nil {
+		t.Error("BrokenNewFunc should exist in the DB -- create's build gate is deferred by default, not skipped entirely")
 	}
 
+	mainPath := filepath.Join(projDir, "main.go")
 	finalFile, err := os.ReadFile(mainPath)
 	if err != nil {
-		t.Fatalf("read main.go after failed build: %v", err)
+		t.Fatalf("read main.go after create: %v", err)
 	}
-	if string(finalFile) != string(originalFile) {
-		t.Errorf("#12: main.go changed on disk despite the build failing -- expected the pre-create content to be restored\nbefore:\n%s\nafter:\n%s", originalFile, finalFile)
+	if !strings.Contains(string(finalFile), "BrokenNewFunc") {
+		t.Errorf("DB and file must land together -- BrokenNewFunc is in the DB but missing from disk:\n%s", finalFile)
 	}
 }
 
@@ -4929,6 +4932,12 @@ func TestHandleCreateFailedBuildDoesNotOrphanModule(t *testing.T) {
 	defer db.Close()
 	s := &server{backend: db, projectDir: projDir}
 
+	// create's default now defers the real build (see handleCreate) --
+	// this test needs a genuine build failure to exercise the #239
+	// module-orphan-on-rollback path, so force the real build via the
+	// same escape hatch commitOrRollbackOnEmit already respects.
+	t.Setenv("DEFN_STRICT_BUILD", "1")
+
 	// A real, pre-existing file defn never ingested or wrote -- stands
 	// in for e.g. resolver/passthrough/passthrough.go.
 	preexistDir := filepath.Join(projDir, "internal", "willfail")
@@ -5101,6 +5110,11 @@ func TestHandleCreate_RolledBackCreateDoesNotClaimSuccess(t *testing.T) {
 	defer db.Close()
 	s := &server{backend: db, projectDir: projDir}
 	s.ready.Store(true)
+
+	// create's default now defers the real build (see handleCreate) --
+	// force it back on to exercise the rolled-back-doesn't-claim-success
+	// path this test guards.
+	t.Setenv("DEFN_STRICT_BUILD", "1")
 
 	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
 		Body: "func BrokenNewFunc() string { return undefinedHelperFunc() }",

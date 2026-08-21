@@ -3644,7 +3644,18 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 			AllowedAdds:    []string{emit.FuncIdentity(name, receiver)},
 		}
 	}
-	buildResult := s.commitOrRollbackOnBuild(tx, commit, rollback, opts)
+	// A brand-new definition has no existing callers to break -- unlike
+	// edit's sig-stable fast path (which is safe because nothing that
+	// already worked can regress), create's fast path is safe for a
+	// different reason: there's nothing FOR this to break yet. The only
+	// risk is the new code's own correctness (e.g. a call to something
+	// undefined), which is exactly the risk edit's sig-stable path
+	// already accepts for a body-only change -- deferred to the next
+	// test/apply rather than caught here. commitOrRollbackOnEmit still
+	// runs the cheap in-process whole-file parse safety-check (catches
+	// "produces invalid Go" at the file level), just not the full
+	// type-check compile.
+	buildResult := s.commitOrRollbackOnEmit(tx, commit, rollback, opts)
 	if buildResult == "" {
 		s.enqueueSummary(d)
 		s.autoResolveFile(args.File, mod.Path)
@@ -5180,7 +5191,18 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		}
 		buildResult = s.emitAndBuildAgainst(s.backend, deleteOpts)
 	} else {
-		buildResult = s.commitOrRollbackOnBuild(tx, commit, rollback, deleteOpts)
+		// By the time we reach here (non-force), the #105 safe-delete
+		// check above has already refused if any caller still
+		// references this def -- so a real build can only catch one
+		// thing a zero-caller delete can't otherwise break: a
+		// structural, non-reference requirement like "package main
+		// needs a func main" (main is never called by other Go code,
+		// so it always shows zero callers regardless). That's a rare
+		// enough edge case that deferring it to the next test/apply --
+		// same tradeoff already accepted for create/edit's sig-stable
+		// path -- is worth it for the common case (deleting genuinely
+		// dead code) not paying a full build every time.
+		buildResult = s.commitOrRollbackOnEmit(tx, commit, rollback, deleteOpts)
 	}
 	// #109 pass 2 (winze op-classification): skip autoResolve on delete.
 	// DeleteDefinition already dropped every refs row where from_def=D
