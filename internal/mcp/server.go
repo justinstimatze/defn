@@ -17,6 +17,7 @@ import (
 	"go/token"
 	"go/types"
 	"io/fs"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -61,7 +62,7 @@ const searchPreviewCount = 3
 // read is cheaper than paying 5×3 preview cost on every search.
 const searchPreviewLines = 2
 
-const Version = "0.26.88"
+const Version = "0.26.89"
 
 var (
 	buildTimeout = envDuration("DEFN_BUILD_TIMEOUT", 30*time.Second)
@@ -786,8 +787,15 @@ func (s *server) notFoundResult(name string) (*sdkmcp.CallToolResult, any, error
 	return errResult(fmt.Errorf("%s", full))
 }
 
+// toJSON serializes v as compact JSON (no indentation). Search/impact/
+// file-defs results are consumed by an LLM parsing the structure, not
+// a human eyeballing whitespace-aligned output -- MarshalIndent's
+// 2-space indentation added ~60-80 bytes of pure whitespace per
+// result entry with zero informational value, confirmed on a real
+// prometheus-18534 trajectory where a 60-result ranked search paid for
+// this on every single entry.
 func toJSON(v any) (string, error) {
-	b, err := json.MarshalIndent(v, "", "  ")
+	b, err := json.Marshal(v)
 	if err != nil {
 		return "", err
 	}
@@ -2539,9 +2547,16 @@ func (s *server) rankedSearchResult(query string, defs []store.Definition, limit
 		if i >= limit {
 			break
 		}
+		// #313: r.Score is an internal ranking float that legitimately
+		// needs many digits to round-trip exactly (e.g.
+		// 8.055157731819678) -- none of that precision past 2 decimals
+		// is informative to a caller who only needs relative ordering
+		// and rough magnitude, and json.Marshal's minimal-round-trip
+		// serialization pays for every digit verbatim across every
+		// result in a ranked list.
 		rs := rankedSummary{
 			Name: r.Def.Name, Kind: r.Def.Kind, Receiver: r.Def.Receiver,
-			SourceFile: r.Def.SourceFile, Score: r.Score,
+			SourceFile: r.Def.SourceFile, Score: math.Round(r.Score*100) / 100,
 		}
 		// #159: preview the top-N ranked hits — model can identify the
 		// winner from body head without a follow-up read.

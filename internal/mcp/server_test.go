@@ -1398,7 +1398,7 @@ func TestBodyScanResult_Hits(t *testing.T) {
 		t.Errorf("expected header naming pattern; got %q", text[:200])
 	}
 	// JSON body includes name+file+snippet.
-	if !strings.Contains(text, `"name": "Greet"`) {
+	if !strings.Contains(text, `"name":"Greet"`) {
 		t.Errorf("expected Greet in JSON body; got %q", text)
 	}
 	if !strings.Contains(text, `"snippet"`) {
@@ -6731,10 +6731,10 @@ func TestBodyScanResult_FileScopesHits(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := resultText(t, result)
-	if !strings.Contains(text, `"name": "SubGreet"`) {
+	if !strings.Contains(text, `"name":"SubGreet"`) {
 		t.Errorf("expected file:\"sub\" scoped body-scan to find SubGreet, got: %s", text)
 	}
-	if strings.Contains(text, `"name": "Greet"`) {
+	if strings.Contains(text, `"name":"Greet"`) {
 		t.Errorf("expected file:\"sub\" to exclude main.go's Greet, got: %s", text)
 	}
 }
@@ -6808,7 +6808,7 @@ func TestHandleCode_SearchQueryAliasesToPattern(t *testing.T) {
 		t.Fatalf("handleCode search via query: %v", err)
 	}
 	text := resultText(t, result)
-	if !strings.Contains(text, `"name": "Greet"`) {
+	if !strings.Contains(text, `"name":"Greet"`) {
 		t.Errorf("expected query: to alias to pattern: and find Greet, got: %s", text)
 	}
 }
@@ -7986,11 +7986,11 @@ func TestHandleTestCoverage_ZeroTestsReturnsEmptyArrayNotNull(t *testing.T) {
 		t.Fatalf("handleTestCoverage: %v", err)
 	}
 	text := resultText(t, result)
-	if strings.Contains(text, `"tests": null`) {
+	if strings.Contains(text, `"tests":null`) {
 		t.Errorf("regression: tests field is null instead of an empty array, got:\n%s", text)
 	}
-	if !strings.Contains(text, `"tests": []`) {
-		t.Errorf("expected \"tests\": [] for a def with zero covering tests, got:\n%s", text)
+	if !strings.Contains(text, `"tests":[]`) {
+		t.Errorf("expected \"tests\":[] for a def with zero covering tests, got:\n%s", text)
 	}
 }
 
@@ -8214,10 +8214,10 @@ func UseC() { Engine() }
 	text := resultText(t, result)
 	// bft's Engine has 1 direct caller (UseBft); chess's has 3 (UseA/B/C).
 	// A wrong resolution to chess's Engine would report combined_callers=3.
-	if !strings.Contains(text, `"direct_callers": 1`) {
+	if !strings.Contains(text, `"direct_callers":1`) {
 		t.Errorf("module:\"testproj/bft\" should have resolved to bft's Engine (1 caller), got:\n%s", text)
 	}
-	if strings.Contains(text, `"direct_callers": 3`) {
+	if strings.Contains(text, `"direct_callers":3`) {
 		t.Errorf("batch-impact scoped to module:\"testproj/bft\" returned chess's Engine (3 callers) instead:\n%s", text)
 	}
 }
@@ -8256,10 +8256,10 @@ func TestHandleValidatePlan_ReceiverDisambiguatesSameNamedMethod(t *testing.T) {
 		t.Fatalf("handleValidatePlan: %v", err)
 	}
 	text := resultText(t, result)
-	if !strings.Contains(text, `"direct_callers": 0`) {
+	if !strings.Contains(text, `"direct_callers":0`) {
 		t.Errorf("receiver:\"*Foo\" should have resolved to Foo's Bar (0 callers), got:\n%s", text)
 	}
-	if strings.Contains(text, `"direct_callers": 2`) {
+	if strings.Contains(text, `"direct_callers":2`) {
 		t.Errorf("validate-plan for receiver:\"*Foo\" resolved to Baz's Bar (2 callers) instead:\n%s", text)
 	}
 }
