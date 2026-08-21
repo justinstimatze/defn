@@ -1081,6 +1081,22 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 				return r, o, e
 			}
 		}
+		// #298: import_path/alias are real codeParam fields, but only
+		// op:"add-import" reads them -- the dispatch below constructs a
+		// narrower editParam that structurally can't carry them, so
+		// op:"edit" silently accepted and dropped both with a normal
+		// success response, no error, no hint. A real prometheus-17395
+		// trajectory retried this 3 times (once inside an apply batch)
+		// before finding add-import, burning ~20 calls hand-verifying its
+		// own import usage in the meantime. Reject instead of silently
+		// no-opping.
+		if args.ImportPath != "" || args.Alias != "" {
+			hint := fmt.Sprintf("use op:\"add-import\" (import_path:%q) to add an import", args.ImportPath)
+			if args.File != "" {
+				hint = fmt.Sprintf("use op:\"add-import\" (file:%q, import_path:%q) to add an import", args.File, args.ImportPath)
+			}
+			return errResult(fmt.Errorf("edit: import_path/alias have no effect on op:\"edit\" -- %s", hint))
+		}
 	case "insert":
 		if r, o, e := need(args.Name, "name"); r != nil {
 			return r, o, e
@@ -1251,6 +1267,46 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 			// to exactly the names actually read.
 			r, o, e := wrapStale(s.handleExpand(ctx, req, codeParam{Names: autoNames, Include: []string{"outline", "callers"}, BodyNames: autoBodyNames}))
 			note := fmt.Sprintf("[circuit breaker: auto-batched %d individual lookups this turn (%s) into one expand call instead of refusing -- call code(op:\"context\"/op:\"expand\", names:[...]) yourself next time to skip this extra round-trip.]\n\n", len(autoNames), strings.Join(autoNames, ", "))
+			// #297: search is the one readShapedOp that isn't nameable --
+			// its own query never joins autoNames (there's no single target
+			// name to track it under), so unlike read/outline/impact/
+			// methods/expand, the rescue above answers a DIFFERENT question
+			// than the one just asked. Serving only the rescue silently
+			// dropped the search itself with no signal it never ran -- the
+			// response looked like a complete, on-topic answer (a real
+			// prometheus-19338 trajectory burned 2 extra calls after
+			// concluding its search term genuinely had zero matches). Run
+			// the search too and surface both.
+			if args.Op == "search" {
+				pattern := args.Pattern
+				if pattern == "" {
+					pattern = args.Name
+				}
+				if pattern == "" {
+					pattern = args.Query
+				}
+				searchArgs := args
+				searchArgs.Pattern = pattern
+				// wrapStale here too -- the search half is the live, just-run
+				// query most likely to need the staleness caveat; leaving it
+				// unwrapped while only the rescue's expand half carried the
+				// banner put the tag on the wrong half of the combined response.
+				sr, _, se := wrapStale(s.handleSearch(ctx, req, searchArgs))
+				if se == nil && sr != nil && len(sr.Content) > 0 {
+					if st, ok := sr.Content[0].(*sdkmcp.TextContent); ok && len(r.Content) > 0 {
+						if rt, ok2 := r.Content[0].(*sdkmcp.TextContent); ok2 {
+							rt.Text = st.Text + "\n\n---\n\n" + rt.Text
+							note = fmt.Sprintf("[circuit breaker: your search for %q ran normally (result above the ---); %d OTHER pending lookups from this turn (%s) were also auto-batched below that instead of refusing them -- call code(op:\"context\"/op:\"expand\", names:[...]) yourself next time to skip the extra round-trip.]\n\n", pattern, len(autoNames), strings.Join(autoNames, ", "))
+						}
+					}
+				} else {
+					// The search itself failed -- say so explicitly rather than
+					// silently falling back to the rescue-only note, which would
+					// look identical to "nothing was asked" and defeat the whole
+					// point of this fix.
+					note = fmt.Sprintf("[circuit breaker: your search for %q FAILED to run (not shown below); %d OTHER pending lookups from this turn (%s) were auto-batched instead of refusing them -- call code(op:\"context\"/op:\"expand\", names:[...]) yourself next time to skip the extra round-trip.]\n\n", pattern, len(autoNames), strings.Join(autoNames, ", "))
+				}
+			}
 			return prependNote(r, note), o, e
 		}
 		if breakerMsg != "" {
@@ -4086,6 +4142,12 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 					errors = append(errors, fmt.Sprintf("edit %s: not found", op.Name))
 				} else if msg := unsupportedFieldOp(d.Kind, "edit"); msg != "" {
 					errors = append(errors, fmt.Sprintf("edit %s: %s", op.Name, msg))
+				} else if op.ImportPath != "" || op.Alias != "" {
+					// #298: same silent no-op as the singleton handleCode path --
+					// see its fix comment for the full rationale. Checked after
+					// resolution so a typo'd name reports "not found" first, the
+					// more fundamental problem.
+					errors = append(errors, fmt.Sprintf("edit %s: import_path/alias have no effect on op:\"edit\" -- use op:\"add-import\" instead", op.Name))
 				} else {
 					sb.WriteString(fmt.Sprintf("~ would edit %s\n", op.Name))
 				}
@@ -4435,6 +4497,15 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			}
 			if msg := unsupportedFieldOp(d.Kind, "edit"); msg != "" {
 				errors = append(errors, fmt.Sprintf("edit %s: %s", op.Name, msg))
+				continue
+			}
+			if op.ImportPath != "" || op.Alias != "" {
+				// #298: same silent no-op as the singleton handleCode path --
+				// see its fix comment for the full rationale. A real
+				// prometheus-17395 trajectory hit this from inside an apply
+				// batch specifically. Checked after resolution so a typo'd
+				// name reports "not found" first, the more fundamental problem.
+				errors = append(errors, fmt.Sprintf("edit %s: import_path/alias have no effect on op:\"edit\" -- use op:\"add-import\" instead", op.Name))
 				continue
 			}
 			if op.OldFragment != "" {

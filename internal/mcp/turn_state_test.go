@@ -470,3 +470,59 @@ func TestHandleCode_CircuitBreakerRescuesNonNameableTrigger(t *testing.T) {
 		}
 	}
 }
+
+func TestHandleCode_CircuitBreakerRescuedSearchStillExecutes(t *testing.T) {
+	t.Setenv("DEFN_CIRCUIT_BREAKER", "2")
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
+
+	// Pending names deliberately avoid "Farewell" in their own name --
+	// Greet/TestGreet's outline+callers can still mention "Farewell" in
+	// PROSE (Farewell calls Greet), which is exactly why the assertion
+	// below checks for the quoted JSON search-result shape (`"name":"Farewell"`)
+	// rather than the bare substring, and checks it lands before the ---
+	// divider (the search section), not just anywhere in the blob.
+	for _, name := range []string{"Greet", "TestGreet"} {
+		r, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: name})
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if strings.Contains(resultText(t, r), "circuit breaker") {
+			t.Fatalf("read %s should be within threshold, got: %s", name, resultText(t, r))
+		}
+	}
+
+	// Third call is past threshold=2 and is search, not nameable --
+	// pattern matches only Farewell's body ("and goodbye").
+	third, _, err := s.handleCode(context.Background(), req, codeParam{Op: "search", Pattern: "goodbye"})
+	if err != nil {
+		t.Fatalf("third call (search): %v", err)
+	}
+	text := resultText(t, third)
+	if !strings.Contains(text, "auto-batched") {
+		t.Fatalf("expected an auto-batch note, got: %s", text)
+	}
+	if !strings.Contains(text, "your search for") {
+		t.Fatalf("expected the rescued search to be called out explicitly, got: %s", text)
+	}
+	// The note itself contains the literal substring "---" inline ("result
+	// above the ---"), so a bare Index(text, "---") would match that instead
+	// of the real section divider -- look for the actual "\n\n---\n\n"
+	// separator the fix inserts between the search and rescue sections.
+	dividerIdx := strings.Index(text, "\n\n---\n\n")
+	searchHitIdx := strings.Index(text, `"name":"Farewell"`)
+	if searchHitIdx == -1 {
+		t.Fatalf("expected the actual search result (JSON entry for Farewell, the only body match for 'goodbye') to be present, got: %s", text)
+	}
+	if dividerIdx == -1 || searchHitIdx > dividerIdx {
+		t.Fatalf("expected the search result to appear BEFORE the --- divider (in the search section, not the auto-batched rescue section), got: %s", text)
+	}
+	for _, name := range []string{"Greet", "TestGreet"} {
+		if !strings.Contains(text, name) {
+			t.Errorf("auto-batched result missing pending name %s: %s", name, text)
+		}
+	}
+}

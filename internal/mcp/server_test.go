@@ -12826,3 +12826,76 @@ func TestHandleTest_OnTestFunctionActuallyRunsIt(t *testing.T) {
 		t.Errorf("expected the test to have actually executed and passed, got: %s", text)
 	}
 }
+
+// TestHandleCode_EditRejectsImportPathAlias guards #298: import_path/
+// alias are real codeParam fields, but only op:"add-import" reads them --
+// the "edit" dispatch below constructs a narrower editParam that
+// structurally can't carry them, so op:"edit" used to silently accept
+// and drop both with a normal success response. A real prometheus-17395
+// trajectory retried this 3 times before finding add-import. This must
+// be rejected instead of silently no-opping.
+func TestHandleCode_EditRejectsImportPathAlias(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op:         "edit",
+		Name:       "Greet",
+		NewBody:    "func Greet(name string) string { return \"Hi, \" + name }",
+		ImportPath: "fmt",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "import_path") || !strings.Contains(text, "add-import") {
+		t.Fatalf("expected a rejection pointing at add-import, got: %s", text)
+	}
+
+	read, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "read", Name: "Greet", Full: true})
+	if strings.Contains(resultText(t, read), "Hi, ") {
+		t.Errorf("rejected edit still landed its new_body: %s", resultText(t, read))
+	}
+}
+
+// TestHandleApply_EditRejectsImportPathAlias is the apply-batched
+// counterpart to TestHandleCode_EditRejectsImportPathAlias -- same gap,
+// reached via handleApply's own "edit" case. A real prometheus-17395
+// trajectory hit this specific path (call #173, inside an apply batch)
+// after already failing twice on the standalone edit path.
+func TestHandleApply_EditRejectsImportPathAlias(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{
+				Op:         "edit",
+				Name:       "Greet",
+				NewBody:    "func Greet(name string) string { return \"Hi, \" + name }",
+				ImportPath: "fmt",
+			},
+		},
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "import_path") || !strings.Contains(text, "add-import") {
+		t.Fatalf("expected a rejection pointing at add-import, got: %s", text)
+	}
+
+	read, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "read", Name: "Greet", Full: true})
+	if strings.Contains(resultText(t, read), "Hi, ") {
+		t.Errorf("rejected batched edit still landed its new_body: %s", resultText(t, read))
+	}
+
+	dryRun, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		DryRun: true,
+		Operations: []applyOp{
+			{Op: "edit", Name: "Greet", NewBody: "func Greet(name string) string { return name }", ImportPath: "fmt"},
+		},
+	})
+	dryText := resultText(t, dryRun)
+	if !strings.Contains(dryText, "import_path") || !strings.Contains(dryText, "add-import") {
+		t.Fatalf("expected dry-run to also reject import_path/alias, got: %s", dryText)
+	}
+}
