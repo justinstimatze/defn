@@ -13923,3 +13923,84 @@ func main() {}
 		t.Errorf("C3 should be untouched: %s", c3.Body)
 	}
 }
+
+// TestHandleApply_PatchBatchedWithEditLandsAtomically proves the actual
+// point of #310: patch can now be batched with an unrelated edit in one
+// atomic transaction.
+func TestHandleApply_PatchBatchedWithEditLandsAtomically(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "patch", Name: "Greet", OldName: "Hello", NewName: "Hi"},
+			{Op: "edit", Name: "Farewell", NewBody: `func Farewell(name string) string {
+	return Greet(name) + " and adieu"
+}`},
+		},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "rolled back") || strings.Contains(text, "Errors") {
+		t.Fatalf("batched patch+edit failed: %s", text)
+	}
+
+	greet, _ := db.GetDefinitionByName("Greet", "")
+	if !strings.Contains(greet.Body, `"Hi, "`) {
+		t.Errorf("expected Greet's patch to land, got: %s", greet.Body)
+	}
+	farewell, _ := db.GetDefinitionByName("Farewell", "")
+	if !strings.Contains(farewell.Body, "and adieu") {
+		t.Errorf("expected Farewell's edit to also land in the same batch, got: %s", farewell.Body)
+	}
+}
+
+// TestHandleApply_PatchDryRunCatchesMissingOldText guards the same
+// #308-class gap for patch: dry-run must actually check the old text
+// exists in the body, not just resolve the target and report a
+// false-positive "would patch" preview.
+func TestHandleApply_PatchDryRunCatchesMissingOldText(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		DryRun:     true,
+		Operations: []applyOp{{Op: "patch", Name: "Greet", OldName: "NOPE_NOT_IN_BODY", NewName: "Hi"}},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "would patch") {
+		t.Fatalf("expected dry-run to catch the missing old text instead of a false-positive preview: %s", text)
+	}
+	if !strings.Contains(text, "Errors") {
+		t.Errorf("expected an error for the missing old text, got: %s", text)
+	}
+}
+
+// TestHandleApply_PatchReplacesFirstOccurrence is the apply-batched
+// counterpart to handlePatch's own basic replace path -- #310:
+// handleApply had no "patch" case at all. Fits the same projEdit
+// pattern used for insert (#309).
+func TestHandleApply_PatchReplacesFirstOccurrence(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "patch", Name: "Greet", OldName: "Hello", NewName: "Hi"},
+		},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "rolled back") || strings.Contains(text, "Errors") {
+		t.Fatalf("patch failed: %s", text)
+	}
+
+	d, _ := db.GetDefinitionByName("Greet", "")
+	if !strings.Contains(d.Body, `"Hi, "`) {
+		t.Errorf("patch not applied, got body: %s", d.Body)
+	}
+}

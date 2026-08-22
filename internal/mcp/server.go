@@ -484,7 +484,8 @@ type applyOp struct {
 	Op          string `json:"op"`
 	Name        string `json:"name,omitempty"`
 	Receiver    string `json:"receiver,omitempty"` // disambiguates same-named methods across types (#219), mirrors nameParam/editParam's Receiver
-	NewName     string `json:"new_name,omitempty"`
+	NewName     string `json:"new_name,omitempty"` // rename: new symbol name (op.Name is resolved as the OLD name for rename -- see its handleApply case)
+	OldName     string `json:"old_name,omitempty"` // patch: old text to replace with new_name (patch resolves the target via op.Name/op.Receiver/op.Module/op.File like every other op, unlike rename)
 	Body        string `json:"body,omitempty"`
 	NewBody     string `json:"new_body,omitempty"`
 	Module      string `json:"module,omitempty"`
@@ -4295,7 +4296,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 					}
 					sb.WriteString(fmt.Sprintf("→ would retarget %s.%s: %q → %q in %d def(s)\n", op.Name, op.Field, op.Old, op.New, would))
 				}
-			case "insert-precondition", "replace-slice", "replace-hunk", "wrap-in-defer", "rename-param", "insert":
+			case "insert-precondition", "replace-slice", "replace-hunk", "wrap-in-defer", "rename-param", "insert", "patch":
 				name := op.Name
 				if name == "" {
 					if inferred, err := s.inferSingleTargetName(s.backend); err != nil {
@@ -4364,6 +4365,13 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 					insertSrc := "package x\n" + newBody
 					if _, parseErr := parser.ParseFile(token.NewFileSet(), "", insertSrc, parser.ParseComments); parseErr != nil {
 						computeErr = fmt.Errorf("insert produces invalid Go: %w", parseErr)
+					}
+				case "patch":
+					// #310: same missing-op capability gap as insert -- mirrors
+					// handlePatch's own old-text-found + first-occurrence-replace
+					// validation.
+					if !strings.Contains(d.Body, op.OldName) {
+						computeErr = fmt.Errorf("old text not found in body")
 					}
 				}
 				if computeErr != nil {
@@ -5214,6 +5222,22 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				}
 				insertAt := idx + len(op.After)
 				return body[:insertAt] + op.Body + body[insertAt:], nil
+			})
+			if errStr != "" {
+				errors = append(errors, errStr)
+			} else {
+				sb.WriteString(line)
+			}
+
+		case "patch":
+			// #310: same missing-op capability gap as insert -- fits the
+			// same shared projEdit pattern (mirrors handlePatch's own
+			// first-occurrence strings.Replace).
+			line, errStr := projEdit(op, func(body string) (string, error) {
+				if !strings.Contains(body, op.OldName) {
+					return "", fmt.Errorf("old text not found in body")
+				}
+				return strings.Replace(body, op.OldName, op.NewName, 1), nil
 			})
 			if errStr != "" {
 				errors = append(errors, errStr)
