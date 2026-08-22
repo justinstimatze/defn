@@ -51,7 +51,12 @@ func writeGitignore(modulePath string) {
 	if len(gitignoreContent) > 0 && !strings.HasSuffix(string(gitignoreContent), "\n") {
 		f.WriteString("\n")
 	}
-	f.WriteString("\n# defn database\n.defn/\n.codex/\n")
+	// #328: settings.local.json is where writeClaudeHooks installs defn's
+	// own hook entry -- Claude Code's own convention treats it as
+	// machine-local and gitignored, but that's not guaranteed to already
+	// be true in every consuming repo, so defn's own scaffolding
+	// shouldn't depend on the project already having the right rule.
+	f.WriteString("\n# defn database\n.defn/\n.codex/\n.claude/settings.local.json\n")
 }
 
 // writeCLAUDEMDSection ensures the CLAUDE.md at modulePath contains
@@ -177,8 +182,19 @@ func defnBinaryPath() string {
 // unrelated same-named "drop" feature elsewhere in the package, and
 // contributed to a wrong-function edit.
 //
+// #328 (external report, winze, reproduced on a throwaway module):
+// writes to .claude/settings.local.json, defn's own gitignored
+// per-machine config, not .claude/settings.json -- the latter is
+// tracked in many consuming repos, and committing an absolute
+// filesystem path into it both leaks the local path and registers a
+// hook no other checkout can resolve. The hook command itself uses
+// ${CLAUDE_PROJECT_DIR} (a Claude Code-documented path placeholder,
+// expanded to the project root at hook-run time) instead of the
+// absolute hookPath, so the entry is portable across machines and
+// checkouts even if it were committed.
+//
 // Idempotent -- preserves any other hooks already declared in
-// settings.json (own or third-party), and does not add a second
+// settings.local.json (own or third-party), and does not add a second
 // UserPromptSubmit entry for defn's hook on repeat init/ingest calls.
 // Writes the script to .defn/hooks/ (gitignored, like the rest of
 // .defn/) rather than the project's own hooks/ directory, so it never
@@ -195,7 +211,7 @@ func writeClaudeHooks(modulePath string) {
 		return
 	}
 
-	settingsPath := filepath.Join(modulePath, ".claude", "settings.json")
+	settingsPath := filepath.Join(modulePath, ".claude", "settings.local.json")
 	settings := map[string]any{}
 	if data, err := os.ReadFile(settingsPath); err == nil {
 		json.Unmarshal(data, &settings)
@@ -206,7 +222,7 @@ func writeClaudeHooks(modulePath string) {
 	}
 	submitGroups, _ := hooksSection["UserPromptSubmit"].([]any)
 
-	command := "bash " + hookPath
+	command := "bash ${CLAUDE_PROJECT_DIR}/.defn/hooks/defn-capture-question.sh"
 	for _, g := range submitGroups {
 		group, ok := g.(map[string]any)
 		if !ok {

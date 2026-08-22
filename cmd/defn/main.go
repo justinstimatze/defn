@@ -176,7 +176,7 @@ func usage() {
 Usage:
   defn init <path>             Ingest + configure MCP
   defn repair [path]           Delete .defn and re-ingest (recovers from corruption)
-  defn ingest <path>           Parse Go source → SQLite database
+  defn ingest <path>           Parse Go source → SQLite database + configure MCP (same as init; --reindex skips config writes)
   defn sync [file]             Re-ingest (single file: fast path via IngestFile+ResolveFile; falls back to full ingest above 50 stale files)
   defn serve                   MCP server for Claude Code
   defn emit <output-dir>       Database → .go files

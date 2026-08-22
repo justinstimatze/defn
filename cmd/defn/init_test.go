@@ -121,13 +121,17 @@ func TestWriteClaudeHooks_WritesScriptAndSettings(t *testing.T) {
 		t.Errorf("expected the installed script to be the capture-question hook, got: %s", data)
 	}
 
-	settingsData, err := os.ReadFile(filepath.Join(dir, ".claude", "settings.json"))
+	if _, err := os.Stat(filepath.Join(dir, ".claude", "settings.json")); err == nil {
+		t.Errorf("expected settings.json (commonly tracked in consuming repos) to be left untouched -- #328")
+	}
+
+	settingsData, err := os.ReadFile(filepath.Join(dir, ".claude", "settings.local.json"))
 	if err != nil {
-		t.Fatalf("read settings.json: %v", err)
+		t.Fatalf("read settings.local.json: %v", err)
 	}
 	var settings map[string]any
 	if err := json.Unmarshal(settingsData, &settings); err != nil {
-		t.Fatalf("unmarshal settings.json: %v", err)
+		t.Fatalf("unmarshal settings.local.json: %v", err)
 	}
 	groups := settings["hooks"].(map[string]any)["UserPromptSubmit"].([]any)
 	if len(groups) != 1 {
@@ -135,8 +139,11 @@ func TestWriteClaudeHooks_WritesScriptAndSettings(t *testing.T) {
 	}
 	entries := groups[0].(map[string]any)["hooks"].([]any)
 	cmd := entries[0].(map[string]any)["command"].(string)
-	if !strings.Contains(cmd, hookPath) {
-		t.Errorf("expected command to reference %s, got %q", hookPath, cmd)
+	if strings.Contains(cmd, dir) {
+		t.Errorf("expected command to be portable (${CLAUDE_PROJECT_DIR}-relative), not the absolute tempdir path, got %q", cmd)
+	}
+	if !strings.Contains(cmd, "${CLAUDE_PROJECT_DIR}/.defn/hooks/defn-capture-question.sh") {
+		t.Errorf("expected command to reference the portable ${CLAUDE_PROJECT_DIR}-relative hook path, got %q", cmd)
 	}
 }
 
@@ -149,13 +156,13 @@ func TestWriteClaudeHooks_IdempotentNoDuplicateEntry(t *testing.T) {
 	writeClaudeHooks(dir)
 	writeClaudeHooks(dir)
 
-	data, err := os.ReadFile(filepath.Join(dir, ".claude", "settings.json"))
+	data, err := os.ReadFile(filepath.Join(dir, ".claude", "settings.local.json"))
 	if err != nil {
-		t.Fatalf("read settings.json: %v", err)
+		t.Fatalf("read settings.local.json: %v", err)
 	}
 	var settings map[string]any
 	if err := json.Unmarshal(data, &settings); err != nil {
-		t.Fatalf("unmarshal settings.json: %v", err)
+		t.Fatalf("unmarshal settings.local.json: %v", err)
 	}
 	groups := settings["hooks"].(map[string]any)["UserPromptSubmit"].([]any)
 	if len(groups) != 1 {
@@ -164,9 +171,11 @@ func TestWriteClaudeHooks_IdempotentNoDuplicateEntry(t *testing.T) {
 }
 
 // TestWriteClaudeHooks_PreservesExistingHooksAndSettings confirms an
-// existing .claude/settings.json (the user's own hooks, or another
-// tool's) survives untouched -- writeClaudeHooks must merge, not
-// overwrite.
+// existing .claude/settings.local.json (the user's own hooks, or
+// another tool's) survives untouched -- writeClaudeHooks must merge,
+// not overwrite. #328: writes to settings.local.json (gitignored),
+// not settings.json (commonly tracked), so this seeds the file defn
+// actually merges into.
 func TestWriteClaudeHooks_PreservesExistingHooksAndSettings(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, ".claude"), 0755); err != nil {
@@ -183,19 +192,19 @@ func TestWriteClaudeHooks_PreservesExistingHooksAndSettings(t *testing.T) {
 			]
 		}
 	}`
-	if err := os.WriteFile(filepath.Join(dir, ".claude", "settings.json"), []byte(existing), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, ".claude", "settings.local.json"), []byte(existing), 0644); err != nil {
 		t.Fatal(err)
 	}
 
 	writeClaudeHooks(dir)
 
-	data, err := os.ReadFile(filepath.Join(dir, ".claude", "settings.json"))
+	data, err := os.ReadFile(filepath.Join(dir, ".claude", "settings.local.json"))
 	if err != nil {
-		t.Fatalf("read settings.json: %v", err)
+		t.Fatalf("read settings.local.json: %v", err)
 	}
 	var settings map[string]any
 	if err := json.Unmarshal(data, &settings); err != nil {
-		t.Fatalf("unmarshal settings.json: %v", err)
+		t.Fatalf("unmarshal settings.local.json: %v", err)
 	}
 
 	perms := settings["permissions"].(map[string]any)
@@ -231,5 +240,23 @@ func TestWriteClaudeHooks_PreservesExistingHooksAndSettings(t *testing.T) {
 	}
 	if !foundDefn {
 		t.Error("expected defn's own UserPromptSubmit hook to be added")
+	}
+}
+
+// TestWriteGitignore_IgnoresClaudeSettingsLocal guards #328: defn's own
+// scaffolding must not depend on the consuming repo already ignoring
+// .claude/settings.local.json (the file writeClaudeHooks writes its
+// hook entry into) -- an uncommitted .gitignore entry would leave that
+// file eligible to be accidentally committed.
+func TestWriteGitignore_IgnoresClaudeSettingsLocal(t *testing.T) {
+	dir := t.TempDir()
+	writeGitignore(dir)
+
+	data, err := os.ReadFile(filepath.Join(dir, ".gitignore"))
+	if err != nil {
+		t.Fatalf("read .gitignore: %v", err)
+	}
+	if !strings.Contains(string(data), ".claude/settings.local.json") {
+		t.Errorf("expected .gitignore to ignore .claude/settings.local.json, got:\n%s", data)
 	}
 }
