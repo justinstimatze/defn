@@ -3583,6 +3583,9 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// Infer name, kind, and test flag from the body.
 	name, kind, receiver, isTest := s.inferFromBody(args.Body)
 	if name == "" {
+		if hint := inferFailureHint(args.Body); hint != "" {
+			return errResult(fmt.Errorf("couldn't infer definition name — %s", hint))
+		}
 		return errResult(fmt.Errorf("couldn't infer definition name from body — make sure it starts with func/type/const/var"))
 	}
 
@@ -4176,7 +4179,11 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				}
 				name, kind, _, _ := s.inferFromBody(op.Body)
 				if name == "" {
-					errors = append(errors, "create: couldn't infer name from body")
+					if hint := inferFailureHint(op.Body); hint != "" {
+						errors = append(errors, "create: couldn't infer name from body -- "+hint)
+					} else {
+						errors = append(errors, "create: couldn't infer name from body")
+					}
 				} else {
 					sb.WriteString(fmt.Sprintf("+ would create %s (%s)\n", name, kind))
 				}
@@ -4619,7 +4626,11 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			}
 			name, kind, receiver, isTest := s.inferFromBody(op.Body)
 			if name == "" {
-				errors = append(errors, "create: couldn't infer name from body")
+				if hint := inferFailureHint(op.Body); hint != "" {
+					errors = append(errors, "create: couldn't infer name from body -- "+hint)
+				} else {
+					errors = append(errors, "create: couldn't infer name from body")
+				}
 				continue
 			}
 			// Mirrors handleCreate's precedence: file: is tried first (most
@@ -11855,4 +11866,26 @@ func mcpDebugf(format string, args ...any) {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "[mcp-debug] "+format+"\n", args...)
+}
+
+// inferFailureHint returns a more specific reason inferFromBody
+// couldn't extract a name from body, or "" if there's nothing more
+// specific to say than the generic "make sure it starts with
+// func/type/const/var" message. #315: a common Go pattern -- extending
+// an existing var/const block with one more entry -- looks like a bare
+// "IDENT = EXPR" line with no var/const keyword, valid only inside a
+// var(...)/const(...) block, never as a standalone top-level decl.
+// Detected by re-parsing wrapped in a var(...) block (the real Go
+// parser, not a string heuristic, so it handles leading comments/
+// whitespace correctly) -- if THAT succeeds, the body is missing its
+// keyword. Confirmed via a real prometheus-18534 trajectory. Shared
+// across handleCreate and both apply create cases (dry-run + real) so
+// the diagnosis can't drift between them the way earlier apply-vs-
+// singleton divergences did this session.
+func inferFailureHint(body string) string {
+	trial := "package x\nvar (\n" + body + "\n)\n"
+	if _, err := parser.ParseFile(token.NewFileSet(), "", trial, parser.ParseComments); err == nil {
+		return "this body looks like an entry inside an existing var/const block, valid only there, not as its own declaration. Prefix it with \"var \" or \"const \" to create it standalone, or read the existing block and use replace-hunk/edit to add this line inside it directly"
+	}
+	return ""
 }

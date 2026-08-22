@@ -13980,3 +13980,82 @@ func TestHandleCode_ReadWithFileNoNameRedirectsToOverview(t *testing.T) {
 		}
 	}
 }
+
+// TestHandleCreate_TrulyUnparseableBodyGetsGenericMessage is the
+// control for #315: garbage that ISN'T a var/const block entry either
+// must keep the original generic message, not the new specific hint.
+func TestHandleCreate_TrulyUnparseableBodyGetsGenericMessage(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		File: "main.go",
+		Body: `this is not valid go at all {{{`,
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "var/const block") {
+		t.Errorf("expected the generic message for truly unparseable input, got the var/const hint instead: %s", text)
+	}
+	if !strings.Contains(text, "make sure it starts with func/type/const/var") {
+		t.Errorf("expected the generic message, got: %s", text)
+	}
+}
+
+// TestHandleCreate_VarBlockEntryGetsSpecificHint is #315: a body like
+// "Foo = fmt.Errorf(...)" (valid only inside an existing var/const
+// block, never standalone) used to fail inferFromBody's parse with no
+// hint at why, giving the generic "make sure it starts with
+// func/type/const/var" message even though the body DOES start with
+// neither by design (it's meant to be a block entry). Confirmed via a
+// real prometheus-18534 trajectory.
+func TestHandleCreate_VarBlockEntryGetsSpecificHint(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		File: "main.go",
+		Body: `SomeSentinelError = fmt.Errorf("boom")`,
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "var/const block") {
+		t.Errorf("expected the var/const block hint, got: %s", text)
+	}
+	if !strings.Contains(text, `"var "`) || !strings.Contains(text, `"const "`) {
+		t.Errorf("expected both var and const prefix suggestions, got: %s", text)
+	}
+}
+
+// TestHandleApply_CreateVarBlockEntryGetsSpecificHint is #315's apply
+// counterpart, covering both the real and dry-run create cases -- both
+// call inferFromBody independently, the same class of singleton-vs-
+// apply divergence risk found repeatedly elsewhere in apply this
+// session, so both need the shared inferFailureHint wired in.
+func TestHandleApply_CreateVarBlockEntryGetsSpecificHint(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	body := `SomeSentinelError = fmt.Errorf("boom")`
+
+	dryRun, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		DryRun:     true,
+		Operations: []applyOp{{Op: "create", File: "main.go", Body: body}},
+	})
+	dryText := resultText(t, dryRun)
+	if !strings.Contains(dryText, "var/const block") {
+		t.Errorf("dry-run: expected the var/const block hint, got: %s", dryText)
+	}
+
+	real, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{{Op: "create", File: "main.go", Body: body}},
+	})
+	realText := resultText(t, real)
+	if !strings.Contains(realText, "var/const block") {
+		t.Errorf("real: expected the var/const block hint, got: %s", realText)
+	}
+}
