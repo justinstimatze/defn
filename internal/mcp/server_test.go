@@ -13566,3 +13566,114 @@ func TestHandleApply_CreateSingleDeclNewNestedPackageGetsOwnModule(t *testing.T)
 		t.Errorf("new package's def must not share ModuleID with the unrelated pre-existing testproj module")
 	}
 }
+
+// TestHandleApply_MoveRelocatesToTargetModuleDirectory is the
+// apply-batch counterpart to TestHandleMove_RelocatesToTargetModuleDirectory
+// -- #307: handleApply had no "move" op at all (a confirmed capability
+// gap, not a bug: an agent could never batch a move with other
+// operations in one atomic transaction). Same fixture, same assertions,
+// through code(op:"apply") instead of the standalone op:"move".
+func TestHandleApply_MoveRelocatesToTargetModuleDirectory(t *testing.T) {
+	s, projDir, _ := setupMoveTestProject(t)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{{Op: "move", Name: "Bar", Module: "other"}},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "rolled back") || strings.Contains(text, "WARNING") || strings.Contains(text, "Errors") {
+		t.Fatalf("apply move reported failure/warning: %s", text)
+	}
+
+	subSrc, err := os.ReadFile(filepath.Join(projDir, "sub", "sub.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(subSrc), "func Bar") {
+		t.Errorf("sub/sub.go still contains Bar after apply move:\n%s", subSrc)
+	}
+	if !strings.Contains(string(subSrc), "func Foo") {
+		t.Errorf("sub/sub.go lost unrelated Foo after apply move:\n%s", subSrc)
+	}
+
+	relocated := filepath.Join(projDir, "other", "sub.go")
+	newSrc, err := os.ReadFile(relocated)
+	if err != nil {
+		t.Fatalf("expected %s to exist after apply move: %v", relocated, err)
+	}
+	if !strings.Contains(string(newSrc), "package other") {
+		t.Errorf("relocated file has wrong package clause:\n%s", newSrc)
+	}
+	if !strings.Contains(string(newSrc), "func Bar() int") {
+		t.Errorf("relocated file missing Bar's body:\n%s", newSrc)
+	}
+
+	goBuild(t, projDir)
+}
+
+// TestHandleApply_MoveBatchedWithEditLandsAtomically is the actual
+// point of #307: an agent can now batch a move together with an
+// unrelated edit in one atomic transaction, instead of needing two
+// separate round-trips with no shared rollback protection.
+func TestHandleApply_MoveBatchedWithEditLandsAtomically(t *testing.T) {
+	s, projDir, _ := setupMoveTestProject(t)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "move", Name: "Bar", Module: "other"},
+			{Op: "edit", Name: "Baz", NewBody: "func Baz() { println(\"baz\") }"},
+		},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "rolled back") || strings.Contains(text, "Errors") {
+		t.Fatalf("batched move+edit failed: %s", text)
+	}
+
+	relocated := filepath.Join(projDir, "other", "sub.go")
+	if _, err := os.Stat(relocated); err != nil {
+		t.Fatalf("expected %s to exist after batched move: %v", relocated, err)
+	}
+	otherSrc, err := os.ReadFile(filepath.Join(projDir, "other", "other.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(otherSrc), `println("baz")`) {
+		t.Errorf("expected Baz's edit to also land in the same batch:\n%s", otherSrc)
+	}
+
+	goBuild(t, projDir)
+}
+
+// TestHandleApply_MoveRequiresModuleAndTargetMustExist covers apply's
+// move validation errors, both in dry-run and live, mirroring
+// handleMove's own error shapes.
+func TestHandleApply_MoveRequiresModuleAndTargetMustExist(t *testing.T) {
+	s, _, _ := setupMoveTestProject(t)
+
+	// module: is required.
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{{Op: "move", Name: "Bar"}},
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "module is required") {
+		t.Errorf("expected a module-required error, got: %s", text)
+	}
+
+	// Target module must exist.
+	result2, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{{Op: "move", Name: "Bar", Module: "nonexistent"}},
+	})
+	text2 := resultText(t, result2)
+	if !strings.Contains(text2, "not found") {
+		t.Errorf("expected a target-module-not-found error, got: %s", text2)
+	}
+
+	// Same validation in dry-run.
+	dryRun, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		DryRun:     true,
+		Operations: []applyOp{{Op: "move", Name: "Bar", Module: "other"}},
+	})
+	dryText := resultText(t, dryRun)
+	if !strings.Contains(dryText, "would move Bar to other") {
+		t.Errorf("expected a dry-run preview of the move, got: %s", dryText)
+	}
+}

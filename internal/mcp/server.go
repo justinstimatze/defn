@@ -4253,6 +4253,19 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				} else {
 					sb.WriteString(fmt.Sprintf("→ would rename %s → %s\n", op.Name, op.NewName))
 				}
+			case "move":
+				// #307: op.Module means the DESTINATION module for move (unlike
+				// every other op, where it scopes/disambiguates the SOURCE) --
+				// so the source lookup passes "" for module, matching
+				// handleMove's own resolveWriteTarget(args.Name, args.Receiver,
+				// "", args.File) call.
+				if op.Module == "" {
+					errors = append(errors, "move: module is required")
+				} else if _, err := s.resolveApplyTarget(s.backend, op.Name, op.Receiver, "", op.File); err != nil {
+					errors = append(errors, fmt.Sprintf("move %s: not found", op.Name))
+				} else {
+					sb.WriteString(fmt.Sprintf("→ would move %s to %s\n", op.Name, op.Module))
+				}
 			case "insert-precondition", "replace-slice", "replace-hunk", "wrap-in-defer", "rename-param":
 				name := op.Name
 				if name == "" {
@@ -4327,6 +4340,12 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	// handleEdit's singleton path, just collected across the batch since
 	// there's no single "the def just edited" here.
 	var editedIDs []int64
+	// #307: move changes module membership, which the incremental
+	// per-file resolveSet this batch otherwise relies on can't capture --
+	// refs are scoped by module, so a full resolve is required whenever
+	// any move happens in this batch (mirrors handleMove's own
+	// s.autoResolve("") -- see its comment).
+	var needsFullResolve bool
 	// #233: add-import's disk write can't go through mergeDeclsIntoSource
 	// (it never touches import blocks) -- queued here, applied via
 	// patchImportOnDisk after commit succeeds, mirroring how every other
@@ -4864,6 +4883,80 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				sb.WriteString(fmt.Sprintf("→ renamed %s → %s (%d callers updated)\n", op.Name, op.NewName, callerCount))
 			}
 
+		case "move":
+			// #307: same as the dry-run case above -- op.Module is the
+			// DESTINATION here, so the source lookup passes "" for module.
+			if op.Module == "" {
+				errors = append(errors, "move: module is required")
+				continue
+			}
+			d, err := s.resolveApplyTarget(tx, op.Name, op.Receiver, "", op.File)
+			if err != nil {
+				errors = append(errors, fmt.Sprintf("move %s: not found", op.Name))
+				continue
+			}
+			if msg := unsupportedFieldOp(d.Kind, "move"); msg != "" {
+				errors = append(errors, fmt.Sprintf("move %s: %s", op.Name, msg))
+				continue
+			}
+			targetMod := s.findModule(op.Module)
+			if targetMod == nil {
+				errors = append(errors, fmt.Sprintf("move %s: target module %q not found", op.Name, op.Module))
+				continue
+			}
+			// Same on-disk-location fix as handleMove's singleton path -- see
+			// its comment for the full rationale: emitModule places a def
+			// under its SourceFile's directory prefix, so the moved def needs
+			// a NEW SourceFile derived from a sibling in the target module
+			// (falling back to a bare basename).
+			oldSourceFile := d.SourceFile
+			newSourceFile := ""
+			if oldSourceFile != "" {
+				base := filepath.Base(oldSourceFile)
+				if siblings, sErr := tx.GetModuleDefinitions(targetMod.ID); sErr == nil {
+					for _, sib := range siblings {
+						if sib.SourceFile != "" {
+							newSourceFile = filepath.ToSlash(filepath.Join(filepath.Dir(sib.SourceFile), base))
+							break
+						}
+					}
+				}
+				if newSourceFile == "" {
+					newSourceFile = base
+				}
+			}
+			identity := d.Name
+			if d.Kind == "function" || d.Kind == "method" {
+				identity = emit.FuncIdentity(d.Name, d.Receiver)
+			}
+			// Delete from old module first, then re-create in the new one --
+			// same delete+insert dance as handleMove's singleton path
+			// (ModuleID isn't independently mutable via UpsertDefinition's
+			// own lookup-by-name+module+kind+receiver+test key).
+			if err := tx.DeleteDefinition(d.ID); err != nil {
+				errors = append(errors, fmt.Sprintf("move %s: %v", op.Name, err))
+				continue
+			}
+			d.ModuleID = targetMod.ID
+			d.SourceFile = newSourceFile
+			d.ID = 0
+			newID, err := tx.UpsertDefinition(d)
+			if err != nil {
+				errors = append(errors, fmt.Sprintf("move %s: %v", op.Name, err))
+				continue
+			}
+			d.ID = newID
+			s.enqueueSummary(d)
+			allowedRemovals = append(allowedRemovals, identity)
+			allowedAdds = append(allowedAdds, identity)
+			addTouched(oldSourceFile)
+			addTouched(newSourceFile)
+			// #307: module membership changed -- force a full resolve at the
+			// tail instead of the scoped per-file resolveSet (see its
+			// declaration comment).
+			needsFullResolve = true
+			sb.WriteString(fmt.Sprintf("→ moved %s to %s\n", op.Name, targetMod.Path))
+
 		case "insert-precondition":
 			line, errStr := projEdit(op, func(body string) (string, error) {
 				return projection.InsertPrecondition(body, op.Condition, op.Ret)
@@ -5076,8 +5169,12 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			TouchedFiles:    goimportsFiles,
 		})
 		if buildResult == "" {
-			for fp := range resolveSet {
-				s.autoResolveFile(fp.file, fp.module)
+			if needsFullResolve {
+				s.autoResolve("")
+			} else {
+				for fp := range resolveSet {
+					s.autoResolveFile(fp.file, fp.module)
+				}
 			}
 		} else {
 			// commitOrRollbackOnBuild's contract: any non-empty result
@@ -5143,8 +5240,12 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				GoimportsFiles:  goimportsFiles,
 				TouchedFiles:    goimportsFiles,
 			})
-			for fp := range resolveSet {
-				s.autoResolveFile(fp.file, fp.module)
+			if needsFullResolve {
+				s.autoResolve("")
+			} else {
+				for fp := range resolveSet {
+					s.autoResolveFile(fp.file, fp.module)
+				}
 			}
 		}
 	}
