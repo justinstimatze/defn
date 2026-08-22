@@ -6288,7 +6288,30 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 					} else {
 						matched = f == scopeDir || strings.HasPrefix(f, scopeDir+"/")
 					}
+					// #330: this loop's whole purpose is "make the
+					// target package physically complete enough for go
+					// test to compile it" -- that only requires files
+					// truly ABSENT from disk (a file go test can't even
+					// find will fail the build). A file that already
+					// EXISTS, even with content that differs from the
+					// DB, is not a compilation blocker: go test builds
+					// against whatever's actually on disk regardless.
+					// Un-conditionally including every matched file
+					// here meant ANY out-of-band disk change to a
+					// sibling file in the target package -- a git
+					// stash, a manual revert, a deletion -- got
+					// silently clobbered back to stale DB content the
+					// next time an unrelated test in the same package
+					// ran. Reproduced live: deleting two files with a
+					// plain `rm`, then running an unrelated test in the
+					// same package, silently restored both from the DB
+					// (see winze's independent report of the same
+					// class of bug via git stash). Only restore what's
+					// actually missing.
 					if matched && !seen[f] {
+						if _, statErr := os.Stat(filepath.Join(s.projectDir, f)); statErr == nil {
+							continue
+						}
 						seen[f] = true
 						scopedFiles = append(scopedFiles, f)
 					}
@@ -6463,6 +6486,20 @@ func (s *server) handleTest(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		sb.WriteString(fmt.Sprintf("\nNO TESTS MATCHED — the %d covering test(s) didn't run in %s (likely scoped to the wrong package, e.g. coverage via interface dispatch in a sibling package); nothing was verified", len(testNames), target))
 	default:
 		sb.WriteString("\nALL TESTS PASSED")
+		// #331: "affected by X" is a call-graph selection -- it has no
+		// signal for tests coupled through something other than a direct
+		// Go reference (a subprocess invocation + golden-file diff, e.g.).
+		// Confirmed live: prometheus-18358's defn arm ran exactly this
+		// call, got ALL TESTS PASSED, and treated that as "nothing else
+		// broke" -- but a doc-generation golden-file test in the same
+		// package was never in the affected set and never ran, silently
+		// missing a required doc update. Disclose the gap so the model
+		// doesn't mistake a narrow, statically-selected run for the
+		// whole package's suite.
+		if total, terr := s.countTestsInDir(filepath.ToSlash(filepath.Dir(d.SourceFile))); terr == nil && total > len(testNames) {
+			sb.WriteString(fmt.Sprintf("\n\n(%d test(s) statically determined as affected by %s ran; %d other test(s) exist in this package that were NOT run -- if your change is coupled through something other than a direct call [e.g. a golden-file or subprocess-invoked test], run those explicitly too.)",
+				len(testNames), args.Name, total-len(testNames)))
+		}
 	}
 
 	return textResult(sb.String()), nil, nil
@@ -11942,3 +11979,37 @@ func inferFailureHint(body string) string {
 }
 
 var buildTimeoutEscalated = envDuration("DEFN_BUILD_TIMEOUT_ESCALATED", 5*time.Minute)
+
+// countTestsInDir counts every Test-kind definition whose source file
+// sits directly in dir (the same package), for disclosing when a
+// call-graph-narrowed "affected by X" test run covers fewer tests than
+// actually exist in that package -- see handleTest's use of this for
+// the #331 receipt. Best-effort: any backend error just means the
+// caller skips the disclosure, since this is purely an informational
+// note, not something worth failing the whole test call over.
+func (s *server) countTestsInDir(dir string) (int, error) {
+	files, err := s.backend.DistinctSourceFiles()
+	if err != nil {
+		return 0, err
+	}
+	total := 0
+	for _, f := range files {
+		fDir := filepath.ToSlash(filepath.Dir(f))
+		if fDir == "" {
+			fDir = "."
+		}
+		if fDir != dir {
+			continue
+		}
+		defs, dErr := s.backend.FindDefinitionsByFile("", f, 0)
+		if dErr != nil {
+			continue
+		}
+		for _, d := range defs {
+			if d.Test {
+				total++
+			}
+		}
+	}
+	return total, nil
+}

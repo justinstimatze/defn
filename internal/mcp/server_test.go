@@ -14189,3 +14189,117 @@ func TestHandleTest_NoTestsMatchedHeaderDoesNotClaimTestsRan(t *testing.T) {
 		t.Errorf("expected the header to say tests were attempted but none ran, got: %s", text)
 	}
 }
+
+// TestHandleTestByName_DoesNotRestoreDivergedSiblingInSamePackage is
+// #330: the pre-test "make the target package buildable" emit matched
+// EVERY file the DB tracks for the whole target package/directory, not
+// just files genuinely missing from disk, so any sibling file in that
+// SAME package whose disk content had diverged from the DB out-of-band
+// (a git stash, a manual revert, a hand edit) got silently overwritten
+// back to stale DB content the next time an unrelated test in that
+// package ran -- even though the file was still present and would have
+// compiled fine as-is. Reproduced live via winze's independent report
+// (git stash on files in the same package as an unrelated edit) and
+// directly on this repo (deleting scratch files, then running an
+// unrelated test in the same package silently restored them). A file
+// that still EXISTS on disk is not a compilation blocker and must be
+// left alone; only a file genuinely ABSENT needs restoring.
+func TestHandleTestByName_DoesNotRestoreDivergedSiblingInSamePackage(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc RootFunc() string { return \"root\" }\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main_test.go"), []byte("package main\n\nimport \"testing\"\n\nfunc TestRootFunc(t *testing.T) {\n\tif RootFunc() == \"\" {\n\t\tt.Fatal(\"empty\")\n\t}\n}\n"), 0644)
+	siblingPath := filepath.Join(projDir, "sibling.go")
+	origSibling := "package main\n\nfunc SiblingFunc() string { return \"original\" }\n"
+	os.WriteFile(siblingPath, []byte(origSibling), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	// Simulate an out-of-band change (git stash revert, manual edit) to
+	// sibling.go AFTER ingest -- the DB still holds origSibling, but
+	// disk now has something different. The file still EXISTS.
+	divergedSibling := "package main\n\nfunc SiblingFunc() string { return \"user-reverted-this-on-purpose\" }\n"
+	if err := os.WriteFile(siblingPath, []byte(divergedSibling), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleTestByName(context.Background(), nil, "TestRootFunc", "", "")
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	if !strings.Contains(resultText(t, result), "ALL TESTS PASSED") {
+		t.Fatalf("expected TestRootFunc to pass, got: %s", resultText(t, result))
+	}
+
+	after, err := os.ReadFile(siblingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != divergedSibling {
+		t.Errorf("handleTestByName silently overwrote a sibling file's out-of-band content back to stale DB state.\nwant (out-of-band content preserved):\n%s\ngot:\n%s", divergedSibling, after)
+	}
+}
+
+// TestHandleTest_DisclosesOtherUnrunTestsInSamePackage is #331: a real
+// prometheus-18358 v17 bench trajectory ran code(op:"test", name:X),
+// got "ALL TESTS PASSED", and treated that as proof nothing else in
+// the package broke -- but a golden-file test coupled to the change
+// only via a subprocess invocation (not a Go reference) was never in
+// the call-graph-derived "affected by X" set and never ran, silently
+// missing a required doc update. The success message must disclose
+// when other tests exist in the same package that this narrowed
+// selection didn't cover.
+func TestHandleTest_DisclosesOtherUnrunTestsInSamePackage(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "root.go"), []byte("package testproj\n\nfunc RootFunc() string { return \"root\" }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "root_test.go"), []byte("package testproj\n\nimport \"testing\"\n\nfunc TestRootFunc(t *testing.T) {\n\tif RootFunc() == \"\" {\n\t\tt.Fatal(\"empty\")\n\t}\n}\n\nfunc TestUnrelatedGoldenFile(t *testing.T) {\n\t// Not statically coupled to RootFunc via any call/reference edge.\n}\n"), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleTest(context.Background(), nil, nameParam{Name: "RootFunc"})
+	if err != nil {
+		t.Fatalf("handleTest(RootFunc): %v", err)
+	}
+	text := resultText(t, result)
+	t.Logf("output:\n%s", text)
+
+	if !strings.Contains(text, "ALL TESTS PASSED") {
+		t.Fatalf("expected the affected test to pass, got: %s", text)
+	}
+	if !strings.Contains(text, "1 other test(s) exist in this package that were NOT run") {
+		t.Errorf("expected a disclosure that TestUnrelatedGoldenFile wasn't covered by this narrowed run, got: %s", text)
+	}
+}
