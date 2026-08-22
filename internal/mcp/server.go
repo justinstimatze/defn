@@ -981,6 +981,26 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 			if args.Op == "read" && strings.TrimSpace(args.LineRange) != "" && strings.TrimSpace(args.File) != "" {
 				return errResult(fmt.Errorf("read: name is required for a single definition — for a line-range slice of a whole file with no specific def in mind, use op:\"read-file\", file:%q, line_range:%q instead", args.File, args.LineRange))
 			}
+			// #314: read/outline with file: and no name has no other
+			// interpretation than "show me everything in this file" --
+			// overview(file:) already computes exactly that, and this
+			// used to just error, telling the model to make that call
+			// itself as a SEPARATE round-trip. Confirmed via a v12 bench
+			// trajectory: this exact pattern (call, get told to use
+			// overview, call overview) hit 16 times across 11/15 tasks --
+			// unlike the circuit breaker's auto-batch hijack (#312,
+			// discarding a valid narrow answer for something else),
+			// there's no valid answer being discarded here: file:+no
+			// name for read/outline is ALWAYS a hard error otherwise, so
+			// redirecting to the one sensible interpretation isn't
+			// overriding a real choice, it's skipping a guaranteed-
+			// useless round-trip. impact/similar have no whole-file
+			// interpretation, so they keep the plain error below.
+			if (args.Op == "read" || args.Op == "outline") && strings.TrimSpace(args.File) != "" && s.backend != nil {
+				r, o, e := s.handleOverview(ctx, req, args)
+				note := fmt.Sprintf("[%s: no name given for a file-scoped call -- showing every def in %q via overview instead of erroring. Pass name:\"<def>\" to target one definition directly next time.]\n\n", args.Op, args.File)
+				return prependNote(r, note), o, e
+			}
 			if strings.TrimSpace(args.File) != "" {
 				return errResult(fmt.Errorf("%s: name is required — pass name:\"<def>\" for one definition, or use op:\"overview\", file:%q to see every def in that file", args.Op, args.File))
 			}

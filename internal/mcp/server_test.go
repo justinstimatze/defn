@@ -13910,3 +13910,73 @@ func TestCollapseAllPassLines(t *testing.T) {
 		t.Errorf("too few PASS lines to bother collapsing must stay untouched, got: %s", strings.Join(gotFew, "|"))
 	}
 }
+
+// TestHandleCode_ImpactWithFileNoNameStillErrors guards the scope of
+// #314's fix: impact/similar have no whole-file interpretation (unlike
+// read/outline), so file:+no name must still be a plain error pointing
+// at overview, not a redirect.
+func TestHandleCode_ImpactWithFileNoNameStillErrors(t *testing.T) {
+	s := &server{backend: nil}
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "impact", File: "main.go"})
+	text := resultText(t, result)
+	if !strings.Contains(text, "name is required") {
+		t.Errorf("expected impact with file, no name to still error, got: %s", text)
+	}
+	if !strings.Contains(text, `op:"overview"`) {
+		t.Errorf("expected the error to still point at op:\"overview\", got: %s", text)
+	}
+}
+
+// TestHandleCode_OutlineWithFileNoNameRedirectsToOverview is #314: a
+// real v12 bench trajectory pattern -- an agent calls outline(file:)
+// with no name, wanting to see everything in that file, and used to
+// just get told to call op:"overview" separately instead. Confirmed
+// hitting 16 times across 11 of 15 tasks in that corpus, always the
+// same wasted round-trip shape. overview(file:) already computes
+// exactly what was wanted, so this redirects instead of erroring.
+func TestHandleCode_OutlineWithFileNoNameRedirectsToOverview(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{Op: "outline", File: "main.go"})
+	if err != nil {
+		t.Fatalf("outline with file, no name: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "name is required") {
+		t.Fatalf("expected a redirect to overview instead of an error, got: %s", text)
+	}
+	for _, name := range []string{"Greet", "Farewell", "main"} {
+		if !strings.Contains(text, name) {
+			t.Errorf("expected the overview redirect to list %s, got: %s", name, text)
+		}
+	}
+	if !strings.Contains(text, "showing every def") {
+		t.Errorf("expected a note explaining the redirect, got: %s", text)
+	}
+}
+
+// TestHandleCode_ReadWithFileNoNameRedirectsToOverview is read's
+// counterpart to the outline redirect above.
+func TestHandleCode_ReadWithFileNoNameRedirectsToOverview(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{Op: "read", File: "main.go"})
+	if err != nil {
+		t.Fatalf("read with file, no name: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "name is required") {
+		t.Fatalf("expected a redirect to overview instead of an error, got: %s", text)
+	}
+	for _, name := range []string{"Greet", "Farewell", "main"} {
+		if !strings.Contains(text, name) {
+			t.Errorf("expected the overview redirect to list %s, got: %s", name, text)
+		}
+	}
+}
