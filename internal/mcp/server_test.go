@@ -13519,3 +13519,50 @@ func Use(w *Widget) int {
 		t.Fatalf("go build ./... failed after apply rename:\n%s", out)
 	}
 }
+
+// TestHandleApply_CreateSingleDeclNewNestedPackageGetsOwnModule guards
+// #306: apply's single-decl "create" branch was missing the #13-style
+// new-package EnsureModule fallback entirely (present in handleCreate,
+// handleCreateMultiDecl, AND apply's own multi-decl create branch) --
+// it hard-errored "file does not map to any known module" instead,
+// so a single-op create targeting a brand-new package inside an apply
+// batch failed outright while the identical request via standalone
+// code(op:"create") or apply's multi-decl branch succeeded.
+func TestHandleApply_CreateSingleDeclNewNestedPackageGetsOwnModule(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{{Op: "create", Body: "func NewSingleFunc() int { return 1 }", File: "pkg/newthing/file.go"}},
+	})
+	text := resultText(t, result)
+	if result.IsError {
+		t.Fatalf("expected new-package apply create to succeed, got error: %s", text)
+	}
+	if strings.Contains(text, "Errors") || strings.Contains(text, "does not map to any known module") {
+		t.Fatalf("expected no errors, got: %s", text)
+	}
+
+	defs, err := db.FindDefinitions("NewSingleFunc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) != 1 {
+		t.Fatalf("expected exactly 1 NewSingleFunc, got %d", len(defs))
+	}
+
+	mods, err := db.ListModules()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var testprojID int64
+	for _, m := range mods {
+		if m.Path == "testproj" {
+			testprojID = m.ID
+		}
+	}
+	if defs[0].ModuleID == testprojID {
+		t.Errorf("new package's def must not share ModuleID with the unrelated pre-existing testproj module")
+	}
+}

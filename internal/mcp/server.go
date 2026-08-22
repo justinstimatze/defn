@@ -4521,8 +4521,27 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				}
 			}
 			if mod == nil && op.File != "" {
-				errors = append(errors, fmt.Sprintf("create %s: file %q does not map to any known module", name, op.File))
-				continue
+				// #306: same #13-style new-package fallback as the multi-decl
+				// branch above and handleCreate/handleCreateMultiDecl -- this
+				// branch used to hard-error here instead, so a single-op
+				// create targeting a brand-new package inside an apply batch
+				// failed outright while the identical request via standalone
+				// code(op:"create") or via this same function's multi-decl
+				// branch succeeded.
+				dir := filepath.ToSlash(filepath.Dir(op.File))
+				newPath := dir
+				if dir != "" && dir != "." {
+					mods, _ := s.backend.ListModules()
+					if root := emit.DetectModuleRoot(mods); root != "" {
+						newPath = root + "/" + dir
+					}
+				}
+				newMod, ensureErr := tx.EnsureModule(newPath, filepath.Base(dir), "")
+				if ensureErr != nil {
+					errors = append(errors, fmt.Sprintf("create %s: create module for new directory %q: %v", name, dir, ensureErr))
+					continue
+				}
+				mod = newMod
 			}
 			if mod == nil {
 				mods, _ := s.backend.ListModules()
