@@ -79,17 +79,18 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 }
 
 type server struct {
-	backend         store.Backend
-	projectDir      string
-	lastResolved    atomic.Int64 // UnixNano timestamp of last resolve (to debounce watcher)
-	ready           atomic.Bool  // true after startup ingest+resolve completes
-	autoCommitCount atomic.Int64 // counts auto-commits; triggers GC every 10
-	idf             *rank.LazyIDF
-	respCache       *respCache             // #77/#152: per-session dedup of read-side responses
-	reach           *reachCache            // #154: in-memory reverse-refs cache for fast batch impact
-	hint            *mutationHint          // #158: apply-batching nudge on serial mutations to one file
-	summaryWorker   *summary.Worker        // #160: async model-summary generation for def_summaries
-	explainClient   *summary.ExplainClient // #186: Sonnet co-processor for op:"explain" with question
+	backend            store.Backend
+	projectDir         string
+	lastResolved       atomic.Int64 // UnixNano timestamp of last resolve (to debounce watcher)
+	ready              atomic.Bool  // true after startup ingest+resolve completes
+	autoCommitCount    atomic.Int64 // counts auto-commits; triggers GC every 10
+	buildSlowConfirmed atomic.Bool  // #327: true once any build in this session has hit buildTimeout -- subsequent builds start at buildTimeoutEscalated directly instead of paying the timeout tax again
+	idf                *rank.LazyIDF
+	respCache          *respCache             // #77/#152: per-session dedup of read-side responses
+	reach              *reachCache            // #154: in-memory reverse-refs cache for fast batch impact
+	hint               *mutationHint          // #158: apply-batching nudge on serial mutations to one file
+	summaryWorker      *summary.Worker        // #160: async model-summary generation for def_summaries
+	explainClient      *summary.ExplainClient // #186: Sonnet co-processor for op:"explain" with question
 }
 
 // Run starts the MCP server over stdio. projDir is the project root where
@@ -3235,15 +3236,6 @@ func (s *server) autoEmitAndBuildWithOpts(opts emit.Opts) string {
 	return s.emitAndBuildAgainst(s.backend, opts)
 }
 
-// emitAndBuildAgainst is autoEmitAndBuildWithOpts generalized to accept
-// the store.Backend to emit against. #12: callers that want the build
-// gate to actually protect their DB write pass a Begin()-scoped tx
-// (which sees the batch's own uncommitted writes, the same way
-// handleApply's existing tx already relies on for cross-op
-// dependencies) instead of s.backend, and only commit it after this
-// returns a clean (empty) result. autoEmitAndBuildWithOpts above is the
-// legacy/unprotected shape, kept for callers that don't (yet) wrap
-// their write in a transaction.
 func (s *server) emitAndBuildAgainst(backend store.Backend, opts emit.Opts) string {
 	if s.projectDir == "" || os.Getenv("DEFN_LEGACY") == "1" {
 		return ""
@@ -3260,9 +3252,19 @@ func (s *server) emitAndBuildAgainst(backend store.Backend, opts emit.Opts) stri
 		fmt.Fprintf(os.Stderr, "  [emit] emit.EmitWithOpts: %s\n", time.Since(t).Round(time.Millisecond))
 	}
 
+	// #327: once we've seen ANY build in this session take long enough to
+	// hit buildTimeout, start subsequent builds at buildTimeoutEscalated
+	// directly -- a longer context deadline is only a ceiling, so it costs
+	// nothing extra for a build that finishes quickly, and it saves
+	// re-paying the timeout wait on every later edit to the same slow
+	// package.
+	firstTimeout := buildTimeout
+	if s.buildSlowConfirmed.Load() {
+		firstTimeout = buildTimeoutEscalated
+	}
+
 	t = time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), buildTimeout)
-	defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), firstTimeout)
 	// #118 winze dispatch 2026-07-22: `go build ./...` on winze's corpus
 	// drags in cmd/ cgo Dolt subtrees (seconds); the corpus itself gates
 	// with `go build .` (25ms). When TouchedFiles is set, scope the build
@@ -3271,9 +3273,43 @@ func (s *server) emitAndBuildAgainst(backend store.Backend, opts emit.Opts) stri
 	// broad changes. runScopedBuild further scopes each touched file's
 	// build to its NEAREST go.mod -- see its doc for why.
 	out, buildErr := s.runScopedBuild(ctx, opts.TouchedFiles)
+	timedOut := buildErr != nil && ctx.Err() == context.DeadlineExceeded
+	cancel()
 	if timing {
 		fmt.Fprintf(os.Stderr, "  [emit] go build: %s\n", time.Since(t).Round(time.Millisecond))
 	}
+	if timedOut {
+		s.buildSlowConfirmed.Store(true)
+	}
+
+	escalated := false
+	if timedOut && firstTimeout < buildTimeoutEscalated {
+		// #327: a hard 30s ceiling makes editing ANY def in a
+		// dependency-heavy main package (confirmed on a real
+		// prometheus-18712 trajectory: cmd/prometheus/main.go timed out
+		// 11 times in a single session, consuming the entire turn/cost
+		// budget with zero successful edits) structurally impossible --
+		// every attempt rolls back at the same wall, regardless of
+		// whether the edit itself was correct. The previous fix here only
+		// correctly LABELED the timeout; it didn't give the build more
+		// time to actually finish. One automatic retry at a much longer
+		// ceiling lets a build that's merely slow (not broken) succeed
+		// within the same tool call, instead of forcing the agent into a
+		// blind manual-retry loop against advice ("set
+		// DEFN_BUILD_TIMEOUT=...") it has no way to act on mid-session --
+		// the running defn serve process's env can't be changed by the
+		// caller.
+		escalated = true
+		t = time.Now()
+		ctx2, cancel2 := context.WithTimeout(context.Background(), buildTimeoutEscalated)
+		out, buildErr = s.runScopedBuild(ctx2, opts.TouchedFiles)
+		timedOut = buildErr != nil && ctx2.Err() == context.DeadlineExceeded
+		cancel2()
+		if timing {
+			fmt.Fprintf(os.Stderr, "  [emit] go build (escalated retry): %s\n", time.Since(t).Round(time.Millisecond))
+		}
+	}
+
 	var sb strings.Builder
 	if len(warnings) > 0 {
 		sb.WriteString("WARNING: " + strings.Join(warnings, "\nWARNING: "))
@@ -3287,14 +3323,15 @@ func (s *server) emitAndBuildAgainst(backend store.Backend, opts emit.Opts) stri
 		// hadn't printed anything yet when it was killed. Left
 		// undistinguished, this looked identical to "your edit broke the
 		// build" with zero diagnostic to act on, so the only recourse was
-		// blind retry (confirmed on a real prometheus-18712 trajectory:
-		// the same edit to cmd/prometheus/main.go -- the single most
-		// dependency-heavy package in the repo -- hit this 3 times in a
-		// row). handleTest already makes this exact distinction for its
-		// own ctx.Err() == DeadlineExceeded case; the build path never got
-		// the same treatment.
-		if ctx.Err() == context.DeadlineExceeded {
-			sb.WriteString(fmt.Sprintf("BUILD TIMED OUT after %s -- this is NOT a build failure; the compiler was killed before finishing, so there is no diagnostic output to show. This can happen on a large/dependency-heavy package (e.g. a main binary importing most of the repo) under load -- set DEFN_BUILD_TIMEOUT=<duration> (e.g. \"2m\") to allow more time before assuming your edit broke something", buildTimeout))
+		// blind retry. handleTest already makes this exact distinction for
+		// its own ctx.Err() == DeadlineExceeded case; the build path never
+		// got the same treatment.
+		if timedOut {
+			if escalated {
+				sb.WriteString(fmt.Sprintf("BUILD TIMED OUT after an escalated %s (also timed out at the normal %s first) -- this package consistently takes longer than that to build in this environment, not a broken edit. Retrying this same op again will not help; every attempt pays the same cost. If you have more changes queued for this package, batch them into one op:\"apply\" call so verification only happens once instead of per-edit.", buildTimeoutEscalated, buildTimeout))
+			} else {
+				sb.WriteString(fmt.Sprintf("BUILD TIMED OUT after %s (already at the escalated ceiling for this session) -- this is NOT a build failure; the compiler was killed before finishing, so there is no diagnostic output to show. Retrying this same op again will not help; every attempt pays the same cost. If you have more changes queued for this package, batch them into one op:\"apply\" call so verification only happens once instead of per-edit.", firstTimeout))
+			}
 		} else {
 			sb.WriteString(fmt.Sprintf("BUILD FAILED:\n%s", out))
 			sb.WriteString(s.suggestMissingImportFixes(out))
@@ -11889,3 +11926,5 @@ func inferFailureHint(body string) string {
 	}
 	return ""
 }
+
+var buildTimeoutEscalated = envDuration("DEFN_BUILD_TIMEOUT_ESCALATED", 5*time.Minute)

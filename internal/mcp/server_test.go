@@ -12576,7 +12576,10 @@ func TestHandleCode_ReadWithLineRangeNoNameSuggestsReadFile(t *testing.T) {
 // messages in a row on cmd/prometheus/main.go). Mirrors
 // TestHandleTestByName_GenuineTimeoutStillReportsTimedOut's pattern of
 // overriding the package-level timeout var to force a fast, deterministic
-// repro instead of relying on a genuinely slow build.
+// repro instead of relying on a genuinely slow build. Both buildTimeout
+// and buildTimeoutEscalated are forced tiny here so the #327 escalated
+// retry also times out -- this guards the "still slow even after
+// escalation" path, not the (separate, happy-path) recovery.
 func TestEmitAndBuildAgainst_TimeoutReportsTimedOutNotEmptyBuildFailed(t *testing.T) {
 	dir := t.TempDir()
 	projDir := filepath.Join(dir, "testproj")
@@ -12596,9 +12599,10 @@ func TestEmitAndBuildAgainst_TimeoutReportsTimedOutNotEmptyBuildFailed(t *testin
 
 	s := &server{backend: db, projectDir: projDir}
 
-	orig := buildTimeout
+	origTimeout, origEscalated := buildTimeout, buildTimeoutEscalated
 	buildTimeout = 1 * time.Nanosecond
-	t.Cleanup(func() { buildTimeout = orig })
+	buildTimeoutEscalated = 1 * time.Nanosecond
+	t.Cleanup(func() { buildTimeout, buildTimeoutEscalated = origTimeout, origEscalated })
 
 	got := s.emitAndBuildAgainst(db, emit.Opts{TouchedFiles: []string{"main.go"}})
 	if strings.Contains(got, "BUILD FAILED:\n\n") || strings.Contains(got, "BUILD FAILED:\n\n\n") {
@@ -12607,8 +12611,14 @@ func TestEmitAndBuildAgainst_TimeoutReportsTimedOutNotEmptyBuildFailed(t *testin
 	if !strings.Contains(got, "BUILD TIMED OUT") {
 		t.Errorf("expected a killed-by-deadline build to report BUILD TIMED OUT, got:\n%q", got)
 	}
-	if !strings.Contains(got, "DEFN_BUILD_TIMEOUT") {
-		t.Errorf("expected the timeout message to point at DEFN_BUILD_TIMEOUT, got:\n%q", got)
+	if strings.Contains(got, "DEFN_BUILD_TIMEOUT") {
+		t.Errorf("expected the message to NOT suggest an env var the caller cannot set mid-session, got:\n%q", got)
+	}
+	if !strings.Contains(got, "apply") {
+		t.Errorf("expected the message to suggest batching into apply instead of blind retry, got:\n%q", got)
+	}
+	if !s.buildSlowConfirmed.Load() {
+		t.Errorf("expected buildSlowConfirmed to be set after a real timeout")
 	}
 }
 
@@ -14057,5 +14067,82 @@ func TestHandleApply_CreateVarBlockEntryGetsSpecificHint(t *testing.T) {
 	realText := resultText(t, real)
 	if !strings.Contains(realText, "var/const block") {
 		t.Errorf("real: expected the var/const block hint, got: %s", realText)
+	}
+}
+
+// TestEmitAndBuildAgainst_BuildSlowConfirmedSkipsWastedFirstAttempt guards
+// the session-level memoization half of #327: once buildSlowConfirmed is
+// set, later builds start at buildTimeoutEscalated directly rather than
+// paying the short buildTimeout's wait again first. Proven here by making
+// buildTimeoutEscalated the SHORT one and buildTimeout the generous one --
+// if firstTimeout selection ignored buildSlowConfirmed, this build would
+// succeed (using the generous buildTimeout); since it's expected to
+// exercise the tiny escalated value instead, it must time out.
+func TestEmitAndBuildAgainst_BuildSlowConfirmedSkipsWastedFirstAttempt(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.buildSlowConfirmed.Store(true)
+
+	origTimeout, origEscalated := buildTimeout, buildTimeoutEscalated
+	buildTimeout = origTimeout                  // generous -- must NOT be the one used
+	buildTimeoutEscalated = 1 * time.Nanosecond // tiny -- must be the one actually used
+	t.Cleanup(func() { buildTimeout, buildTimeoutEscalated = origTimeout, origEscalated })
+
+	got := s.emitAndBuildAgainst(db, emit.Opts{TouchedFiles: []string{"main.go"}})
+	if !strings.Contains(got, "BUILD TIMED OUT") {
+		t.Errorf("expected firstTimeout to use buildTimeoutEscalated when buildSlowConfirmed is set, got:\n%q", got)
+	}
+}
+
+// TestEmitAndBuildAgainst_EscalatedRetrySucceedsOnSlowButValidBuild guards
+// the actual #327 fix: a build that's merely slow (not broken) should
+// succeed via the automatic escalated retry within the same call, instead
+// of rolling back forever at a fixed 30s ceiling regardless of
+// correctness (the real failure mode on the prometheus-18712 trajectory).
+func TestEmitAndBuildAgainst_EscalatedRetrySucceedsOnSlowButValidBuild(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+
+	origTimeout, origEscalated := buildTimeout, buildTimeoutEscalated
+	buildTimeout = 1 * time.Nanosecond    // forces the first attempt to time out
+	buildTimeoutEscalated = origEscalated // generous default -- the trivial build finishes well within it
+	t.Cleanup(func() { buildTimeout, buildTimeoutEscalated = origTimeout, origEscalated })
+
+	got := s.emitAndBuildAgainst(db, emit.Opts{TouchedFiles: []string{"main.go"}})
+	if got != "" {
+		t.Errorf("expected the escalated retry to succeed on a valid build with no error, got:\n%q", got)
+	}
+	if !s.buildSlowConfirmed.Load() {
+		t.Errorf("expected buildSlowConfirmed to be set even though the retry ultimately succeeded")
 	}
 }
