@@ -13727,3 +13727,199 @@ func TestHandleApply_DryRunAddImportValidatesFileResolution(t *testing.T) {
 		t.Errorf("expected a 'no defs in' error, got: %s", text)
 	}
 }
+
+// TestHandleApply_InsertAppliesAnchorSplice is the apply-batched
+// counterpart to TestHandleInsert -- #309: handleApply had no "insert"
+// case at all, so an agent that wanted to splice text after an anchor
+// inside a batch had to fall back to a separate handleInsert round-trip
+// with no shared rollback protection against the rest of the batch.
+func TestHandleApply_InsertAppliesAnchorSplice(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "insert", Name: "Greet", After: "Hello", Body: " there"},
+		},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "rolled back") || strings.Contains(text, "Errors") {
+		t.Fatalf("insert failed: %s", text)
+	}
+
+	d, _ := db.GetDefinitionByName("Greet", "")
+	if !strings.Contains(d.Body, "Hello there") {
+		t.Errorf("insert not applied, got body: %s", d.Body)
+	}
+}
+
+// TestHandleApply_InsertBatchedWithEditLandsAtomically proves the
+// actual point of #309: insert can now be batched with an unrelated
+// edit in one atomic transaction.
+func TestHandleApply_InsertBatchedWithEditLandsAtomically(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "insert", Name: "Greet", After: "Hello", Body: " there"},
+			{Op: "edit", Name: "Farewell", NewBody: `func Farewell(name string) string {
+	return Greet(name) + " and adieu"
+}`},
+		},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "rolled back") || strings.Contains(text, "Errors") {
+		t.Fatalf("batched insert+edit failed: %s", text)
+	}
+
+	greet, _ := db.GetDefinitionByName("Greet", "")
+	if !strings.Contains(greet.Body, "Hello there") {
+		t.Errorf("expected Greet's insert to land, got: %s", greet.Body)
+	}
+	farewell, _ := db.GetDefinitionByName("Farewell", "")
+	if !strings.Contains(farewell.Body, "and adieu") {
+		t.Errorf("expected Farewell's edit to also land in the same batch, got: %s", farewell.Body)
+	}
+}
+
+// TestHandleApply_InsertDryRunCatchesBadAnchor guards the same #308-class
+// gap for insert: dry-run must actually locate the anchor and validate
+// the resulting syntax, not just resolve the target and report a
+// false-positive "would insert" preview.
+func TestHandleApply_InsertDryRunCatchesBadAnchor(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		DryRun:     true,
+		Operations: []applyOp{{Op: "insert", Name: "Greet", After: "NOPE_ANCHOR_XYZ", Body: " there"}},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "would insert") {
+		t.Fatalf("expected dry-run to catch the missing anchor instead of a false-positive preview: %s", text)
+	}
+	if !strings.Contains(text, "Errors") {
+		t.Errorf("expected an error for the missing anchor, got: %s", text)
+	}
+}
+
+// TestHandleApply_RetargetFieldValueBatchedWithEditLandsAtomically proves
+// the actual point of #309: retarget-field-value can now be batched with
+// an unrelated edit in one atomic transaction.
+func TestHandleApply_RetargetFieldValueBatchedWithEditLandsAtomically(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "retarget-field-value", Name: "NoSuchType", Field: "X", Old: "a", New: "b"},
+			{Op: "edit", Name: "Farewell", NewBody: `func Farewell(name string) string {
+	return Greet(name) + " and adieu"
+}`},
+		},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "rolled back") || strings.Contains(text, "Errors") {
+		t.Fatalf("batched retarget-field-value+edit failed: %s", text)
+	}
+	if !strings.Contains(text, "0 def(s)") {
+		t.Errorf("expected '0 def(s)' for a type with no matches, got %q", text)
+	}
+
+	farewell, _ := db.GetDefinitionByName("Farewell", "")
+	if !strings.Contains(farewell.Body, "and adieu") {
+		t.Errorf("expected Farewell's edit to also land in the same batch, got: %s", farewell.Body)
+	}
+}
+
+// TestHandleApply_RetargetFieldValueDryRunRequiresFieldAndValue guards
+// the same #308-class gap for retarget-field-value: dry-run must
+// actually validate name/field/old/new instead of always reporting a
+// clean preview regardless of the request's validity.
+func TestHandleApply_RetargetFieldValueDryRunRequiresFieldAndValue(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		DryRun:     true,
+		Operations: []applyOp{{Op: "retarget-field-value", Name: "Claim"}},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "would retarget") {
+		t.Fatalf("expected dry-run to reject missing field/old/new instead of a false-positive preview: %s", text)
+	}
+	if !strings.Contains(text, "Errors") {
+		t.Errorf("expected an error for the missing field, got: %s", text)
+	}
+}
+
+// TestHandleApply_RetargetFieldValueRewritesMatchingComposites is the
+// apply-batched counterpart to
+// TestHandleRetargetFieldValue_RewritesMatchingComposites -- #309:
+// handleApply had no "retarget-field-value" case at all.
+func TestHandleApply_RetargetFieldValueRewritesMatchingComposites(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "claims.go"), []byte(`package main
+
+type Claim struct {
+	Subject string
+	Object  string
+}
+
+var C1 = Claim{Subject: "s1", Object: "OldTarget"}
+var C2 = Claim{Subject: "s2", Object: "OldTarget"}
+var C3 = Claim{Subject: "s3", Object: "Different"}
+
+func main() {}
+`), 0644)
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "retarget-field-value", Name: "Claim", Field: "Object", Old: "OldTarget", New: "NewTarget"},
+		},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "rolled back") || strings.Contains(text, "Errors") {
+		t.Fatalf("retarget-field-value failed: %s", text)
+	}
+	if !strings.Contains(text, "2 def(s)") {
+		t.Errorf("expected '2 def(s)' updated, got %q", text)
+	}
+
+	c1, _ := db.GetDefinitionByName("C1", "")
+	if !strings.Contains(c1.Body, "NewTarget") || strings.Contains(c1.Body, "OldTarget") {
+		t.Errorf("C1 not retargeted: %s", c1.Body)
+	}
+	c3, _ := db.GetDefinitionByName("C3", "")
+	if !strings.Contains(c3.Body, "Different") {
+		t.Errorf("C3 should be untouched: %s", c3.Body)
+	}
+}

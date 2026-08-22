@@ -509,6 +509,7 @@ type applyOp struct {
 	NewParam   string `json:"new_param,omitempty"`                                                                                                                                                                                                                     // rename-param
 	ImportPath string `json:"import_path,omitempty"`                                                                                                                                                                                                                   // add-import
 	Alias      string `json:"alias,omitempty"`                                                                                                                                                                                                                         // add-import
+	Field      string `json:"field,omitempty"`                                                                                                                                                                                                                         // retarget-field-value: composite-literal field name
 }
 
 // Legacy param types used by internal handlers.
@@ -4266,7 +4267,35 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				} else {
 					sb.WriteString(fmt.Sprintf("→ would move %s to %s\n", op.Name, op.Module))
 				}
-			case "insert-precondition", "replace-slice", "replace-hunk", "wrap-in-defer", "rename-param":
+			case "retarget-field-value":
+				// #309: mirrors handleRetargetFieldValue's own top-of-function
+				// validation, then actually runs the read-only sweep (same
+				// pure retargetFieldInBody call the real case uses) instead of
+				// just checking that name/field/old/new look plausible --
+				// same "actually run the real transform" principle as the
+				// insert dry-run case above.
+				if op.Name == "" || op.Field == "" {
+					errors = append(errors, "retarget-field-value: name (struct type) and field are required")
+				} else if op.Old == "" && op.New == "" {
+					errors = append(errors, "retarget-field-value: at least one of old, new must be non-empty")
+				} else if mods, err := s.backend.ListModules(); err != nil {
+					errors = append(errors, fmt.Sprintf("retarget-field-value: list modules: %v", err))
+				} else {
+					would := 0
+					for _, m := range mods {
+						defs, dErr := s.backend.GetModuleDefinitions(m.ID)
+						if dErr != nil {
+							continue
+						}
+						for _, d := range defs {
+							if _, n, ok := retargetFieldInBody(d.Body, op.Name, op.Field, op.Old, op.New); ok && n > 0 {
+								would++
+							}
+						}
+					}
+					sb.WriteString(fmt.Sprintf("→ would retarget %s.%s: %q → %q in %d def(s)\n", op.Name, op.Field, op.Old, op.New, would))
+				}
+			case "insert-precondition", "replace-slice", "replace-hunk", "wrap-in-defer", "rename-param", "insert":
 				name := op.Name
 				if name == "" {
 					if inferred, err := s.inferSingleTargetName(s.backend); err != nil {
@@ -4319,6 +4348,23 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 					_, computeErr = projection.WrapInDefer(d.Body, op.StmtIndex, op.DeferBody)
 				case "rename-param":
 					_, computeErr = projection.RenameParam(d.Body, op.OldParam, op.NewParam)
+				case "insert":
+					// #309: insert isn't a projection.* pure function like its
+					// siblings above, but the same "actually run the real
+					// transform, not just resolution/kind checks" principle
+					// applies -- mirrors handleInsert's own anchor+parse
+					// validation.
+					idx := strings.Index(d.Body, op.After)
+					if idx < 0 {
+						computeErr = fmt.Errorf("anchor text not found in body")
+						break
+					}
+					insertAt := idx + len(op.After)
+					newBody := d.Body[:insertAt] + op.Body + d.Body[insertAt:]
+					insertSrc := "package x\n" + newBody
+					if _, parseErr := parser.ParseFile(token.NewFileSet(), "", insertSrc, parser.ParseComments); parseErr != nil {
+						computeErr = fmt.Errorf("insert produces invalid Go: %w", parseErr)
+					}
 				}
 				if computeErr != nil {
 					errors = append(errors, fmt.Sprintf("%s %s: %v", op.Op, name, computeErr))
@@ -5033,6 +5079,63 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			needsFullResolve = true
 			sb.WriteString(fmt.Sprintf("→ moved %s to %s\n", op.Name, targetMod.Path))
 
+		case "retarget-field-value":
+			// #309: same missing-op capability gap as move/insert -- this
+			// doesn't fit projEdit's single-resolved-target shape since it
+			// sweeps every def in every module (mirrors handleRetargetFieldValue's
+			// own loop, using tx instead of a fresh Begin() so it shares the
+			// batch's transaction). Unlike move, this only rewrites composite-
+			// literal string values -- refs graph is unaffected, so no
+			// needsFullResolve; addResolve's per-file scoped resolve (same as
+			// the singleton's autoResolveFile loop) is enough.
+			if op.Name == "" || op.Field == "" {
+				errors = append(errors, "retarget-field-value: name (struct type) and field are required")
+				continue
+			}
+			if op.Old == "" && op.New == "" {
+				errors = append(errors, "retarget-field-value: at least one of old, new must be non-empty")
+				continue
+			}
+			mods, err := tx.ListModules()
+			if err != nil {
+				errors = append(errors, fmt.Sprintf("retarget-field-value: list modules: %v", err))
+				continue
+			}
+			retargeted := 0
+			var affectedNames []string
+			for _, m := range mods {
+				defs, dErr := tx.GetModuleDefinitions(m.ID)
+				if dErr != nil {
+					continue
+				}
+				for _, d := range defs {
+					newBody, n, ok := retargetFieldInBody(d.Body, op.Name, op.Field, op.Old, op.New)
+					if !ok || n == 0 {
+						continue
+					}
+					d.Body = newBody
+					d.Signature = extractSignature(newBody)
+					if _, err := tx.UpsertDefinition(&d); err != nil {
+						errors = append(errors, fmt.Sprintf("retarget-field-value: update %s: %v", d.Name, err))
+						continue
+					}
+					retargeted++
+					addTouched(d.SourceFile)
+					addResolve(d.SourceFile, d.ModuleID)
+					if len(affectedNames) < 10 {
+						affectedNames = append(affectedNames, formatReceiver(d.Receiver)+d.Name)
+					}
+				}
+			}
+			sb.WriteString(fmt.Sprintf("→ retargeted %s.%s: %q → %q in %d def(s)\n", op.Name, op.Field, op.Old, op.New, retargeted))
+			if len(affectedNames) > 0 {
+				suffix := ""
+				if retargeted > len(affectedNames) {
+					suffix = fmt.Sprintf(" (+%d more)", retargeted-len(affectedNames))
+				}
+				sb.WriteString("  Affected: " + strings.Join(affectedNames, ", ") + suffix + "\n")
+			}
+
 		case "insert-precondition":
 			line, errStr := projEdit(op, func(body string) (string, error) {
 				return projection.InsertPrecondition(body, op.Condition, op.Ret)
@@ -5092,6 +5195,25 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		case "rename-param":
 			line, errStr := projEdit(op, func(body string) (string, error) {
 				return projection.RenameParam(body, op.OldParam, op.NewParam)
+			})
+			if errStr != "" {
+				errors = append(errors, errStr)
+			} else {
+				sb.WriteString(line)
+			}
+
+		case "insert":
+			// #309: same missing-op capability gap as move -- handleApply
+			// had no "insert" case at all. Fits the shared projEdit pattern
+			// directly (projEdit already does the parse-validate/identity-
+			// guard/upsert/touched-tracking every projection op needs).
+			line, errStr := projEdit(op, func(body string) (string, error) {
+				idx := strings.Index(body, op.After)
+				if idx < 0 {
+					return "", fmt.Errorf("anchor text not found in body")
+				}
+				insertAt := idx + len(op.After)
+				return body[:insertAt] + op.Body + body[insertAt:], nil
 			})
 			if errStr != "" {
 				errors = append(errors, errStr)
