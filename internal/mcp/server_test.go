@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -5729,8 +5728,32 @@ func TestHandleApply_RenamePointerReceiverMethodThenEditSameBatch(t *testing.T) 
 // where the first `search` call raced the always-on reingest and
 // returned unrelated defs, leading the agent to edit the wrong function.
 func TestAlreadyFreshlyIngested(t *testing.T) {
+	// #332: .defn lives INSIDE the project directory in real usage
+	// (defn init/ingest nest it there, and newMCPServer is always
+	// invoked with the real project root) -- build fixtures with that
+	// same nesting rather than reusing setupTestDB's separate sibling
+	// .defn/testproj layout, since alreadyFreshlyIngested now compares
+	// against the DB file's own on-disk mtime under projectDir/.defn.
+	setup := func(t *testing.T) (store.Backend, string) {
+		t.Helper()
+		dir := t.TempDir()
+		os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+		os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n\nfunc Greet(name string) string { return \"Hello, \" + name }\n\nfunc main() {}\n"), 0644)
+		db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ingest.Ingest(db, dir); err != nil {
+			t.Fatal("ingest:", err)
+		}
+		if err := resolve.Resolve(db, dir); err != nil {
+			t.Fatal("resolve:", err)
+		}
+		return db, dir
+	}
+
 	t.Run("fresh right after ingest", func(t *testing.T) {
-		db, projDir := setupTestDB(t)
+		db, projDir := setup(t)
 		defer db.Close()
 		if !alreadyFreshlyIngested(db, projDir) {
 			t.Error("expected fresh DB right after ingest to be reported as already fresh")
@@ -5738,26 +5761,22 @@ func TestAlreadyFreshlyIngested(t *testing.T) {
 	})
 
 	t.Run("stale after a file is touched", func(t *testing.T) {
-		db, projDir := setupTestDB(t)
+		db, projDir := setup(t)
 		defer db.Close()
 
-		lastIngestStr, err := db.GetMeta("last_ingest")
-		if err != nil || lastIngestStr == "" {
-			t.Fatalf("expected last_ingest meta to be set after ingest, got %q, err=%v", lastIngestStr, err)
-		}
-		lastIngest, err := strconv.ParseInt(lastIngestStr, 10, 64)
+		dbInfo, err := os.Stat(filepath.Join(projDir, ".defn", "defn.db"))
 		if err != nil {
-			t.Fatalf("parse last_ingest: %v", err)
+			t.Fatalf("stat defn.db: %v", err)
 		}
 
 		mainGo := filepath.Join(projDir, "main.go")
-		future := time.Unix(lastIngest+10, 0)
+		future := dbInfo.ModTime().Add(10 * time.Second)
 		if err := os.Chtimes(mainGo, future, future); err != nil {
 			t.Fatalf("chtimes: %v", err)
 		}
 
 		if alreadyFreshlyIngested(db, projDir) {
-			t.Error("expected a file modified after last_ingest to be reported as NOT fresh")
+			t.Error("expected a file modified after the DB was written to be reported as NOT fresh")
 		}
 	})
 
@@ -5768,12 +5787,43 @@ func TestAlreadyFreshlyIngested(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer db.Close()
-		projDir := filepath.Join(dir, "testproj")
-		os.MkdirAll(projDir, 0755)
-		os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+		os.MkdirAll(dir, 0755)
+		os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
 
-		if alreadyFreshlyIngested(db, projDir) {
-			t.Error("expected a DB with no last_ingest meta to never be reported as fresh")
+		if alreadyFreshlyIngested(db, dir) {
+			t.Error("expected a DB with no defn.db on disk yet to never be reported as fresh")
+		}
+	})
+
+	t.Run("fresh despite a clone-fresh mtime on go files (#332)", func(t *testing.T) {
+		// The exact bug: git clone stamps every checked-out file with
+		// the clone's OWN wall-clock time regardless of content, then a
+		// previously-ingested .defn/ gets restored (e.g. from a cache
+		// tarball) SEPARATELY and LATER. The old mtime-vs-stored-value
+		// check saw every .go file as "newer than last_ingest" and
+		// forced a full reingest on every single run despite the DB
+		// already being 100% current. Simulate that ordering: ingest
+		// first (so file content matches the DB), bump the .go file's
+		// mtime forward as a clone would, then restore-in-place the
+		// .defn dir by touching defn.db even later -- the real
+		// harness's tar-extract-after-clone sequence.
+		db, projDir := setup(t)
+		defer db.Close()
+
+		now := time.Now()
+		mainGo := filepath.Join(projDir, "main.go")
+		cloneTime := now.Add(5 * time.Second)
+		if err := os.Chtimes(mainGo, cloneTime, cloneTime); err != nil {
+			t.Fatalf("chtimes main.go: %v", err)
+		}
+		dbFile := filepath.Join(projDir, ".defn", "defn.db")
+		restoreTime := now.Add(10 * time.Second)
+		if err := os.Chtimes(dbFile, restoreTime, restoreTime); err != nil {
+			t.Fatalf("chtimes defn.db: %v", err)
+		}
+
+		if !alreadyFreshlyIngested(db, projDir) {
+			t.Error("expected a DB restored AFTER a fresh clone's mtime bump to still be reported as fresh")
 		}
 	})
 }

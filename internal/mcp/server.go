@@ -10300,7 +10300,7 @@ func (s *server) resolveApplyTarget(backend store.Backend, name, receiver, modul
 	return d, err
 }
 
-// alreadyFreshlyIngested reports whether the DB's last_ingest already
+// alreadyFreshlyIngested reports whether the DB's on-disk state already
 // covers every .go file under projectDir, so newMCPServer's startup
 // goroutine can skip a redundant full packages.Load+ingest+resolve.
 //
@@ -10317,20 +10317,43 @@ func (s *server) resolveApplyTarget(backend store.Backend, name, receiver, modul
 // agent confidently edited the wrong function -- scored F1=0.00 while
 // files-mode got partial credit on the same task.
 //
-// Returns false (must reingest) whenever last_ingest is missing or
-// unparseable -- a never-ingested DB must never be treated as fresh.
-// Mirrors the walk in cmd/defn's countStaleFiles/walkGoFiles and
-// db.DB.StaleFiles; kept as its own small copy since internal/mcp
-// can't import cmd/defn (package main), and this check is narrower
-// than the full nested-module-aware walk ingest itself needs -- it
-// only needs to know whether ANY covered file changed.
+// #332: originally compared file mtimes against the STORED last_ingest
+// metadata VALUE (a timestamp baked into the DB from whenever it was
+// first ingested). That value survives a `defn.db` copy byte-for-byte,
+// but git clone always stamps checked-out files with the clone's OWN
+// wall-clock time regardless of content -- so the extremely common
+// "git clone, then restore a previously-ingested .defn/ cache" pattern
+// (confirmed live: the bench harness's own tar-cache restore path,
+// prometheus-17395) made EVERY .go file's mtime newer than the stale
+// baked-in value, unconditionally forcing the full slow reingest path
+// every single run even though the DB was already 100% current --
+// defeating the harness's own caching and leaving a real session
+// showing "results may be stale" for 84% of its calls (155 of 185).
+// Compare against the DB directory's own on-disk mtime instead --
+// whatever wrote/restored .defn last is the actual freshness boundary,
+// immune to a checkout's unrelated mtime reset. Check the WAL/SHM
+// sidecars too (WAL mode may not bump defn.db's own mtime on every
+// write) and take the latest of the three.
 func alreadyFreshlyIngested(db store.Backend, projectDir string) bool {
-	lastIngestStr, err := db.GetMeta("last_ingest")
-	if err != nil || lastIngestStr == "" {
+	// OpenBackend creates defn.db as a side effect of merely connecting,
+	// even with zero rows ingested -- the file's existence alone can't
+	// distinguish "never ingested" from "ingested, then restored." Keep
+	// the metadata check for that; only the freshness THRESHOLD below
+	// switches from the stored value to the file's own on-disk mtime.
+	if lastIngestStr, err := db.GetMeta("last_ingest"); err != nil || lastIngestStr == "" {
 		return false
 	}
-	lastIngest, err := strconv.ParseInt(lastIngestStr, 10, 64)
-	if err != nil {
+
+	dbDir := filepath.Join(projectDir, ".defn")
+	var lastIngest int64
+	for _, name := range []string{"defn.db", "defn.db-wal", "defn.db-shm"} {
+		if info, err := os.Stat(filepath.Join(dbDir, name)); err == nil {
+			if t := info.ModTime().Unix(); t > lastIngest {
+				lastIngest = t
+			}
+		}
+	}
+	if lastIngest == 0 {
 		return false
 	}
 	fresh := true
