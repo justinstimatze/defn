@@ -459,3 +459,55 @@ func TestCheckTurnBoundary_ResetsStarterInjectedOnNewToken(t *testing.T) {
 		t.Fatalf("new turn-token should reset starterInjected so this turn can get its own bundle")
 	}
 }
+
+// TestCheckTurnBoundary_KeepsStarterInjectedWhenQuestionUnchanged is
+// #328: a real bench trajectory (prometheus-19184, v17 corpus) showed
+// .turn-token bump again with the IDENTICAL captured question and no
+// new user-role message anywhere in the transcript -- Claude Code's
+// UserPromptSubmit hook re-fired within what was, from the harness's
+// perspective, a single continuous autonomous task. The old
+// unconditional reset made the #203/#312 starter bundle re-fire on the
+// same question, costing several extra KB for zero new information. A
+// token change alone is no longer enough to reset starterInjected --
+// the captured question has to have actually changed too.
+func TestCheckTurnBoundary_KeepsStarterInjectedWhenQuestionUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".defn"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	tokenPath := filepath.Join(dir, ".defn", ".turn-token")
+	questionPath := filepath.Join(dir, ".defn", ".last-question")
+	s := &server{projectDir: dir}
+	sc := &sessionCache{entries: map[string]cacheEntry{}}
+
+	if err := os.WriteFile(questionPath, []byte("fix the panic in msk.go"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tokenPath, []byte("turn-1"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s.checkTurnBoundary(sc)
+	sc.starterInjected = true
+
+	// Token bumps again (as if the hook re-fired) but the captured
+	// question is byte-identical -- not a genuine new turn.
+	if err := os.WriteFile(tokenPath, []byte("turn-2"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s.checkTurnBoundary(sc)
+	if !sc.starterInjected {
+		t.Fatalf("a token bump with an unchanged question should not reset starterInjected")
+	}
+
+	// A genuinely different question on a later token bump still resets.
+	if err := os.WriteFile(questionPath, []byte("now add a test for the fix"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tokenPath, []byte("turn-3"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s.checkTurnBoundary(sc)
+	if sc.starterInjected {
+		t.Fatalf("a token bump with a genuinely new question should still reset starterInjected")
+	}
+}

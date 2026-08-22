@@ -42,7 +42,21 @@ type sessionCache struct {
 	entries         map[string]cacheEntry
 	starterInjected bool   // #203/#312: true after this TURN's first orient op has appended the starter bundle; reset per-turn by checkTurnBoundary, not session-lifetime-once
 	turnToken       string // #209: last-seen turn-token; a change means a new turn started
-	readShapedCount int    // #209: individual read-shaped calls made so far this turn
+	// lastQuestion is the captured .last-question text as of the last
+	// checkTurnBoundary call. #328: a real bench trajectory
+	// (prometheus-19184, v17 corpus) showed .turn-token bumping again
+	// with the IDENTICAL captured question and no new user-role message
+	// anywhere in the transcript -- Claude Code's UserPromptSubmit hook
+	// re-fired within what is, from the harness's perspective, a single
+	// continuous autonomous task. Treating every token change as a
+	// genuine new turn made the #203/#312 starter bundle re-fire on the
+	// same question, costing several extra KB for zero new information.
+	// A turn only counts as "new" for starterInjected purposes if the
+	// question text actually changed; the read/write circuit-breaker
+	// counters still reset on any token change since a wider budget
+	// there is harmless.
+	lastQuestion    string
+	readShapedCount int // #209: individual read-shaped calls made so far this turn
 	// writeShapedCount tracks individual apply-batchable write calls (see
 	// writeShapedOps) made so far this turn since the last reset --
 	// drives writeBatchNudge's one-time suggestion to batch remaining
