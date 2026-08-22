@@ -1348,17 +1348,32 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		// Cross-def context reuse, symmetric with outline's below: a
 		// non-full read's best case IS the full body, so if that body was
 		// already served this session via read(full:true), a later plain
-		// read (no full:true, no query) can only return the same content
-		// or a downgraded subset -- never more. Bypassed when full:true or
-		// a query is set: those aren't redundant with a prior plain-args
-		// full-body serve check the same way outline's bypass works.
-		if !args.Full && req != nil && s.respCache != nil && strings.TrimSpace(args.Query) == "" && strings.TrimSpace(args.LineRange) == "" && args.Module == "" && args.File == "" {
+		// read (no query) can only return the same content or a downgraded
+		// subset -- never more. #311: a REPEAT full:true read of the same
+		// still-fresh (unedited) name is just as redundant -- confirmed via
+		// a real prometheus-18534 trajectory where extrapolatedRate got
+		// re-served in full TWICE (7896 bytes each) with no edit in between
+		// (two failed edit attempts that rolled back, which correctly do
+		// NOT invalidate bodyServed -- see delete(sc.bodyServed, name) only
+		// firing on a real mutation). Only bypassed by query/line_range/
+		// module/file, same as outline's bypass below -- those genuinely
+		// narrow or redirect the request, unlike full:true which asks for
+		// exactly what's already cached.
+		if req != nil && s.respCache != nil && strings.TrimSpace(args.Query) == "" && strings.TrimSpace(args.LineRange) == "" && args.Module == "" && args.File == "" {
 			if epochsAgo, ok := s.respCache.bodyServedEpochsAgo(req.Session, args.Name); ok {
 				if epochsAgo <= staleEpochThreshold {
-					stub := fmt.Sprintf(
-						"[%s's full body was already read in this session (read with full:true) -- a plain read would return the same content or a downgraded subset, never more. Nothing new here. If the def may have changed since, call code(op:\"sync\") first.]\n",
-						args.Name,
-					)
+					var stub string
+					if args.Full {
+						stub = fmt.Sprintf(
+							"[%s's full body was already read in this session (read with full:true) and hasn't changed since -- re-reading would return identical content. Nothing new here. If the def may have changed since, call code(op:\"sync\") first.]\n",
+							args.Name,
+						)
+					} else {
+						stub = fmt.Sprintf(
+							"[%s's full body was already read in this session (read with full:true) -- a plain read would return the same content or a downgraded subset, never more. Nothing new here. If the def may have changed since, call code(op:\"sync\") first.]\n",
+							args.Name,
+						)
+					}
 					return textResult(stub), nil, nil
 				}
 				// #227: the earlier full-body serve survived enough

@@ -571,3 +571,68 @@ func TestHandleCode_RepeatBareReadAfterOutlineDowngradeServesFullBody(t *testing
 		t.Errorf("expected second bare read to contain the full body, got: %s", secondText)
 	}
 }
+
+// TestHandleCode_RepeatFullReadNotSuppressedAfterEdit proves the
+// suppression added above still correctly clears once the def is
+// actually mutated -- a real edit between the two full:true reads must
+// invalidate the cache and serve the fresh body, not a stale stub.
+func TestHandleCode_RepeatFullReadNotSuppressedAfterEdit(t *testing.T) {
+	s, req := setupCrossDefReuseServer(t)
+	ctx := context.Background()
+
+	if _, _, err := s.handleCode(ctx, req, codeParam{Op: "read", Name: "Chunky", Full: true}); err != nil {
+		t.Fatalf("first read full:true: %v", err)
+	}
+
+	editedBody := "func Chunky(items []string) (int, error) {\n\ttotal := 0\n\t// edited\n\tfor _, item := range items {\n\t\tif item == \"\" {\n\t\t\tcontinue\n\t\t}\n\t\ttotal++\n\t}\n\tif total == 0 {\n\t\treturn 0, nil\n\t}\n\tdefer func() {\n\t\ttotal = 0\n\t}()\n\tgo func() {\n\t\tprocess(items)\n\t}()\n\tselect {\n\tcase <-done:\n\t}\n\treturn total, nil\n}"
+	if _, _, err := s.handleCode(ctx, req, codeParam{Op: "edit", Name: "Chunky", NewBody: editedBody}); err != nil {
+		t.Fatalf("edit Chunky: %v", err)
+	}
+
+	second, _, err := s.handleCode(ctx, req, codeParam{Op: "read", Name: "Chunky", Full: true})
+	if err != nil {
+		t.Fatalf("second read full:true: %v", err)
+	}
+	secondText := resultText(t, second)
+	if strings.Contains(secondText, "already read") {
+		t.Errorf("expected the edit to invalidate suppression, got a stale stub:\n%s", secondText)
+	}
+	if !strings.Contains(secondText, "// edited") {
+		t.Errorf("expected the fresh edited body, got:\n%s", secondText)
+	}
+}
+
+// TestHandleCode_RepeatFullReadSuppressedWhenUnchanged is the fix for
+// #311: a second read(full:true) of the same still-unedited def used to
+// always re-serve the full body, even though a plain read or outline of
+// the same def in this position would already have been suppressed.
+// Confirmed via a real prometheus-18534 trajectory where extrapolatedRate
+// got its full ~7.9KB body re-served twice with no edit in between --
+// two failed edit attempts in the middle correctly did not invalidate the
+// cache (they never mutated the def), so both full:true reads were
+// genuinely redundant.
+func TestHandleCode_RepeatFullReadSuppressedWhenUnchanged(t *testing.T) {
+	s, req := setupCrossDefReuseServer(t)
+	ctx := context.Background()
+
+	first, _, err := s.handleCode(ctx, req, codeParam{Op: "read", Name: "Chunky", Full: true})
+	if err != nil {
+		t.Fatalf("first read full:true: %v", err)
+	}
+	firstText := resultText(t, first)
+	if !strings.Contains(firstText, "total++") {
+		t.Fatalf("expected first full read to contain the body, got:\n%s", firstText)
+	}
+
+	second, _, err := s.handleCode(ctx, req, codeParam{Op: "read", Name: "Chunky", Full: true})
+	if err != nil {
+		t.Fatalf("second read full:true: %v", err)
+	}
+	secondText := resultText(t, second)
+	if !strings.Contains(secondText, "already read") {
+		t.Errorf("expected second full:true read to be suppressed, got:\n%s", secondText)
+	}
+	if strings.Contains(secondText, "total++") {
+		t.Errorf("expected second full:true read to NOT re-transmit the body, got:\n%s", secondText)
+	}
+}
