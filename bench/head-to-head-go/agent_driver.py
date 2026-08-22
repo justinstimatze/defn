@@ -683,10 +683,9 @@ def _ensure_disk_space(min_gb=DISK_FREE_MIN_GB):
     tasks to disk exhaustion mid-run, and one of them didn't even
     surface as an error -- the agent reported it as an "environment
     blocker" in its own final message, scoring as a cheap, clean-looking
-    failure instead of the infra problem it actually was. Cleans go's
-    build cache and orphaned go-build temp dirs (the actual repeat
-    offender -- crashed/killed `go test`/`go vet` runs leave these
-    behind) before giving up.
+    failure instead of the infra problem it actually was. Cleans orphaned
+    go-build temp dirs (the actual repeat offender -- crashed/killed `go
+    test`/`go vet` runs leave these behind) before giving up.
 
     2026-08-19: wrapped in a flock. This function is check-then-act
     (measure free space, clean if low, measure again) with no
@@ -695,15 +694,33 @@ def _ensure_disk_space(min_gb=DISK_FREE_MIN_GB):
     (e.g. via `xargs -P<N>` over single-instance invocations, which
     needs no other harness changes to work). Without the lock, N
     concurrent tasks all observe "below threshold" at once, all run
-    `go clean -cache` redundantly at the same time, and the post-clean
-    free-space number any one of them sees no longer reflects what's
-    actually free by the time IT starts consuming disk -- the other
-    N-1 processes are consuming concurrently too. The lock only
-    serializes this check-and-clean step itself (a few seconds), not
-    each task's full disk usage for its whole lifetime -- it does not
-    by itself guarantee peak concurrent usage stays under the limit,
-    just removes the redundant-cleanup race and gives every caller an
-    honest, un-raced measurement to decide against.
+    cleanup redundantly at the same time, and the post-clean free-space
+    number any one of them sees no longer reflects what's actually free
+    by the time IT starts consuming disk -- the other N-1 processes are
+    consuming concurrently too. The lock only serializes this
+    check-and-clean step itself (a few seconds), not each task's full
+    disk usage for its whole lifetime -- it does not by itself guarantee
+    peak concurrent usage stays under the limit, just removes the
+    redundant-cleanup race and gives every caller an honest, un-raced
+    measurement to decide against.
+
+    2026-08-22: `go clean -cache` used to run here too, but GOCACHE is
+    shared across every concurrently-running task -- this harness always
+    runs with parallelism>1 (arm-parallel via xargs -P, both arms at
+    once). The flock above only protects THIS function's own
+    check-and-clean step; it does nothing to protect a SIBLING task's
+    already-in-flight `go/packages.Load` read of a cache object this
+    call is about to delete out from under it. That's not just wasted
+    work, it's a genuine correctness bug: confirmed on a real
+    prometheus-17395 trajectory, "ingest: package errors: open
+    .../93ffcd...-d: no such file or directory" twice in one session,
+    each one forcing a fresh full resync and burning ~15 extra tool-call
+    round-trips before the agent recovered. GOCACHE also isn't actually
+    the disk hog here -- per-task workdirs (each a full repo clone +
+    ingested DB, ~100-450MB) are -- so removing the cache wipe loses
+    little reclaim capacity while removing a real hazard. /tmp/go-build*
+    entries remain safe to clean: those are per-invocation temp dirs,
+    never shared with a sibling task's live process.
     """
     import fcntl
     import glob
@@ -719,11 +736,6 @@ def _ensure_disk_space(min_gb=DISK_FREE_MIN_GB):
                 f"[disk] {free_gb:.1f}GB free, below {min_gb}GB -- cleaning caches",
                 file=sys.stderr,
             )
-            subprocess.run(
-                ["go", "clean", "-cache"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
             for entry in glob.glob("/tmp/go-build*"):
                 shutil.rmtree(entry, ignore_errors=True)
             free_gb = shutil.disk_usage(WORKDIR_ROOT).free / 1e9
@@ -733,8 +745,11 @@ def _ensure_disk_space(min_gb=DISK_FREE_MIN_GB):
     if free_gb < min_gb:
         raise RuntimeError(
             f"only {free_gb:.1f}GB free on {WORKDIR_ROOT}'s filesystem after "
-            f"cleanup (need {min_gb}GB) -- resize the volume or free space "
-            f"manually before continuing"
+            f"cleanup (need {min_gb}GB) -- resize the volume, or free space "
+            f"manually (e.g. delete completed tasks' workdirs under "
+            f"{WORKDIR_ROOT}) before continuing. Do not re-add a shared-cache "
+            f"wipe here -- see this function's 2026-08-22 docstring note for "
+            f"why that corrupts concurrently-running sibling tasks."
         )
 
 
