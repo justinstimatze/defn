@@ -6504,6 +6504,8 @@ func truncateTestOutput(out string) string {
 		lines = append(lines, rawLines[i])
 	}
 
+	lines = collapseAllPassLines(lines)
+
 	const headN, tailN = 40, 20
 	joined := strings.Join(lines, "\n")
 
@@ -11828,4 +11830,57 @@ func starterQuestionForOp(args codeParam) (string, bool) {
 		return q, true
 	}
 	return "", false
+}
+
+// allPassCollapseMinCount is the minimum number of "--- PASS:" lines
+// (top-level + subtests combined) before collapseAllPassLines bothers
+// collapsing them. Below this, individual test names are cheap and
+// still useful context; above it, they're mostly redundant noise once
+// nothing failed.
+const allPassCollapseMinCount = 20
+
+// collapseAllPassLines replaces a long run of "--- PASS:" lines with a
+// single count when the whole test run had zero failures. Every PASS
+// line is deliberately kept when a failure exists elsewhere in the same
+// output (truncateTestOutput's own doc comment explains why: they're
+// compact and name which tests ran, useful for traceability) -- but that
+// rationale weakens sharply once nothing failed at all: enumerating
+// dozens of unrelated test names carries no signal a bare count doesn't
+// already carry, and #311's own read-dedup fix is proof this class of
+// "the model doesn't need to see the same names again" redundancy is a
+// real, recurring cost driver. Confirmed via a real prometheus-12024
+// trajectory: 5 separate all-pass `test` calls in one session dumped
+// ~1.7KB each of near-identical PASS enumeration (same ~50 test names
+// repeated across all 5, e.g. TestManagerApplyConfig/
+// TestProviderStaleTargetsAreDropped/etc.), all landing under
+// testOutputCap so truncateTestOutput's existing windowed-summary path
+// never engaged -- this collapse runs before that cap check specifically
+// to catch this under-cap case.
+func collapseAllPassLines(lines []string) []string {
+	passCount := 0
+	for _, l := range lines {
+		t := strings.TrimSpace(l)
+		if strings.HasPrefix(t, "--- FAIL:") {
+			return lines
+		}
+		if strings.HasPrefix(t, "--- PASS:") {
+			passCount++
+		}
+	}
+	if passCount < allPassCollapseMinCount {
+		return lines
+	}
+	out := make([]string, 0, len(lines)-passCount+1)
+	collapsed := false
+	for _, l := range lines {
+		if strings.HasPrefix(strings.TrimSpace(l), "--- PASS:") {
+			if !collapsed {
+				out = append(out, fmt.Sprintf("--- PASS: (%d tests, all passed -- no failures, names omitted)", passCount))
+				collapsed = true
+			}
+			continue
+		}
+		out = append(out, l)
+	}
+	return out
 }

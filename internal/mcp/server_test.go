@@ -2629,11 +2629,12 @@ func TestTruncateTestOutput(t *testing.T) {
 		t.Errorf("truncated output must include truncation marker, got:\n%s", got)
 	}
 
-	// All-pass large output still gets summarized but marker says no failures.
-	// 400 iterations, not 200: the RUN lines are stripped unconditionally
-	// now, so 200 --- PASS lines alone (~5.8KB) would land under
-	// testOutputCap and skip windowing entirely -- this needs to stay
-	// above the cap to keep exercising the windowed-summary path.
+	// All-pass large output gets collapsed by collapseAllPassLines (#311)
+	// before the cap check even runs, so this now exercises the collapse
+	// path rather than the windowed-summary path -- "no failures" comes
+	// from collapseAllPassLines's own message, not the cap-exceeded
+	// branch's. See TestCollapseAllPassLines for the collapse's own
+	// dedicated coverage.
 	var allPass strings.Builder
 	for i := 0; i < 400; i++ {
 		allPass.WriteString(fmt.Sprintf("=== RUN   TestFoo_%d\n--- PASS: TestFoo_%d (0.00s)\n", i, i))
@@ -14002,5 +14003,50 @@ func TestHandleApply_PatchReplacesFirstOccurrence(t *testing.T) {
 	d, _ := db.GetDefinitionByName("Greet", "")
 	if !strings.Contains(d.Body, `"Hi, "`) {
 		t.Errorf("patch not applied, got body: %s", d.Body)
+	}
+}
+
+// TestCollapseAllPassLines covers #311's collapse of a long all-pass
+// test run: many PASS lines (including indented subtests) with zero
+// failures collapse to one count line; any failure, or too few PASS
+// lines to matter, must stay untouched.
+func TestCollapseAllPassLines(t *testing.T) {
+	var manyPass []string
+	for i := 0; i < 25; i++ {
+		manyPass = append(manyPass, fmt.Sprintf("--- PASS: TestFoo_%d (0.00s)", i))
+	}
+	manyPass = append(manyPass, "    --- PASS: TestFoo_0/sub (0.00s)")
+	manyPass = append(manyPass, "PASS")
+	manyPass = append(manyPass, "ok  \tpkg\t0.500s")
+
+	got := collapseAllPassLines(manyPass)
+	gotText := strings.Join(got, "|")
+	if strings.Contains(gotText, "TestFoo_0 ") {
+		t.Errorf("expected individual PASS names to be collapsed, got: %s", gotText)
+	}
+	if !strings.Contains(gotText, "26 tests, all passed") {
+		t.Errorf("expected a collapsed count of 26 (25 top-level + 1 subtest), got: %s", gotText)
+	}
+	if !strings.Contains(gotText, "ok  \tpkg\t0.500s") {
+		t.Errorf("expected package result line to survive collapse, got: %s", gotText)
+	}
+
+	var withFail []string
+	for i := 0; i < 25; i++ {
+		withFail = append(withFail, fmt.Sprintf("--- PASS: TestFoo_%d (0.00s)", i))
+	}
+	withFail = append(withFail, "--- FAIL: TestFoo_25 (0.01s)")
+	gotFail := collapseAllPassLines(withFail)
+	if strings.Join(gotFail, "|") != strings.Join(withFail, "|") {
+		t.Errorf("a run with any failure must not be collapsed, got: %s", strings.Join(gotFail, "|"))
+	}
+
+	var fewPass []string
+	for i := 0; i < 5; i++ {
+		fewPass = append(fewPass, fmt.Sprintf("--- PASS: TestFoo_%d (0.00s)", i))
+	}
+	gotFew := collapseAllPassLines(fewPass)
+	if strings.Join(gotFew, "|") != strings.Join(fewPass, "|") {
+		t.Errorf("too few PASS lines to bother collapsing must stay untouched, got: %s", strings.Join(gotFew, "|"))
 	}
 }
