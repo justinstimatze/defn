@@ -68,6 +68,12 @@ func TestDedup_ContentChangeMiss(t *testing.T) {
 	}
 }
 
+// TestDedup_WriteInvalidates is #313: invalidate() no longer wipes
+// sc.entries pre-emptively -- dedup()'s own post-hoc hash comparison
+// against the freshly recomputed response is already safe regardless
+// of what happened in between, so a write that doesn't actually change
+// this read's output should still dedupe afterward instead of forcing
+// a wasted re-transmission.
 func TestDedup_WriteInvalidates(t *testing.T) {
 	c := newRespCache()
 	sess := &sdkmcp.ServerSession{}
@@ -76,8 +82,8 @@ func TestDedup_WriteInvalidates(t *testing.T) {
 	c.dedup(sess, "read", "Foo", mkText(body))
 	c.invalidate(sess)
 	r := c.dedup(sess, "read", "Foo", mkText(body))
-	if got := r.Content[0].(*sdkmcp.TextContent).Text; strings.Contains(got, "cached") {
-		t.Errorf("after invalidate: read should MISS; got stub %q", got)
+	if got := r.Content[0].(*sdkmcp.TextContent).Text; !strings.Contains(got, "cached") {
+		t.Errorf("after invalidate, identical content should still dedupe to a cache-hit stub; got %q", got)
 	}
 }
 
@@ -270,6 +276,14 @@ func TestBodyServed_NilSessionSafe(t *testing.T) {
 	}
 }
 
+// TestInvalidateNames_PreservesUnrelatedEntries is #313: entries no
+// longer get deleted by invalidateNames at all (touched name, untouched
+// name, or the project overview alike) -- dedup()'s post-hoc hash
+// comparison makes that pre-emptive deletion unnecessary for
+// correctness. What invalidateNames still must do is clear
+// bodyServed/readDowngraded for the touched names specifically, since
+// those short-circuit BEFORE a handler runs and would otherwise risk
+// serving stale content without ever re-verifying it.
 func TestInvalidateNames_PreservesUnrelatedEntries(t *testing.T) {
 	c := newRespCache()
 	sess := &sdkmcp.ServerSession{}
@@ -280,22 +294,27 @@ func TestInvalidateNames_PreservesUnrelatedEntries(t *testing.T) {
 	c.dedup(sess, "read", "Foo", mkText(foo))
 	c.dedup(sess, "read", "Bar", mkText(bar))
 	c.dedup(sess, "overview", "project", mkText(proj))
+	c.markBodyServed(sess, "Foo")
 
 	c.invalidateNames(sess, []string{"Foo"}, nil)
 
-	// Foo's entry is gone: a repeat read of Foo should NOT hit the stub.
-	if r := c.dedup(sess, "read", "Foo", mkText(foo)); strings.Contains(r.Content[0].(*sdkmcp.TextContent).Text, "cached") {
-		t.Errorf("Foo should have been invalidated; got a cache-hit stub")
+	// Foo's dedup entry survives (content unchanged) -- but its
+	// bodyServed state was cleared since Foo was in the touched names.
+	if r := c.dedup(sess, "read", "Foo", mkText(foo)); !strings.Contains(r.Content[0].(*sdkmcp.TextContent).Text, "cached") {
+		t.Errorf("Foo's dedup entry should survive with identical content, got full content instead of a cache-hit stub")
+	}
+	if c.hasBodyServed(sess, "Foo") {
+		t.Errorf("Foo's bodyServed state should have been cleared -- it was in the touched names")
 	}
 
-	// Bar's entry survives: a repeat read of Bar SHOULD hit the stub.
+	// Bar's entry survives too -- it was never touched.
 	if r := c.dedup(sess, "read", "Bar", mkText(bar)); !strings.Contains(r.Content[0].(*sdkmcp.TextContent).Text, "cached") {
 		t.Errorf("Bar should NOT have been invalidated; got full content instead of a cache-hit stub")
 	}
 
-	// overview|project always gets cleared by any determinable-blast-radius write.
-	if r := c.dedup(sess, "overview", "project", mkText(proj)); strings.Contains(r.Content[0].(*sdkmcp.TextContent).Text, "cached") {
-		t.Errorf("overview|project should always be invalidated; got a cache-hit stub")
+	// overview|project also survives now -- no more unconditional clear.
+	if r := c.dedup(sess, "overview", "project", mkText(proj)); !strings.Contains(r.Content[0].(*sdkmcp.TextContent).Text, "cached") {
+		t.Errorf("overview|project should survive with identical content, got full content instead of a cache-hit stub")
 	}
 }
 
@@ -399,38 +418,6 @@ func TestWriteTargets(t *testing.T) {
 	}
 }
 
-func TestInvalidateNames_FindScopedToFile(t *testing.T) {
-	c := newRespCache()
-	sess := &sdkmcp.ServerSession{}
-	a := mkPayload("find-a")
-	b := mkPayload("find-b")
-
-	c.dedup(sess, "find", "pkg/a.go|0", mkText(a))
-	c.dedup(sess, "find", "pkg/b.go|0", mkText(b))
-
-	c.invalidateNames(sess, nil, []string{"pkg/a.go"})
-
-	if r := c.dedup(sess, "find", "pkg/a.go|0", mkText(a)); strings.Contains(r.Content[0].(*sdkmcp.TextContent).Text, "cached") {
-		t.Errorf("find entries for the touched file should be cleared, got a cache-hit stub")
-	}
-	if r := c.dedup(sess, "find", "pkg/b.go|0", mkText(b)); !strings.Contains(r.Content[0].(*sdkmcp.TextContent).Text, "cached") {
-		t.Errorf("find entries for an untouched file should survive, got full content instead of a cache-hit stub")
-	}
-}
-
-func TestInvalidateNames_SearchAlwaysCleared(t *testing.T) {
-	c := newRespCache()
-	sess := &sdkmcp.ServerSession{}
-	res := mkPayload("search-results")
-
-	c.dedup(sess, "search", "auth|10|false", mkText(res))
-	c.invalidateNames(sess, []string{"SomeUnrelatedDef"}, nil)
-
-	if r := c.dedup(sess, "search", "auth|10|false", mkText(res)); strings.Contains(r.Content[0].(*sdkmcp.TextContent).Text, "cached") {
-		t.Errorf("search entries should always be cleared by any determinable write, got a cache-hit stub")
-	}
-}
-
 func TestBodyServedEpochsAgo(t *testing.T) {
 	c := newRespCache()
 	sess := &sdkmcp.ServerSession{}
@@ -526,24 +513,6 @@ func TestHandleCode_ContextRepeatHitsDedupStub(t *testing.T) {
 	thirdText := resultText(t, third)
 	if strings.Contains(thirdText, "cached: identical") {
 		t.Errorf("a different question should not hit the dedup stub, got:\n%s", thirdText)
-	}
-}
-
-// TestInvalidateNames_ContextAlwaysCleared is the regression for
-// invalidateNames missing a "context|" branch alongside "search|" --
-// context's dedup key is free-text question, modeled explicitly on
-// search's own convention (per dedupOpKey's case comment), but only
-// search actually got the blanket-clear treatment in invalidateNames.
-func TestInvalidateNames_ContextAlwaysCleared(t *testing.T) {
-	c := newRespCache()
-	sess := &sdkmcp.ServerSession{}
-	res := mkPayload("context-bundle")
-
-	c.dedup(sess, "context", "how does auth work", mkText(res))
-	c.invalidateNames(sess, []string{"SomeUnrelatedDef"}, nil)
-
-	if r := c.dedup(sess, "context", "how does auth work", mkText(res)); strings.Contains(r.Content[0].(*sdkmcp.TextContent).Text, "cached") {
-		t.Errorf("context entries should always be cleared by any determinable write, got a cache-hit stub")
 	}
 }
 
@@ -803,5 +772,46 @@ func TestHandleCode_TestDedup_DoesNotCacheATimedOutResult(t *testing.T) {
 	}
 	if !strings.Contains(text2, "TIMED OUT") {
 		t.Errorf("expected the second call to genuinely re-run and time out again, got: %s", text2)
+	}
+}
+
+// TestInvalidateNames_SearchEntriesSurviveWhenContentUnchanged is #313:
+// search entries used to be force-cleared unconditionally by any
+// determinable write, on the theory that a write could shift what a
+// pattern matches anywhere in the DB. But dedup()'s post-hoc hash
+// comparison already handles that safely -- if the write actually
+// changed what the pattern matches, the freshly recomputed search
+// result won't hash-match the old entry and the real content is served;
+// if it didn't, the identical result now correctly dedupes instead of
+// being force-cleared and wastefully re-transmitted.
+func TestInvalidateNames_SearchEntriesSurviveWhenContentUnchanged(t *testing.T) {
+	c := newRespCache()
+	sess := &sdkmcp.ServerSession{}
+	res := mkPayload("search-results")
+
+	c.dedup(sess, "search", "auth|10|false", mkText(res))
+	c.invalidateNames(sess, []string{"SomeUnrelatedDef"}, nil)
+
+	if r := c.dedup(sess, "search", "auth|10|false", mkText(res)); !strings.Contains(r.Content[0].(*sdkmcp.TextContent).Text, "cached") {
+		t.Errorf("search entries should survive an unrelated write when content is unchanged, got full content instead of a cache-hit stub")
+	}
+}
+
+// TestInvalidateNames_ContextEntriesSurviveWhenContentUnchanged is
+// #313's counterpart for context, which used to get the same
+// unconditional force-clear treatment as search (modeled explicitly on
+// it, per dedupOpKey's case comment) for the same reasoning that no
+// longer applies: dedup()'s post-hoc hash comparison already makes a
+// pre-emptive clear unnecessary for correctness.
+func TestInvalidateNames_ContextEntriesSurviveWhenContentUnchanged(t *testing.T) {
+	c := newRespCache()
+	sess := &sdkmcp.ServerSession{}
+	res := mkPayload("context-bundle")
+
+	c.dedup(sess, "context", "how does auth work", mkText(res))
+	c.invalidateNames(sess, []string{"SomeUnrelatedDef"}, nil)
+
+	if r := c.dedup(sess, "context", "how does auth work", mkText(res)); !strings.Contains(r.Content[0].(*sdkmcp.TextContent).Text, "cached") {
+		t.Errorf("context entries should survive an unrelated write when content is unchanged, got full content instead of a cache-hit stub")
 	}
 }

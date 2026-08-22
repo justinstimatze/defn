@@ -502,7 +502,16 @@ func TestHandleCode_ReadDowngradeTrackingInvalidatedByEdit(t *testing.T) {
 		t.Fatalf("read after edit: %v", err)
 	}
 	afterEditText := resultText(t, afterEdit)
-	if !strings.Contains(afterEditText, "Outline shown") {
+	// #313: readDowngraded is still correctly invalidated by the edit --
+	// this read re-evaluates and downgrades fresh rather than skipping
+	// straight to a full body. But that fresh outline-level rendering
+	// (sig/doc/flow) happens to be byte-identical to the first read's,
+	// since only an internal string literal changed between v1/v2 -- so
+	// the general entries dedup (no longer force-cleared by the edit,
+	// per #313) correctly replaces it with a "cached" stub instead of
+	// wastefully re-transmitting the identical outline. Both are safe;
+	// accept either.
+	if !strings.Contains(afterEditText, "Outline shown") && !strings.Contains(afterEditText, "cached") {
 		t.Errorf("expected the first read after an edit to re-downgrade (stale readDowngraded tracking must be invalidated), got: %s", afterEditText)
 	}
 	if strings.Contains(afterEditText, "padding to push body") {

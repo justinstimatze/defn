@@ -246,6 +246,19 @@ func (c *respCache) getSession(sess *sdkmcp.ServerSession) *sessionCache {
 	return sc
 }
 
+// invalidate clears bodyServed/readDowngraded/lastTestRun -- state that
+// short-circuits BEFORE a handler runs, so a stale entry there could
+// serve a wrong answer without ever re-verifying it. #313: entries
+// (the general op+argKey -> hash dedup) is deliberately NOT cleared
+// here anymore -- dedup() only ever serves a cached stub after
+// hash-comparing the freshly recomputed response against the old one,
+// so it's already safe regardless of what happened in between; wiping
+// it pre-emptively on every write was throwing away a real, safe
+// dedup opportunity for the common case where a write doesn't actually
+// change a given read's output (confirmed via a real prometheus-19017
+// trajectory: the same overview(file:) call re-ran 3 times with
+// unrelated creates in between, identical 847-byte output every time,
+// none of it deduped).
 func (c *respCache) invalidate(sess *sdkmcp.ServerSession) {
 	if sess == nil {
 		return
@@ -253,7 +266,6 @@ func (c *respCache) invalidate(sess *sdkmcp.ServerSession) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if sc, ok := c.sessions[sess]; ok {
-		sc.entries = map[string]cacheEntry{}
 		sc.bodyServed = nil
 		sc.readDowngraded = nil
 		sc.lastTestRun = nil
@@ -352,13 +364,23 @@ func (c *respCache) markBodyServed(sess *sdkmcp.ServerSession, name string) {
 	sc.bodyServed[name] = sc.compactionEpoch
 }
 
-// invalidateNames clears only the dedup and bodyServed entries anchored
-// on the given names and files, plus the project-wide overview (its
-// content spans every def, so any determinable-blast-radius write still
-// invalidates it). This is the scoped counterpart to invalidate -- use
-// it whenever writeTargets can determine the write's blast radius;
-// fall back to invalidate (full wipe) when it can't.
-func (c *respCache) invalidateNames(sess *sdkmcp.ServerSession, names, files []string) {
+// invalidateNames clears the bodyServed/readDowngraded entries anchored
+// on the given names, plus lastTestRun (see invalidate's doc comment
+// for why those three specifically -- they short-circuit BEFORE a
+// handler runs, so staleness there is a real correctness risk). #313:
+// this used to also delete every sc.entries key touched by the write
+// (scoped here, full wipe in invalidate), including force-clearing
+// search/context/overview|project unconditionally -- removed for the
+// same reason as invalidate: dedup()'s own post-hoc hash comparison
+// against the freshly recomputed response already makes that
+// pre-emptive deletion redundant, and it was throwing away real dedup
+// opportunities whenever a write didn't actually change a given read's
+// output. files is no longer used (it only fed the removed file-keyed
+// entries clearing) but the parameter stays -- the caller's
+// writeTargets(args) already computes both, and callers passing the
+// exact same two-tuple through with no adaptation matters more here
+// than trimming an unused param.
+func (c *respCache) invalidateNames(sess *sdkmcp.ServerSession, names, _ []string) {
 	if sess == nil {
 		return
 	}
@@ -368,50 +390,10 @@ func (c *respCache) invalidateNames(sess *sdkmcp.ServerSession, names, files []s
 	if !ok {
 		return
 	}
-	delete(sc.entries, "overview|project")
-	for key := range sc.entries {
-		// search's cache key is pattern text, not a def/file identity --
-		// any determinable write could shift what a pattern matches
-		// anywhere in the DB, so (like overview|project) it's always
-		// cleared rather than attempting per-pattern staleness analysis.
-		if strings.HasPrefix(key, "search|") {
-			delete(sc.entries, key)
-			continue
-		}
-		// context's key is free-text question, modeled explicitly on
-		// search's own "any determinable write could shift the answer"
-		// reasoning (its own case comment says so) -- give it the same
-		// blanket-clear treatment. Without this, a cached context bundle
-		// was untouched by every scoped write (edit/rename/create/delete/
-		// apply) and only ever cleared by a full invalidate (sync/resolve/
-		// merge), unlike search which explicitly gets this.
-		if strings.HasPrefix(key, "context|") {
-			delete(sc.entries, key)
-			continue
-		}
-		for _, name := range names {
-			for _, op := range readOpsWithNameKey {
-				prefix := op + "|" + name
-				if key == prefix || strings.HasPrefix(key, prefix+"|") {
-					delete(sc.entries, key)
-				}
-			}
-		}
-		for _, file := range files {
-			if key == "read-file|"+file || key == "file-defs|"+file || key == "overview|file:"+file || strings.HasPrefix(key, "find|"+file+"|") {
-				delete(sc.entries, key)
-			}
-		}
-	}
 	for _, name := range names {
 		delete(sc.bodyServed, name)
 		delete(sc.readDowngraded, name)
 	}
-	// A test's pass/fail depends on an unbounded surface of code it
-	// exercises, not just the names/files this write's blast radius
-	// could determine -- unlike the scoped clears above, every pending
-	// cached test result is invalidated regardless of scope. See
-	// lastTestRun's doc comment.
 	sc.lastTestRun = nil
 }
 

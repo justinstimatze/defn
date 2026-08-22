@@ -334,7 +334,6 @@ func TestHandleCode_CircuitBreakerAutoBatchesInsteadOfRefusing(t *testing.T) {
 	}
 }
 
-
 // TestWriteBatchNudge_FiresOnceAtThreshold guards the fix for a v8
 // bench finding: defn invoked the Go toolchain 82% more often than
 // files-mode (178 vs 98 calls across a 15-task corpus) because every
