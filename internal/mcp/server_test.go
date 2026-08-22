@@ -14146,3 +14146,46 @@ func TestEmitAndBuildAgainst_EscalatedRetrySucceedsOnSlowButValidBuild(t *testin
 		t.Errorf("expected buildSlowConfirmed to be set even though the retry ultimately succeeded")
 	}
 }
+
+func TestHandleTest_NoTestsMatchedHeaderDoesNotClaimTestsRan(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "sub"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "root.go"), []byte("package testproj\n\nfunc RootFunc() string { return \"root\" }\n\nfunc unrelatedMarker() string { return \"unrelated\" }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "root_test.go"), []byte("package testproj\n\nimport \"testing\"\n\nfunc TestUnrelated(t *testing.T) {\n\tif unrelatedMarker() == \"\" {\n\t\tt.Fatal(\"root-unrelated-marker\")\n\t}\n}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "sub", "sub_test.go"), []byte("package sub\n\nimport (\n\t\"testing\"\n\n\t\"testproj\"\n)\n\nfunc TestSubFunc(t *testing.T) {\n\tif testproj.RootFunc() == \"\" {\n\t\tt.Fatal(\"sub-package-marker\")\n\t}\n}\n"), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleTest(context.Background(), nil, nameParam{Name: "RootFunc"})
+	if err != nil {
+		t.Fatalf("handleTest(RootFunc): %v", err)
+	}
+	text := resultText(t, result)
+	t.Logf("output:\n%s", text)
+
+	if !strings.Contains(text, "NO TESTS MATCHED") {
+		t.Fatalf("test setup didn't produce the intended no-match scenario (covering test must live outside this def's own-package scope), got: %s", text)
+	}
+	if strings.HasPrefix(text, "Running") {
+		t.Errorf("header still asserts a definite \"Running N of N tests\" count even though nothing matched -- must say none ran instead, got: %s", text)
+	}
+	if !strings.Contains(text, "but none ran") {
+		t.Errorf("expected the header to say tests were attempted but none ran, got: %s", text)
+	}
+}

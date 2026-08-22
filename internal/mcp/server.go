@@ -6431,9 +6431,23 @@ func (s *server) handleTest(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	out, err := cmd.CombinedOutput()
 
 	outStr := string(out)
+	noneMatched := testMatchedNothing(outStr)
+
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Running %d of %d tests (affected by %s) across %s:\n\n",
-		len(testNames), len(testNames), args.Name, target))
+	if noneMatched {
+		// #329: the "Running N of N tests" header used to print
+		// unconditionally, then get flatly contradicted a few lines
+		// later by "NO TESTS MATCHED" -- confirmed confusing live on a
+		// real prometheus-12024 v17 trajectory, where the model burned
+		// several extra calls recovering from a header that read like
+		// a completed, successful run. Say what actually happened
+		// instead of asserting a count that didn't hold up.
+		sb.WriteString(fmt.Sprintf("Attempted %d covering test(s) (affected by %s) across %s, but none ran:\n\n",
+			len(testNames), args.Name, target))
+	} else {
+		sb.WriteString(fmt.Sprintf("Running %d of %d tests (affected by %s) across %s:\n\n",
+			len(testNames), len(testNames), args.Name, target))
+	}
 	sb.WriteString(truncateTestOutput(outStr))
 
 	switch {
@@ -6445,7 +6459,7 @@ func (s *server) handleTest(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		sb.WriteString(fmt.Sprintf("\nTIMED OUT after %s -- this is NOT a pass; the run was killed before finishing. This may be a hang from your edit, or simply a large/slow test package -- set DEFN_TEST_TIMEOUT=<duration> (e.g. \"5m\") to allow more time before assuming a hang", testTimeout))
 	case err != nil:
 		sb.WriteString("\nSOME TESTS FAILED")
-	case testMatchedNothing(outStr):
+	case noneMatched:
 		sb.WriteString(fmt.Sprintf("\nNO TESTS MATCHED — the %d covering test(s) didn't run in %s (likely scoped to the wrong package, e.g. coverage via interface dispatch in a sibling package); nothing was verified", len(testNames), target))
 	default:
 		sb.WriteString("\nALL TESTS PASSED")
