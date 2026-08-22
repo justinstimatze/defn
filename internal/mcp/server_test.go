@@ -14353,3 +14353,79 @@ func TestHandleTest_DisclosesOtherUnrunTestsInSamePackage(t *testing.T) {
 		t.Errorf("expected a disclosure that TestUnrelatedGoldenFile wasn't covered by this narrowed run, got: %s", text)
 	}
 }
+
+// TestHandleEdit_ImpactNudgeIncludesReceiverWhenPresent is #333: a real
+// prometheus-19017 v17 bench trajectory edited (ActiveQueryTracker).Insert
+// (correctly disambiguated via receiver:), got the "FYI: N callers, M
+// tests affected. Run code(op:"test", name:"Insert") to verify." nudge
+// with the receiver dropped, then followed that exact suggestion --
+// which silently resolved to an unrelated tsdb/chunkenc.Insert (highest
+// caller-count tiebreak) instead of the just-edited method, running 1697
+// unrelated tests and reporting "ALL TESTS PASSED" with zero real
+// verification of the actual change. The ambiguity was disclosed
+// correctly (ambiguityNote fired), but the model didn't re-add
+// receiver: on the follow-up call. The suggested command must include
+// the receiver it already knows, so there's nothing to forget.
+func TestHandleEdit_ImpactNudgeIncludesReceiverWhenPresent(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "a.go"), []byte(`package testproj
+
+type Foo struct{}
+
+func (f Foo) Insert(x int) int { return x }
+
+func UseFoo(f Foo) int { return f.Insert(1) }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "a_test.go"), []byte(`package testproj
+
+import "testing"
+
+func TestFooInsert(t *testing.T) {
+	if (Foo{}).Insert(1) != 1 {
+		t.Fatal("wrong")
+	}
+}
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "b.go"), []byte(`package testproj
+
+type Bar struct{}
+
+func (b Bar) Insert(x int) int { return x + 1 }
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op:       "edit",
+		Name:     "Insert",
+		Receiver: "Foo",
+		NewBody:  "func (f Foo) Insert(x int) int { return x + 100 }",
+	})
+	if err != nil {
+		t.Fatalf("handleCode edit: %v", err)
+	}
+	text := resultText(t, result)
+	t.Logf("output:\n%s", text)
+
+	if !strings.Contains(text, `receiver:"Foo"`) {
+		t.Errorf(`expected the FYI suggestion to include receiver:"Foo" so a follow-up test call resolves to the just-edited method, not an unrelated same-named one, got: %s`, text)
+	}
+}

@@ -2913,8 +2913,25 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 					prodCallers++
 				}
 			}
-			sb.WriteString(fmt.Sprintf("\nFYI: %d callers, %d tests affected. Run code(op:\"test\", name:\"%s\") to verify.\n",
-				prodCallers, len(impact.Tests), d.Name))
+			// #333: this used to always suggest test(name:X), dropping the
+			// receiver even when d has one -- so an edit correctly
+			// disambiguated via receiver: handed the model a follow-up
+			// command that silently drops that same disambiguation.
+			// Confirmed live twice (prometheus-18765's "refresh",
+			// prometheus-19017's "Insert"): the ambiguity WAS disclosed by
+			// ambiguityNote, but the model didn't re-add receiver: on the
+			// next call, and defn's own blast-radius tiebreak then resolved
+			// to an unrelated same-named def in a different package,
+			// silently verifying the wrong 1697 tests. Suggesting the
+			// already-known-correct receiver here removes the need for the
+			// model to remember to repeat it.
+			if d.Receiver != "" {
+				sb.WriteString(fmt.Sprintf("\nFYI: %d callers, %d tests affected. Run code(op:\"test\", name:\"%s\", receiver:\"%s\") to verify.\n",
+					prodCallers, len(impact.Tests), d.Name, d.Receiver))
+			} else {
+				sb.WriteString(fmt.Sprintf("\nFYI: %d callers, %d tests affected. Run code(op:\"test\", name:\"%s\") to verify.\n",
+					prodCallers, len(impact.Tests), d.Name))
+			}
 		}
 		if !d.Test {
 			sb.WriteString(s.testCoverageHint(d.ModuleID, d.SourceFile))
