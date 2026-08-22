@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import shlex
+import sqlite3
 import subprocess
 import sys
 import time
@@ -371,6 +372,7 @@ def setup_workspace(task, arm="defn", corpus_dir=DEFAULT_CORPUS_DIR):
         return workdir
 
     print(f"[setup] defn init + ingest (~1 min)", file=sys.stderr)
+
     # Bug-fix bench workdirs contain broken code (that's the whole
     # point) — package-parse errors are expected on some ingests.
     # Use subprocess.run and check that `.defn/` was created rather
@@ -384,23 +386,67 @@ def setup_workspace(task, arm="defn", corpus_dir=DEFAULT_CORPUS_DIR):
     # script's own cwd) instead of each process's own workdir. Passing
     # cwd=workdir works around it; this looks like a real defn CLI bug
     # independent of this harness, worth filing separately.
-    subprocess.run(
-        ["defn", "init", "."],
-        cwd=workdir,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    subprocess.run(
-        ["defn", "ingest", "."],
-        cwd=workdir,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    def _run_init_and_ingest():
+        subprocess.run(
+            ["defn", "init", "."],
+            cwd=workdir,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["defn", "ingest", "."],
+            cwd=workdir,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def _ingested_def_count():
+        # #328: `defn init` alone creates .defn/ (schema only, zero rows) --
+        # checking directory existence alone only proves init ran, not that
+        # ingest actually populated anything. Confirmed directly: under the
+        # heavier load of running both arms concurrently, two tasks' ingest
+        # produced a 655KB schema-only .defn/ (zero modules) with the exact
+        # same binary+repo that produced a healthy ~115MB .defn/ moments
+        # earlier in isolation -- ingest silently did nothing while still
+        # exiting 0, and the cached "fresh .defn/" was then reused as if it
+        # were real. The live agent session only discovered "no modules
+        # ingested" many minutes into its budget, well after the empty
+        # cache had already been written.
+        db_path = os.path.join(defn_dir, "defn.db")
+        if not os.path.isfile(db_path):
+            return 0
+        try:
+            conn = sqlite3.connect(db_path)
+            try:
+                return conn.execute("SELECT COUNT(*) FROM definitions").fetchone()[0]
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return 0
+
+    _run_init_and_ingest()
     if not os.path.isdir(defn_dir):
         raise RuntimeError(
             f"[setup] defn init/ingest did not create {defn_dir} — "
             f"see manual `defn init {workdir}` for the underlying error"
         )
+    if _ingested_def_count() == 0:
+        # Likely transient contention (concurrent tasks competing for the
+        # box's CPU/disk) rather than a real per-project ingest failure --
+        # one retry from a clean slate is cheap compared to silently
+        # caching an empty database for the rest of the task.
+        print(
+            f"[setup] ingest produced zero definitions -- retrying once",
+            file=sys.stderr,
+        )
+        shutil.rmtree(defn_dir, ignore_errors=True)
+        _run_init_and_ingest()
+        if _ingested_def_count() == 0:
+            raise RuntimeError(
+                f"[setup] defn init/ingest ingested zero definitions in "
+                f"{defn_dir} after a retry — see manual `defn init {workdir} "
+                f"&& defn ingest {workdir}` for the underlying error"
+            )
 
     # Cache the fresh ingest. Tar (no compression) — Dolt's noms store
     # is already densely packed; gzip barely helps and doubles extract cost.
