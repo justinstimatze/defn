@@ -1256,91 +1256,28 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		}
 		s.trackReadShapedName(sc, args.Op, nameForTracking)
 		breakerMsg := s.circuitBreakerCheck(sc, args.Op, isBatch)
-		// A block on a nameable op does not just refuse -- it auto-batches
-		// every name seen since the last reset into one expand call instead.
-		// Measured motivation (2026-08-08 pilot digging): a bare refusal
-		// assumes the model immediately restructures its whole remaining
-		// strategy after one denial. It often doesn't -- one real
-		// trajectory hit 11 CONSECUTIVE blocked calls (26% of that
-		// trajectory's entire tool budget) before switching to batching,
-		// each one a full round-trip returning zero information. This
-		// makes the server robust to that instead of depending on the
-		// model's compliance.
-		var autoNames []string
-		var autoBodyNames []string
-		// Gate on accumulated names, not on whether THIS call's op is
-		// itself nameable: search is pattern-based and can't resolve a
-		// target for itself, but if earlier read/outline/impact calls
-		// this turn already built up pendingReadNames, a search that
-		// trips the breaker can still be rescued with that backlog
-		// instead of a zero-info refusal (v9 bench: 22% of fires were
-		// exactly this — search tripped with a non-empty backlog).
-		if breakerMsg != "" && len(sc.pendingReadNames) > 0 {
-			autoNames = append([]string(nil), sc.pendingReadNames...)
-			autoBodyNames = append([]string(nil), sc.pendingBodyNames...)
-			sc.pendingReadNames = nil
-			sc.pendingBodyNames = nil
-			sc.readShapedCount = 0
+		// #312: instrumentation-only now. This used to hijack a tripped
+		// call -- auto-batching the accumulated backlog through expand (or,
+		// with no backlog, a bare refusal) instead of ever running the op
+		// actually requested. Two things argue against continuing to
+		// enforce that hijack blind: (1) the project's own prior measurement
+		// found 0/19 auto-batch fires were followed by the model proactively
+		// reaching for context/expand afterward -- it only recovers cost
+		// after the fact, it never changed future behavior; (2) a live
+		// example found the hijack bundling 4 unrelated names' full outlines
+		// (19.8KB one of them) into the response for a call that was
+		// already narrowly file-scoped, which is its own kind of confusing.
+		// Also consistent with Anthropic's own less-prompting-for-frontier-
+		// models guidance: lean on better primitives (see the read-dedup and
+		// all-pass-test-collapse fixes from the same investigation) rather
+		// than reactively overriding the model's own tool choice. Logged via
+		// mcpDebugf so real per-turn trip-rate data exists before deciding
+		// whether this mechanism (or a redesigned one) is worth reviving --
+		// see turnToken/pendingReadNames, still tracked below, unchanged.
+		if breakerMsg != "" {
+			mcpDebugf("circuit breaker WOULD have fired for op=%s (pending backlog=%d names) -- instrumentation only, call proceeds normally. Message would have been: %s", args.Op, len(sc.pendingReadNames), breakerMsg)
 		}
 		s.respCache.mu.Unlock()
-		if len(autoNames) > 0 {
-			// #250: a blocked op:"read" mid-batch wants source, not just
-			// outline+callers -- dropping the body silently downgraded the
-			// response below what was actually asked for (a real
-			// grpc-go-3351 trajectory burned 2 extra round-trips
-			// re-requesting the body this should have returned). #279: but
-			// that body want is per-NAME, not per-batch -- applying it to
-			// every name folded into the batch dumped full source for defs
-			// only ever outlined/searched (etcd-21620: 19KB of unrequested
-			// bodies across 2 auto-batch calls). BodyNames restricts "body"
-			// to exactly the names actually read.
-			r, o, e := wrapStale(s.handleExpand(ctx, req, codeParam{Names: autoNames, Include: []string{"outline", "callers"}, BodyNames: autoBodyNames}))
-			note := fmt.Sprintf("[circuit breaker: auto-batched %d individual lookups this turn (%s) into one expand call instead of refusing -- call code(op:\"context\"/op:\"expand\", names:[...]) yourself next time to skip this extra round-trip.]\n\n", len(autoNames), strings.Join(autoNames, ", "))
-			// #297: search is the one readShapedOp that isn't nameable --
-			// its own query never joins autoNames (there's no single target
-			// name to track it under), so unlike read/outline/impact/
-			// methods/expand, the rescue above answers a DIFFERENT question
-			// than the one just asked. Serving only the rescue silently
-			// dropped the search itself with no signal it never ran -- the
-			// response looked like a complete, on-topic answer (a real
-			// prometheus-19338 trajectory burned 2 extra calls after
-			// concluding its search term genuinely had zero matches). Run
-			// the search too and surface both.
-			if args.Op == "search" {
-				pattern := args.Pattern
-				if pattern == "" {
-					pattern = args.Name
-				}
-				if pattern == "" {
-					pattern = args.Query
-				}
-				searchArgs := args
-				searchArgs.Pattern = pattern
-				// wrapStale here too -- the search half is the live, just-run
-				// query most likely to need the staleness caveat; leaving it
-				// unwrapped while only the rescue's expand half carried the
-				// banner put the tag on the wrong half of the combined response.
-				sr, _, se := wrapStale(s.handleSearch(ctx, req, searchArgs))
-				if se == nil && sr != nil && len(sr.Content) > 0 {
-					if st, ok := sr.Content[0].(*sdkmcp.TextContent); ok && len(r.Content) > 0 {
-						if rt, ok2 := r.Content[0].(*sdkmcp.TextContent); ok2 {
-							rt.Text = st.Text + "\n\n---\n\n" + rt.Text
-							note = fmt.Sprintf("[circuit breaker: your search for %q ran normally (result above the ---); %d OTHER pending lookups from this turn (%s) were also auto-batched below that instead of refusing them -- call code(op:\"context\"/op:\"expand\", names:[...]) yourself next time to skip the extra round-trip.]\n\n", pattern, len(autoNames), strings.Join(autoNames, ", "))
-						}
-					}
-				} else {
-					// The search itself failed -- say so explicitly rather than
-					// silently falling back to the rescue-only note, which would
-					// look identical to "nothing was asked" and defeat the whole
-					// point of this fix.
-					note = fmt.Sprintf("[circuit breaker: your search for %q FAILED to run (not shown below); %d OTHER pending lookups from this turn (%s) were auto-batched instead of refusing them -- call code(op:\"context\"/op:\"expand\", names:[...]) yourself next time to skip the extra round-trip.]\n\n", pattern, len(autoNames), strings.Join(autoNames, ", "))
-				}
-			}
-			return prependNote(r, note), o, e
-		}
-		if breakerMsg != "" {
-			return textResult(breakerMsg), nil, nil
-		}
 	}
 
 	switch args.Op {
@@ -11883,4 +11820,19 @@ func collapseAllPassLines(lines []string) []string {
 		out = append(out, l)
 	}
 	return out
+}
+
+// mcpDebugf prints a trace line to stderr when DEFN_MCP_DEBUG=1,
+// prefixed for easy grepping. No-op (and effectively free -- one env
+// lookup) otherwise. Mirrors internal/emit's emitDebugf -- a permanent,
+// reusable dev tool, not a one-off diagnostic. Re-checks the env var on
+// every call rather than caching it so a long-lived `defn serve`
+// process doesn't need a restart to pick it up.
+//
+// Usage: DEFN_MCP_DEBUG=1 defn serve 2>&1 | grep mcp-debug
+func mcpDebugf(format string, args ...any) {
+	if os.Getenv("DEFN_MCP_DEBUG") != "1" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[mcp-debug] "+format+"\n", args...)
 }

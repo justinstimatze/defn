@@ -33,6 +33,17 @@ func circuitBreakerThreshold() int {
 // changed token means a new turn started, so the read-shaped circuit
 // breaker counter resets -- each turn gets its own budget instead of
 // accumulating across the whole session.
+//
+// #312: also resets starterInjected. The #203 starter bundle was
+// session-lifetime-once ("first orient op of this session, won't
+// repeat") despite the intent (per CLAUDE.md) being "first tool
+// response of a task/turn" -- in a multi-turn conversation it only
+// ever fired once, on whichever turn happened to make the first
+// eligible call, and every later turn's own fresh question got no
+// bundle at all. Turn-scoping it costs nothing extra: the hook already
+// re-captures the real question every turn (.defn/.last-question), so
+// this is purely widening an existing one-shot's window, not adding
+// new machinery.
 func (s *server) checkTurnBoundary(sc *sessionCache) {
 	if s.projectDir == "" {
 		return
@@ -47,6 +58,7 @@ func (s *server) checkTurnBoundary(sc *sessionCache) {
 		sc.readShapedCount = 0
 		sc.pendingReadNames = nil
 		sc.writeShapedCount = 0
+		sc.starterInjected = false
 	}
 }
 

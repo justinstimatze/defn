@@ -40,7 +40,7 @@ type respCache struct {
 type sessionCache struct {
 	seq             int64
 	entries         map[string]cacheEntry
-	starterInjected bool   // #203: true after first orient op has appended the starter bundle
+	starterInjected bool   // #203/#312: true after this TURN's first orient op has appended the starter bundle; reset per-turn by checkTurnBoundary, not session-lifetime-once
 	turnToken       string // #209: last-seen turn-token; a change means a new turn started
 	readShapedCount int    // #209: individual read-shaped calls made so far this turn
 	// writeShapedCount tracks individual apply-batchable write calls (see

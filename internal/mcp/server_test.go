@@ -7202,39 +7202,6 @@ func UseC(e *Engine) string { return e.Protocol }
 	}
 }
 
-// TestHandleCode_CircuitBreakerAutoBatchIncludesBodyWhenReadWasBlocked
-// guards the #250 fix: a blocked op:"read" auto-batched through expand
-// used to hardcode Include:["outline","callers"], silently dropping the
-// body a "read" call is for -- a real grpc-go-3351 trajectory burned 2
-// extra round-trips re-requesting the body this should have returned
-// the first time.
-func TestHandleCode_CircuitBreakerAutoBatchIncludesBodyWhenReadWasBlocked(t *testing.T) {
-	t.Setenv("DEFN_CIRCUIT_BREAKER", "2")
-	db, projDir := setupTestDB(t)
-	defer db.Close()
-	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
-	s.ready.Store(true)
-	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
-
-	for _, name := range []string{"Greet", "Farewell"} {
-		if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: name}); err != nil {
-			t.Fatalf("read %s: %v", name, err)
-		}
-	}
-
-	third, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "main"})
-	if err != nil {
-		t.Fatalf("third read: %v", err)
-	}
-	text := resultText(t, third)
-	if !strings.Contains(text, "auto-batched") {
-		t.Fatalf("expected an auto-batch note, got: %s", text)
-	}
-	if !strings.Contains(text, `"Hello, "`) {
-		t.Errorf("auto-batched result from a blocked op:\"read\" must include the actual source body (Greet's \"Hello, \" literal), not just outline+callers: %s", text)
-	}
-}
-
 // TestHandleSearch_IncludeParamNotedAsIgnored guards the #250 fix:
 // search accepted include: (a real codeParam field, but only wired up
 // for expand's graph-hop selection) with zero effect and zero signal --
@@ -11491,53 +11458,6 @@ func TestHandleInsertHeader_RejectsBodyThatBreaksParsing(t *testing.T) {
 	}
 }
 
-// TestHandleCode_CircuitBreakerAutoBatchBodyOnlyForNamesActuallyRead
-// guards the #279/#290 fix: the circuit-breaker auto-batch redirect used
-// to key "include body" off a single session-wide bool -- ANY op:"read"
-// call this turn meant EVERY name folded into the auto-batch got its
-// full source dumped, even names the model only ever outlined or
-// searched. Confirmed on a real etcd-21620 trajectory: 2 auto-batch
-// calls added 19KB of unrequested bodies this way. Body inclusion is now
-// tracked per name, not per turn.
-func TestHandleCode_CircuitBreakerAutoBatchBodyOnlyForNamesActuallyRead(t *testing.T) {
-	t.Setenv("DEFN_CIRCUIT_BREAKER", "2")
-	db, projDir := setupTestDB(t)
-	defer db.Close()
-	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
-	s.ready.Store(true)
-	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
-
-	// Greet is only ever outlined -- should get outline+callers, no body.
-	if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "outline", Name: "Greet"}); err != nil {
-		t.Fatalf("outline Greet: %v", err)
-	}
-	// Farewell and main are read -- should get body in the auto-batch.
-	if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "Farewell"}); err != nil {
-		t.Fatalf("read Farewell: %v", err)
-	}
-	third, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "main"})
-	if err != nil {
-		t.Fatalf("third read: %v", err)
-	}
-	text := resultText(t, third)
-	if !strings.Contains(text, "auto-batched") {
-		t.Fatalf("expected an auto-batch note, got: %s", text)
-	}
-
-	if !strings.Contains(text, `Greet(name) + " and goodbye"`) {
-		t.Errorf("Farewell was read -- expected its body in the auto-batch, got: %s", text)
-	}
-	if !strings.Contains(text, `Farewell("world")`) {
-		t.Errorf("main was read -- expected its body in the auto-batch, got: %s", text)
-	}
-	if strings.Contains(text, `"Hello, " + name`) {
-		t.Errorf("Greet was only outlined, not read -- its body must NOT appear in the auto-batch, got: %s", text)
-	}
-	if !strings.Contains(text, "Greet") {
-		t.Errorf("Greet should still appear via outline (name/signature), got: %s", text)
-	}
-}
-
 // TestHandleApply_InsertHeaderCombinedWithEditDoesNotRollBackBatch guards
 // the #296 bug found reviewing e65af5d: insert-header was wired into
 // writeTargets/isWriteOp but never into handleApply's own op-dispatch
@@ -11966,66 +11886,6 @@ func TestHandleTestByName_GenuineTimeoutStillReportsTimedOut(t *testing.T) {
 	text := resultText(t, result)
 	if !strings.Contains(text, "TIMED OUT") {
 		t.Errorf("expected a genuine hang past the deadline to still report TIMED OUT, got:\n%s", text)
-	}
-}
-
-// TestHandleCode_CircuitBreakerAutoBatchPreservesReceiverDisambiguation is
-// the traefik-13303 regression: a receiver-qualified read (disambiguating
-// one of several same-named methods across different types) used to lose
-// that qualifier when the circuit breaker later auto-batched the bare
-// name through expand, silently re-resolving it via the generic
-// best-effort tiebreak -- landing on a completely different, unrelated
-// method sharing the same name, with no signal anything had changed.
-func TestHandleCode_CircuitBreakerAutoBatchPreservesReceiverDisambiguation(t *testing.T) {
-	t.Setenv("DEFN_CIRCUIT_BREAKER", "2")
-	dir := t.TempDir()
-	projDir := filepath.Join(dir, "testproj")
-	os.MkdirAll(projDir, 0755)
-	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
-	os.WriteFile(filepath.Join(projDir, "sni.go"), []byte("package testproj\n\ntype SNICheck struct{}\n\nfunc (s *SNICheck) ServeHTTP() string {\n\treturn \"sni-marker\"\n}\n"), 0644)
-	os.WriteFile(filepath.Join(projDir, "ping.go"), []byte("package testproj\n\ntype Handler struct{}\n\nfunc (h *Handler) ServeHTTP() string {\n\treturn \"ping-marker\"\n}\n"), 0644)
-	os.WriteFile(filepath.Join(projDir, "other.go"), []byte("package testproj\n\nfunc OtherFunc() string {\n\treturn \"other\"\n}\n"), 0644)
-
-	dbPath := filepath.Join(dir, ".defn")
-	db, err := store.OpenBackend(dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	if err := ingest.Ingest(db, projDir); err != nil {
-		t.Fatal("ingest:", err)
-	}
-	if err := resolve.Resolve(db, projDir); err != nil {
-		t.Fatal("resolve:", err)
-	}
-
-	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
-	s.ready.Store(true)
-	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
-
-	// Deliberately disambiguated: the SNICheck receiver, not Handler's
-	// same-named method.
-	if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "ServeHTTP", Receiver: "SNICheck"}); err != nil {
-		t.Fatalf("read ServeHTTP(SNICheck): %v", err)
-	}
-	if _, _, err := s.handleCode(context.Background(), req, codeParam{Op: "outline", Name: "OtherFunc"}); err != nil {
-		t.Fatalf("outline OtherFunc: %v", err)
-	}
-	// Third read-shaped call trips the breaker (threshold=2) and
-	// auto-batches everything tracked so far, including ServeHTTP.
-	third, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "OtherFunc"})
-	if err != nil {
-		t.Fatalf("third read: %v", err)
-	}
-	text := resultText(t, third)
-	if !strings.Contains(text, "auto-batched") {
-		t.Fatalf("expected an auto-batch note, got: %s", text)
-	}
-	if !strings.Contains(text, "sni-marker") {
-		t.Errorf("auto-batch should preserve the SNICheck disambiguation and include its body, got: %s", text)
-	}
-	if strings.Contains(text, "ping-marker") {
-		t.Errorf("auto-batch re-resolved ServeHTTP to the WRONG (unrelated Handler) receiver, got: %s", text)
 	}
 }
 

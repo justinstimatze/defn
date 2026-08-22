@@ -280,16 +280,16 @@ func TestCheckCompactionEpoch_MissingFileIsNoOp(t *testing.T) {
 	}
 }
 
-// TestHandleCode_CircuitBreakerAutoBatchesInsteadOfRefusing is the
-// end-to-end counterpart to the circuitBreakerCheck unit tests above.
-// Measured motivation (2026-08-08 pilot digging): a bare refusal assumes
-// the model immediately restructures its whole remaining strategy after
-// one denial. Real trajectories showed that assumption failing badly --
-// one hit 11 CONSECUTIVE blocked calls (26% of that trajectory's entire
-// tool budget), each a full round-trip returning zero information,
-// before the model adapted. This proves the block now auto-batches the
-// names seen this turn into one expand call and serves real content
-// instead of just nagging.
+// TestHandleCode_CircuitBreakerAutoBatchesInsteadOfRefusing is #312:
+// the breaker's auto-batch hijack (and its bare-refusal fallback) is
+// gone -- both were reactive nudges the project's own prior measurement
+// found had 0/19 follow-through (the model never adapted afterward, it
+// just recovered cost after the fact), and one auto-batch was observed
+// bundling in unrelated names' full outlines for a call that was
+// already narrowly scoped. The breaker is instrumentation-only now
+// (see mcpDebugf): tripping it must NOT change the response at all --
+// a call past threshold still returns its own real, untouched content,
+// same as if the breaker didn't exist.
 func TestHandleCode_CircuitBreakerAutoBatchesInsteadOfRefusing(t *testing.T) {
 	t.Setenv("DEFN_CIRCUIT_BREAKER", "2")
 	db, projDir := setupTestDB(t)
@@ -308,32 +308,32 @@ func TestHandleCode_CircuitBreakerAutoBatchesInsteadOfRefusing(t *testing.T) {
 		}
 	}
 
-	// Third read is past threshold=2 -- must auto-batch Greet+Farewell+main
-	// via expand instead of a bare refusal.
+	// Third read is past threshold=2 -- must still return main's own real
+	// content, not an auto-batch note and not a bare refusal.
 	third, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "main"})
 	if err != nil {
 		t.Fatalf("third read: %v", err)
 	}
 	text := resultText(t, third)
-	if !strings.Contains(text, "auto-batched") {
-		t.Fatalf("expected an auto-batch note, got: %s", text)
+	if strings.Contains(text, "auto-batched") || strings.Contains(text, "circuit breaker") {
+		t.Fatalf("breaker is instrumentation-only now -- tripping it must not alter the response, got: %s", text)
 	}
-	for _, name := range []string{"Greet", "Farewell", "main"} {
-		if !strings.Contains(text, name) {
-			t.Errorf("auto-batched result missing %s: %s", name, text)
-		}
+	if !strings.Contains(text, "func main()") {
+		t.Fatalf("expected main's own real content past threshold, got: %s", text)
 	}
 
-	// The auto-batch redirect must itself count as a reset -- the next
-	// singleton call should NOT be immediately blocked again.
+	// Fourth read, still past threshold -- same guarantee holds every
+	// subsequent call in the turn, not just the one that first tripped it.
 	fourth, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: "Greet"})
 	if err != nil {
 		t.Fatalf("fourth read: %v", err)
 	}
-	if strings.Contains(resultText(t, fourth), "circuit breaker") {
-		t.Fatalf("expected fresh budget after auto-batch reset, got: %s", resultText(t, fourth))
+	fourthText := resultText(t, fourth)
+	if strings.Contains(fourthText, "auto-batched") || strings.Contains(fourthText, "circuit breaker") {
+		t.Fatalf("expected the response to stay unaltered on a later past-threshold call too, got: %s", fourthText)
 	}
 }
+
 
 // TestWriteBatchNudge_FiresOnceAtThreshold guards the fix for a v8
 // bench finding: defn invoked the Go toolchain 82% more often than
@@ -424,105 +424,39 @@ func TestWriteBatchNudge_StrippedDisablesEntirely(t *testing.T) {
 	}
 }
 
-// TestHandleCode_CircuitBreakerRescuesNonNameableTrigger guards a v9
-// (sonnet) bench finding: the auto-batch rescue only fired when the
-// call that TRIPPED the breaker was itself nameable (read/outline/
-// impact/methods/expand), gated via nameableReadOps[args.Op]. But
-// pendingReadNames accumulates across ANY read-shaped call, so a
-// "search" that trips the breaker after earlier reads already built up
-// a backlog got a bare zero-info refusal even though there was real
-// content to rescue with -- 22% of all breaker fires in that run were
-// exactly this shape (search tripping with a non-empty backlog). The
-// rescue should key off "is there a backlog to serve", not "is this
-// call's own op nameable".
-func TestHandleCode_CircuitBreakerRescuesNonNameableTrigger(t *testing.T) {
-	t.Setenv("DEFN_CIRCUIT_BREAKER", "2")
-	db, projDir := setupTestDB(t)
-	defer db.Close()
-	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
-	s.ready.Store(true)
-	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
-
-	for _, name := range []string{"Greet", "Farewell"} {
-		r, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: name})
-		if err != nil {
-			t.Fatalf("read %s: %v", name, err)
-		}
-		if strings.Contains(resultText(t, r), "circuit breaker") {
-			t.Fatalf("read %s should be within threshold, got: %s", name, resultText(t, r))
-		}
+// TestCheckTurnBoundary_ResetsStarterInjectedOnNewToken is #312: the
+// #203 starter bundle used to be session-lifetime-once ("won't repeat"
+// for the whole session) even though the intent was one per turn -- in
+// a multi-turn conversation every turn after the first got no bundle at
+// all. checkTurnBoundary now resets starterInjected alongside its other
+// per-turn counters, so the SAME turn keeps its one-shot suppressed but
+// a NEW turn gets a fresh shot at the bundle.
+func TestCheckTurnBoundary_ResetsStarterInjectedOnNewToken(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".defn"), 0755); err != nil {
+		t.Fatal(err)
 	}
+	tokenPath := filepath.Join(dir, ".defn", ".turn-token")
+	s := &server{projectDir: dir}
+	sc := &sessionCache{entries: map[string]cacheEntry{}}
 
-	// Third call is past threshold=2, but it's a SEARCH (not nameable) --
-	// must still auto-batch the Greet+Farewell backlog via expand
-	// instead of a bare, zero-info refusal.
-	third, _, err := s.handleCode(context.Background(), req, codeParam{Op: "search", Pattern: "nonexistentxyz"})
-	if err != nil {
-		t.Fatalf("third call (search): %v", err)
+	if err := os.WriteFile(tokenPath, []byte("turn-1"), 0644); err != nil {
+		t.Fatal(err)
 	}
-	text := resultText(t, third)
-	if !strings.Contains(text, "auto-batched") {
-		t.Fatalf("expected search to be rescued with an auto-batch note, got a bare refusal instead: %s", text)
-	}
-	for _, name := range []string{"Greet", "Farewell"} {
-		if !strings.Contains(text, name) {
-			t.Errorf("auto-batched rescue missing %s: %s", name, text)
-		}
-	}
-}
+	s.checkTurnBoundary(sc)
+	sc.starterInjected = true
 
-func TestHandleCode_CircuitBreakerRescuedSearchStillExecutes(t *testing.T) {
-	t.Setenv("DEFN_CIRCUIT_BREAKER", "2")
-	db, projDir := setupTestDB(t)
-	defer db.Close()
-	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
-	s.ready.Store(true)
-	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
-
-	// Pending names deliberately avoid "Farewell" in their own name --
-	// Greet/TestGreet's outline+callers can still mention "Farewell" in
-	// PROSE (Farewell calls Greet), which is exactly why the assertion
-	// below checks for the quoted JSON search-result shape (`"name":"Farewell"`)
-	// rather than the bare substring, and checks it lands before the ---
-	// divider (the search section), not just anywhere in the blob.
-	for _, name := range []string{"Greet", "TestGreet"} {
-		r, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read", Name: name})
-		if err != nil {
-			t.Fatalf("read %s: %v", name, err)
-		}
-		if strings.Contains(resultText(t, r), "circuit breaker") {
-			t.Fatalf("read %s should be within threshold, got: %s", name, resultText(t, r))
-		}
+	// Same token again -- same turn, the one-shot must stay consumed.
+	s.checkTurnBoundary(sc)
+	if !sc.starterInjected {
+		t.Fatalf("same turn-token should not reset starterInjected")
 	}
 
-	// Third call is past threshold=2 and is search, not nameable --
-	// pattern matches only Farewell's body ("and goodbye").
-	third, _, err := s.handleCode(context.Background(), req, codeParam{Op: "search", Pattern: "goodbye"})
-	if err != nil {
-		t.Fatalf("third call (search): %v", err)
+	if err := os.WriteFile(tokenPath, []byte("turn-2"), 0644); err != nil {
+		t.Fatal(err)
 	}
-	text := resultText(t, third)
-	if !strings.Contains(text, "auto-batched") {
-		t.Fatalf("expected an auto-batch note, got: %s", text)
-	}
-	if !strings.Contains(text, "your search for") {
-		t.Fatalf("expected the rescued search to be called out explicitly, got: %s", text)
-	}
-	// The note itself contains the literal substring "---" inline ("result
-	// above the ---"), so a bare Index(text, "---") would match that instead
-	// of the real section divider -- look for the actual "\n\n---\n\n"
-	// separator the fix inserts between the search and rescue sections.
-	dividerIdx := strings.Index(text, "\n\n---\n\n")
-	searchHitIdx := strings.Index(text, `"name":"Farewell"`)
-	if searchHitIdx == -1 {
-		t.Fatalf("expected the actual search result (JSON entry for Farewell, the only body match for 'goodbye') to be present, got: %s", text)
-	}
-	if dividerIdx == -1 || searchHitIdx > dividerIdx {
-		t.Fatalf("expected the search result to appear BEFORE the --- divider (in the search section, not the auto-batched rescue section), got: %s", text)
-	}
-	for _, name := range []string{"Greet", "TestGreet"} {
-		if !strings.Contains(text, name) {
-			t.Errorf("auto-batched result missing pending name %s: %s", name, text)
-		}
+	s.checkTurnBoundary(sc)
+	if sc.starterInjected {
+		t.Fatalf("new turn-token should reset starterInjected so this turn can get its own bundle")
 	}
 }
