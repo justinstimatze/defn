@@ -13677,3 +13677,53 @@ func TestHandleApply_MoveRequiresModuleAndTargetMustExist(t *testing.T) {
 		t.Errorf("expected a dry-run preview of the move, got: %s", dryText)
 	}
 }
+
+// TestHandleApply_DryRunProjectionOpsActuallyValidate guards #308:
+// apply's dry-run for the projEdit-shared group (insert-precondition/
+// replace-slice/replace-hunk/wrap-in-defer/rename-param) only checked
+// resolution and kind support, never actually running the real
+// projection function -- so a dry-run could report a clean "~ would
+// wrap-in-defer on Greet" preview for a request whose real call fails
+// outright (e.g. an out-of-range stmt_index).
+func TestHandleApply_DryRunProjectionOpsActuallyValidate(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		DryRun:     true,
+		Operations: []applyOp{{Op: "wrap-in-defer", Name: "Greet", StmtIndex: 9999, DeferBody: "cleanup()"}},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "would wrap-in-defer") {
+		t.Fatalf("expected dry-run to catch the out-of-range stmt_index instead of a false-positive preview: %s", text)
+	}
+	if !strings.Contains(text, "Errors") {
+		t.Errorf("expected an error for the invalid stmt_index, got: %s", text)
+	}
+}
+
+// TestHandleApply_DryRunAddImportValidatesFileResolution guards #308:
+// apply's add-import dry-run only checked import_path != "", skipping
+// the file/module resolution the real call performs -- so a dry-run
+// could falsely report success for a file with no defs at all, where
+// the real call would immediately error with "no defs in ...".
+func TestHandleApply_DryRunAddImportValidatesFileResolution(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		DryRun:     true,
+		Operations: []applyOp{{Op: "add-import", ImportPath: "fmt", File: "nonexistent.go"}},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "would add import") {
+		t.Fatalf("expected dry-run to catch the unresolvable file instead of a false-positive preview: %s", text)
+	}
+	if !strings.Contains(text, "no defs in") {
+		t.Errorf("expected a 'no defs in' error, got: %s", text)
+	}
+}

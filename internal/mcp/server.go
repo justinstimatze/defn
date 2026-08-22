@@ -4276,19 +4276,95 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 						name = inferred
 					}
 				}
-				if d, err := s.resolveApplyTarget(s.backend, name, op.Receiver, op.Module, op.File); err != nil {
+				d, err := s.resolveApplyTarget(s.backend, name, op.Receiver, op.Module, op.File)
+				if err != nil {
 					errors = append(errors, fmt.Sprintf("%s %s: not found", op.Op, name))
-				} else if msg := unsupportedFieldOp(d.Kind, op.Op); msg != "" {
-					errors = append(errors, fmt.Sprintf("%s %s: %s", op.Op, name, msg))
-				} else {
-					sb.WriteString(fmt.Sprintf("~ would %s on %s\n", op.Op, name))
+					continue
 				}
+				if msg := unsupportedFieldOp(d.Kind, op.Op); msg != "" {
+					errors = append(errors, fmt.Sprintf("%s %s: %s", op.Op, name, msg))
+					continue
+				}
+				// #308: actually run the real projection function against
+				// d.Body instead of only checking resolution/kind -- each of
+				// these has real validation (empty condition/ret/defer_body/
+				// old_param, out-of-range stmt_index/hunk index, "no param
+				// named X", malformed condition text, ...) that only surfaced
+				// at compute time, so a clean dry-run preview could be
+				// followed by the identical real call failing outright.
+				var computeErr error
+				switch op.Op {
+				case "insert-precondition":
+					_, computeErr = projection.InsertPrecondition(d.Body, op.Condition, op.Ret)
+				case "replace-slice":
+					idx := op.Index
+					if idx == 0 {
+						idx = 1
+					}
+					if op.Force {
+						_, computeErr = projection.ReplaceSliceForce(d.Body, op.Slice, idx, op.New)
+					} else {
+						_, computeErr = projection.ReplaceSlice(d.Body, op.Slice, idx, op.New)
+					}
+				case "replace-hunk":
+					oldText, newText := op.Old, op.New
+					if oldText == "" && op.OldFragment != "" {
+						oldText = op.OldFragment
+					}
+					if newText == "" && op.NewFragment != "" {
+						newText = op.NewFragment
+					}
+					_, computeErr = projection.ReplaceHunk(d.Body, oldText, newText, op.Index, op.ReplaceAll)
+				case "wrap-in-defer":
+					_, computeErr = projection.WrapInDefer(d.Body, op.StmtIndex, op.DeferBody)
+				case "rename-param":
+					_, computeErr = projection.RenameParam(d.Body, op.OldParam, op.NewParam)
+				}
+				if computeErr != nil {
+					errors = append(errors, fmt.Sprintf("%s %s: %v", op.Op, name, computeErr))
+					continue
+				}
+				sb.WriteString(fmt.Sprintf("~ would %s on %s\n", op.Op, name))
 			case "add-import":
+				// #308: the real case resolves file/module before writing --
+				// dry-run used to skip that entirely, so it could report a
+				// clean preview for a file with no defs, an ambiguous missing
+				// file:, or any other resolution failure the real call would
+				// immediately error on.
 				if op.ImportPath == "" {
 					errors = append(errors, "add-import: import_path is required")
-				} else {
-					sb.WriteString(fmt.Sprintf("+ would add import %q\n", op.ImportPath))
+					continue
 				}
+				file := op.File
+				if file == "" {
+					all, err := s.backend.DistinctSourceFiles()
+					if err != nil {
+						errors = append(errors, fmt.Sprintf("add-import: %v", err))
+						continue
+					}
+					var candidates []string
+					for _, f := range all {
+						if !strings.HasSuffix(f, "_test.go") {
+							candidates = append(candidates, f)
+						}
+					}
+					if len(candidates) == 1 {
+						file = candidates[0]
+					} else {
+						errors = append(errors, fmt.Sprintf("add-import: file is required (found %d non-test .go files)", len(candidates)))
+						continue
+					}
+				}
+				dir := ""
+				if idx := strings.LastIndex(file, "/"); idx >= 0 {
+					dir = file[:idx]
+				}
+				defs, err := s.backend.FindDefinitionsByFile(dir, file, 0)
+				if err != nil || len(defs) == 0 {
+					errors = append(errors, fmt.Sprintf("add-import: no defs in %q", file))
+					continue
+				}
+				sb.WriteString(fmt.Sprintf("+ would add import %q to %s\n", op.ImportPath, file))
 			case "insert-header":
 				if op.File == "" || strings.TrimSpace(op.Body) == "" {
 					errors = append(errors, "insert-header: file and body are required")
