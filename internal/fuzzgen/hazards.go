@@ -110,6 +110,7 @@ type Hazard struct {
 var AllHazards = []Hazard{
 	{"colliding_basenames", hazardCollidingBasenames},
 	{"scattered_init", hazardScatteredInit},
+	{"method_named_init", hazardMethodNamedInit},
 	{"multi_package", hazardMultiPackage},
 	{"grouped_const_iota", hazardGroupedConstIota},
 	{"embedded_fields", hazardEmbeddedFields},
@@ -119,6 +120,9 @@ var AllHazards = []Hazard{
 	{"test_file_interleave", hazardTestFileInterleave},
 	{"go_embed_directive", hazardGoEmbedDirective},
 	{"interface_satisfaction", hazardInterfaceSatisfaction},
+	{"field_named_after_own_type", hazardFieldNamedAfterOwnType},
+	{"multi_name_var_decl", hazardMultiNameVarDecl},
+	{"type_alias", hazardTypeAlias},
 }
 
 // hazardInterfaceSatisfaction adds an interface and a concrete type that
@@ -132,4 +136,121 @@ var AllHazards = []Hazard{
 func hazardInterfaceSatisfaction(_ *rand.Rand, m *SyntheticModule) {
 	m.AddFile("pkg/ifacesat/iface.go", "package ifacesat\n\ntype Greeter interface {\n\tGreet() string\n}\n")
 	m.AddFile("pkg/ifacesat/impl.go", "package ifacesat\n\ntype Person struct {\n\tName string\n}\n\nfunc (p *Person) Greet() string {\n\treturn \"hello \" + p.Name\n}\n\nfunc UseGreeter(g Greeter) string {\n\treturn g.Greet()\n}\n")
+}
+
+// hazardMethodNamedInit reproduces the ingestFunc receiver-blindness
+// bug (#354, found via a real caddy-6179 bench trajectory): a
+// package-level func init() and a METHOD named init() (e.g. func (T)
+// init()) in the SAME file were both fed through the SAME "multiple
+// init() functions need synthetic disambiguation" counter meant only
+// for the package-level case -- a method can never actually collide
+// with a package-level function of the same name (the receiver
+// already distinguishes it, exactly like any other method), so
+// renaming it to "init_1" produced a DB name matching nothing in the
+// real source. Downstream, this made every unrelated edit in the file
+// fail to match an on-disk declaration, and emit -- unable to place
+// "init_1" -- appended a byte-for-byte duplicate of the untouched
+// original method, corrupting the file with a genuine "method already
+// declared" Go compile error. TestRoundTrip_Hazards's declaration-
+// multiset check (assertRoundTrip's own doc comment: "catches missing/
+// duplicated decls") would have caught this on every `go test ./...`
+// had this shape existed in the hazard set before the bug shipped.
+func hazardMethodNamedInit(r *rand.Rand, m *SyntheticModule) {
+	src := `package methodinitpkg
+
+var registered bool
+
+func init() {
+	registered = true
+}
+
+type Widget struct{}
+
+func (w *Widget) init() {
+	registered = true
+}
+`
+	m.AddFile("pkg/methodinitpkg/file.go", src)
+}
+
+// hazardFieldNamedAfterOwnType reproduces the shape behind #352 (found
+// via a real caddy-7870 bench trajectory): Go's own "Foo *Foo"
+// self-referencing field idiom -- a struct field sharing its bare Name
+// with an unrelated top-level type in the same file (e.g. a health-check
+// config's "Upstream *Upstream" field). The confirmed #352 bug was at
+// the query/resolution layer (GetDefinitionByName), already fixed and
+// covered by dedicated store/mcp tests -- this hazard adds defense-in-
+// depth at the ingest/emit round-trip layer, since it's exactly the
+// "two things sharing an identifier, distinguished only by kind/
+// receiver" pattern this fuzzer exists to stress.
+func hazardFieldNamedAfterOwnType(_ *rand.Rand, m *SyntheticModule) {
+	src := `package fieldtype
+
+type Upstream struct {
+	Dial string
+}
+
+type ActiveHealthChecks struct {
+	Upstream *Upstream
+}
+
+func (a *ActiveHealthChecks) Target() string {
+	return a.Upstream.Dial
+}
+`
+	m.AddFile("pkg/fieldtype/hosts.go", src)
+}
+
+// hazardMultiNameVarDecl reproduces the prometheus-corpus bug (commit
+// 50d14c0): mergeDeclsIntoSource unconditionally bailed on any var/
+// const ValueSpec declaring more than one name on a single line (e.g.
+// "var a, b, c int"), permanently blocking writes to that file. Already
+// covered by dedicated internal/emit and internal/mcp unit tests
+// (TestMergeDeclsIntoSource_MultiNameValueSpecMatchesUnderFirstName,
+// TestHandleEdit_MultiNameVarSpecInGroupedBlockDoesNotFalselyBlockUnrelatedEdit)
+// but never exercised in this fuzzer's mutation-sequence/combined-
+// hazard context until now.
+func hazardMultiNameVarDecl(_ *rand.Rand, m *SyntheticModule) {
+	src := `package multiname
+
+var alpha, beta, gamma int
+
+const low, high = 0, 100
+
+func Sum() int {
+	return alpha + beta + gamma + low + high
+}
+`
+	m.AddFile("pkg/multiname/vars.go", src)
+}
+
+// hazardTypeAlias exercises `type X = Y` (a type ALIAS, ast.TypeSpec
+// with Assign set) alongside an ordinary `type Z Y` (a distinct
+// defined type) in the same file. Not grounded in a confirmed defn
+// bug -- added from external research into structurally-relevant Go
+// gotchas (as opposed to the runtime/semantic gotchas most "Go
+// pitfalls" lists cover, which don't apply to a tool that reassembles
+// source text rather than executing it). A type alias and a defined
+// type produce a different ast.TypeSpec shape (Assign token position
+// set vs. unset); untested until now.
+func hazardTypeAlias(_ *rand.Rand, m *SyntheticModule) {
+	src := `package typealias
+
+type Meters float64
+
+// Kilometers is an ALIAS for Meters -- NOT a distinct type.
+type Kilometers = Meters
+
+// Feet is a distinct DEFINED type based on Meters.
+type Feet Meters
+
+func ToKilometers(m Meters) Kilometers {
+	return Kilometers(m) / 1000
+}
+
+func ToFeet(m Meters) Feet {
+	return Feet(m) * 3.28084
+}
+`
+	m.AddFile("pkg/typealias/units.go", src)
 }

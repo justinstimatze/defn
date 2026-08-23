@@ -530,3 +530,67 @@ func TestIngest_BrokenNestedModuleDoesNotFailWholeIngest(t *testing.T) {
 		t.Errorf("root module should still ingest despite a broken nested module: %v", err)
 	}
 }
+
+// TestIngestFunc_MethodNamedInitNotConfusedWithPackageLevelInit is the
+// #354 regression: ingestFunc's init-disambiguation counter (added for
+// #241 to handle Go's own "multiple package-level init() functions per
+// file" quirk) applied to ANY func named "init", including methods --
+// but a method can never collide with a package-level function of the
+// same name (the receiver already makes it distinct; Go itself would
+// reject two init() methods on the SAME receiver as an ordinary
+// redeclaration, same as any other method name). Confirmed live via
+// caddy-6179 (modules/caddyhttp/encode/encode.go): a package-level
+// init() followed by (*responseWriter).init() renamed the METHOD to
+// "init_1" -- a name matching nothing in the actual source text, since
+// methods are matched by identifier, not a synthetic DB-only alias.
+// Every subsequent edit/create in that file failed to match an
+// on-disk declaration, and emit -- unable to find where "init_1"
+// belonged -- appended a byte-for-byte duplicate of the untouched
+// original method to the end of the file, corrupting it with a
+// genuine "method already declared" Go compile error.
+func TestIngestFunc_MethodNamedInitNotConfusedWithPackageLevelInit(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(dir, "main.go"), []byte(`package testproj
+
+func init() {
+	println("pkg init")
+}
+
+type Widget struct{}
+
+func (w *Widget) init() {
+	println("widget init")
+}
+`), 0644)
+
+	db := testDB(t)
+	if err := Ingest(db, dir); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	defs, err := db.FindDefinitionsByFile("testproj", "main.go", 0)
+	if err != nil {
+		t.Fatalf("FindDefinitionsByFile: %v", err)
+	}
+
+	var pkgInit, methodInit *store.Definition
+	for i := range defs {
+		d := &defs[i]
+		if d.Name == "init" && d.Kind == "function" && d.Receiver == "" {
+			pkgInit = d
+		}
+		if d.Name == "init" && d.Kind == "method" && d.Receiver == "*Widget" {
+			methodInit = d
+		}
+		if strings.HasPrefix(d.Name, "init_") {
+			t.Errorf("expected no synthetic init_N name -- a method can never collide with the package-level init(), got def %+v", d)
+		}
+	}
+	if pkgInit == nil {
+		t.Fatal("expected the package-level init() to be found, named bare \"init\"")
+	}
+	if methodInit == nil {
+		t.Fatal("expected (*Widget).init() to be found, ALSO named bare \"init\" (disambiguated by receiver, not a synthetic suffix)")
+	}
+}

@@ -580,13 +580,35 @@ func ingestFunc(db store.Backend, fset *token.FileSet, mod *store.Module, file *
 	sig := renderSignature(fset, fn)
 	doc := fn.Doc.Text()
 
-	// Multiple init() functions are valid in Go. Give each a unique name
-	// so they don't overwrite each other in the database. Keyed by
-	// (module, sourceFile), not module alone -- see ingestState's
-	// initCounter doc comment for why a module-wide counter is unstable
-	// across ingest modes.
+	// Multiple PACKAGE-LEVEL init() functions are valid in Go. Give each
+	// a unique name so they don't overwrite each other in the database.
+	// Keyed by (module, sourceFile), not module alone -- see
+	// ingestState's initCounter doc comment for why a module-wide
+	// counter is unstable across ingest modes.
+	//
+	// #354: gated on receiver == "" -- a METHOD named init() (e.g.
+	// func (rw *responseWriter) init()) is NOT the same Go quirk this
+	// counter exists for. A method can never collide with a
+	// package-level function of the same name (the receiver already
+	// makes it a distinct identifier; Go itself would reject two
+	// init() methods on the SAME receiver as a real redeclaration
+	// error, same as any other method name), so it must keep its bare
+	// "init" name -- disambiguated by Receiver, exactly like every
+	// other method. Applying this counter to a method anyway
+	// (confirmed live via caddy-6179, modules/caddyhttp/encode/
+	// encode.go: a package-level init() at line 37 followed by
+	// (*responseWriter).init() at line 438) renamed the METHOD to
+	// "init_1" in the DB -- a name that doesn't match anything in the
+	// actual .go source text (methods are matched by identifier, not a
+	// synthetic DB-only alias). Every subsequent edit/create in that
+	// file "could not be matched to an on-disk declaration" for
+	// *responseWriter.init_1, and emit -- unable to find where "init_1"
+	// belonged -- appended a byte-for-byte duplicate of the untouched
+	// original method to the end of the file instead, corrupting it
+	// with a genuine "method already declared" Go compile error the
+	// agent never asked for and had never touched.
 	name := fn.Name.Name
-	if name == "init" {
+	if name == "init" && receiver == "" {
 		key := fmt.Sprintf("%d:%s", mod.ID, sourceFile)
 		n := state.initCounter[key]
 		if n > 0 {
