@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -14900,5 +14901,127 @@ func (a *ActiveHealthChecks) Target() string {
 	}
 	if d.Kind != "type" {
 		t.Fatalf("expected the top-level type, got kind=%q", d.Kind)
+	}
+}
+
+// TestCoupledChangeHint_IncludesTestCallersNotCaughtByBuildGate is the
+// #353 regression: a real caddy-7870 trajectory (2026-08-23) needed a
+// coupled signature change across a production caller AND two _test.go
+// callers. coupledChangeHint's build-failure tip only ever named the
+// production caller (test callers were deliberately excluded, on the
+// assumption test-coverage risk was already flagged elsewhere) -- but
+// go build (the check gating every write op) never compiles _test.go
+// files at all, so the test callers got ZERO signal from either the
+// hint or the build gate itself. The model in that trajectory only
+// avoided shipping a test-breaking change because it happened to
+// remember, ~60 calls earlier in the same session, that a test file
+// called the def -- luck, not a guarantee. Test callers must now be
+// surfaced too, clearly labeled as build-gate-blind.
+func TestCoupledChangeHint_IncludesTestCallersNotCaughtByBuildGate(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "coupledproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module coupledproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package coupledproj
+
+func Fetch(url string) string { return url }
+
+func Use() string { return Fetch("http://example.com") }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "main_test.go"), []byte(`package coupledproj
+
+import "testing"
+
+func TestFetch(t *testing.T) {
+	Fetch("http://example.com")
+}
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db}
+	d, err := db.GetDefinitionByName("Fetch", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hint := s.coupledChangeHint(d.ID)
+
+	if !strings.Contains(hint, "Use") {
+		t.Errorf("expected the production caller Use named, got: %q", hint)
+	}
+	if !strings.Contains(hint, "TestFetch") {
+		t.Errorf("expected the test caller TestFetch named, got: %q", hint)
+	}
+	if !strings.Contains(hint, "build check") {
+		t.Errorf("expected a note that test callers aren't caught by the build check, got: %q", hint)
+	}
+	if !strings.Contains(hint, "this def has") {
+		t.Errorf("expected the production-caller phrasing to still be present, got: %q", hint)
+	}
+}
+
+// TestHandleSearch_MCPDebugTracesEachStage verifies the DEFN_MCP_DEBUG=1
+// instrumentation added 2026-08-23 to help root-cause a still-open
+// mystery: a real caddy-7870 trajectory (post-#352-fix) showed
+// search(pattern:"hosts.LoadOrStore") return two completely different,
+// non-overlapping result sets on two calls in the same read-only
+// session, with no edits in between -- not reordering, a genuine
+// content swap. A direct static replay against the persisted database
+// afterward could NOT reproduce it (deterministic, single stable
+// result across 5 repeated runs), meaning whatever caused the live
+// divergence is tied to transient session/server state a static
+// re-query can't see. This trace (stage1/stage2/merged/file-filtered/
+// final, each with per-def IDs, not just names) is the tool for
+// catching the next live occurrence -- see debugDefIDs's own doc
+// comment for why IDs specifically matter here (two same-named-but-
+// different-row results would look identical without them).
+func TestHandleSearch_MCPDebugTracesEachStage(t *testing.T) {
+	t.Setenv("DEFN_MCP_DEBUG", "1")
+
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	origStderr := os.Stderr
+	os.Stderr = w
+	result, _, _ := s.handleSearch(context.Background(), nil, codeParam{Pattern: "Greet"})
+	w.Close()
+	os.Stderr = origStderr
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+
+	text := resultText(t, result)
+	if !strings.Contains(text, "Greet") {
+		t.Fatal("expected Greet in search results -- fixture broken, trace assertions below would be meaningless")
+	}
+
+	for _, want := range []string{
+		"[mcp-debug] search pattern=\"Greet\" stage1(FindDefinitions):",
+		"[mcp-debug] search pattern=\"Greet\" stage2(SearchDefinitions/FTS):",
+		"[mcp-debug] search pattern=\"Greet\" merged:",
+		"[mcp-debug] search pattern=\"Greet\" FINAL returned",
+		"Greet(id=",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected debug output to contain %q, got:\n%s", want, out)
+		}
 	}
 }

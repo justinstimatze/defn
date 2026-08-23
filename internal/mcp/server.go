@@ -2549,12 +2549,14 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	if strings.Contains(args.Pattern, "%") {
 		// SQL LIKE pattern (e.g., "%Auth%").
 		defs, err = s.backend.FindDefinitions(args.Pattern)
+		mcpDebugf("search pattern=%q (LIKE glob): %d result(s): %s", args.Pattern, len(defs), debugDefIDs(defs))
 	} else {
 		// Search names/signatures first (indexed, fast).
 		defs, err = s.backend.FindDefinitions("%" + args.Pattern + "%")
 		if err != nil {
 			return errResult(err)
 		}
+		mcpDebugf("search pattern=%q stage1(FindDefinitions): %d result(s): %s", args.Pattern, len(defs), debugDefIDs(defs))
 		// #216: always also run the FTS body/doc search and merge, rather
 		// than gating it on Stage 1 being completely empty. Stage 1's
 		// signature LIKE can incidentally match a def whose ingested
@@ -2563,9 +2565,11 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		// complete and correct FTS search entirely: one coincidental,
 		// arbitrarily incomplete Stage 1 hit meant Stage 2 never ran.
 		ftsDefs, ftsErr := s.backend.SearchDefinitions(args.Pattern)
+		mcpDebugf("search pattern=%q stage2(SearchDefinitions/FTS): %d result(s), err=%v: %s", args.Pattern, len(ftsDefs), ftsErr, debugDefIDs(ftsDefs))
 		if ftsErr == nil {
 			defs = mergeDefsByID(defs, ftsDefs)
 		}
+		mcpDebugf("search pattern=%q merged: %d result(s): %s", args.Pattern, len(defs), debugDefIDs(defs))
 	}
 	if err != nil {
 		return errResult(err)
@@ -2632,6 +2636,7 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 			}
 		}
 		defs = filtered
+		mcpDebugf("search pattern=%q file-filtered by %q: %d result(s): %s", args.Pattern, args.File, len(defs), debugDefIDs(defs))
 	}
 
 	// #299 followup: bodyScanResult's go-doc hint only fires on a hard
@@ -2728,6 +2733,7 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	if includeNote != "" {
 		text = includeNote + text
 	}
+	mcpDebugf("search pattern=%q FINAL returned %d of %d result(s): %s", args.Pattern, len(results), len(defs), debugDefIDs(defs))
 	return textResult(text), nil, nil
 }
 
@@ -10724,30 +10730,59 @@ var testNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 func (s *server) coupledChangeHint(defIDs ...int64) string {
 	seen := map[string]bool{}
 	var names []string
+	// #353 (caddy-7870, 2026-08-23): test callers used to be silently
+	// dropped here on the assumption that test-coverage risk was already
+	// flagged elsewhere (impact's own WARNING). That misses the actual
+	// failure mode: the build check gating every write op is `go build`,
+	// which never compiles _test.go files at all -- a signature change
+	// that breaks ONLY a test caller gets zero signal from either this
+	// hint or the build gate itself. Confirmed live: a model only avoided
+	// shipping a test-breaking fillHost signature change because it
+	// happened to remember, from ~60 calls earlier in the same session,
+	// that a _test.go file called it -- luck, not a guarantee. Test
+	// callers are now surfaced too, clearly labeled as build-gate-blind
+	// so the model knows NOT to trust silence from `go build` here.
+	seenTest := map[string]bool{}
+	var testNames []string
 	for _, id := range defIDs {
 		impact, err := s.backend.GetImpact(id)
 		if err != nil {
 			continue
 		}
 		for _, c := range impact.DirectCallers {
-			if c.Test || seen[c.Name] {
+			if c.Test {
+				if seenTest[c.Name] || len(testNames) >= 3 {
+					continue
+				}
+				seenTest[c.Name] = true
+				testNames = append(testNames, c.Name)
+				continue
+			}
+			if seen[c.Name] || len(names) >= 3 {
 				continue
 			}
 			seen[c.Name] = true
 			names = append(names, c.Name)
-			if len(names) >= 3 {
-				break
-			}
-		}
-		if len(names) >= 3 {
-			break
 		}
 	}
-	if len(names) == 0 {
+	if len(names) == 0 && len(testNames) == 0 {
 		return ""
 	}
-	return fmt.Sprintf("\nTip: this def has %s (%s) -- if this build failure is from a coupled signature change, batch this edit together with a fix to it via op:\"apply\".\n",
-		pluralizeCallers(len(names)), strings.Join(names, ", "))
+	var sb strings.Builder
+	sb.WriteString("\nTip: ")
+	switch {
+	case len(names) > 0 && len(testNames) > 0:
+		fmt.Fprintf(&sb, "this def has %s (%s), plus %s (%s) NOT caught by this build check (go build skips _test.go files)",
+			pluralizeCallers(len(names)), strings.Join(names, ", "),
+			pluralizeTestCallers(len(testNames)), strings.Join(testNames, ", "))
+	case len(names) > 0:
+		fmt.Fprintf(&sb, "this def has %s (%s)", pluralizeCallers(len(names)), strings.Join(names, ", "))
+	default:
+		fmt.Fprintf(&sb, "this def is called by %s (%s), NOT caught by this build check (go build skips _test.go files)",
+			pluralizeTestCallers(len(testNames)), strings.Join(testNames, ", "))
+	}
+	sb.WriteString(" -- if this build failure is from a coupled signature change, batch a fix to them into this same edit via op:\"apply\".\n")
+	return sb.String()
 }
 
 // pluralizeCallers renders "a direct caller"/"direct callers" to match
@@ -12551,3 +12586,38 @@ func parseUnmatchedOnlyIdentities(result string) (identities []string, pure bool
 // other failure shape ("skipped writing — would remove"), where the
 // write was refused entirely and disk was NOT touched.
 const unmatchedOnlyWarningMarker = "could not be matched to an on-disk declaration and were NOT written: ["
+
+// pluralizeTestCallers is pluralizeCallers's test-caller counterpart,
+// used by coupledChangeHint's #353 test-caller branch.
+func pluralizeTestCallers(n int) string {
+	if n == 1 {
+		return "a test caller"
+	}
+	return "test callers"
+}
+
+// debugDefIDs renders a compact "Name(id=N)" list for mcpDebugf trace
+// lines. IDs (not just names) are the point: two calls returning
+// differently-ordered same-name results are easy to eyeball as "the
+// same defs, fine", but only the ID makes a genuine content swap (a
+// stale row, a duplicate, a different def entirely) visible at a
+// glance. Caps at 20 entries so a large candidate set doesn't blow out
+// a single trace line.
+func debugDefIDs(defs []store.Definition) string {
+	if len(defs) == 0 {
+		return "(none)"
+	}
+	n := len(defs)
+	if n > 20 {
+		n = 20
+	}
+	parts := make([]string, n)
+	for i := 0; i < n; i++ {
+		parts[i] = fmt.Sprintf("%s(id=%d)", defs[i].Name, defs[i].ID)
+	}
+	out := strings.Join(parts, ", ")
+	if len(defs) > 20 {
+		out += fmt.Sprintf(", ... (%d more)", len(defs)-20)
+	}
+	return out
+}
