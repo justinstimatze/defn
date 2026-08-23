@@ -101,7 +101,7 @@ func TestContextRank_EmbeddingBonusOnlyWithoutTokenOverlap(t *testing.T) {
 			EmbeddingScore: 0.8,
 		},
 	}
-	ranked := contextRank(cands, tokens)
+	ranked := contextRank(cands, tokens, nil)
 
 	var embeddingOnlyScore, nameHitScore int
 	for _, c := range ranked {
@@ -148,4 +148,36 @@ func VerifyLoginToken(token string) bool {
 	}
 
 	return &server{backend: db, projectDir: projDir}
+}
+
+// TestContextRank_RareTokenOutranksCommonMultiTokenMatch is the
+// regression for a real v18 bench trajectory (prometheus-17395): a
+// question about "add lightsail unit test" ranked
+// TestAddTypeAndUnitLabels and several other totally unrelated defs
+// ABOVE every actual Lightsail/EC2 def, because plain per-token
+// counting gave "add"/"unit"/"test" (near-ubiquitous across any Go
+// repo's test names) the same per-hit weight as "lightsail" (a
+// handful of matches total) -- three generic hits outscored one
+// perfectly on-topic rare one. tokenDF simulates that codebase-wide
+// frequency; contextRank must weight rare tokens enough that the
+// on-topic def still wins.
+func TestContextRank_RareTokenOutranksCommonMultiTokenMatch(t *testing.T) {
+	tokens := []string{"add", "unit", "test", "lightsail"}
+	tokenDF := map[string]int{
+		"add":       200,
+		"unit":      150,
+		"test":      500,
+		"lightsail": 3,
+	}
+	cands := []contextCandidate{
+		{Def: store.Definition{Name: "TestAddTypeAndUnitLabels", Test: true}},
+		{Def: store.Definition{Name: "LightsailDiscovery"}},
+	}
+
+	ranked := contextRank(cands, tokens, tokenDF)
+
+	if ranked[0].Def.Name != "LightsailDiscovery" {
+		t.Fatalf("expected LightsailDiscovery (rare on-topic token) to rank first, got %q first (scores: %d, %d)",
+			ranked[0].Def.Name, ranked[0].Score, ranked[1].Score)
+	}
 }

@@ -84,23 +84,29 @@ type contextCandidate struct {
 
 // contextRank scores + sorts candidates against the filtered token
 // set. Returns descending by score. Deterministic tie-break by name.
-func contextRank(cands []contextCandidate, tokens []string) []contextCandidate {
+// tokenDF (may be nil) maps each token to how many distinct defs it
+// matched codebase-wide; contextTokenWeight uses it to down-weight
+// generic tokens. A nil/empty map (e.g. from direct unit-test calls
+// that don't populate it) makes every token weight 1.0 -- identical
+// to the pre-#334 unweighted scoring.
+func contextRank(cands []contextCandidate, tokens []string, tokenDF map[string]int) []contextCandidate {
 	for i := range cands {
 		d := cands[i].Def
 		nameLower := strings.ToLower(d.Name)
 		sigLower := strings.ToLower(d.Signature)
 		docLower := strings.ToLower(d.Doc)
 		summaryLower := strings.ToLower(cands[i].Summary)
-		var name, sig, summary int
+		var name, sig, summary float64
 		for _, tok := range tokens {
+			w := contextTokenWeight(tokenDF[tok])
 			if strings.Contains(nameLower, tok) {
-				name++
+				name += w
 			}
 			if strings.Contains(sigLower, tok) || strings.Contains(docLower, tok) {
-				sig++
+				sig += w
 			}
 			if summaryLower != "" && strings.Contains(summaryLower, tok) {
-				summary++
+				summary += w
 			}
 		}
 		s := name*8 + sig*3 + summary*6
@@ -112,12 +118,12 @@ func contextRank(cands []contextCandidate, tokens []string) []contextCandidate {
 		// also matched by name/summary doesn't need the (noisier) hashing-
 		// trick signal stacked on top.
 		if cands[i].FromEmbedding && name == 0 && sig == 0 && summary == 0 {
-			s += int(cands[i].EmbeddingScore * 8)
+			s += cands[i].EmbeddingScore * 8
 		}
 		if d.Test {
 			s -= 5
 		}
-		cands[i].Score = s
+		cands[i].Score = int(s)
 	}
 	sort.SliceStable(cands, func(i, j int) bool {
 		if cands[i].Score != cands[j].Score {
@@ -362,13 +368,21 @@ func (s *server) gatherContextCandidates(question string) ([]contextCandidate, [
 	//     question when the name has no lexical overlap).
 	// Dedupe by def ID; flags OR together across paths.
 	seen := map[int64]contextCandidate{}
+	// tokenDF: how many DISTINCT defs (codebase-wide) each token matched
+	// via any of the three searches below -- contextRank uses this to
+	// down-weight tokens too generic to be a useful discriminator (see
+	// contextTokenWeight's doc comment for the real trajectory that
+	// motivated this).
+	tokenDF := make(map[string]int, len(tokens))
 	for _, tok := range tokens {
+		matchedIDs := map[int64]bool{}
 		if defs, err := s.backend.FindDefinitions("%" + tok + "%"); err == nil {
 			for _, d := range defs {
 				c := seen[d.ID]
 				c.Def = d
 				c.FromName = true
 				seen[d.ID] = c
+				matchedIDs[d.ID] = true
 			}
 		}
 		if defs, err := s.backend.SearchDefinitions(tok); err == nil {
@@ -379,6 +393,7 @@ func (s *server) gatherContextCandidates(question string) ([]contextCandidate, [
 					c.FromBody = true
 				}
 				seen[d.ID] = c
+				matchedIDs[d.ID] = true
 			}
 		}
 		if ids, err := s.backend.SearchDefSummaries(tok); err == nil {
@@ -402,8 +417,10 @@ func (s *server) gatherContextCandidates(question string) ([]contextCandidate, [
 					}
 				}
 				seen[id] = c
+				matchedIDs[id] = true
 			}
 		}
+		tokenDF[tok] = len(matchedIDs)
 	}
 	// #198: embedding-based semantic search. Adds defs that share zero
 	// tokens with the question but score high on a local hashing-trick
@@ -421,7 +438,7 @@ func (s *server) gatherContextCandidates(question string) ([]contextCandidate, [
 	for _, c := range seen {
 		cands = append(cands, c)
 	}
-	return contextRank(cands, tokens), tokens, nil
+	return contextRank(cands, tokens, tokenDF), tokens, nil
 }
 
 // truncateForHeader caps a display label to maxLen runes, appending an
@@ -435,4 +452,37 @@ func truncateForHeader(s string, maxLen int) string {
 		return s
 	}
 	return string(r[:maxLen]) + fmt.Sprintf("… (%d more chars)", len(r)-maxLen)
+}
+
+// contextRareTokenCeiling is the codebase-wide match count below which
+// a token is treated as fully specific (weight 1.0) for contextRank.
+// Above it, weight tapers toward zero.
+const contextRareTokenCeiling = 20
+
+// contextTokenWeight down-weights a token's contribution to contextRank
+// by how many DISTINCT definitions across the whole codebase it matched
+// (name/body/summary combined via any search path) -- a proxy for how
+// generic vs. specific the token is. Real trajectory (prometheus-17395,
+// v18 bench): an "AWS SD: add lightsail unit test" question ranked
+// TestAddTypeAndUnitLabels and several completely unrelated defs
+// (OTLP histogram translation, XOR chunk decoding, k8s service
+// discovery -- zero AWS-specific tokens shared) ABOVE every actual
+// Lightsail/EC2 def in the repo. Plain per-token counting gave
+// "add"/"unit"/"test" -- near-ubiquitous across any Go repo's test
+// names -- the exact same per-hit weight as "lightsail", which matched
+// only a handful of defs total; stacking several generic-token hits
+// across name+sig+doc+summary let irrelevant defs outscore the one
+// genuinely on-topic rare token. The op's own Sonnet synthesis
+// correctly reported "the provided source does not contain the
+// answer," and the model fell back to ~20 manual singleton reads to
+// find the real Lightsail defs by hand -- exactly the round-trip
+// sprawl context/expand exist to prevent. Below the ceiling, a token
+// is fully specific (weight 1.0, identical to the pre-fix unweighted
+// behavior); above it, weight tapers so a token common enough to be
+// useless as a discriminator stops contributing real score.
+func contextTokenWeight(df int) float64 {
+	if df <= contextRareTokenCeiling {
+		return 1.0
+	}
+	return float64(contextRareTokenCeiling) / float64(df)
 }

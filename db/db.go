@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -37,8 +38,9 @@ import (
 // own doc comment. Not a read-only guarantee an external caller can
 // rely on for e.g. safe concurrent sharing.
 type DB struct {
-	mu sync.Mutex
-	s  store.Backend
+	mu   sync.Mutex
+	s    store.Backend
+	path string
 }
 
 // Open opens a defn database at the given path (e.g. ".defn").
@@ -50,7 +52,7 @@ func Open(path string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DB{s: s}, nil
+	return &DB{s: s, path: path}, nil
 }
 
 // Close releases database resources.
@@ -329,13 +331,21 @@ func (db *DB) Traverse(name, direction string, refKinds []string, maxDepth int) 
 // StaleFiles returns paths of .go files under projectDir that have been
 // modified more recently than the last ingest. Empty slice means the
 // database is in sync with the filesystem (or no ingest timestamp has
-// been recorded — e.g. databases created before this feature).
+// been recorded -- e.g. databases created before this feature).
 //
 // Walks projectDir recursively, skipping .defn/, .git/, vendor/,
 // node_modules/, and testdata/ directories.
+//
+// #332-class fix: the freshness threshold is derived from defn.db's own
+// on-disk mtime, not the stored last_ingest meta value -- a caller that
+// restores a previously-ingested DB onto a fresh checkout (whose .go
+// files carry the checkout's OWN mtime, unrelated to the original
+// ingest time) would otherwise see every file as stale even when
+// content matches exactly.
 func (db *DB) StaleFiles(projectDir string) ([]string, error) {
 	db.mu.Lock()
 	lastIngestStr, err := db.s.GetMeta("last_ingest")
+	dbPath := db.path
 	db.mu.Unlock()
 	if err != nil {
 		return nil, err
@@ -343,9 +353,26 @@ func (db *DB) StaleFiles(projectDir string) ([]string, error) {
 	if lastIngestStr == "" {
 		return nil, nil
 	}
-	lastIngest, err := strconv.ParseInt(lastIngestStr, 10, 64)
-	if err != nil {
+	if _, err := strconv.ParseInt(lastIngestStr, 10, 64); err != nil {
 		return nil, fmt.Errorf("parse last_ingest: %w", err)
+	}
+
+	// #332-class fix: derive the freshness threshold from the DB's own
+	// on-disk mtime rather than the stored meta value -- a caller that
+	// restores a previously-ingested DB from a cache/tarball onto a
+	// fresh checkout (whose .go files carry the checkout's OWN mtime, not
+	// the original ingest time) would otherwise see every file as
+	// modified-since-ingest even though content matches exactly.
+	var lastIngest int64
+	for _, name := range []string{"defn.db", "defn.db-wal", "defn.db-shm"} {
+		if info, err := os.Stat(filepath.Join(dbPath, name)); err == nil {
+			if t := info.ModTime().Unix(); t > lastIngest {
+				lastIngest = t
+			}
+		}
+	}
+	if lastIngest == 0 {
+		return nil, nil
 	}
 
 	var stale []string

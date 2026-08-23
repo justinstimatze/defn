@@ -3,7 +3,9 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/justinstimatze/defn/internal/store"
 )
@@ -151,5 +153,116 @@ func TestCollectStatus_NoLegacyDoltTreeStaysZero(t *testing.T) {
 
 	if r.LegacyDoltBytes != 0 || r.LegacyDoltPath != "" {
 		t.Fatalf("expected no legacy dolt fields set, got path=%q bytes=%d", r.LegacyDoltPath, r.LegacyDoltBytes)
+	}
+}
+
+// TestCountStaleFiles_NotFooledByOldStoredMetaValue is the real-usage
+// regression for the same bug via countStaleFiles (backs warnIfStale /
+// announceStaleIngest / collectStatus -- i.e. `defn status`, `defn
+// ingest`, `defn query` in production). A restored DB whose defn.db
+// mtime is newer than both the stored meta value AND the go file's
+// mtime must not be reported as stale.
+func TestCountStaleFiles_NotFooledByOldStoredMetaValue(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	goFile := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(goFile, []byte("package main\n\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldStored := time.Now().Add(-3 * time.Hour).Unix()
+	if err := db.SetMeta("last_ingest", strconv.FormatInt(oldStored, 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	if err := os.Chtimes(goFile, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(dbPath, "defn.db"), now.Add(time.Second), now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	count, _ := countStaleFiles(db, dir, dbPath)
+	if count != 0 {
+		t.Fatalf("expected 0 stale files when defn.db's own mtime is newer than the go file, got %d", count)
+	}
+}
+
+// TestCountStaleFiles_StillDetectsGenuinelyStaleFile is the fix's
+// boundary check: a go file genuinely touched AFTER defn.db was last
+// written must still be reported stale.
+func TestCountStaleFiles_StillDetectsGenuinelyStaleFile(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	goFile := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(goFile, []byte("package main\n\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.SetMeta("last_ingest", strconv.FormatInt(time.Now().Unix(), 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(filepath.Join(dbPath, "defn.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	future := info.ModTime().Add(10 * time.Second)
+	if err := os.Chtimes(goFile, future, future); err != nil {
+		t.Fatal(err)
+	}
+
+	count, sample := countStaleFiles(db, dir, dbPath)
+	if count != 1 {
+		t.Fatalf("expected 1 stale file, got %d (sample=%q)", count, sample)
+	}
+}
+
+// TestLastIngestUnix_UsesDBFileMtimeNotStoredMetaValue guards the
+// CLI-side sibling of #332: lastIngestUnix used to trust the
+// wall-clock NUMBER stored in the last_ingest meta row as the
+// freshness threshold. A workflow that copies/restores a .defn/
+// directory onto a fresh checkout (bench harness cache restore, or
+// any git-clone-then-restore-DB sequence) preserves that old stored
+// number while the restored defn.db's own mtime reflects the restore
+// time -- comparing fresh checkout mtimes against a stale stored
+// number falsely reports every file as modified-since-ingest.
+// lastIngestUnix must derive the threshold from defn.db's own
+// on-disk mtime, not the value stored inside it.
+func TestLastIngestUnix_UsesDBFileMtimeNotStoredMetaValue(t *testing.T) {
+	dbPath := t.TempDir()
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	oldStored := time.Now().Add(-3 * time.Hour).Unix()
+	if err := db.SetMeta("last_ingest", strconv.FormatInt(oldStored, 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	recent := time.Now()
+	dbFile := filepath.Join(dbPath, "defn.db")
+	if err := os.Chtimes(dbFile, recent, recent); err != nil {
+		t.Fatal(err)
+	}
+
+	got := lastIngestUnix(db, dbPath)
+	if got < recent.Add(-2*time.Second).Unix() {
+		t.Fatalf("expected lastIngestUnix to reflect defn.db's on-disk mtime (~%d), got %d (stored meta value was %d)", recent.Unix(), got, oldStored)
 	}
 }

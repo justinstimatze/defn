@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPingSucceedsOnOpenDB(t *testing.T) {
@@ -201,5 +202,101 @@ func Leaf() string { return "leaf" }
 	}
 	if len(leafAfterSync) != 1 {
 		t.Fatalf("expected Leaf to be ingested after whole-module Sync, got %d matches", len(leafAfterSync))
+	}
+}
+
+// TestStaleFiles_NotFooledByRestoredDBWithOldMetaMtime guards the
+// public-API instance of the #332 bug class: StaleFiles used to
+// compare .go file mtimes against the wall-clock NUMBER stored in the
+// last_ingest meta row. An external embedder that restores a
+// previously-synced .defn/ onto a freshly checked-out tree (the go
+// files get the checkout's OWN mtime, unrelated to when Sync last
+// ran) would see every file reported as modified-since-ingest even
+// though content matches exactly. The threshold must come from
+// defn.db's own on-disk mtime instead.
+func TestStaleFiles_NotFooledByRestoredDBWithOldMetaMtime(t *testing.T) {
+	modDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(modDir, "go.mod"), []byte("module example.com/greet\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	goFile := filepath.Join(modDir, "greet.go")
+	if err := os.WriteFile(goFile, []byte("package greet\n\nfunc Hello() string { return \"hi\" }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dbDir := t.TempDir()
+	dbPath := filepath.Join(dbDir, ".defn")
+	d, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	if err := d.Sync(modDir); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	// Simulate a cache-restore ordering: the go file gets a fresh mtime
+	// (as a git clone/checkout would stamp it) well AFTER Sync ran, then
+	// defn.db is restored in place even later -- the exact sequence #332
+	// found in the real bench harness. defn.db's own mtime ends up the
+	// most recent thing on disk, so nothing should read as stale.
+	now := time.Now()
+	if err := os.Chtimes(goFile, now.Add(2*time.Second), now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(dbPath, "defn.db"), now.Add(5*time.Second), now.Add(5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	stale, err := d.StaleFiles(modDir)
+	if err != nil {
+		t.Fatalf("StaleFiles: %v", err)
+	}
+	if len(stale) != 0 {
+		t.Fatalf("expected no stale files (defn.db's own mtime is the most recent thing on disk), got %v", stale)
+	}
+}
+
+// TestStaleFiles_StillDetectsGenuinelyStaleFile is the fix's boundary
+// check: a go file genuinely touched after defn.db was last written
+// must still be reported stale.
+func TestStaleFiles_StillDetectsGenuinelyStaleFile(t *testing.T) {
+	modDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(modDir, "go.mod"), []byte("module example.com/greet\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	goFile := filepath.Join(modDir, "greet.go")
+	if err := os.WriteFile(goFile, []byte("package greet\n\nfunc Hello() string { return \"hi\" }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dbDir := t.TempDir()
+	dbPath := filepath.Join(dbDir, ".defn")
+	d, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	if err := d.Sync(modDir); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	info, err := os.Stat(filepath.Join(dbPath, "defn.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	future := info.ModTime().Add(10 * time.Second)
+	if err := os.Chtimes(goFile, future, future); err != nil {
+		t.Fatal(err)
+	}
+
+	stale, err := d.StaleFiles(modDir)
+	if err != nil {
+		t.Fatalf("StaleFiles: %v", err)
+	}
+	if len(stale) != 1 {
+		t.Fatalf("expected 1 genuinely stale file, got %v", stale)
 	}
 }
