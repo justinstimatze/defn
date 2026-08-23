@@ -94,6 +94,26 @@ type Opts struct {
 	// -- only set this when the incoming body is already well-formatted,
 	// or accept minor cosmetic drift until the next non-skipped emit.
 	SkipGoimports bool
+
+	// IntendedNames lists the def identity/identities (FuncIdentity-
+	// formatted for methods/functions: "Recv.Name" or bare "Name" for
+	// free functions/types/consts/vars) that THIS specific write
+	// operation intends to change. #350: writeFile's "could not be
+	// matched to an on-disk declaration" warning fires whenever ANY
+	// definition sharing the file has a stale DB row -- including ones
+	// this operation never asked to touch -- and commitOrRollbackOn used
+	// to treat every such warning as proof the requested change failed,
+	// rolling back a write that had actually succeeded. Confirmed live
+	// (caddy-7870/6179, 2026-08-23): a single permanently-stale def (a
+	// duplicate ingested "init" method) blocked 5 different edit/create/
+	// apply attempts to unrelated definitions in the same file, none of
+	// which the warning was ever actually about. When set, a warning
+	// naming ONLY identities outside this list is treated as a benign,
+	// pre-existing divergence rather than this call's own failure. Empty
+	// (the default for any caller that hasn't set it) preserves the
+	// original conservative behavior exactly -- any non-empty warning
+	// still rolls back.
+	IntendedNames []string
 }
 
 // Emit writes all definitions from the database as .go files into outDir.

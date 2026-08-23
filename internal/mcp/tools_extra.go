@@ -169,6 +169,7 @@ func (s *server) handleMove(_ context.Context, _ *sdkmcp.CallToolRequest, args m
 	opts := emit.Opts{
 		AllowedRemovals: []string{identity},
 		AllowedAdds:     []string{identity},
+		IntendedNames:   []string{identity},
 	}
 	var touched []string
 	if oldSourceFile != "" {

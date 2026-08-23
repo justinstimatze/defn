@@ -16,6 +16,7 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"io"
 	"io/fs"
 	"math"
 	"net/http"
@@ -116,8 +117,54 @@ func RunHTTP(ctx context.Context, database store.Backend, projDir, addr string) 
 // RunShared starts an HTTP/SSE server on addr and simultaneously serves
 // this client over stdio. Used for auto-sharing: first session starts the
 // HTTP daemon; subsequent sessions proxy to it via RunProxy.
+//
+// #351: self-shuts-down after DEFN_SERVE_IDLE_TIMEOUT (default 45m) of
+// zero requests across BOTH transports, tracked via a single
+// AddReceivingMiddleware hook rather than instrumenting stdio and HTTP
+// separately -- every request, regardless of which transport it arrived
+// on, funnels through the server's own method dispatch. Without this, a
+// defn serve process nobody's using anymore (the project's original
+// session ended, or a test/bench harness forgot to kill an ephemeral
+// instance) runs forever -- confirmed live, ~2.7 days of idle uptime
+// found accumulating on a real machine, 2026-08-23. DEFN_SERVE_IDLE_TIMEOUT
+// set to "0" (or any non-positive duration) disables the check entirely.
 func RunShared(ctx context.Context, database store.Backend, projDir, addr string) error {
 	_, mcpServer := newMCPServer(ctx, database, projDir)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var lastActivity atomic.Int64
+	lastActivity.Store(time.Now().UnixNano())
+	mcpServer.AddReceivingMiddleware(func(next sdkmcp.MethodHandler) sdkmcp.MethodHandler {
+		return func(ctx context.Context, method string, req sdkmcp.Request) (sdkmcp.Result, error) {
+			lastActivity.Store(time.Now().UnixNano())
+			return next(ctx, method, req)
+		}
+	})
+
+	if idle := serveIdleTimeout(); idle > 0 {
+		go func() {
+			ticker := time.NewTicker(idleCheckInterval(idle))
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if time.Since(time.Unix(0, lastActivity.Load())) > idle {
+						fmt.Fprintf(os.Stderr, "defn: idle for over %s, shutting down\n", idle)
+						cancel()
+						// Safety net: not every transport is guaranteed to
+						// unblock promptly on ctx cancellation. Force exit
+						// if we're somehow still alive shortly after.
+						time.AfterFunc(5*time.Second, func() { os.Exit(0) })
+						return
+					}
+				}
+			}
+		}()
+	}
 
 	// Start HTTP/SSE in background.
 	fmt.Fprintf(os.Stderr, "defn: shared server on %s\n", addr)
@@ -136,9 +183,56 @@ func RunShared(ctx context.Context, database store.Backend, projDir, addr string
 	return mcpServer.Run(ctx, &sdkmcp.StdioTransport{})
 }
 
+// serveIdleTimeout returns the configured idle-shutdown duration for
+// RunShared, from DEFN_SERVE_IDLE_TIMEOUT (e.g. "45m"). Unset defaults to
+// 45m. Empty/unparseable/non-positive disables the check (returns 0).
+func serveIdleTimeout() time.Duration {
+	v := os.Getenv("DEFN_SERVE_IDLE_TIMEOUT")
+	if v == "" {
+		v = "45m"
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return 0
+	}
+	return d
+}
+
+// idleCheckInterval picks how often RunShared polls for idleness relative
+// to the configured timeout -- frequent enough that shutdown isn't
+// sluggish on a long timeout, infrequent enough not to spin on a short
+// one (e.g. in a test).
+func idleCheckInterval(idle time.Duration) time.Duration {
+	iv := idle / 10
+	if iv < 10*time.Second {
+		iv = 10 * time.Second
+	}
+	if iv > 5*time.Minute {
+		iv = 5 * time.Minute
+	}
+	return iv
+}
+
 // RunProxy bridges a stdio MCP client to an existing HTTP/SSE defn server.
 // This is the lightweight path (~5 MB) for the second+ session.
-func RunProxy(ctx context.Context, sseEndpoint string) error {
+//
+// #351: if the upstream daemon dies mid-session (idle-timeout, crash, or
+// manual kill), self-heals for the REST OF THE SYSTEM rather than just
+// erroring out silently: confirms the upstream is actually gone (not a
+// transient blip), spawns a fresh detached `defn serve` for this project
+// (same pattern `defn restart` already uses) so the next connection
+// attempt lands warm instead of cold, then exits with a clear message.
+// Deliberately does NOT try to keep THIS session's own connection alive
+// through the transition -- that would mean rebinding an already-
+// initialized stdio connection to a fresh in-process server without the
+// client resending MCP's `initialize` handshake, which the SDK's session
+// state machine isn't verified to tolerate. Failing loudly and fast is
+// safer than guessing at unverified protocol semantics for a live
+// session -- see the real trajectory this guards against: an agent
+// killed what looked like an idle orphan process and it turned out to be
+// the live proxy, silently breaking its own tool connection with no
+// recovery path (2026-08-23).
+func RunProxy(ctx context.Context, dbPath, projDir, addr string) error {
 	// Connect stdio side.
 	stdioConn, err := (&sdkmcp.StdioTransport{}).Connect(ctx)
 	if err != nil {
@@ -146,12 +240,11 @@ func RunProxy(ctx context.Context, sseEndpoint string) error {
 	}
 	defer stdioConn.Close()
 
-	// Connect to the SSE server.
+	sseEndpoint := fmt.Sprintf("http://%s/sse", addr)
 	sseConn, err := (&sdkmcp.SSEClientTransport{Endpoint: sseEndpoint}).Connect(ctx)
 	if err != nil {
 		return fmt.Errorf("sse connect: %w", err)
 	}
-	defer sseConn.Close()
 
 	// Bridge: stdio → SSE and SSE → stdio.
 	errc := make(chan error, 2)
@@ -181,7 +274,107 @@ func RunProxy(ctx context.Context, sseEndpoint string) error {
 			}
 		}
 	}()
-	return <-errc
+	bridgeErr := <-errc
+	sseConn.Close()
+
+	wantIdentity, _ := filepath.Abs(projDir)
+	if isDefnListeningAt(addr) && defnIdentityAtAddr(addr) == wantIdentity {
+		// The upstream is still there and still ours -- this was a
+		// transient bridge hiccup, not a dead daemon. Don't spawn a
+		// competing replacement.
+		return fmt.Errorf("proxy bridge error (upstream still alive): %w", bridgeErr)
+	}
+
+	fmt.Fprintf(os.Stderr, "defn: upstream shared server on %s is gone (%v) -- spawning a fresh one for the next connection\n", addr, bridgeErr)
+	if spawnErr := spawnDetachedServe(dbPath, projDir); spawnErr != nil {
+		fmt.Fprintf(os.Stderr, "defn: could not spawn a replacement server: %v\n", spawnErr)
+	}
+	return fmt.Errorf("upstream shared server on %s disconnected -- a fresh one has been started; reconnect to continue", addr)
+}
+
+// isDefnListeningAt reports whether something answering the defn SSE
+// protocol is listening at addr. Deliberately a separate, minimal copy
+// from cmd/defn's own probe helper (used only at initial cmdServe
+// startup) rather than a shared export -- this one is exercised from a
+// live failure path (RunProxy's upstream-death check) and keeping it
+// self-contained avoids coupling this package's error-recovery behavior
+// to unrelated changes in the CLI's startup probing.
+func isDefnListeningAt(addr string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("http://%s/sse", addr), nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.Header.Get("Content-Type") == "text/event-stream"
+}
+
+// defnIdentityAtAddr fetches /identity from a running defn HTTP server
+// and returns the absolute project directory it's pinned to. Returns ""
+// if unreachable or absent.
+func defnIdentityAtAddr(addr string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("http://%s/identity", addr), nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(body))
+}
+
+// spawnDetachedServe launches a fresh, detached `defn serve` for dbPath
+// so the next connection attempt (this session's reconnect, or any other
+// session) lands on a warm daemon instead of paying a cold start. Mirrors
+// the respawn pattern `defn restart` already uses. The child is fully
+// detached (own session, released) so it outlives this process.
+func spawnDetachedServe(dbPath, projDir string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locate self: %w", err)
+	}
+	cmd := exec.Command(exe, "serve")
+	cmd.Dir = projDir
+	cmd.Env = append(os.Environ(), "DEFN_DB="+dbPath)
+	// Security review flagged the original predictable "/tmp/defn-
+	// autorespawn-<unix-timestamp>.log" path as a symlink-attack vector:
+	// a world-writable dir + a guessable name + no O_EXCL means another
+	// local user could pre-place a symlink there and redirect this
+	// process's log writes anywhere it can write. os.CreateTemp uses a
+	// cryptographically random suffix and O_EXCL under the hood, so it
+	// fails rather than follows a pre-existing symlink; scoping the
+	// directory to the user's own cache dir (falling back to os.TempDir
+	// only if that's unavailable) keeps it out of the shared /tmp
+	// namespace entirely as defense in depth.
+	logDir := os.TempDir()
+	if cacheDir, cerr := os.UserCacheDir(); cerr == nil {
+		logDir = filepath.Join(cacheDir, "defn")
+	}
+	if err := os.MkdirAll(logDir, 0700); err != nil {
+		return fmt.Errorf("create log dir: %w", err)
+	}
+	logFile, err := os.CreateTemp(logDir, "autorespawn-*.log")
+	if err != nil {
+		return fmt.Errorf("open log: %w", err)
+	}
+	defer logFile.Close()
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.SysProcAttr = detachedSysProcAttr()
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("spawn: %w", err)
+	}
+	return cmd.Process.Release()
 }
 
 // mcpHTTPMux returns the ServeMux used by RunHTTP and RunShared. MCP
@@ -383,7 +576,7 @@ For any "how does X work in this codebase" discovery question, reach for context
 
 Orient before you read: overview (project shape) → outline (def shape) → impact (when you know which def matters). Only read whole bodies when you're about to edit them; whole-file reads on files you won't touch are pure wire cost — use outline or search instead.
 
-Ops: overview (project-wide shape when called with no args — one line per module with def counts + first exported names; pass file:"pkg-path" or file:"pkg-path/file.go" to drill in; the right first-touch when you don't know which def matters yet), outline (compact projection of a def — sig + doc + caller/callee summary, no body; use when body isn't needed), search, impact (blast radius of a known def — pass format:"json" for structured output; callers, transitives, test coverage in one call), read (returns the def body + a compact "Related" footer with summary, top-3 callers, top-3 callees, and semantically-adjacent defs — one call gives you what would otherwise take 3-4 sequential impact/outline calls; auto-downgrades to outline when body > 1500 bytes, pass full:true or mode:"body" to force; for a large body, pass line_range:"700-820" (1-indexed, file-relative, "-" or ":" both accepted) to get back just that span instead — also bypasses the auto-downgrade, and composes with query: to filter further within the returned range), read-and-verify (read a def AND run its covering tests in one call — use during bug triage so you see behavior alongside source and don't spiral into read-loops; pass name), read-file (all defs' bodies in one file — pass file:"path"; whole-file counterpart to read; prefer over N sequential read calls when scanning; for a large file, pass line_range:"700-820" the same as read to keep only the definitions overlapping that file-relative range, each narrowed to its own overlapping span), expand (bundle a def's outline/body/callers in one call — pass name:"F", or names:["A","B",...] to batch several targets into ONE response instead of one expand per target; include:["outline","callers","body"] controls sections, defaults to outline+callers; prefer over read+impact+read chains AND over N sequential single-name expand calls — round-trip count within a turn is the dominant session cost driver, not per-call size), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), replace-hunk (replace a byte-exact occurrence of 'old' inside a def body with 'new' — byte-exact PUTGET, content-addressed inside the def; pass name+old+new, plus index=1..N if 'old' occurs more than once, or replace_all:true to replace every occurrence with the same 'new' in one call — prefer replace_all over N indexed calls in one apply batch when every occurrence gets the identical replacement, since indices shift as earlier matches are consumed within the same batch; empty 'new' deletes the hunk(s). Send zero anchor context when the hunk is def-unique — the name argument does the file-level disambiguation), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file), explain (structural analysis of a def — pass name to get sig + callers + callees + test coverage; ALSO accepts question:"how does X handle Y" which routes to a Sonnet co-processor that returns a prose answer grounded in the def's source with provenance refs. Cheaper than reading + interpreting a large body yourself when the answer is prose, not code. names:["A","B"] for multi-def scope. Requires ANTHROPIC_API_KEY), plan (pass intent:"..." — the co-processor grounds your intent in real defs via context's own candidate search, emits a compact trajectory, and defn mechanically walks it server-side in one round-trip instead of you sequencing several read/outline/impact calls yourself. Requires ANTHROPIC_API_KEY; falls back to a clear error pointing at plan-dsl/plan-sexpr when unset), plan-dsl / plan-sexpr (mechanically walk a trajectory YOU already wrote — pass plan:"..." in the compact DSL "@Def.field[!test]" form (plan-dsl) or the S-expression "(op target [!test])" form (plan-sexpr), op one of read/outline/impact; no API key needed), similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create (single def from body; with file: set, body may hold multiple top-level decls to author a whole file in one call — the whole-file equivalent of files-mode Write), delete (safe by default — refuses when other defs still reference this def; pass force:true to delete anyway. Refusal message lists the callers so you can rewrite them first. Pass file:"path/to/x.go" with no name: to bulk-delete every definition in that file in one call — same safety check, scoped to callers outside the file; the file itself is NOT removed from disk by default, only its defs — pass remove_file:true alongside file: to also delete the file itself once its defs are purged), retarget-field-value (rewrite a composite-literal field's string value across every def whose body matches — pass name:"<StructType>" field:"<Field>" old:"<oldStr>" new:"<newStr>"; AST-safe, so unrelated occurrences of the string won't match), rename, move, test (run ONLY tests that cover a given def — pass name; scoped subset, not the full suite; prefer over bash 'go test ./...' when you only need coverage for a specific change. Also accepts test:"TestX" to run one test by name — use this to REPRODUCE a bug from the issue BEFORE writing any code; a passing test means your hypothesis about which def is broken is wrong. An identical test call repeated with no write in between this session returns the cached result instead of rerunning the real subprocess — pass force:true to force a genuine rerun anyway), apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 6 projection ops insert-precondition/replace-slice/replace-hunk/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (rarely needed — every edit op auto-syncs the DB; only use after external file changes outside the code tool), query (raw SQL escape hatch — for schema analytics only; NEVER use to look up a def by name, grep bodies, or list files/defs-in-file — use search/outline/read-file/file-defs/impact instead, which are far cheaper on the wire), patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), commit (snapshot current state), status (current branch + dirty state), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), version (no params — running build's version string + on-disk binary path/mtime; call this after a rebuild+reconnect to confirm you're actually talking to fresh code, not a stale already-running serve process)`,
+Ops: overview (project-wide shape when called with no args — one line per module with def counts + first exported names; pass file:"pkg-path" or file:"pkg-path/file.go" to drill in; the right first-touch when you don't know which def matters yet), outline (compact projection of a def — sig + doc + caller/callee summary, no body; use when body isn't needed), search, impact (blast radius of a known def — pass format:"json" for structured output; callers, transitives, test coverage in one call), read (returns the def body + a compact "Related" footer with summary, top-3 callers, top-3 callees, and semantically-adjacent defs — one call gives you what would otherwise take 3-4 sequential impact/outline calls; auto-downgrades to outline when body > 1500 bytes, pass full:true or mode:"body" to force; for a large body, pass line_range:"700-820" (1-indexed, file-relative, "-" or ":" both accepted) to get back just that span instead — also bypasses the auto-downgrade, and composes with query: to filter further within the returned range), read-and-verify (read a def AND run its covering tests in one call — use during bug triage so you see behavior alongside source and don't spiral into read-loops; pass name), read-file (all defs' bodies in one file — pass file:"path"; whole-file counterpart to read; prefer over N sequential read calls when scanning; for a large file, pass line_range:"700-820" the same as read to keep only the definitions overlapping that file-relative range, each narrowed to its own overlapping span), expand (bundle a def's outline/body/callers in one call — pass name:"F", or names:["A","B",...] to batch several targets into ONE response instead of one expand per target; include:["outline","callers","body"] controls sections, defaults to outline+callers; prefer over read+impact+read chains AND over N sequential single-name expand calls — round-trip count within a turn is the dominant session cost driver, not per-call size), slice (verbatim AST-role slice of a def — pass slice:"signature"|"doc"|"body"|"error-branch"|"return"|"loop" to get just that piece), insert-precondition (insert an if-block at function entry — byte-exact PUTGET; pass name+condition+ret), replace-slice (replace the Nth AST-role slice with verbatim bytes — byte-exact PUTGET; pass name+slice+index+new; refuses if replacement would discard interior comments — pass force:true to override), replace-hunk (replace a byte-exact occurrence of 'old' inside a def body with 'new' — byte-exact PUTGET, content-addressed inside the def; pass name+old+new, plus index=1..N if 'old' occurs more than once, or replace_all:true to replace every occurrence with the same 'new' in one call — prefer replace_all over N indexed calls in one apply batch when every occurrence gets the identical replacement, since indices shift as earlier matches are consumed within the same batch; empty 'new' deletes the hunk(s). Send zero anchor context when the hunk is def-unique — the name argument does the file-level disambiguation), wrap-in-defer (insert defer stmt before Nth top-level statement — byte-exact PUTGET; pass name+stmt_index+defer_body), rename-param (rename value param or receiver via ast.Object scoping — ≡_gofmt equivalence; pass name+old_param+new_param), add-import (add import path to file's module — goimports-canonical grouping (stdlib / third-party); pass import_path+file?+alias? — file inferred if DB has one non-test .go file; safe to call unconditionally — it checks the file itself and no-ops if the import is already present, so don't burn a search call pre-checking first: search doesn't index import specs and will falsely report "no matches"), explain (structural analysis of a def — pass name to get sig + callers + callees + test coverage; ALSO accepts question:"how does X handle Y" which routes to a Sonnet co-processor that returns a prose answer grounded in the def's source with provenance refs. Cheaper than reading + interpreting a large body yourself when the answer is prose, not code. names:["A","B"] for multi-def scope. Requires ANTHROPIC_API_KEY), plan (pass intent:"..." — the co-processor grounds your intent in real defs via context's own candidate search, emits a compact trajectory, and defn mechanically walks it server-side in one round-trip instead of you sequencing several read/outline/impact calls yourself. Requires ANTHROPIC_API_KEY; falls back to a clear error pointing at plan-dsl/plan-sexpr when unset), plan-dsl / plan-sexpr (mechanically walk a trajectory YOU already wrote — pass plan:"..." in the compact DSL "@Def.field[!test]" form (plan-dsl) or the S-expression "(op target [!test])" form (plan-sexpr), op one of read/outline/impact; no API key needed), similar, untested, edit (full body OR old_fragment+new_fragment), insert (after anchor), create (single def from body; with file: set, body may hold multiple top-level decls to author a whole file in one call — the whole-file equivalent of files-mode Write), delete (safe by default — refuses when other defs still reference this def; pass force:true to delete anyway. Refusal message lists the callers so you can rewrite them first. Pass file:"path/to/x.go" with no name: to bulk-delete every definition in that file in one call — same safety check, scoped to callers outside the file; the file itself is NOT removed from disk by default, only its defs — pass remove_file:true alongside file: to also delete the file itself once its defs are purged), retarget-field-value (rewrite a composite-literal field's string value across every def whose body matches — pass name:"<StructType>" field:"<Field>" old:"<oldStr>" new:"<newStr>"; AST-safe, so unrelated occurrences of the string won't match), rename, move, test (run ONLY tests that cover a given def — pass name; scoped subset, not the full suite; prefer over bash 'go test ./...' when you only need coverage for a specific change. Also accepts test:"TestX" to run one test by name — use this to REPRODUCE a bug from the issue BEFORE writing any code; a passing test means your hypothesis about which def is broken is wrong. An identical test call repeated with no write in between this session returns the cached result instead of rerunning the real subprocess — pass force:true to force a genuine rerun anyway), apply (batch multiple ops atomically in one turn — accepts create/edit/delete/rename PLUS all 6 projection ops insert-precondition/replace-slice/replace-hunk/wrap-in-defer/rename-param/add-import; rolls back on any error; one emit+build for the whole batch), diff, history, find, sync (rarely needed — every edit op auto-syncs the DB; only use after external file changes outside the code tool), query (raw SQL escape hatch — for schema analytics only; NEVER use to look up a def by name, grep bodies, or list files/defs-in-file — use search/outline/read-file/file-defs/impact instead, which are far cheaper on the wire), patch, simulate, validate-plan, pragmas (query comment pragmas), literals (query composite literal fields), traverse (recursive graph traversal), commit (snapshot current state), status (current branch + dirty state), diff-defs (definitions that differ between two refs — pass from:"X" and optionally to:"Y"; defaults to working tree), version (no params — running build's version string + on-disk binary path/mtime; call this after a rebuild+reconnect to confirm you're actually talking to fresh code, not a stale already-running serve process)`,
 	}, s.handleCode)
 
 	return s, mcpServer
@@ -2126,8 +2319,23 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 		// reflexively retries with full:true when the hint reads like a
 		// menu. They still work; they're documented in the tool
 		// description, not advertised inline.
+		// #349: "Full body only needed when editing" presupposes the
+		// caller has already decided not to edit -- but a deliberate,
+		// by-name read of a specific candidate function (as opposed to
+		// a broad exploratory sweep) is often precisely someone still
+		// deciding whether a change belongs there. Confirmed live
+		// (etcd-io/etcd-13506, 2026-08-23): the agent navigated to the
+		// two functions the gold fix actually touches, got outlines of
+		// both, and the "only needed when editing" framing reads as
+		// permission to stop looking -- it never re-read either body
+		// (which would have served the full body for free per the
+		// alreadyDowngraded path above) and concluded no fix was
+		// needed, at a dead loss (files-mode found the real gap on the
+		// same task). Neutral wording states what the outline covers
+		// without asserting whether the body is needed, leaving that
+		// call to the caller instead of supplying a false one.
 		note := fmt.Sprintf(
-			"_[Outline shown — body is %d bytes / %d lines. Full body only needed when editing.]_\n\n",
+			"_[Outline shown — body is %d bytes / %d lines; this covers signature, doc, callers, and callees, not the implementation itself.]_\n\n",
 			len(d.Body), strings.Count(d.Body, "\n")+1,
 		)
 		// #313 followup: mention a fresh cached summary as an explicit
@@ -2192,6 +2400,25 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 				queryHint = candidateHint
 			}
 		}
+	}
+
+	// #334: even an explicit full:true/mode:"body" request can produce a
+	// body so large it overflows the calling client's own oversized-
+	// tool-result handling -- see readFullBodyHardCap's doc comment for
+	// the real trajectory and the size calibration. Fires after query
+	// filtering (a query may have already shrunk body below the cap),
+	// and appends to queryHint rather than replacing it so a query note
+	// and a truncation note can both appear.
+	if len(body) > readFullBodyHardCap {
+		cut := strings.LastIndexByte(body[:readFullBodyHardCap], '\n')
+		if cut <= 0 {
+			cut = readFullBodyHardCap
+		}
+		body = body[:cut]
+		queryHint += fmt.Sprintf(
+			"[body truncated at %d of %d bytes -- too large to return in full. Use read(name:%q, query:\"<keyword>\") to see only the statements matching a keyword instead of a truncated arbitrary slice.]\n\n",
+			cut, len(d.Body), args.Name,
+		)
 	}
 
 	var sb strings.Builder
@@ -2835,7 +3062,7 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 	}
 	var buildResult string
 	if sigStable {
-		opts := emit.Opts{}
+		opts := emit.Opts{IntendedNames: []string{emit.FuncIdentity(d.Name, d.Receiver)}}
 		if d.SourceFile != "" {
 			opts.GoimportsFiles = []string{d.SourceFile}
 			opts.TouchedFiles = []string{d.SourceFile}
@@ -2855,9 +3082,10 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 		if os.Getenv("DEFN_MEASURE_TIMING") == "1" {
 			fmt.Fprintf(os.Stderr, "  [edit] signature changed, build required:\n    old: %q\n    new: %q\n", oldSignature, d.Signature)
 		}
-		var opts emit.Opts
+		opts := emit.Opts{IntendedNames: []string{emit.FuncIdentity(d.Name, d.Receiver)}}
 		if d.SourceFile != "" {
-			opts = emit.Opts{GoimportsFiles: []string{d.SourceFile}, TouchedFiles: []string{d.SourceFile}}
+			opts.GoimportsFiles = []string{d.SourceFile}
+			opts.TouchedFiles = []string{d.SourceFile}
 		}
 		buildResult = s.commitOrRollbackOnBuild(tx, commit, rollback, opts)
 	}
@@ -3515,9 +3743,10 @@ func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest
 	}
 	d.ID = id
 
-	var opts emit.Opts
+	opts := emit.Opts{IntendedNames: []string{emit.FuncIdentity(d.Name, d.Receiver)}}
 	if d.SourceFile != "" {
-		opts = emit.Opts{GoimportsFiles: []string{d.SourceFile}, TouchedFiles: []string{d.SourceFile}}
+		opts.GoimportsFiles = []string{d.SourceFile}
+		opts.TouchedFiles = []string{d.SourceFile}
 	}
 	buildResult := s.commitOrRollbackOnBuild(tx, commit, rollback, opts)
 
@@ -3598,9 +3827,10 @@ func (s *server) handleInsert(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		return errResult(err)
 	}
 
-	var opts emit.Opts
+	opts := emit.Opts{IntendedNames: []string{emit.FuncIdentity(d.Name, d.Receiver)}}
 	if d.SourceFile != "" {
-		opts = emit.Opts{GoimportsFiles: []string{d.SourceFile}, TouchedFiles: []string{d.SourceFile}}
+		opts.GoimportsFiles = []string{d.SourceFile}
+		opts.TouchedFiles = []string{d.SourceFile}
 	}
 	buildResult := s.commitOrRollbackOnBuild(tx, commit, rollback, opts)
 	if buildResult != "" {
@@ -3612,6 +3842,14 @@ func (s *server) handleInsert(_ context.Context, _ *sdkmcp.CallToolRequest, args
 }
 
 func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args createParam) (*sdkmcp.CallToolResult, any, error) {
+	// #334: catch double-escaped whitespace before isImportsOnlyBody can
+	// silently swallow a malformed body into a "successful" comment-only
+	// scaffold -- see doubleEscapedHint's doc comment for the exact
+	// mechanism and the real trajectory that motivated this.
+	if hint := doubleEscapedHint(args.Body); hint != "" {
+		return errResult(fmt.Errorf("create: %s", hint))
+	}
+
 	// Multi-decl bodies: allowed when file: is set. Each top-level decl is
 	// upserted as its own Definition, all sharing the same SourceFile.
 	// Single autoEmit+build at the end. Without file: the model has no way
@@ -3805,6 +4043,7 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 			GoimportsFiles: []string{args.File},
 			TouchedFiles:   []string{args.File},
 			AllowedAdds:    []string{emit.FuncIdentity(name, receiver)},
+			IntendedNames:  []string{emit.FuncIdentity(name, receiver)},
 		}
 	}
 	// A brand-new definition has no existing callers to break -- unlike
@@ -4503,6 +4742,10 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	// handleEdit's singleton path, just collected across the batch since
 	// there's no single "the def just edited" here.
 	var editedIDs []int64
+	// #350: identities this batch is deliberately editing/retargeting, so
+	// an unrelated stale def elsewhere in a touched file doesn't roll back
+	// an otherwise-successful batch -- see Opts.IntendedNames.
+	var editedIdentities []string
 	// #307: move changes module membership, which the incremental
 	// per-file resolveSet this batch otherwise relies on can't capture --
 	// refs are scoped by module, so a full resolve is required whenever
@@ -4851,6 +5094,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				addTouched(d.SourceFile)
 				addResolve(d.SourceFile, d.ModuleID)
 				editedIDs = append(editedIDs, d.ID)
+				editedIdentities = append(editedIdentities, emit.FuncIdentity(d.Name, d.Receiver))
 				if !d.Test && firstNonTestModuleID == 0 {
 					firstNonTestModuleID = d.ModuleID
 				}
@@ -5167,6 +5411,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 					retargeted++
 					addTouched(d.SourceFile)
 					addResolve(d.SourceFile, d.ModuleID)
+					editedIdentities = append(editedIdentities, emit.FuncIdentity(d.Name, d.Receiver))
 					if len(affectedNames) < 10 {
 						affectedNames = append(affectedNames, formatReceiver(d.Receiver)+d.Name)
 					}
@@ -5421,11 +5666,16 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		for f := range touchedFiles {
 			goimportsFiles = append(goimportsFiles, f)
 		}
+		intendedNames := make([]string, 0, len(allowedRemovals)+len(allowedAdds)+len(editedIdentities))
+		intendedNames = append(intendedNames, allowedRemovals...)
+		intendedNames = append(intendedNames, allowedAdds...)
+		intendedNames = append(intendedNames, editedIdentities...)
 		buildResult = s.commitOrRollbackOnBuild(tx, commit, rollback, emit.Opts{
 			AllowedRemovals: allowedRemovals,
 			AllowedAdds:     allowedAdds,
 			GoimportsFiles:  goimportsFiles,
 			TouchedFiles:    goimportsFiles,
+			IntendedNames:   intendedNames,
 		})
 		if buildResult == "" {
 			if needsFullResolve {
@@ -5567,6 +5817,7 @@ func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolR
 
 	updated := 0
 	var affectedNames []string
+	var affectedIdentities []string
 	// #109 pass 2: collect the (file, modulePath) tuples we touched so
 	// we can scope the post-op resolve. Retarget only changes composite
 	// literal string values → refs graph is unaffected; only literal_fields
@@ -5595,6 +5846,7 @@ func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolR
 			if d.SourceFile != "" {
 				touched[filePkg{d.SourceFile, m.Path}] = true
 			}
+			affectedIdentities = append(affectedIdentities, emit.FuncIdentity(d.Name, d.Receiver))
 			if len(affectedNames) < 10 {
 				affectedNames = append(affectedNames, formatReceiver(d.Receiver)+d.Name)
 			}
@@ -5611,6 +5863,7 @@ func (s *server) handleRetargetFieldValue(_ context.Context, _ *sdkmcp.CallToolR
 	buildResult := s.commitOrRollbackOnBuild(tx, commit, rollback, emit.Opts{
 		GoimportsFiles: goimportsFiles,
 		TouchedFiles:   goimportsFiles,
+		IntendedNames:  affectedIdentities,
 	})
 	if buildResult != "" {
 		return textResult(fmt.Sprintf("retarget-field-value %s.%s rolled back — nothing was saved\n\n%s", typeName, field, buildResult)), nil, nil
@@ -5789,7 +6042,7 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// receivers unwrapped); match that. Without this, the file on disk
 	// would be left unchanged and watchFiles would resurrect the def.
 	qualified := emit.FuncIdentity(d.Name, d.Receiver)
-	deleteOpts := emit.Opts{AllowedRemovals: []string{qualified}}
+	deleteOpts := emit.Opts{AllowedRemovals: []string{qualified}, IntendedNames: []string{qualified}}
 	if d.SourceFile != "" {
 		deleteOpts.GoimportsFiles = []string{d.SourceFile}
 		deleteOpts.TouchedFiles = []string{d.SourceFile}
@@ -6074,11 +6327,15 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// #163: rename = delete-old + create-new to the emit path. Declare
 	// both so the merge can splice in-place (old name removed, new
 	// name spliced) instead of leaving the new name behind as drift.
+	intendedNames := make([]string, 0, len(allowedRemovals)+len(allowedAdds))
+	intendedNames = append(intendedNames, allowedRemovals...)
+	intendedNames = append(intendedNames, allowedAdds...)
 	opts := emit.Opts{
 		AllowedRemovals: allowedRemovals,
 		AllowedAdds:     allowedAdds,
 		GoimportsFiles:  goimportsFiles,
 		TouchedFiles:    goimportsFiles,
+		IntendedNames:   intendedNames,
 	}
 	var buildResult string
 	if riskyInterfaceRename || updatedReceivers > 0 {
@@ -7259,9 +7516,10 @@ func (s *server) handlePatch(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		return errResult(err)
 	}
 
-	var opts emit.Opts
+	opts := emit.Opts{IntendedNames: []string{emit.FuncIdentity(d.Name, d.Receiver)}}
 	if d.SourceFile != "" {
-		opts = emit.Opts{GoimportsFiles: []string{d.SourceFile}, TouchedFiles: []string{d.SourceFile}}
+		opts.GoimportsFiles = []string{d.SourceFile}
+		opts.TouchedFiles = []string{d.SourceFile}
 	}
 	buildResult := s.commitOrRollbackOnBuild(tx, commit, rollback, opts)
 	if buildResult != "" {
@@ -9357,9 +9615,10 @@ func (s *server) applyEditTerse(session *sdkmcp.ServerSession, d *store.Definiti
 		return errResult(err)
 	}
 
-	var opts emit.Opts
+	opts := emit.Opts{IntendedNames: []string{emit.FuncIdentity(d.Name, d.Receiver)}}
 	if d.SourceFile != "" {
-		opts = emit.Opts{GoimportsFiles: []string{d.SourceFile}, TouchedFiles: []string{d.SourceFile}}
+		opts.GoimportsFiles = []string{d.SourceFile}
+		opts.TouchedFiles = []string{d.SourceFile}
 	}
 	var buildResult string
 	if sigStable {
@@ -10092,29 +10351,6 @@ func (s *server) commitOrRollbackOnEmit(tx store.Backend, commit func() error, r
 	return s.commitOrRollbackOn(tx, commit, rollback, opts, s.emitOnlyAgainst)
 }
 
-// commitOrRollbackOn is the shared #12 mechanism behind both
-// commitOrRollbackOnBuild and commitOrRollbackOnEmit: snapshot the
-// files opts will touch, run the given emit variant against tx (so it
-// sees the caller's own uncommitted writes), and commit tx only if
-// the result comes back completely clean. A non-empty result restores
-// the snapshotted files and lets rollback() undo the DB write, so
-// neither side reflects the failed mutation.
-//
-// Snapshotting is scoped to opts.TouchedFiles (falling back to
-// GoimportsFiles); a caller with neither set gets no file-level
-// protection here -- that's the existing full-project-emit fallback
-// path, already rare, and out of scope for this pass (see #12).
-//
-// Concurrency tradeoff, worth being explicit about: SQLiteDB.Begin()
-// serializes ALL transactions on a single process-wide mutex (txMu).
-// Previously the DB write committed (and released that lock)
-// immediately, before emit (+ build, where applicable) ran outside
-// it. This holds tx open for the full emit/build duration instead, so
-// a slow build now also holds the lock that long -- trading some
-// cross-request concurrency for the correctness this closes. Builds
-// are normally scoped to just the touched package(s), so this is
-// expected to be small in practice, but it is a real cost, not a free
-// rearrangement.
 func (s *server) commitOrRollbackOn(tx store.Backend, commit func() error, rollback func(), opts emit.Opts, run func(store.Backend, emit.Opts) string) string {
 	files := opts.TouchedFiles
 	if len(files) == 0 {
@@ -10127,6 +10363,39 @@ func (s *server) commitOrRollbackOn(tx store.Backend, commit func() error, rollb
 
 	result := run(tx, opts)
 	if result != "" {
+		// #350: a writeFile "could not be matched" warning about a def
+		// this operation never asked to touch means the ACTUAL requested
+		// change still landed on disk -- only some unrelated, pre-existing
+		// stale DB row couldn't also be synced. Rolling back here throws
+		// away a successful write because of noise about something else
+		// entirely. See Opts.IntendedNames for the full rationale and the
+		// live trajectory that found this. Only bypasses rollback when
+		// EVERY def named in the warning is provably unrelated to what this
+		// call intended to write; any hard failure marker (build failure,
+		// timeout, emit error, or writeFile's OTHER "write refused
+		// entirely" shape) still always rolls back, no exceptions.
+		if len(opts.IntendedNames) > 0 {
+			if unmatched, pure := parseUnmatchedOnlyIdentities(result); pure {
+				intended := make(map[string]bool, len(opts.IntendedNames))
+				for _, n := range opts.IntendedNames {
+					intended[n] = true
+				}
+				overlap := false
+				for _, u := range unmatched {
+					if intended[u] {
+						overlap = true
+						break
+					}
+				}
+				if !overlap {
+					if err := commit(); err != nil {
+						restoreFiles(snaps)
+						return fmt.Sprintf("commit error: %v (on-disk changes reverted)", err)
+					}
+					return ""
+				}
+			}
+		}
 		restoreFiles(snaps)
 		rollback()
 		return result
@@ -10223,6 +10492,42 @@ func (s *server) resolveEditTarget(name, receiver, module, file string) (*store.
 	}
 
 	if receiver == "" {
+		// #339: file was previously only ever used to derive a MODULE
+		// scope via findModuleByFile above -- store.Module is per go.mod,
+		// so in a single-module repo (the common case) that's no real
+		// disambiguation at all between same-named defs in different
+		// files. Real trajectory (prometheus-19236): outline(name:
+		// "NewDiscovery", file:"discovery/moby/docker.go") silently
+		// resolved to discovery/moby/dockerswarm.go's NewDiscovery
+		// instead (docker.go's real constructor is NewDockerDiscovery),
+		// with no indication the file: filter didn't match -- costing a
+		// misdirected read before the model caught its own mistake from
+		// the response's Location: line. A file can't have two
+		// non-method top-level decls sharing one Name (a Go compile
+		// error), so an exact source_file match is unambiguous when
+		// found -- try it before the module-scoped/blast-radius path.
+		if file != "" {
+			if defs, ferr := s.backend.FindDefinitionsByFile("", file, 0); ferr == nil {
+				for i := range defs {
+					// #352: a struct field is NOT a top-level Go
+					// declaration, so this shortcut's own "a file can't
+					// have two non-method top-level decls sharing one
+					// Name" invariant doesn't cover it -- a field can
+					// (and commonly does, via Go's own "Foo *Foo"
+					// self-referencing field idiom) share its bare Name
+					// with an unrelated top-level def in the same file.
+					// Skip fields here so a receiverless lookup falls
+					// through to GetDefinitionByName, which excludes
+					// them for the same reason.
+					if defs[i].Kind == "field" {
+						continue
+					}
+					if defs[i].Name == name && defs[i].SourceFile == file {
+						return &defs[i], nil
+					}
+				}
+			}
+		}
 		d, err := s.backend.GetDefinitionByName(name, modulePath)
 		if err == nil && d != nil {
 			return d, nil
@@ -10480,14 +10785,32 @@ func (s *server) resolveDottedQualifiedName(backend store.Backend, name string) 
 		// FilterDefinitions is metadata-only (its query hardcodes an
 		// empty body column) -- fetch the full definition by ID once it
 		// has located the right one.
-		matches, merr := backend.FilterDefinitions(bare, "", f, 1)
+		//
+		// #352-class: kind:"" means no kind filter, so a struct field
+		// can match "bare" exactly as readily as a top-level type/func --
+		// Go's own "Foo *Foo" self-referencing field idiom means a field
+		// commonly shares its bare Name with an unrelated type. Fetch a
+		// few candidates instead of limit:1 and skip fields, matching
+		// GetDefinitionByName's exclusion for the same bare-name,
+		// no-receiver case.
+		matches, merr := backend.FilterDefinitions(bare, "", f, 5)
 		if merr != nil || len(matches) == 0 {
 			continue
 		}
-		if full, gerr := backend.GetDefinition(matches[0].ID); gerr == nil && full != nil {
+		var picked *store.Definition
+		for i := range matches {
+			if matches[i].Kind != "field" {
+				picked = &matches[i]
+				break
+			}
+		}
+		if picked == nil {
+			continue
+		}
+		if full, gerr := backend.GetDefinition(picked.ID); gerr == nil && full != nil {
 			return full, nil
 		}
-		return &matches[0], nil
+		return picked, nil
 	}
 	return nil, nil
 }
@@ -10633,7 +10956,21 @@ func (s *server) resolveWriteTarget(name, receiver, module, file string) (*store
 }
 
 func (s *server) ambiguityNote(name, receiver, module, file string) string {
-	if receiver != "" || module != "" || file != "" || strings.TrimSpace(name) == "" {
+	// #339: file was deliberately dropped from this guard. It reads like
+	// a reliable disambiguator alongside receiver/module, but
+	// findModuleByFile only resolves a file to a MODULE scope, and its
+	// suffix-matching logic only succeeds for nested-module layouts --
+	// for the common case of a file living in a subdirectory of a single
+	// flat root module (module path "github.com/x/y", file
+	// "pkg/sub/foo.go"), it returns nil and the lookup falls through
+	// completely unscoped. A real trajectory (prometheus-19236) passed
+	// file: expecting it to disambiguate, silently got back the one
+	// definition sharing that name anywhere in the project (from a
+	// totally different file), and had no note telling it file: hadn't
+	// actually narrowed anything down. module still reliably
+	// disambiguates (an exact module-path match is a real store-level
+	// filter, not a heuristic), so it stays in the guard.
+	if receiver != "" || module != "" || strings.TrimSpace(name) == "" {
 		return ""
 	}
 	// #287: a caller can embed the receiver directly in name using Go's
@@ -10859,12 +11196,47 @@ func suggestClosestFragmentHint(body, old string) string {
 // runBuildIn runs `go build` against targets with dir as the working
 // directory, returning combined output and the command's error (nil
 // on a clean build).
+//
+// Retries once with -o pointed at a scratch directory if the plain
+// build fails because a target's own package name collides with go
+// build's default output path. Confirmed live (etcd-io/etcd-15760,
+// 2026-08-23): a scoped build target that resolves to a single main
+// package directory (buildTargetsForFiles produces "./etcdutl" for a
+// file touched in etcdutl/) makes `go build` write an executable
+// named after that package into dir (the project root) by default --
+// which collides with the etcdutl/ directory ITSELF, since the built
+// package's own name matches a top-level directory in the repo.
+// Result: "go: build output \"etcdutl\" already exists and is a
+// directory", reported to the caller as a false BUILD FAILED even
+// though the edit compiles fine. Any repo with main packages as
+// top-level subdirectories (routine for multi-command CLI tools) can
+// hit this on any edit whose build scope narrows to just that
+// directory.
+//
+// The -o retry is NOT applied unconditionally: forcing directory-mode
+// -o (an existing directory as -o's value) requires at least one
+// target to be a main package, or go build fails with "go: no main
+// packages to build" -- which is exactly what happened building this
+// project's own overwhelmingly-more-common case of ordinary
+// (non-main) library packages when this fix's first version applied
+// -o to every call (caught by TestWriteSafetyConformance). Retrying
+// only on the specific collision error keeps the plain, unscoped
+// build as the default and only pays the scratch-dir cost on the
+// rare path that actually needs it -- and by construction, hitting
+// that exact error already proves at least one target IS a main
+// package, so the retry's directory-mode -o is always valid when it
+// fires.
 func (s *server) runBuildIn(ctx context.Context, dir string, targets []string) (string, error) {
-	args := append([]string{"build"}, targets...)
-	cmd := exec.CommandContext(ctx, "go", args...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	out, err := runGoBuildArgs(ctx, dir, targets, "")
+	if err == nil || !strings.Contains(out, "already exists and is a directory") {
+		return out, err
+	}
+	tmpOut, mkErr := os.MkdirTemp("", "defn-build-out-*")
+	if mkErr != nil {
+		return out, err
+	}
+	defer os.RemoveAll(tmpOut)
+	return runGoBuildArgs(ctx, dir, targets, tmpOut+string(os.PathSeparator))
 }
 
 // runScopedBuild runs `go build` scoped to touchedFiles (repo-relative
@@ -11118,6 +11490,7 @@ func (s *server) handleFieldRename(d *store.Definition, args renameParam) (*sdkm
 	buildResult := s.commitOrRollbackOnBuild(tx, commit, rollback, emit.Opts{
 		GoimportsFiles: goimportsFiles,
 		TouchedFiles:   goimportsFiles,
+		IntendedNames:  []string{emit.FuncIdentity(parentType.Name, parentType.Receiver)},
 	})
 
 	var sb strings.Builder
@@ -11454,6 +11827,7 @@ func (s *server) handleDeleteFile(_ context.Context, _ *sdkmcp.CallToolRequest, 
 		AllowedRemovals: qualified,
 		GoimportsFiles:  []string{args.File},
 		TouchedFiles:    []string{args.File},
+		IntendedNames:   qualified,
 	}
 	var buildResult string
 	if args.Force {
@@ -12011,6 +12385,9 @@ func mcpDebugf(format string, args ...any) {
 // the diagnosis can't drift between them the way earlier apply-vs-
 // singleton divergences did this session.
 func inferFailureHint(body string) string {
+	if hint := doubleEscapedHint(body); hint != "" {
+		return hint
+	}
 	trial := "package x\nvar (\n" + body + "\n)\n"
 	if _, err := parser.ParseFile(token.NewFileSet(), "", trial, parser.ParseComments); err == nil {
 		return "this body looks like an entry inside an existing var/const block, valid only there, not as its own declaration. Prefix it with \"var \" or \"const \" to create it standalone, or read the existing block and use replace-hunk/edit to add this line inside it directly"
@@ -12053,3 +12430,124 @@ func (s *server) countTestsInDir(dir string) (int, error) {
 	}
 	return total, nil
 }
+
+// doubleEscapedHint detects a body whose whitespace arrived as the
+// literal two-character sequences \n/\t instead of real newline/tab
+// control characters -- a real prometheus-19017 trajectory: a JSON
+// tool-call argument got escaped TWICE (a backslash-n in the JSON
+// source decodes to a literal backslash-plus-n PAIR in the resulting
+// string value, not an actual newline byte), so the body's
+// declaration line and everything after it collapsed onto one
+// physical line. That's worse than an outright parse failure when the
+// body starts with a `//` doc comment: Go's line-comment rule (a `//`
+// comment runs to the next REAL newline) silently swallows the entire
+// func/type/const/var text into the comment itself, so handleCreate's
+// isImportsOnlyBody check sees a "valid, comment-only" body and
+// reports a successful scaffold -- a file written with ZERO of the
+// intended content, not an error at all. Confirmed burning 3
+// failed-or-silently-wrong create attempts in that trajectory before a
+// 4th call with real newlines finally landed the test. Threshold: a
+// handful of literal \n with few or no real newlines is a strong
+// signal; legitimate Go source essentially never has a declaration
+// spanning many \n-containing string literals while itself staying on
+// one physical line.
+func doubleEscapedHint(body string) string {
+	literalNewlines := strings.Count(body, "\\n")
+	realNewlines := strings.Count(body, "\n")
+	if literalNewlines >= 3 && realNewlines < literalNewlines/2 {
+		return fmt.Sprintf("body appears to contain literal \\n escape sequences (found %d) instead of real newline characters (found %d) -- this usually means the argument was JSON-escaped twice; pass actual newline/tab characters, not the two-character \\n/\\t sequences", literalNewlines, realNewlines)
+	}
+	return ""
+}
+
+// readFullBodyHardCap is the byte size above which even an explicit
+// full:true/mode:"body" read gets truncated with a query-adaptive-read
+// pointer, rather than returned whole. Distinct from and much larger
+// than readAutoOutlineThreshold (1500) -- that threshold governs the
+// routine "is this large enough to default to outline" decision, and
+// its own note deliberately does NOT mention query:/full:true escape
+// hatches (a prior chi bench found the model reflexively retries them
+// when they read like a menu, defeating the downgrade's purpose even
+// on defs that didn't need it). This cap fires only when the model has
+// ALREADY asked for the full body and gotten one so large it would
+// overflow the CALLING CLIENT's own oversized-tool-result handling --
+// a real prometheus-18712 trajectory hit exactly this: a 1262-line,
+// ~51KB main() read via full:true got silently redirected by Claude
+// Code's own CLI to a persisted-output file on disk (defn has no
+// visibility into or control over that redirect), and the model then
+// burned ~15 calls blindly grepping that file for the ~20 lines it
+// actually needed. Truncating here, on defn's own terms, at a size
+// chosen from real data -- comfortably above a 20KB body that DID
+// read fine via full:true in another real trajectory, comfortably
+// below the ~51KB body that didn't -- guarantees defn's own actionable
+// truncation note wins the race instead of an opaque client-side
+// punt, and only asks the model to switch to query: exactly when it's
+// the correct next move, not as a routine suggestion.
+const readFullBodyHardCap = 30000
+
+// runGoBuildArgs runs `go build [-o outDir] targets...` with dir as the
+// working directory. outDir == "" omits -o entirely (plain build).
+func runGoBuildArgs(ctx context.Context, dir string, targets []string, outDir string) (string, error) {
+	args := []string{"build"}
+	if outDir != "" {
+		args = append(args, "-o", outDir)
+	}
+	args = append(args, targets...)
+	cmd := exec.CommandContext(ctx, "go", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// hardFailureMarkers are substrings that, if present anywhere in a
+// commitOrRollbackOn result, prove disk was NOT safely updated for
+// everything requested -- these always force a rollback regardless of
+// Opts.IntendedNames, no exceptions.
+var hardFailureMarkers = []string{
+	"BUILD FAILED",
+	"BUILD TIMED OUT",
+	"emit error:",
+	"commit error:",
+	"skipped writing —",
+}
+
+// parseUnmatchedOnlyIdentities returns the def identities named across
+// every writeFile "could not be matched" warning in result, and
+// whether result consists ENTIRELY of this warning shape (true) or
+// contains anything else -- a hard failure marker, or unrecognized
+// content -- that must always roll back (false). #350.
+func parseUnmatchedOnlyIdentities(result string) (identities []string, pure bool) {
+	if result == "" {
+		return nil, false
+	}
+	for _, m := range hardFailureMarkers {
+		if strings.Contains(result, m) {
+			return nil, false
+		}
+	}
+	rest := result
+	found := false
+	for {
+		idx := strings.Index(rest, unmatchedOnlyWarningMarker)
+		if idx < 0 {
+			break
+		}
+		found = true
+		rest = rest[idx+len(unmatchedOnlyWarningMarker):]
+		end := strings.IndexByte(rest, ']')
+		if end < 0 {
+			return nil, false
+		}
+		identities = append(identities, strings.Fields(rest[:end])...)
+		rest = rest[end+1:]
+	}
+	return identities, found
+}
+
+// unmatchedOnlyWarningMarker is writeFile's exact phrase for the case
+// where the AST-merge succeeded and disk WAS updated for every
+// definition that matched -- only some OTHER, unrelated definition's
+// stale DB row couldn't also be spliced in. Distinct from writeFile's
+// other failure shape ("skipped writing — would remove"), where the
+// write was refused entirely and disk was NOT touched.
+const unmatchedOnlyWarningMarker = "could not be matched to an on-disk declaration and were NOT written: ["

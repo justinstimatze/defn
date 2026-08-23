@@ -741,3 +741,69 @@ func TestSetDefSummaryMinHash_PreservesOneLineAndModel(t *testing.T) {
 		t.Errorf("minhash not stored correctly: got %v", all[defID])
 	}
 }
+
+// TestGetDefinitionByName_ExcludesStructFieldsFromBareNameLookup is a
+// regression for a real bench trajectory (caddyserver/caddy-7870,
+// 2026-08-23): Go's own "Foo *Foo" self-referencing field idiom (e.g. a
+// health-check config's "Upstream *Upstream" field) means a struct
+// field can share its bare Name with a completely unrelated top-level
+// type. The blast-radius tiebreak (ORDER BY non-test caller ref count
+// DESC) had no kind awareness, so a field with more callers than the
+// actual type silently won -- an agent trying to read/edit the type
+// got the field back instead, with no indication anything was
+// ambiguous. A bare, receiverless lookup must never resolve to a
+// field; fields are only reachable via GetDefinitionByNameAndReceiver.
+func TestGetDefinitionByName_ExcludesStructFieldsFromBareNameLookup(t *testing.T) {
+	db, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	mod, err := db.EnsureModule("example.com/pkg", "pkg", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	typeID, err := db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "Upstream", Kind: "type", Exported: true,
+		Body: "type Upstream struct {\n\tDial string\n}", SourceFile: "hosts.go",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fieldID, err := db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "Upstream", Kind: "field", Receiver: "ActiveHealthChecks",
+		Body: "Upstream string `json:\"upstream,omitempty\"`", SourceFile: "hosts.go",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Give the FIELD strictly more non-test callers than the type has,
+	// so the pre-fix ref-count tiebreak would deterministically pick
+	// it -- proving the exclusion, not just a lucky tie-break order.
+	callerID, err := db.UpsertDefinition(&Definition{
+		ModuleID: mod.ID, Name: "Provision", Kind: "method", Receiver: "ActiveHealthChecks",
+		Body: "func (a *ActiveHealthChecks) Provision() {}", SourceFile: "healthchecks.go",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetManyReferences(map[int64][]Reference{
+		callerID: {{FromDef: callerID, ToDef: fieldID, Kind: "field-access"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	d, err := db.GetDefinitionByName("Upstream", "")
+	if err != nil {
+		t.Fatalf("GetDefinitionByName: %v", err)
+	}
+	if d.Kind == "field" {
+		t.Fatalf("GetDefinitionByName(%q) resolved a bare, receiverless lookup to struct field %s.%s (id=%d) instead of the top-level type (id=%d) -- fields must only be reachable via GetDefinitionByNameAndReceiver", "Upstream", d.Receiver, d.Name, d.ID, typeID)
+	}
+	if d.ID != typeID {
+		t.Fatalf("expected the top-level type (id=%d), got id=%d kind=%q", typeID, d.ID, d.Kind)
+	}
+}

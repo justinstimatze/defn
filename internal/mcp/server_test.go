@@ -14429,3 +14429,476 @@ func (b Bar) Insert(x int) int { return x + 1 }
 		t.Errorf(`expected the FYI suggestion to include receiver:"Foo" so a follow-up test call resolves to the just-edited method, not an unrelated same-named one, got: %s`, text)
 	}
 }
+
+// TestHandleCreate_DoubleEscapedBodyWithLeadingCommentDoesNotSilentlySucceedAsScaffold
+// reproduces the more dangerous shape from the same prometheus-19017
+// trajectory (messages 70/76): a leading doc comment used real
+// newlines, but everything after it -- including the func declaration
+// itself -- was double-escaped. Go's line-comment rule (a `//`
+// comment runs to the next REAL newline) silently swallowed the whole
+// func into the comment, so isImportsOnlyBody saw a "valid,
+// comment-only" body and the OLD behavior reported a successful
+// scaffold with none of the intended content ever written -- worse
+// than an outright error since it looked like progress. This must be
+// rejected instead.
+func TestHandleCreate_DoubleEscapedBodyWithLeadingCommentDoesNotSilentlySucceedAsScaffold(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	body := "// TestFoo checks something.\n// crashing the process.\\nfunc TestFoo(t *testing.T) {\\n\\tx := 1\\n\\t_ = x\\n}"
+
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		File: "extra_test.go",
+		Body: body,
+	})
+	text := resultText(t, result)
+
+	if strings.Contains(text, "Scaffolded") {
+		t.Fatalf("double-escaped body must not silently succeed as a comment-only scaffold, got: %s", text)
+	}
+	if !strings.Contains(text, "JSON-escaped twice") {
+		t.Errorf("expected a hint about double-escaped JSON, got: %s", text)
+	}
+}
+
+// TestHandleCreate_DoubleEscapedNewlinesRejectedWithHint is the
+// regression for a real prometheus-19017 trajectory: the model's
+// tool-call argument was JSON-escaped twice, so the body's control
+// characters arrived as the literal two-character sequences \n/\t
+// instead of real newline/tab bytes. inferFromBody can't find a name
+// in that (it's a syntax error outside a string literal), and the
+// generic "make sure it starts with func/type/const/var" message gave
+// no signal toward the real problem -- it took the model 4 attempts to
+// land real newlines. doubleEscapedHint should name the actual cause
+// on the first attempt.
+func TestHandleCreate_DoubleEscapedNewlinesRejectedWithHint(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	body := "func TestSomething(t *testing.T) {\\n\\tx := 1\\n\\t_ = x\\n}"
+
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body: body,
+	})
+	text := resultText(t, result)
+
+	if !strings.Contains(text, "JSON-escaped twice") {
+		t.Errorf("expected a hint about double-escaped JSON, got: %s", text)
+	}
+	if strings.Contains(text, "Created") {
+		t.Errorf("double-escaped body must not silently succeed, got: %s", text)
+	}
+}
+
+// TestHandleCreate_LegitimateEscapedNewlineInStringLiteralNotFlagged
+// guards doubleEscapedHint's false-positive boundary: a real, valid
+// one-liner containing an actual escaped-newline STRING LITERAL
+// (legitimate Go, not double-escaped JSON) must still create normally.
+func TestHandleCreate_LegitimateEscapedNewlineInStringLiteralNotFlagged(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body: "func NewSeparator() string { return \"a\\nb\" }",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Created") {
+		t.Errorf("expected legitimate body with one string-literal \\n escape to create normally, got: %s", text)
+	}
+}
+
+// TestResolveEditTarget_FileDisambiguatesSameNamedFunctionInOneModule is
+// issue #339: file was only ever used to derive a MODULE scope via
+// findModuleByFile, which frequently resolves to nothing for a plain
+// subdirectory of a single flat root module (findModuleByFile's suffix
+// matching only succeeds for nested-module layouts) -- so a
+// file-scoped lookup often falls through to GetDefinitionByName(name,
+// "") completely unscoped. Two same-named, zero-caller functions in
+// different files/packages of one module is a genuine tie for that
+// fallback's blast-radius query: it can satisfy a request for EITHER
+// file, but not both in the same run, since it returns one fixed
+// row regardless of which file was actually asked for. An exact
+// source_file match (this fix) is the only way to correctly satisfy
+// both directions.
+func TestResolveEditTarget_FileDisambiguatesSameNamedFunctionInOneModule(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	if err := os.MkdirAll(filepath.Join(projDir, "pkga"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(projDir, "pkgb"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "pkga", "a.go"), []byte(`package pkga
+
+func NewThing() string { return "a" }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "pkgb", "b.go"), []byte(`package pkgb
+
+func NewThing() string { return "b" }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	da, err := s.resolveEditTarget("NewThing", "", "", filepath.Join("pkga", "a.go"))
+	if err != nil {
+		t.Fatalf("resolveEditTarget(pkga/a.go): %v", err)
+	}
+	if da.SourceFile != filepath.Join("pkga", "a.go") {
+		t.Errorf("file:%q should resolve to pkga's NewThing, got source_file=%q", filepath.Join("pkga", "a.go"), da.SourceFile)
+	}
+
+	db2, err := s.resolveEditTarget("NewThing", "", "", filepath.Join("pkgb", "b.go"))
+	if err != nil {
+		t.Fatalf("resolveEditTarget(pkgb/b.go): %v", err)
+	}
+	if db2.SourceFile != filepath.Join("pkgb", "b.go") {
+		t.Errorf("file:%q should resolve to pkgb's NewThing, got source_file=%q", filepath.Join("pkgb", "b.go"), db2.SourceFile)
+	}
+}
+
+// TestHandleCode_AmbiguityNoteStillFiresWhenFileGivenButDoesNotDisambiguate
+// is issue #339: ambiguityNote used to bail out unconditionally whenever
+// file was non-empty, on the assumption that file: always narrows
+// resolution. But findModuleByFile only resolves file to a MODULE
+// scope, and its suffix-matching only succeeds for nested-module
+// layouts -- for a file in a subdirectory of one flat root module
+// (this fixture, and the real prometheus-19236 trajectory), it
+// resolves to nothing and the lookup falls through completely
+// unscoped. Passing file: should not silently suppress the warning
+// that a project-wide name collision exists.
+func TestHandleCode_AmbiguityNoteStillFiresWhenFileGivenButDoesNotDisambiguate(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "bft"), 0755)
+	os.MkdirAll(filepath.Join(projDir, "chess"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "bft", "engine.go"), []byte("package bft\n\ntype Engine struct{ Replica string }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "chess", "engine.go"), []byte(`package chess
+
+type Engine struct{ Protocol string }
+
+func NewEngine() *Engine { return &Engine{} }
+func UseA(e *Engine) string { return e.Protocol }
+func UseB(e *Engine) string { return e.Protocol }
+func UseC(e *Engine) string { return e.Protocol }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op: "outline", Name: "Engine", File: filepath.Join("bft", "engine.go"),
+	})
+	if err != nil {
+		t.Fatalf("handleCode outline: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "2 definitions share the name") {
+		t.Errorf("expected an ambiguity note even with file: set, got:\n%s", text)
+	}
+}
+
+// TestRunBuildIn_MainPackageDirNameDoesNotCollideWithOutput guards a real
+// bug (etcd-io/etcd-15760, 2026-08-23): building a single main-package
+// target like "./etcdutl" without an explicit -o makes `go build` write
+// an executable named "etcdutl" into the working directory by default --
+// colliding with the etcdutl/ directory itself when the repo has a
+// top-level directory of the same name (routine for CLI tools with
+// subcommand packages). That produced a false "BUILD FAILED: go: build
+// output \"etcdutl\" already exists and is a directory" even though the
+// edit compiled cleanly.
+func TestRunBuildIn_MainPackageDirNameDoesNotCollideWithOutput(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module example.com/x\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pkgDir := filepath.Join(tmpDir, "etcdutl")
+	if err := os.Mkdir(pkgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mainSrc := "package main\n\nfunc main() {}\n"
+	if err := os.WriteFile(filepath.Join(pkgDir, "main.go"), []byte(mainSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &server{}
+	out, err := s.runBuildIn(context.Background(), tmpDir, []string{"./etcdutl"})
+	if err != nil {
+		t.Fatalf("runBuildIn failed on a package dir name that collides with go build's default output path: %s", out)
+	}
+
+	if _, err := os.Stat(pkgDir); err != nil {
+		t.Fatalf("etcdutl/ directory was disturbed by the build: %v", err)
+	}
+	if info, err := os.Stat(pkgDir); err == nil && !info.IsDir() {
+		t.Fatalf("etcdutl was overwritten by the build output, no longer a directory")
+	}
+}
+
+// TestHandleEdit_UnrelatedStaleDefDoesNotBlockUnrelatedEdit guards the
+// #350 fix: a writeFile "could not be matched to an on-disk
+// declaration" warning about some OTHER, unrelated definition in the
+// same file must not roll back an edit that itself landed cleanly.
+// Real trajectory (caddyserver/caddy-6179/7870, 2026-08-23): a single
+// permanently-stale def (a duplicate ingested "init" method) blocked 5
+// different edit/create/apply attempts targeting unrelated definitions
+// in the same file, none of which the warning was ever actually about.
+func TestHandleEdit_UnrelatedStaleDefDoesNotBlockUnrelatedEdit(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+
+	greet, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert a definition that will never match anything on disk --
+	// simulating the permanently-stale def class of bug without needing
+	// to reproduce its ingest-level root cause. Sharing Greet's
+	// SourceFile means any write to that file re-triggers writeFile's
+	// "could not be matched" warning for this def, every time,
+	// regardless of what's actually being edited.
+	if _, err := db.UpsertDefinition(&store.Definition{
+		ModuleID:   greet.ModuleID,
+		Name:       "GhostMethod",
+		Kind:       "method",
+		Receiver:   "*Ghost",
+		Body:       "func (g *Ghost) GhostMethod() {}",
+		SourceFile: greet.SourceFile,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleEdit(context.Background(), nil, editParam{
+		Name:    "Greet",
+		NewBody: "func Greet(name string) string {\n\treturn \"Hi, \" + name\n}",
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "rolled back") {
+		t.Fatalf("Greet's own edit should not roll back due to an unrelated stale def (GhostMethod), got: %s", text)
+	}
+	if !strings.Contains(text, "Updated") {
+		t.Errorf("expected a success message, got: %s", text)
+	}
+
+	onDisk, err := os.ReadFile(filepath.Join(projDir, greet.SourceFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(onDisk), `"Hi, " + name`) {
+		t.Errorf("Greet's edit was not actually written to disk despite a non-rollback response:\n%s", onDisk)
+	}
+}
+
+// TestResolveEditTarget_FileScopedLookupSkipsStructFieldSharingTypeName
+// is a regression for a real bench trajectory (caddyserver/caddy-7870,
+// 2026-08-23): reverseproxy/hosts.go declares
+// "type ActiveHealthChecks struct { Upstream *Upstream }" before
+// "type Upstream struct {...}" -- Go's own self-referencing field
+// idiom. resolveEditTarget's #339 "exact file match is unambiguous"
+// shortcut assumed a file can't have two non-method top-level decls
+// sharing a Name, which is true, but doesn't account for FIELDS (not
+// top-level decls) sharing a Name with an unrelated top-level type --
+// it took the FIRST name+file match by source line, which was the
+// earlier-declared field, and returned it silently. The live agent
+// then spent ~20 tool calls trying to edit what it believed was the
+// type, always refused as "doesn't support struct fields," never
+// realizing the type itself was never actually targeted.
+func TestResolveEditTarget_FileScopedLookupSkipsStructFieldSharingTypeName(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "fieldproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module fieldproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "hosts.go"), []byte(`package fieldproj
+
+type ActiveHealthChecks struct {
+	Upstream *Upstream
+}
+
+type Upstream struct {
+	Dial string
+}
+
+func (a *ActiveHealthChecks) Target() string {
+	return a.Upstream.Dial
+}
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	d, err := s.resolveEditTarget("Upstream", "", "", "hosts.go")
+	if err != nil {
+		t.Fatalf("resolveEditTarget: %v", err)
+	}
+	if d.Kind == "field" {
+		t.Fatalf("resolveEditTarget(name:\"Upstream\", file:\"hosts.go\") resolved to struct field %s.%s instead of the top-level type -- file: scoping made an ambiguous bare name WORSE, not better, since it bypassed the (already kind-aware) fallback path entirely", d.Receiver, d.Name)
+	}
+	if d.Kind != "type" {
+		t.Fatalf("expected the top-level type, got kind=%q", d.Kind)
+	}
+}
+
+// TestResolveWriteTarget_FieldSharingTypeNameNoLongerFalselyAmbiguous
+// is a #352 followup: GetDefinitionByName now excludes struct fields
+// from bare-name lookups, so a receiverless write to a type sharing
+// its name with an unrelated field resolves deterministically. But
+// CountDefinitionsByName (which resolveWriteTarget's ambiguity refusal
+// uses) was never updated to match -- it still counts the field, so
+// the exact same bare name GetDefinitionByName now resolves cleanly
+// gets refused as "ambiguous" anyway, immediately after resolving it
+// correctly. A receiverless write to a type must not be refused just
+// because an unrelated struct field happens to share its name.
+func TestResolveWriteTarget_FieldSharingTypeNameNoLongerFalselyAmbiguous(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "fieldproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module fieldproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "hosts.go"), []byte(`package fieldproj
+
+type ActiveHealthChecks struct {
+	Upstream *Upstream
+}
+
+type Upstream struct {
+	Dial string
+}
+
+func (a *ActiveHealthChecks) Target() string {
+	return a.Upstream.Dial
+}
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	d, err := s.resolveWriteTarget("Upstream", "", "", "")
+	if err != nil {
+		t.Fatalf("resolveWriteTarget(\"Upstream\") with no receiver/module/file: %v (should have resolved deterministically to the type, since GetDefinitionByName now excludes the field)", err)
+	}
+	if d.Kind != "type" {
+		t.Fatalf("expected the top-level type, got kind=%q", d.Kind)
+	}
+}
+
+// TestResolveDottedQualifiedName_SkipsStructFieldSharingTypeName is a
+// third #352-class site: resolveDottedQualifiedName resolves Go's own
+// "pkg.Symbol" convention (e.g. "hosts.Upstream") via
+// FilterDefinitions(bare, kind:"", file, limit:1) -- kind:"" means no
+// kind filter, and limit:1 takes whatever ORDER BY d.name (a no-op
+// tiebreak among same-named rows) returns first. The same
+// "Foo *Upstream" self-referencing field idiom that broke
+// resolveEditTarget and GetDefinitionByName can make this path return
+// a struct field instead of the top-level type too.
+func TestResolveDottedQualifiedName_SkipsStructFieldSharingTypeName(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "fieldproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module fieldproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "hosts.go"), []byte(`package fieldproj
+
+type ActiveHealthChecks struct {
+	Upstream *Upstream
+}
+
+type Upstream struct {
+	Dial string
+}
+
+func (a *ActiveHealthChecks) Target() string {
+	return a.Upstream.Dial
+}
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	d, err := s.resolveDottedQualifiedName(db, "hosts.Upstream")
+	if err != nil {
+		t.Fatalf("resolveDottedQualifiedName: %v", err)
+	}
+	if d == nil {
+		t.Fatal("expected a match, got nil")
+	}
+	if d.Kind == "field" {
+		t.Fatalf("resolveDottedQualifiedName(\"hosts.Upstream\") resolved to struct field %s.%s instead of the top-level type", d.Receiver, d.Name)
+	}
+	if d.Kind != "type" {
+		t.Fatalf("expected the top-level type, got kind=%q", d.Kind)
+	}
+}

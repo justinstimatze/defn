@@ -402,6 +402,22 @@ func (s *SQLiteDB) GetDefinition(id int64) (*Definition, error) {
 
 // GetDefinitionByName mirrors *DB.GetDefinitionByName: file:line syntax,
 // receiver.method parsing, module-fuzzy match, blast-radius tiebreak.
+//
+// Struct fields are excluded from every name-only match below (#352).
+// A field's bare Name commonly collides with an unrelated top-level
+// def -- Go's own "Foo *Foo" self-referencing field idiom (e.g. a
+// health-check config's "Upstream *Upstream" field) means a field can
+// share its exact Name with the type it points at, in the same file.
+// Confirmed live (caddyserver/caddy-7870): a bare, receiverless lookup
+// for the type "Upstream" resolved to a field named "Upstream" on an
+// unrelated struct instead, because the field had more callers and
+// this tiebreak had no kind awareness -- the agent then spent ~20 tool
+// calls trying to edit what it believed was the type, always refused
+// as "doesn't support struct fields," never realizing the type itself
+// was never actually targeted. Fields are only meaningfully addressed
+// via their parent type anyway, through GetDefinitionByNameAndReceiver
+// (unaffected by this exclusion) -- that path already backs every
+// legitimate field operation (see handleFieldRename).
 func (s *SQLiteDB) GetDefinitionByName(name, modulePath string) (*Definition, error) {
 	if strings.Contains(name, ".") && !strings.Contains(name, "/") {
 		dotIdx := strings.LastIndex(name, ".")
@@ -459,12 +475,12 @@ func (s *SQLiteDB) GetDefinitionByName(name, modulePath string) (*Definition, er
 	          LEFT JOIN bodies b ON b.def_id = d.id`
 
 	if modulePath != "" {
-		query := baseQuery + " JOIN modules m ON d.module_id = m.id WHERE d.name = ? AND m.path = ?"
+		query := baseQuery + " JOIN modules m ON d.module_id = m.id WHERE d.name = ? AND d.kind != 'field' AND m.path = ?"
 		d := &Definition{}
 		if err := scanSQLiteDef(s.db.QueryRowContext(s.Ctx(), query, name, modulePath), d); err == nil {
 			return d, nil
 		}
-		query = baseQuery + " JOIN modules m ON d.module_id = m.id WHERE d.name = ? AND m.path LIKE ?" +
+		query = baseQuery + " JOIN modules m ON d.module_id = m.id WHERE d.name = ? AND d.kind != 'field' AND m.path LIKE ?" +
 			` ORDER BY (SELECT COUNT(*) FROM refs r WHERE r.to_def = d.id) DESC LIMIT 1`
 		d = &Definition{}
 		if err := scanSQLiteDef(s.db.QueryRowContext(s.Ctx(), query, name, "%"+modulePath+"%"), d); err == nil {
@@ -472,7 +488,7 @@ func (s *SQLiteDB) GetDefinitionByName(name, modulePath string) (*Definition, er
 		}
 	}
 
-	query := baseQuery + " WHERE d.name = ?" +
+	query := baseQuery + " WHERE d.name = ? AND d.kind != 'field'" +
 		` ORDER BY (SELECT COUNT(*) FROM refs r
 		  JOIN definitions caller ON caller.id = r.from_def AND caller.test = 0
 		  WHERE r.to_def = d.id) DESC LIMIT 1`
@@ -2687,10 +2703,15 @@ func (s *SQLiteDB) SetExplainCache(cacheKey, question, scope, answer, model stri
 }
 
 // CountDefinitionsByName returns how many definitions share name,
-// regardless of module/package.
+// regardless of module/package. Excludes struct fields (#352 followup)
+// to stay consistent with GetDefinitionByName, which already excludes
+// them from bare-name resolution -- without this, a receiverless write
+// to a type sharing its name with an unrelated field would resolve
+// cleanly via GetDefinitionByName and then get refused as "ambiguous"
+// anyway by this count, right after resolving it correctly.
 func (s *SQLiteDB) CountDefinitionsByName(name string) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(s.Ctx(), "SELECT COUNT(*) FROM definitions WHERE name = ?", name).Scan(&n)
+	err := s.db.QueryRowContext(s.Ctx(), "SELECT COUNT(*) FROM definitions WHERE name = ? AND kind != 'field'", name).Scan(&n)
 	if err != nil {
 		return 0, err
 	}

@@ -265,7 +265,7 @@ func cmdIngest(modulePath string, reindex bool) {
 		return
 	}
 
-	announceStaleIngest(db, modulePath)
+	announceStaleIngest(db, modulePath, dbPath)
 	fmt.Fprintf(os.Stderr, "ingesting %s...\n", modulePath)
 	logMem("before packages.Load")
 	timing := os.Getenv("DEFN_SYNC_TIMING") == "1"
@@ -1051,7 +1051,6 @@ func cmdServe(httpAddr string) {
 			port = 9420 + (port-9420)%580
 		}
 		addr := fmt.Sprintf("127.0.0.1:%d", port)
-		sseURL := fmt.Sprintf("http://%s/sse", addr)
 
 		if !isDefnListening(addr) {
 			// Free — claim it as the shared backend for this project.
@@ -1075,7 +1074,7 @@ func cmdServe(httpAddr string) {
 		gotIdentity := defnIdentityAt(addr)
 		if gotIdentity == wantIdentity {
 			fmt.Fprintf(os.Stderr, "defn: proxying to shared server on %s\n", addr)
-			if err := mcpserver.RunProxy(ctx, sseURL); err != nil {
+			if err := mcpserver.RunProxy(ctx, dbPath, projDir, addr); err != nil {
 				fatal(err)
 			}
 			return
@@ -1387,13 +1386,14 @@ func fetchVersion(addr string) string {
 }
 
 func cmdQuery(sql string) {
-	db, err := store.OpenBackend(getDBPath())
+	dbPath := getDBPath()
+	db, err := store.OpenBackend(dbPath)
 	if err != nil {
 		fatal(err)
 	}
 	defer db.Close()
 
-	warnIfStale(db, ".")
+	warnIfStale(db, ".", dbPath)
 
 	results, err := db.Query(sql)
 	if err != nil {
@@ -1405,19 +1405,32 @@ func cmdQuery(sql string) {
 	enc.Encode(results)
 }
 
-// lastIngestUnix returns the recorded last-ingest timestamp, or 0 when
-// the DB predates the meta (very old DBs) or has never been ingested.
-func lastIngestUnix(db store.Backend) int64 {
+// lastIngestUnix returns the freshness threshold to compare .go file
+// mtimes against. #332-class fix: derived from defn.db's (or its -wal/
+// -shm sidecars') own on-disk mtime, not the wall-clock number stored
+// in the last_ingest meta row -- a restored/cache-copied DB carries a
+// meta value from whenever the original ingest ran, unrelated to when
+// this copy actually landed on disk, so every file compared against it
+// reads as falsely stale. Returns 0 when the DB predates the meta (very
+// old DBs), has never been ingested, or the DB files aren't found.
+func lastIngestUnix(db store.Backend, dbPath string) int64 {
 	s, err := db.GetMeta("last_ingest")
 	if err != nil || s == "" {
 		return 0
 	}
-	t, err := strconv.ParseInt(s, 10, 64)
-	if err != nil {
+	if _, err := strconv.ParseInt(s, 10, 64); err != nil {
 		fmt.Fprintf(os.Stderr, "defn: warning: corrupted last_ingest meta %q: %v (run 'defn ingest .' to repair)\n", s, err)
 		return 0
 	}
-	return t
+	var latest int64
+	for _, name := range []string{"defn.db", "defn.db-wal", "defn.db-shm"} {
+		if info, err := os.Stat(filepath.Join(dbPath, name)); err == nil {
+			if t := info.ModTime().Unix(); t > latest {
+				latest = t
+			}
+		}
+	}
+	return latest
 }
 
 // walkGoFiles enumerates .go files under projectDir, returning the full
@@ -1485,11 +1498,12 @@ func walkGoFiles(projectDir string, since int64) (all []string, stale []string) 
 }
 
 // countStaleFiles reports how many .go files under projectDir have
-// been modified since the last ingest. Returns (0, "") when the DB
-// has no last_ingest meta (older DBs) or nothing is stale. sample is
-// the first stale path encountered, for user-facing messages.
-func countStaleFiles(db store.Backend, projectDir string) (count int, sample string) {
-	since := lastIngestUnix(db)
+// been modified since the last ingest (see lastIngestUnix). Returns
+// (0, "") when the DB has no last_ingest meta (older DBs) or nothing
+// is stale. sample is the first stale path encountered, for user-facing
+// messages.
+func countStaleFiles(db store.Backend, projectDir, dbPath string) (count int, sample string) {
+	since := lastIngestUnix(db, dbPath)
 	if since == 0 {
 		return 0, ""
 	}
@@ -1588,7 +1602,7 @@ func tryIncrementalIngest(db store.Backend, projectDir, dbPath string) bool {
 // Disqualifies the fast path on: no last_ingest meta (first ingest), or
 // total churn (stale + added + deleted) above incrementalIngestThreshold.
 func incrementalPreflight(db store.Backend, projectDir, dbPath string) (stale, added []string, deleted []string, ok bool) {
-	since := lastIngestUnix(db)
+	since := lastIngestUnix(db, dbPath)
 	if since == 0 {
 		return nil, nil, nil, false // first ingest, or pre-meta DB
 	}
@@ -1821,11 +1835,11 @@ func maybeCompactAfterIncremental(db store.Backend, dbPath string) {
 }
 
 // warnIfStale prints a stderr notice when the working tree has .go
-// files newer than the last ingest — signaling that read ops (query,
+// files newer than the last ingest -- signaling that read ops (query,
 // status) may return stale results. Silent when up to date or when
 // the DB predates last_ingest.
-func warnIfStale(db store.Backend, projectDir string) {
-	count, sample := countStaleFiles(db, projectDir)
+func warnIfStale(db store.Backend, projectDir, dbPath string) {
+	count, sample := countStaleFiles(db, projectDir, dbPath)
 	if count == 0 {
 		return
 	}
@@ -1838,10 +1852,10 @@ func warnIfStale(db store.Backend, projectDir string) {
 
 // announceStaleIngest prints a one-line notice of pending stale files
 // on entry to ingest/sync so the user sees staleness was detected and
-// is being resolved by the current operation — closing the loop that
+// is being resolved by the current operation -- closing the loop that
 // `warnIfStale` opens on read paths.
-func announceStaleIngest(db store.Backend, projectDir string) {
-	count, sample := countStaleFiles(db, projectDir)
+func announceStaleIngest(db store.Backend, projectDir, dbPath string) {
+	count, sample := countStaleFiles(db, projectDir, dbPath)
 	if count == 0 {
 		return
 	}
@@ -2045,7 +2059,7 @@ func collectStatus(dbPath string) statusReport {
 		Modules: len(mods), Definitions: len(defs),
 	}
 
-	count, sample := countStaleFiles(db, ".")
+	count, sample := countStaleFiles(db, ".", dbPath)
 	r.Freshness = &freshnessInfo{
 		UpToDate:   count == 0,
 		StaleCount: count,

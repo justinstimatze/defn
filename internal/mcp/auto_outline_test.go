@@ -162,3 +162,110 @@ func TestHandleGetDefinition_LineRangeNarrowsBody(t *testing.T) {
 		t.Errorf("':' separator form should behave identically; got: %s", text2)
 	}
 }
+
+// TestHandleGetDefinition_FullReadTruncatesBodyOverHardCap is the
+// regression for #334: a real prometheus-18712 trajectory read a
+// 1262-line/~51KB main() via full:true and the response overflowed
+// Claude Code CLI's own oversized-tool-result handling, silently
+// redirecting to a persisted-output file the model then had to
+// blindly grep ~15 times to find the ~20 lines it actually needed.
+// An explicit full:true/mode:"body" request for a body over
+// readFullBodyHardCap must now be truncated on defn's own terms, with
+// a note naming the real size and pointing at query-adaptive read.
+func TestHandleGetDefinition_FullReadTruncatesBodyOverHardCap(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := &server{backend: db}
+
+	mod, _ := db.EnsureModule("example.com/svc", "svc", "")
+	var b strings.Builder
+	b.WriteString("func Enormous() {\n")
+	for i := 0; i < 800; i++ {
+		fmt.Fprintf(&b, "\tfmt.Println(\"line %04d padding padding padding padding\")\n", i)
+	}
+	b.WriteString("}\n")
+	body := b.String()
+	if len(body) <= readFullBodyHardCap {
+		t.Fatalf("fixture body (%d bytes) must exceed readFullBodyHardCap (%d) for this test to be meaningful", len(body), readFullBodyHardCap)
+	}
+
+	d := &store.Definition{
+		ModuleID: mod.ID, Name: "Enormous", Kind: "function",
+		Body: body, Signature: "func Enormous()",
+	}
+	d.Hash = store.HashBody(d.Body)
+	if _, err := db.UpsertDefinition(d); err != nil {
+		t.Fatal(err)
+	}
+
+	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Enormous", Full: true})
+	text := resultText(t, result)
+
+	if len(text) >= len(body) {
+		t.Errorf("expected a truncated response smaller than the original %d-byte body, got %d bytes total", len(body), len(text))
+	}
+	if !strings.Contains(text, "body truncated") {
+		t.Errorf("expected a truncation note, got: %.500s...", text)
+	}
+	if !strings.Contains(text, "query:") {
+		t.Errorf("expected the truncation note to point at query-adaptive read, got: %.500s...", text)
+	}
+	if !strings.Contains(text, "line 0000") {
+		t.Errorf("expected the START of the body to still be present (truncation keeps the head), got: %.300s...", text)
+	}
+	if strings.Contains(text, "line 0799") {
+		t.Errorf("expected the END of the body to be truncated away, but found the last line")
+	}
+}
+
+// TestHandleGetDefinition_QueryFilterOnHugeBodyAvoidsTruncation
+// confirms the #334 hard-cap check runs AFTER query filtering: when a
+// query narrows a huge body down to just the matching statements, the
+// result should be small enough to skip the truncation note entirely
+// -- query-adaptive read is the intended way out of the cap, not
+// something it should fight with.
+func TestHandleGetDefinition_QueryFilterOnHugeBodyAvoidsTruncation(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := &server{backend: db}
+
+	mod, _ := db.EnsureModule("example.com/svc", "svc", "")
+	var b strings.Builder
+	b.WriteString("func Enormous() {\n")
+	for i := 0; i < 800; i++ {
+		fmt.Fprintf(&b, "\tfmt.Println(\"line %04d padding padding padding padding\")\n", i)
+	}
+	b.WriteString("\tfmt.Println(\"the needle statement\")\n")
+	b.WriteString("}\n")
+	body := b.String()
+	if len(body) <= readFullBodyHardCap {
+		t.Fatalf("fixture body (%d bytes) must exceed readFullBodyHardCap (%d)", len(body), readFullBodyHardCap)
+	}
+
+	d := &store.Definition{
+		ModuleID: mod.ID, Name: "Enormous", Kind: "function",
+		Body: body, Signature: "func Enormous()",
+	}
+	d.Hash = store.HashBody(d.Body)
+	if _, err := db.UpsertDefinition(d); err != nil {
+		t.Fatal(err)
+	}
+
+	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "Enormous", Query: "needle"})
+	text := resultText(t, result)
+
+	if strings.Contains(text, "body truncated") {
+		t.Errorf("query filtering should have shrunk the body below the hard cap, no truncation note expected, got: %.300s...", text)
+	}
+	if !strings.Contains(text, "the needle statement") {
+		t.Errorf("expected the query-matched statement to survive filtering, got: %.300s...", text)
+	}
+}
