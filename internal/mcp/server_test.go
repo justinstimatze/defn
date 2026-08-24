@@ -14220,6 +14220,16 @@ func TestHandleTest_NoTestsMatchedHeaderDoesNotClaimTestsRan(t *testing.T) {
 		t.Fatal("resolve:", err)
 	}
 
+	// Simulate a stale DB: the covering test is renamed on disk (e.g. an
+	// external edit, or a sibling session, that hasn't synced yet) after
+	// ingest already captured it as "TestSubFunc". This is now the only
+	// realistic way to reach "none ran" for handleTest -- a package-scope
+	// mismatch no longer produces it, since handleTest now scopes to
+	// every package that actually houses a covering test, not just the
+	// edited def's own package (see
+	// TestHandleTest_CoveringTestInDifferentPackageStillRuns).
+	os.WriteFile(filepath.Join(projDir, "sub", "sub_test.go"), []byte("package sub\n\nimport (\n\t\"testing\"\n\n\t\"testproj\"\n)\n\nfunc TestSubFuncRenamed(t *testing.T) {\n\tif testproj.RootFunc() == \"\" {\n\t\tt.Fatal(\"sub-package-marker\")\n\t}\n}\n"), 0644)
+
 	s := &server{backend: db, projectDir: projDir}
 	s.ready.Store(true)
 
@@ -15159,5 +15169,59 @@ func TestHandleReadFile_LineRangeOnHugeDefSuggestsQueryFilter(t *testing.T) {
 	}
 	if !strings.Contains(text, "TestHuge") {
 		t.Errorf("expected the hint to name the huge def, got: %s", text)
+	}
+}
+
+// TestHandleTest_CoveringTestInDifferentPackageStillRuns is the cli-405
+// regression: handleTest used to scope go test to ONLY the edited
+// definition's own package (testScopeTarget(d.SourceFile)), even though
+// impact.Tests can legitimately live in a different package entirely (a
+// caller in a sibling package, or interface-dispatch coverage). That left
+// the covering test's real package completely unscanned, so `go test`
+// matched nothing there and this handler reported a confusing "NO TESTS
+// MATCHED" even though the covering test is real -- confirmed live on a
+// cli/cli bench trajectory where RenderMarkdown's actual covering tests
+// never ran and the model shipped an unverified fix (F1=0.00). Verifies
+// the covering test's own package gets included in the scope even when it
+// differs from the def's own package.
+func TestHandleTest_CoveringTestInDifferentPackageStillRuns(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "helper"), 0755)
+	os.MkdirAll(filepath.Join(projDir, "caller"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "helper", "helper.go"), []byte("package helper\n\nfunc Helper() string { return \"x\" }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "caller", "caller.go"), []byte("package caller\n\nimport \"testproj/helper\"\n\nfunc UseHelper() string { return helper.Helper() }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "caller", "caller_test.go"), []byte("package caller\n\nimport \"testing\"\n\nfunc TestUseHelper(t *testing.T) {\n\tif UseHelper() == \"\" {\n\t\tt.Fatal(\"caller-package-marker\")\n\t}\n}\n"), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleTest(context.Background(), nil, nameParam{Name: "Helper"})
+	if err != nil {
+		t.Fatalf("handleTest(Helper): %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "NO TESTS MATCHED") {
+		t.Fatalf("expected Helper's covering test (in a different package) to actually run, got NO TESTS MATCHED:\n%s", text)
+	}
+	if !strings.Contains(text, "ALL TESTS PASSED") {
+		t.Errorf("expected covering test to run and pass, got:\n%s", text)
+	}
+	if !strings.Contains(text, "./caller/...") {
+		t.Errorf("expected scope to include caller's own package ./caller/..., got:\n%s", text)
 	}
 }

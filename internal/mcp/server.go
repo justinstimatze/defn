@@ -6725,11 +6725,49 @@ func (s *server) handleTest(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	// whole-repo flood #241 fixed for handleTestByName, just on the
 	// sibling name-based entry point. Scope to the target definition's
 	// own package the same way.
-	target := s.testScopeTarget(d.SourceFile)
+	//
+	// cli-405: a definition's covering tests can legitimately live in a
+	// DIFFERENT package than the definition itself (a caller in a
+	// sibling package, or interface-dispatch coverage) -- scoping only
+	// to d's own directory left those tests' packages completely
+	// unscanned, so `go test` matched nothing there and this handler
+	// reported a confusing "NO TESTS MATCHED" even though the covering
+	// tests are real and exist on disk. Confirmed live on a cli/cli
+	// bench trajectory: RenderMarkdown's 13 covering tests lived partly
+	// outside utils/'s own directory, none ran, and the model shipped
+	// an unverified fix (F1=0.00). Scope to the union of directories
+	// housing d AND every impact.Tests[i] -- each Definition's
+	// SourceFile is already the real, correct repo-relative path (the
+	// same reasoning testScopeTarget itself uses for an exact module
+	// match), so no fuzzy hint resolution is needed here.
+	targetSet := map[string]bool{}
+	addTestDir := func(sourceFile string) {
+		dir := filepath.ToSlash(filepath.Dir(sourceFile))
+		if dir == "" || dir == "." {
+			targetSet["."] = true
+			return
+		}
+		targetSet["./"+dir+"/..."] = true
+	}
+	addTestDir(d.SourceFile)
+	for _, t := range impact.Tests {
+		addTestDir(t.SourceFile)
+	}
+	targets := make([]string, 0, len(targetSet))
+	for t := range targetSet {
+		targets = append(targets, t)
+	}
+	sort.Strings(targets)
+	target := strings.Join(targets, " ")
 
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeoutFor(len(testNames), target))
+	timeoutTarget := "./..."
+	if len(targets) > 0 {
+		timeoutTarget = targets[0]
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeoutFor(len(testNames), timeoutTarget))
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "test", "-run", runPattern, "-count=1", "-v", target)
+	cmdArgs := append([]string{"test", "-run", runPattern, "-count=1", "-v"}, targets...)
+	cmd := exec.CommandContext(ctx, "go", cmdArgs...)
 	cmd.Dir = s.projectDir
 	out, err := cmd.CombinedOutput()
 
