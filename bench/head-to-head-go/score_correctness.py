@@ -61,9 +61,10 @@ _SAFE_RECEIVER = re.compile(r"^\*?[A-Za-z_][A-Za-z0-9_]*$")
 _SAFE_PAREN_RECV = re.compile(
     r"^\(\*([A-Za-z_][A-Za-z0-9_]*)\)\.([A-Za-z_][A-Za-z0-9_]*)$"
 )
+_SAFE_MODULE = re.compile(r"^[A-Za-z0-9_./-]+$")
 
 
-def resolve_defname_to_file(name, workdir, receiver=None):
+def resolve_defname_to_file(name, workdir, receiver=None, module=None):
     """Ask defn where a named def lives. Returns list of candidate paths
     (possibly multiple — same def name across packages) or empty list.
 
@@ -79,6 +80,16 @@ def resolve_defname_to_file(name, workdir, receiver=None):
     trajectory: reported touched=12 for an edit that only landed in 2
     files, traced to this exact query never using the receiver the tool
     call actually specified.
+
+    Same class of bug for struct/function names disambiguated by module:
+    instead of receiver -- confirmed 2026-08-24 via a real cli-5537
+    trajectory. cli/cli defines a `CreateOptions` struct in 5 different
+    packages (gist/issue/pr/release/repo create commands); an edit call
+    that correctly disambiguated via module:"...pkg/cmd/repo/create" still
+    got all 5 files counted as touched here (only 1 was ever written to),
+    tanking that arm's precision for a resolution mistake the SCORER made,
+    not the arm. Filter by module the same way the receiver filter above
+    already does when the tool call provided one.
     """
     if not name or not workdir or not os.path.isdir(os.path.join(workdir, ".defn")):
         return []
@@ -114,14 +125,19 @@ def resolve_defname_to_file(name, workdir, receiver=None):
             # Fallback for a dotted-name calling convention, in case some
             # other harness or agent shape uses it.
             recv, bare = name.rsplit(".", 1)
+    mod_filter = ""
+    if module and _SAFE_MODULE.match(module):
+        mod_filter = (
+            f" AND module_id = (SELECT id FROM modules WHERE path = '{module}')"
+        )
     if recv:
         sql = (
             "SELECT DISTINCT source_file FROM definitions "
             f"WHERE name = '{bare}' AND (receiver = '{recv}' "
-            f"OR receiver = '*{recv}' OR receiver LIKE '%{recv}')"
+            f"OR receiver = '*{recv}' OR receiver LIKE '%{recv}'){mod_filter}"
         )
     else:
-        sql = f"SELECT DISTINCT source_file FROM definitions WHERE name = '{name}'"
+        sql = f"SELECT DISTINCT source_file FROM definitions WHERE name = '{name}'{mod_filter}"
     try:
         out = subprocess.check_output(
             ["defn", "query", sql],
@@ -253,7 +269,10 @@ def arm_touched_files(arm_data, workdir_hint):
                         # clone -- old_name no longer exists to look up.
                         defname = args.get("name") or args.get("new_name")
                         for f in resolve_defname_to_file(
-                            defname, workdir_hint, args.get("receiver")
+                            defname,
+                            workdir_hint,
+                            args.get("receiver"),
+                            args.get("module"),
                         ):
                             touched.add(normalize_path(f, workdir_hint))
                 elif op == "apply":
@@ -264,7 +283,10 @@ def arm_touched_files(arm_data, workdir_hint):
                         else:
                             defname = sub.get("name") or sub.get("new_name")
                             for f in resolve_defname_to_file(
-                                defname, workdir_hint, sub.get("receiver")
+                                defname,
+                                workdir_hint,
+                                sub.get("receiver"),
+                                sub.get("module"),
                             ):
                                 touched.add(normalize_path(f, workdir_hint))
             # files-mode arm: Edit/Write/MultiEdit are the actual write
