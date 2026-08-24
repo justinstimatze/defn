@@ -15025,3 +15025,88 @@ func TestHandleSearch_MCPDebugTracesEachStage(t *testing.T) {
 		}
 	}
 }
+
+// TestHandleRename_TypeRenameDoesNotCorruptFieldNamedAfterItsOwnType is
+// the #355 regression: found live via the field_named_after_own_type
+// fuzzer hazard (added for #352's "Foo *Foo" self-referencing field
+// idiom) -- FuzzMutationSequence reported "go build failed after a
+// mutation defn reported as successful: a.Upstream undefined" in under
+// a second, fully deterministic. Root cause: renaming the type
+// "Upstream" correctly identifies ActiveHealthChecks as a real caller
+// (its field's TYPE position genuinely references Upstream) and
+// rewrites that struct's body via astRename -- which, before this fix,
+// renamed BOTH the field's type reference AND its own declared NAME
+// (since "Upstream *Upstream" is textually the same identifier twice),
+// even though a field's name is never supposed to be touched by
+// anything except the dedicated field-rename path. This silently broke
+// every untouched caller referencing the field, like Target()'s
+// a.Upstream.Dial, with defn reporting full success throughout.
+func TestHandleRename_TypeRenameDoesNotCorruptFieldNamedAfterItsOwnType(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "fieldtype")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module fieldtype\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "hosts.go"), []byte(`package fieldtype
+
+type Upstream struct {
+	Dial string
+}
+
+type ActiveHealthChecks struct {
+	Upstream *Upstream
+}
+
+func (a *ActiveHealthChecks) Target() string {
+	return a.Upstream.Dial
+}
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleRename(context.Background(), nil, renameParam{
+		OldName: "Upstream",
+		NewName: "Backend",
+	})
+	if err != nil {
+		t.Fatalf("handleRename: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "rolled back") {
+		t.Fatalf("expected rename to succeed, got: %s", text)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(projDir, "hosts.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(raw)
+	if !strings.Contains(src, "type Backend struct") {
+		t.Errorf("expected the type declaration renamed to Backend, got:\n%s", src)
+	}
+	if !strings.Contains(src, "Upstream *Backend") {
+		t.Errorf("expected the field's TYPE updated to *Backend while its NAME stays Upstream, got:\n%s", src)
+	}
+	if !strings.Contains(src, "a.Upstream.Dial") {
+		t.Errorf("expected Target()'s untouched field access a.Upstream.Dial preserved, got:\n%s", src)
+	}
+
+	cmd := exec.Command("go", "build", "./...")
+	cmd.Dir = projDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build ./... failed after the rename:\n%s", out)
+	}
+}

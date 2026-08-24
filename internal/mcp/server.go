@@ -7551,6 +7551,25 @@ func (s *server) handlePatch(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 // same name will have that unrelated reference renamed too. Fixing this
 // properly requires plumbing go/types occurrence positions through to
 // rename time, not a quick patch — accepted, documented gap for now.
+//
+// #355 (found live via a real caddy-7870-motivated fuzzer hazard,
+// field_named_after_own_type): one specific instance of the limitation
+// above IS fixed here, unconditionally, because it's never legitimate
+// in ANY caller: a struct field's own declared NAME (an *ast.Field's
+// Names, e.g. the "Upstream" in "Upstream *Upstream" -- Go's own
+// self-referencing field idiom) must never be touched by this function,
+// full stop. Field-name renames always go through a completely separate
+// path (handleFieldRename/renameFieldInType), so a field's own Names
+// entry is never this rename's actual target -- but when the struct's
+// OWN declaring type is renamed (a real, correct caller: the field's
+// TYPE position genuinely needs updating), the old blanket "any Ident
+// matching oldName" walk also renamed the field's NAME merely because
+// it shares the same text as its type. Confirmed live: renaming type
+// Upstream correctly updated ActiveHealthChecks's field type (*Upstream
+// -> *NewName) but ALSO renamed the field's own name to NewName,
+// silently breaking every untouched caller referencing the field as
+// a.Upstream -- "a.Upstream undefined" after a mutation defn reported
+// as fully successful.
 func astRename(body, oldName, newName string) (string, int) {
 	src := "package x\n" + body
 	fset := token.NewFileSet()
@@ -7584,6 +7603,22 @@ func astRename(body, oldName, newName string) (string, int) {
 			}
 		}
 	}
+
+	// #355: a struct field's own declared name is never this rename's
+	// target (see the doc comment above) -- collect every *ast.Field's
+	// Names idents up front, unconditionally, so the walk below skips
+	// them exactly like a locally-shadowed declaration.
+	fieldNames := map[*ast.Ident]bool{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		field, ok := n.(*ast.Field)
+		if !ok {
+			return true
+		}
+		for _, name := range field.Names {
+			fieldNames[name] = true
+		}
+		return true
+	})
 
 	// Collect locally-declared identifiers so we don't rename them.
 	// A local var/param named "Render" shouldn't be renamed when we're
@@ -7647,7 +7682,7 @@ func astRename(body, oldName, newName string) (string, int) {
 		if !ok || ident.Name != oldName {
 			return true
 		}
-		if localDecls[ident] {
+		if localDecls[ident] || fieldNames[ident] {
 			skipped++
 			return true
 		}
