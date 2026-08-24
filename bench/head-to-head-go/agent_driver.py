@@ -342,6 +342,50 @@ def setup_workspace(task, arm="defn", corpus_dir=DEFAULT_CORPUS_DIR):
         stderr=subprocess.DEVNULL,
     )
 
+    # Contamination fix #2: the `git clone` above pulls the FULL upstream
+    # history, including every commit chronologically AFTER
+    # base_commit_sha -- confirmed exploited live on a real cli-5503
+    # trajectory: the files-mode (Bash-equipped) arm ran `git log --all
+    # --oneline | grep -i "label list"`, found the actual real-world fix
+    # commit (PR #5503 -- the same number as the task itself) still
+    # reachable via refs/remotes/origin/*, and `git show`/`git apply`'d it
+    # verbatim instead of solving the task, bypassing the benchmark
+    # outright. HEAD is detached at base_commit_sha (not a branch ref), so
+    # deleting every OTHER ref and pruning leaves base_commit_sha's own
+    # ancestry (the legitimate pre-fix history `git diff`/`git status`
+    # need for scoring) fully intact, while anything only reachable via
+    # origin/main or another branch tip becomes unreachable and gets
+    # garbage collected -- `git show <future-sha>` fails outright, not
+    # just `git log --all` coming up empty. Safe to rerun: a later
+    # setup_workspace call on this same workdir re-fetches base_commit_sha
+    # by exact SHA (no refspec match, so no refs/remotes/origin/* ref gets
+    # recreated) and this step prunes again regardless.
+    #
+    # Known remaining gap: this closes the "browse already-fetched local
+    # history" path that was actually exploited, not a fully hermetic one
+    # -- if the Bash sandbox has open network egress to github.com, an
+    # agent could still `git fetch origin <sha-or-branch>` fresh. Closing
+    # that requires a network-policy change outside this script.
+    ref_out = subprocess.check_output(
+        ["git", "-C", workdir, "for-each-ref", "--format=%(refname)"],
+        text=True,
+    )
+    for ref in ref_out.splitlines():
+        ref = ref.strip()
+        if ref:
+            subprocess.check_call(
+                ["git", "-C", workdir, "update-ref", "-d", ref],
+                stderr=subprocess.DEVNULL,
+            )
+    subprocess.check_call(
+        ["git", "-C", workdir, "reflog", "expire", "--expire=now", "--all"],
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.check_call(
+        ["git", "-C", workdir, "gc", "--prune=now", "--quiet"],
+        stderr=subprocess.DEVNULL,
+    )
+
     # files-mode arm gets none of this: no .defn/, no defn-authored CLAUDE.md
     # block. It must be the honest native baseline -- Read/Write/Edit/Bash
     # against a repo that has never seen defn -- or the comparison isn't
