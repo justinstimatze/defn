@@ -15225,3 +15225,69 @@ func TestHandleTest_CoveringTestInDifferentPackageStillRuns(t *testing.T) {
 		t.Errorf("expected scope to include caller's own package ./caller/..., got:\n%s", text)
 	}
 }
+
+// TestResolveEditTarget_FileScopedExactMatchPopulatesBody guards a real
+// cli/cli-2671 bench trajectory: resolveEditTarget's #339 exact-file-match
+// fast path resolves the RIGHT definition (confirmed via its correct
+// SourceFile/Module in the response) but returns it straight from
+// FindDefinitionsByFile, whose query never selects/joins the bodies
+// table -- every definition it returns has a permanently empty Body
+// field. Every caller of resolveEditTarget trusts d.Body directly with
+// no re-fetch (handleGetDefinition renders it straight into the code
+// fence), so a file:-disambiguated read/outline of an ambiguously-named
+// def silently came back with a blank body, and edit/replace-hunk's
+// old_fragment matching against that empty body always failed with
+// "not found in body" -- confirmed live: five same-named createRun
+// functions across cli/cli's command packages, file:-disambiguated to
+// the right one every time, body empty every time.
+func TestResolveEditTarget_FileScopedExactMatchPopulatesBody(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	if err := os.MkdirAll(filepath.Join(projDir, "pkga"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(projDir, "pkgb"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "pkga", "a.go"), []byte(`package pkga
+
+func NewThing() string { return "a-marker" }
+`), 0644)
+	os.WriteFile(filepath.Join(projDir, "pkgb", "b.go"), []byte(`package pkgb
+
+func NewThing() string { return "b-marker" }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	da, err := s.resolveEditTarget("NewThing", "", "", filepath.Join("pkga", "a.go"))
+	if err != nil {
+		t.Fatalf("resolveEditTarget(pkga/a.go): %v", err)
+	}
+	if !strings.Contains(da.Body, "a-marker") {
+		t.Errorf("file:-disambiguated NewThing (pkga) should have its real body populated (containing %q), got body=%q", "a-marker", da.Body)
+	}
+
+	db2, err := s.resolveEditTarget("NewThing", "", "", filepath.Join("pkgb", "b.go"))
+	if err != nil {
+		t.Fatalf("resolveEditTarget(pkgb/b.go): %v", err)
+	}
+	if !strings.Contains(db2.Body, "b-marker") {
+		t.Errorf("file:-disambiguated NewThing (pkgb) should have its real body populated (containing %q), got body=%q", "b-marker", db2.Body)
+	}
+}

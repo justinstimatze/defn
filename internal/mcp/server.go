@@ -10623,6 +10623,20 @@ func (s *server) resolveEditTarget(name, receiver, module, file string) (*store.
 						continue
 					}
 					if defs[i].Name == name && defs[i].SourceFile == file {
+						// FindDefinitionsByFile's query never selects/joins
+						// the bodies table -- every Definition it returns
+						// has a permanently empty Body field. Every caller
+						// of resolveEditTarget trusts d.Body directly with
+						// no re-fetch, so returning defs[i] here silently
+						// produced a resolved-but-bodyless definition:
+						// correct SourceFile/Module shown, blank code fence
+						// on read/outline, and old_fragment matching always
+						// failing on edit/replace-hunk. GetDefinition joins
+						// bodies and is the one already-correct source of a
+						// fully-populated Definition by ID.
+						if full, gerr := s.backend.GetDefinition(defs[i].ID); gerr == nil {
+							return full, nil
+						}
 						return &defs[i], nil
 					}
 				}
