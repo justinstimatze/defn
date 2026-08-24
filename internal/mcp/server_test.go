@@ -15110,3 +15110,54 @@ func (a *ActiveHealthChecks) Target() string {
 		t.Fatalf("go build ./... failed after the rename:\n%s", out)
 	}
 }
+
+// TestHandleReadFile_LineRangeOnHugeDefSuggestsQueryFilter is the #356
+// regression: two real bench trajectories (caddy-13474, traefik-13041)
+// showed a model paging through a huge single def (a >1000-line
+// table-driven test function) via repeated read-file line_range
+// guesses -- one even with the exact target line number already in
+// hand from a test failure trace -- instead of read(name:X,
+// query:"<keyword>"), which jumps straight to matching statements in
+// one call. Both tools already existed; the model just never reached
+// for the one built for this. Surface it directly whenever the
+// requested range is small relative to a def's own full span, the
+// shape that signals "hunting for a needle in a huge def" rather than
+// "reading a known slice".
+func TestHandleReadFile_LineRangeOnHugeDefSuggestsQueryFilter(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "hugefile")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module hugefile\n\ngo 1.26\n"), 0644)
+
+	var b strings.Builder
+	b.WriteString("package hugefile\n\nimport \"testing\"\n\nfunc TestHuge(t *testing.T) {\n")
+	for i := 0; i < 400; i++ {
+		fmt.Fprintf(&b, "\t_ = %d // padding line %d\n", i, i)
+	}
+	b.WriteString("}\n")
+	os.WriteFile(filepath.Join(projDir, "huge_test.go"), []byte(b.String()), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	result, _, err := s.handleReadFile(context.Background(), nil, codeParam{File: "huge_test.go", LineRange: "200-210"})
+	if err != nil {
+		t.Fatalf("read-file: %v", err)
+	}
+	text := resultText(t, result)
+
+	if !strings.Contains(text, "query:\"<keyword>\"") {
+		t.Errorf("expected a hint pointing at read(name:X, query:...) for a narrow range inside a huge def, got: %s", text)
+	}
+	if !strings.Contains(text, "TestHuge") {
+		t.Errorf("expected the hint to name the huge def, got: %s", text)
+	}
+}

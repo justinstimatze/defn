@@ -7838,6 +7838,27 @@ func (s *server) handleReadFile(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 			"[line_range read-file: showing %d definition(s) overlapping file lines %d-%d. Pass line_range=\"\" for every definition in the file.]\n\n",
 			len(defs), wantStart, wantEnd,
 		))
+		// #356: two real bench trajectories (caddy-13474, traefik-13041)
+		// showed a model paging through a huge single def (a >1000-line
+		// table-driven test function) via repeated read-file line_range
+		// guesses -- including one case with the exact target line number
+		// already in hand from a test failure trace -- instead of
+		// read(name:X, query:"<keyword>"), which jumps straight to the
+		// matching statements in one call. Both tools existed; the model
+		// just didn't reach for the one built for this. Surface it
+		// directly whenever the requested range is small relative to a
+		// def's own full span -- the shape that signals "hunting for a
+		// needle inside a huge def" rather than "reading a known slice".
+		for _, d := range defs {
+			span := d.EndLine - d.StartLine
+			if span > 300 && (wantEnd-wantStart+1) < span/4 {
+				sb.WriteString(fmt.Sprintf(
+					"[tip: %s spans %d lines (L%d-%d) -- if you're hunting for specific content by keyword rather than a known line number, read(name:%q, query:\"<keyword>\") jumps straight to the matching statements instead of guessing more ranges.]\n\n",
+					d.Name, span, d.StartLine, d.EndLine, d.Name,
+				))
+				break
+			}
+		}
 	}
 	for _, d := range defs {
 		recv := formatReceiver(d.Receiver)
