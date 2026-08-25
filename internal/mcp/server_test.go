@@ -1366,7 +1366,7 @@ func TestSearchBodiesLike(t *testing.T) {
 	if !strings.Contains(h.Snippet, "Hello") {
 		t.Errorf("snippet missing needle: %q", h.Snippet)
 	}
-	if h.Line < h.Line || h.Line == 0 {
+	if h.Line <= 0 {
 		t.Errorf("Line should be >0 (absolute in source): %d", h.Line)
 	}
 

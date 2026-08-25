@@ -1733,7 +1733,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		// of several declarations anyway.
 		if args.Name != "" && countTopLevelDecls(args.Body) <= 1 {
 			if inferred, _, _, _ := s.inferFromBody(args.Body); inferred != "" && inferred != args.Name {
-				return errResult(fmt.Errorf("create: name:%q doesn't match %q, the name body actually declares -- create always infers the definition's name from body's own declaration, not from a separate name: param; make body declare %q or remove name:", args.Name, inferred, args.Name))
+				return errResult(fmt.Errorf("create: name:%q doesn't match %q, the name body actually declares -- create always infers the definition's name from body's own declaration, not from a separate name: param; make body declare %q or remove the name: param", args.Name, inferred, args.Name))
 			}
 		}
 		return s.handleCreate(ctx, req, createParam{Body: args.Body, Module: args.Module, File: args.File, DryRun: args.DryRun})
@@ -7581,7 +7581,7 @@ func (s *server) handleOverview(ctx context.Context, _ *sdkmcp.CallToolRequest, 
 				}
 			}
 			if len(kept) == 0 {
-				return errResult(fmt.Errorf("overview: no defs in %s match query=%q (of %d total). Drop the query for the full listing.", file, args.Query, totalDefs))
+				return errResult(fmt.Errorf("overview: no defs in %s match query=%q (of %d total) -- drop the query for the full listing", file, args.Query, totalDefs))
 			}
 			defs = kept
 		}
@@ -9346,7 +9346,13 @@ func (s *server) handleOutline(_ context.Context, req *sdkmcp.CallToolRequest, a
 	// Size-aware fallback: for tiny bodies, read is smaller than
 	// outline. Route to the read handler transparently.
 	if len(d.Body) < outlineBodyThreshold {
-		return s.handleGetDefinition(nil, req, args)
+		// handleOutline's own ctx param is unused (blank identifier) by
+		// every caller in this codebase, so there's no live context to
+		// forward here -- context.Background() instead of nil (staticcheck
+		// SA1012) costs nothing today (handleGetDefinition ignores its own
+		// ctx param too, matching this file's universal convention) and
+		// avoids a future panic if either ever starts using it for real.
+		return s.handleGetDefinition(context.Background(), req, args)
 	}
 
 	var modulePath string

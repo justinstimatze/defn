@@ -683,7 +683,7 @@ func runChainCase(scratch, defnBin string, c chain, mode string) mutationResult 
 	syncCmd.Dir = scratch
 	_ = syncCmd.Run()
 
-	prompt := c.prompt
+	var prompt string
 	if mode == "defn" {
 		prompt = mutationDefnPreamble + "\n\n---\n\n" + c.prompt
 	} else {

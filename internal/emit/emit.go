@@ -239,11 +239,16 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, []
 
 	var writtenFiles []writtenFile
 	for _, mod := range modules {
-		locs, written, modWarnings, err := emitModule(db, &mod, outDir, moduleRoot, opts.AllowedRemovals, opts.AllowedAdds, touchedSet)
+		// emitModule's locs return value is discarded here -- both return
+		// paths below throw away whatever gets accumulated into allLocs at
+		// this point (the scoped path returns nil for locs; the unscoped
+		// path resets allLocs = nil and rebuilds it fresh via buildLocIndex
+		// a few lines down), so appending it here was pure wasted work on
+		// every emit (staticcheck SA4010).
+		_, written, modWarnings, err := emitModule(db, &mod, outDir, moduleRoot, opts.AllowedRemovals, opts.AllowedAdds, touchedSet)
 		if err != nil {
 			return nil, nil, fmt.Errorf("emit %s: %w", mod.Path, err)
 		}
-		allLocs = append(allLocs, locs...)
 		writtenFiles = append(writtenFiles, written...)
 		warnings = append(warnings, modWarnings...)
 	}

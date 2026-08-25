@@ -575,7 +575,6 @@ func cmdSync(file string) {
 		fatal(fmt.Errorf("resolve file: %w", err))
 	}
 	phase("resolve-file (packages.Load)", t)
-	t = time.Now()
 	fmt.Fprintf(os.Stderr, "synced %s: %d definitions updated\n", file, n)
 }
 
