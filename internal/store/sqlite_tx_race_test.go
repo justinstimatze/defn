@@ -32,6 +32,15 @@ import (
 // contract on its own merits -- but do not treat a pass here as proof
 // the live bug's exact mechanism is fixed. The live before/after
 // reproduction via a rebuilt binary is the actual evidence for that.
+//
+// `writers` bumped 1 -> 8 (2026-08-24): this pattern DOES reliably
+// reproduce a separate, real bug -- a deferred BEGIN's read-then-write
+// snapshot upgrade racing a concurrent writer's WAL commit returns
+// SQLITE_BUSY_SNAPSHOT (extended code 517), which busy_timeout does
+// NOT retry (it's a snapshot-isolation conflict, not lock contention).
+// Confirmed: failed within 5 runs at 8 writers before OpenSQLite's
+// _txlock=immediate fix, 10/10 clean after. Keeping writers at 8 makes
+// this test an effective regression guard for that fix.
 func TestBeginRollback_ConcurrentWriterCannotObserveRolledBackWrite(t *testing.T) {
 	dir := t.TempDir()
 	db, err := OpenSQLite(filepath.Join(dir, "defn.db"))
@@ -52,7 +61,7 @@ func TestBeginRollback_ConcurrentWriterCannotObserveRolledBackWrite(t *testing.T
 	}
 
 	const iterations = 100
-	const writers = 1
+	const writers = 8
 
 	for i := 0; i < iterations; i++ {
 		stopBg := make(chan struct{})

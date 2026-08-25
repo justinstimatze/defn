@@ -114,7 +114,19 @@ func OpenSQLite(path string) (*SQLiteDB, error) {
 	// foreground write a real chance to land during a long ingest
 	// instead of failing fast and pushing error recovery onto the
 	// model.
-	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(30000)"
+	// _txlock=immediate: a DEFERRED transaction (the driver default) that
+	// reads then writes can fail to upgrade its snapshot with
+	// SQLITE_BUSY_SNAPSHOT (extended code 517) when a concurrent writer
+	// commits to the WAL in between -- busy_timeout's retry-on-contention
+	// does NOT cover this case, since it's a snapshot-isolation conflict,
+	// not ordinary lock contention. Confirmed live: reproduced reliably
+	// under 8x background-writer contention in
+	// TestBeginRollback_ConcurrentWriterCannotObserveRolledBackWrite,
+	// gone after this fix under the same stress. Every BeginTx call in
+	// this codebase goes through Begin() (write-only, see its doc
+	// comment), so acquiring the write lock immediately at BEGIN instead
+	// of deferring it has no read-only-transaction downside here.
+	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(30000)&_txlock=immediate"
 
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
