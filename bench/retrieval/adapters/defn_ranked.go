@@ -119,6 +119,24 @@ func (a *DefnRanked) Retrieve(repoPath string, task benchtype.Task, tokenBudget 
 	idf := a.idfFor(repoPath)
 	scored := rank.Rank(task.Description, cands, idf, rank.DefaultWeights)
 
+	// Graph re-rank ("lexical proposes, graph disposes" -- see
+	// internal/rank/graphrank.go): the same rank.GraphRerank internal/mcp
+	// wires into search/context, applied here so this harness's P@10/R@10/
+	// NDCG/MRR numbers actually measure it instead of only exercising the
+	// lexical Rank path. BENCH_GRAPH_RERANK=0 disables it for a paired
+	// before/after comparison.
+	if w := benchGraphRerankWeight(); w > 0 && len(cands) >= 2 {
+		ids := make([]int64, len(cands))
+		for i, c := range cands {
+			ids[i] = c.Def.ID
+		}
+		if edges, err := a.edgesAmong(repoPath, ids); err == nil {
+			scored = rank.GraphRerank(scored, edges, w, 0, 0)
+		} else if benchVerbose() {
+			fmt.Fprintf(os.Stderr, "[defn-ranked] task=%s edgesAmong error: %v\n", task.ID, err)
+		}
+	}
+
 	limit := 20
 	if len(scored) < limit {
 		limit = len(scored)
@@ -152,10 +170,13 @@ func (a *DefnRanked) SupportsLearning() bool                                    
 func (a *DefnRanked) RecordFeedback(_ string, _ benchtype.Task, _ []string) error { return nil }
 func (a *DefnRanked) Reset(_ string) error                                        { return nil }
 
-// queryWithBody fetches name/receiver/kind/source_file plus body and
+// queryWithBody fetches id/name/receiver/kind/source_file plus body and
 // non-test caller count for every def whose name contains kw. Stays in
 // the CLI shell-out style of the unranked adapter so we measure the
-// same path; the only difference is the SELECT shape.
+// same path; the only difference is the SELECT shape. id is required
+// for the graph-rerank measurement (GraphRerank keys everything by
+// Definition.ID) -- earlier versions of this adapter never selected it,
+// which would have silently collapsed every candidate onto ID 0.
 func (a *DefnRanked) queryWithBody(repoPath, keyword string) ([]struct {
 	def     store.Definition
 	callers int
@@ -168,7 +189,7 @@ func (a *DefnRanked) queryWithBody(repoPath, keyword string) ([]struct {
 	// Two correlated subqueries fill caller_count (non-test) and
 	// test_count (test) so the ranker's graph-signal features have data.
 	sql := fmt.Sprintf(
-		"SELECT d.name, IFNULL(d.receiver,'') AS receiver, d.`kind` AS kind, "+
+		"SELECT d.id AS id, d.name, IFNULL(d.receiver,'') AS receiver, d.`kind` AS kind, "+
 			"IFNULL(d.source_file,'') AS source_file, IFNULL(b.body,'') AS body, "+
 			"(SELECT COUNT(*) FROM refs r JOIN definitions c ON c.id = r.from_def "+
 			"WHERE c.test = FALSE AND r.to_def = d.id) AS caller_count, "+
@@ -200,6 +221,7 @@ func (a *DefnRanked) queryWithBody(repoPath, keyword string) ([]struct {
 			tests   int
 		}{
 			def: store.Definition{
+				ID:         int64(asInt(m["id"])),
 				Name:       asStr(m["name"]),
 				Receiver:   asStr(m["receiver"]),
 				Kind:       asStr(m["kind"]),
@@ -381,4 +403,48 @@ func logRatio(n, df int) float64 {
 	num := float64(n + 1)
 	den := float64(df + 1)
 	return math.Log(num / den)
+}
+
+// edgesAmong fetches every refs edge (from_def, to_def) where BOTH
+// endpoints are in ids, shelled through the same `defn query` path
+// queryWithBody uses -- mirrors internal/store's SQLiteDB.EdgesAmong, but
+// this adapter has no store.Backend handle of its own (it only ever talks
+// to the project through the CLI), so it can't call that method directly.
+func (a *DefnRanked) edgesAmong(repoPath string, ids []int64) ([][2]int64, error) {
+	if len(ids) < 2 {
+		return nil, nil
+	}
+	strs := make([]string, len(ids))
+	for i, id := range ids {
+		strs[i] = fmt.Sprintf("%d", id)
+	}
+	in := "(" + strings.Join(strs, ",") + ")"
+	sql := "SELECT from_def, to_def FROM refs WHERE from_def IN " + in + " AND to_def IN " + in
+	cmd := exec.Command(a.bin, "query", sql)
+	cmd.Dir = repoPath
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	maps, err := parseJSONRows(out)
+	if err != nil {
+		return nil, err
+	}
+	edges := make([][2]int64, 0, len(maps))
+	for _, m := range maps {
+		edges = append(edges, [2]int64{int64(asInt(m["from_def"])), int64(asInt(m["to_def"]))})
+	}
+	return edges, nil
+}
+
+// benchGraphRerankWeight lets a before/after comparison run be driven from
+// the environment instead of a code edit: BENCH_GRAPH_RERANK=0 disables the
+// rerank entirely (GraphRerank's own graphWeight<=0 early-return), matching
+// internal/mcp's graphRerankWeight (1.0) otherwise -- same equal-footing,
+// "pending tune" rationale as DefaultWeights' other entries.
+func benchGraphRerankWeight() float64 {
+	if os.Getenv("BENCH_GRAPH_RERANK") == "0" {
+		return 0
+	}
+	return 1.0
 }
