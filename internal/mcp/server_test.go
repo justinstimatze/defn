@@ -8151,7 +8151,7 @@ func TestHandleCode_RemovedDoltOpsGetSpecificAnswerNotUnknownOp(t *testing.T) {
 
 	for _, op := range []string{"status", "diff", "branch", "checkout", "merge", "commit", "conflicts", "resolve", "merge-abort", "diff-defs", "history"} {
 		t.Run(op, func(t *testing.T) {
-			result, _, err := s.handleCode(context.Background(), nil, codeParam{Op: op, Branch: "x", Message: "x", Name: "x", Body: "x", From: "x"})
+			result, _, err := s.handleCode(context.Background(), nil, codeParam{Op: op, Name: "x", Body: "x"})
 			if err != nil {
 				t.Fatalf("handleCode(%q): %v", op, err)
 			}
@@ -10517,6 +10517,7 @@ func TestHandleCode_DryRunNeverWritesForAnyWriteOp(t *testing.T) {
 		{"replace-hunk", codeParam{Op: "replace-hunk", Name: "Greet", Old: "Hello, ", New: "Hi, ", DryRun: true}},
 		{"wrap-in-defer", codeParam{Op: "wrap-in-defer", Name: "Greet", DeferBody: `println("done")`, DryRun: true}},
 		{"rename-param", codeParam{Op: "rename-param", Name: "Greet", OldParam: "name", NewParam: "n", DryRun: true}},
+		{"patch", codeParam{Op: "patch", Name: "Greet", OldName: "Hello, ", NewName: "Hi, ", DryRun: true}},
 	}
 
 	for _, c := range cases {
@@ -15540,5 +15541,108 @@ func TestHandleCode_CreateNameParamMatchingBodyIsAllowed(t *testing.T) {
 	text := resultText(t, result)
 	if !strings.Contains(text, "Created") {
 		t.Fatalf("expected create to succeed when name: matches body's declared name, got: %s", text)
+	}
+}
+
+// TestHandleCode_ExplainBareNamesLoopsOverEachName guards explain's bare
+// (non-question) path silently dropping names: -- the validation switch
+// accepts names: as an acceptable scope for explain (mirroring the
+// question-driven path's own Names support), but handleExplain takes
+// nameParam, which has no Names field. A caller passing names:["A","B"]
+// with no question: got args.Name silently empty, producing a confusing
+// `definition "" not found` with no signal names: was the problem.
+func TestHandleCode_ExplainBareNamesLoopsOverEachName(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op:    "explain",
+		Names: []string{"Greet", "Farewell"},
+	})
+	if err != nil {
+		t.Fatalf("handleCode: %v", err)
+	}
+	text := resultText(t, result)
+	if result.IsError {
+		t.Fatalf("expected bare explain with names: to succeed, got error: %s", text)
+	}
+	if !strings.Contains(text, "Greet") || !strings.Contains(text, "Farewell") {
+		t.Errorf("expected explain blocks for both Greet and Farewell, got: %s", text)
+	}
+	if strings.Contains(text, "not found") {
+		t.Errorf("names: should have resolved both defs, not fallen through to a not-found path: %s", text)
+	}
+}
+
+// TestHandleCreate_MultiDeclDryRunDoesNotWrite guards handleCreateMultiDecl,
+// which is dispatched from handleCreate BEFORE its own "#dry-run-create"
+// check ever runs (the multi-decl branch returns early) -- dry_run:true
+// on a multi-decl body silently wrote every declaration for real.
+func TestHandleCreate_MultiDeclDryRunDoesNotWrite(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op:     "create",
+		File:   "extra/multi.go",
+		Body:   "func FirstFn() int { return 1 }\n\nfunc SecondFn() int { return 2 }",
+		DryRun: true,
+	})
+	if err != nil {
+		t.Fatalf("handleCode: %v", err)
+	}
+	text := resultText(t, result)
+	if result.IsError {
+		t.Fatalf("expected dry-run multi-decl create to succeed, got error: %s", text)
+	}
+	if !strings.Contains(text, "dry run") {
+		t.Errorf("expected dry-run preview text, got: %s", text)
+	}
+
+	if _, err := db.GetDefinitionByName("FirstFn", ""); err == nil {
+		t.Errorf("FirstFn should NOT have been created under dry_run:true, but it exists in the DB")
+	}
+	if _, err := db.GetDefinitionByName("SecondFn", ""); err == nil {
+		t.Errorf("SecondFn should NOT have been created under dry_run:true, but it exists in the DB")
+	}
+	if _, statErr := os.Stat(filepath.Join(projDir, "extra/multi.go")); statErr == nil {
+		t.Errorf("extra/multi.go should NOT have been written to disk under dry_run:true, but it exists")
+	}
+}
+
+// TestHandleCreate_ScaffoldFileDryRunDoesNotWrite guards
+// handleCreateScaffoldFile, which is dispatched from handleCreate BEFORE
+// its own "#dry-run-create" check ever runs (the scaffold branch returns
+// early) -- dry_run:true on an imports-only/package-only body silently
+// wrote the scaffold file for real.
+func TestHandleCreate_ScaffoldFileDryRunDoesNotWrite(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op:     "create",
+		File:   "extra/scaffold.go",
+		Body:   "package extra\n\nimport \"fmt\"\n",
+		DryRun: true,
+	})
+	if err != nil {
+		t.Fatalf("handleCode: %v", err)
+	}
+	text := resultText(t, result)
+	if result.IsError {
+		t.Fatalf("expected dry-run scaffold create to succeed, got error: %s", text)
+	}
+	if !strings.Contains(text, "dry run") {
+		t.Errorf("expected dry-run preview text, got: %s", text)
+	}
+
+	if _, statErr := os.Stat(filepath.Join(projDir, "extra/scaffold.go")); statErr == nil {
+		t.Errorf("extra/scaffold.go should NOT have been written to disk under dry_run:true, but it exists")
 	}
 }

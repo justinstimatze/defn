@@ -599,13 +599,14 @@ Ops: overview (project-wide shape when called with no args — one line per modu
 //	find: file (+ optional line)
 //	query: sql
 //	apply: operations
-//	untested, diff, sync, version: (no params)
-//	branch: (none to list; branch + optional from to create; branch + force=true to delete)
-//	checkout: branch
-//	merge: branch
-//	commit: message
-//	status: (no params)
+//	untested, sync, version: (no params)
 //	emit: out (directory path — absolute or relative to the project root)
+//
+// The Dolt-era git-semantics ops (branch/checkout/merge/commit/status/
+// diff/conflicts/resolve/merge-abort/diff-defs/history) were removed in
+// the v0.27 SQLite migration -- see removedDoltOps. Their former fields
+// (branch/from/message/pick/to) were removed with them; nothing reads
+// them anymore.
 type codeParam struct {
 	Op          string           `json:"op"`
 	Name        string           `json:"name,omitempty"`
@@ -632,12 +633,7 @@ type codeParam struct {
 	Limit       int              `json:"limit,omitempty"`
 	Direction   string           `json:"direction,omitempty"`
 	RefKinds    []string         `json:"ref_kinds,omitempty"`
-	Branch      string           `json:"branch,omitempty"`
-	From        string           `json:"from,omitempty"`
-	Message     string           `json:"message,omitempty"`
 	Force       bool             `json:"force,omitempty"`
-	Pick        string           `json:"pick,omitempty"`
-	To          string           `json:"to,omitempty"`
 	Out         string           `json:"out,omitempty"`
 	Rank        bool             `json:"rank,omitempty"`
 	Slice       string           `json:"slice,omitempty"`
@@ -1675,6 +1671,24 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		// legacy static-context shape.
 		if strings.TrimSpace(args.Question) != "" {
 			return wrapStale(s.handleExplainWithQuestion(ctx, req, args))
+		}
+		// names: is validated as an acceptable scope for explain above
+		// (mirroring the question-driven path's own Names support), but
+		// handleExplain takes nameParam, which has no Names field -- a
+		// caller passing names:["A","B"] with no question: got args.Name
+		// silently empty, producing a confusing `definition "" not found`
+		// with no signal names: was the actual problem. Loop and
+		// concatenate, same scope semantics as handleExplainWithQuestion.
+		if strings.TrimSpace(args.Name) == "" && len(args.Names) > 0 {
+			var sb strings.Builder
+			for i, name := range args.Names {
+				r, _, _ := wrapStale(s.handleExplain(ctx, req, nameParam{Name: name, Receiver: args.Receiver, Module: args.Module, File: args.File}))
+				if i > 0 {
+					sb.WriteString("\n---\n\n")
+				}
+				sb.WriteString(resultTextRaw(r))
+			}
+			return textResult(sb.String()), nil, nil
 		}
 		r, o, e := wrapStale(s.handleExplain(ctx, req, nameParam{Name: args.Name, Receiver: args.Receiver, Module: args.Module, File: args.File}))
 		if note := s.ambiguityNote(args.Name, args.Receiver, args.Module, args.File); note != "" {
@@ -4461,6 +4475,24 @@ func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult
 		def.ID = id
 		s.enqueueSummary(def)
 		ids = append(ids, id)
+	}
+
+	// handleCreateMultiDecl is dispatched from handleCreate BEFORE its own
+	// "#dry-run-create" check ever runs (this branch returns early), so
+	// dry_run:true on a multi-decl body silently wrote every declaration
+	// for real. tx was never committed above, so returning here instead
+	// of calling commit() lets the deferred rollback() undo the
+	// EnsureModule/UpsertDefinition writes just made inside tx -- the
+	// same "actually run the real transform, then roll back" strategy
+	// used elsewhere in this file for a faithful preview.
+	if args.DryRun {
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("would create %d defs in %s (%s):\n", len(decls), args.File, mod.Path))
+		for _, d := range decls {
+			recv := formatReceiver(d.Receiver)
+			sb.WriteString(fmt.Sprintf("  + %s%s (%s)\n", recv, d.Name, d.Kind))
+		}
+		return dryRunResult(sb.String())
 	}
 
 	if err := commit(); err != nil {
@@ -7701,6 +7733,15 @@ func (s *server) handlePatch(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		return errResult(fmt.Errorf("old text not found in %s body", args.Name))
 	}
 
+	// patch never checked dry_run:true at all -- same silent no-op class
+	// as the other write ops before #246/#308 extended dry-run coverage
+	// to them; patch was simply missed. Placed after every validation
+	// gate above (resolution, kind support, old-text-found) so the
+	// preview genuinely reflects what patch would do.
+	if args.DryRun {
+		return dryRunResult(fmt.Sprintf("would patch %s: replace %q → %q", args.Name, args.OldName, args.NewName))
+	}
+
 	d.Body = strings.Replace(d.Body, args.OldName, args.NewName, 1)
 	d.Signature = extractSignature(d.Body)
 
@@ -10210,6 +10251,16 @@ func (s *server) handleCreateScaffoldFile(args createParam) (*sdkmcp.CallToolRes
 	// reporting the outcome inline as if it were informational rather
 	// than a rolled-back write, unlike every sibling handler's
 	// "rolled back — nothing was saved" framing for the same contract.
+	// handleCreateScaffoldFile is dispatched from handleCreate BEFORE its
+	// own "#dry-run-create" check ever runs (this branch returns early),
+	// so dry_run:true on an imports-only/package-only body silently wrote
+	// the scaffold file for real. Checked here, before Begin(), since
+	// nothing has been written yet at this point -- no transaction or
+	// rollback needed for the preview.
+	if args.DryRun {
+		return dryRunResult(fmt.Sprintf("would scaffold %s (%s) — %d bytes, no defs yet", args.File, mod.Path, len(body)))
+	}
+
 	tx, commit, rollback, txErr := s.backend.Begin()
 	if txErr != nil {
 		return errResult(txErr)
