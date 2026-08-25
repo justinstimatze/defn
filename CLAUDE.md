@@ -10,58 +10,13 @@ not `go build ./...`), not vs defn-on-defn benches. Perf work is judged by
 real-workload numbers, not synthetic sweep curves — ask winze (or another
 external user) to run their shape before claiming a win.
 
-v8 head-to-head (2026-08-20, 15-task Prometheus corpus) found defn losing on
-both axes it's supposed to win: 14.4% more expensive per task than files-mode
-(worse than v7's 3.9% gap), and triggering the Go toolchain (build/test) 82%
-more often (178 vs 98 invocations, +5.3/task average, consistent in 14/15
-tasks) — every edit-class op auto-emits+builds, where a files-mode agent
-batches edits and checks on its own schedule. Confirmed root causes so far:
-`test` op returns unfiltered `-v` PASS/RUN noise below its 6KB summarization
-cap (66% pure noise); the one-shot starter bundle echoes the full captured
-question back into its own header; `read` rejects `line_range` and forces a
-retry (hit in 40% of tasks); a build-timeout is misreported as an empty
-"BUILD FAILED:" indistinguishable from a real compile error (the same
-`ctx.Err() == context.DeadlineExceeded` handling `handleTest` already has is
-missing from `emitAndBuildAgainst`/`runBuildIn`). None of this closes on its
-own without also cutting call *count*, not just call size — richer
-per-call content only pays for itself when it replaces multiple cheaper
-calls, and the aggregate call counts here came out roughly even.
-
-**Status update (2026-08-21): all 4 of the above root causes are now fixed**
-— `truncateTestOutput` strips `=== RUN`/`=== PAUSE`/`=== CONT` unconditionally
-(not just above the size cap); the starter bundle's header truncates via
-`truncateForHeader`/`truncateList`; `read` with `line_range` and no `name`
-redirects to `op:"read-file"` instead of erroring blind; `emitAndBuildAgainst`
-now checks `ctx.Err() == context.DeadlineExceeded` and reports "BUILD TIMED
-OUT" distinctly from a real compile failure (test:
-`TestEmitAndBuildAgainst_TimeoutReportsTimedOutNotEmptyBuildFailed`). Don't
-re-investigate these four — if a future bench run still shows one of these
-symptoms, that's a regression in the fix, not an unfixed root cause; check
-the referenced function/test first before re-diagnosing from scratch.
-
-v10 sonnet re-run (2026-08-21, same 15-task Prometheus corpus, after 4 more
-targeted bug fixes) quantified where that call count actually goes, and it is
-NOT primarily an edit-batching problem: of arm_defn's 567 calls, edit-class
-ops (edit/create/delete/replace-hunk/apply/add-import/insert-header) are only
-10.4%, `test` is 9.9%, defn read-class ops (read/search/outline/overview/
-context/impact) are 51.5%, and non-defn Read/Grep/Glob add another 25.6% —
-**~77% combined read-shaped**. `context`/`expand`, the ops built specifically
-to consolidate reads into one call, were used 4 times in 567 calls (0.7%)
-despite being the documented biggest lever. Both existing in-band nudges show
-near-zero observed follow-through: `writeBatchNudge` fired 7 times, 0/7
-followed by an actual `apply` call; the read-side circuit breaker's
-auto-batch rescue fired 19 times, but 0/19 were followed by the model
-proactively reaching for `context`/`expand` on its own afterward — it just
-resumes singleton calls, so the rescue only recovers cost *after* 6-8 wasted
-round-trips already happened. Conclusion: further `apply`-batching investment
-caps out near ~7% of total call-count reduction (and ~29% of single edits are
-structurally unbatchable in advance — the need for a second edit often isn't
-known until after the first lands); reactive in-band text nudges are a dead
-lever regardless of threshold tuning. Untried, highest-estimated-leverage
-direction: proactive consolidation BEFORE the first singleton read is even
-possible — e.g. auto-injecting a `context(question:<task>)`-shaped bundle as
-the first tool response of a task/turn — rather than a nudge that only fires
-after the cost is already paid.
+Standing finding (v8-v10 bench, 15-task Prometheus corpus): ~77% of a
+session's calls are read-shaped, and `context`/`expand` — built to
+consolidate those reads — see ~0.7% adoption. Reactive in-band nudges
+toward them are a confirmed dead lever (0/7 and 0/19 observed
+follow-through, measured twice). Full root-cause history, fix commits,
+and a live open question about the starter-bundle's actual downstream
+effect: see `docs/lessons-learned.md`.
 
 ## Code Navigation and Editing
 

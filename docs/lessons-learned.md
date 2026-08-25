@@ -273,6 +273,125 @@ chi-explore bench (`bench/session-cumulative/`) after — enforcement
 that isn't measured against the actual workload is how this regression
 happened in the first place.
 
+## v8-v10 bench findings (2026-08-20/21) and the starter-bundle correction (2026-08-24)
+
+v8 head-to-head (15-task Prometheus corpus) found defn 14.4% more expensive
+per task than files-mode and triggering the Go toolchain 82% more often.
+Four root causes, all fixed by 2026-08-21 (check the referenced test before
+re-diagnosing any of these from scratch):
+- `test` returned unfiltered `-v` PASS/RUN noise (66% pure noise) below its
+  size cap — `truncateTestOutput` now strips `=== RUN`/`PAUSE`/`CONT`
+  unconditionally.
+- The starter bundle echoed the full captured question into its own header
+  — now truncates via `truncateForHeader`/`truncateList`.
+- `read` rejected `line_range` with no `name` and forced a retry (hit in
+  40% of tasks) — now redirects to `op:"read-file"`.
+- A build timeout was misreported as an indistinguishable empty
+  "BUILD FAILED:" — `emitAndBuildAgainst`/`runBuildIn` now check
+  `ctx.Err() == context.DeadlineExceeded` and report "BUILD TIMED OUT"
+  (test: `TestEmitAndBuildAgainst_TimeoutReportsTimedOutNotEmptyBuildFailed`).
+
+v10 re-run (same corpus, after those 4 fixes) found the remaining cost is
+NOT primarily an edit-batching problem: of 567 calls, edit-class ops are
+only 10.4%, `test` is 9.9%, defn read-class ops are 51.5%, non-defn
+Read/Grep/Glob another 25.6% — ~77% combined read-shaped. `context`/
+`expand` (built to consolidate reads) were used 4 times (0.7%). Both
+existing in-band nudges show zero observed follow-through: `writeBatchNudge`
+fired 7 times, 0/7 followed by an `apply` call; the circuit breaker's
+auto-batch rescue fired 19 times, 0/19 followed by the model reaching for
+`context`/`expand` on its own afterward. Conclusion: further apply-batching
+investment caps out near ~7% of total call-count reduction; reactive
+in-band text nudges are a dead lever regardless of threshold tuning.
+
+**The correction (2026-08-24)**: v10 called "auto-injecting a
+`context(question:<task>)`-shaped bundle as the first tool response of a
+turn" an "untried, highest-estimated-leverage direction" — this was wrong.
+That mechanism already existed, built 2026-07-23 (`f90b264`, #203) and
+refined four times since (#302 widened it past search/overview to
+read/outline/impact/expand; #303 fixed dedup-hash poisoning; #312
+turn-scoped it instead of session-lifetime-once; #328, 2026-08-22 — one
+day after the v10 entry). The v10 run had it live the whole time; its own
+0.7% figure measures the model *choosing* to call context/expand itself,
+which the bundle's passive auto-injection was never going to move. Caught
+only because a later session was asked to "build" this as new, went to
+implement it, and found it already shipped. Lesson: bench-finding prose
+is not exempt from going stale — re-verify a claim like this (git log,
+grep the mechanism by name) before either building on it or trusting it
+as current state.
+
+**Still open** at the time of the correction: has the bundle's actual
+downstream call-count/cost effect ever been measured post-#312/#328 with
+a controlled A/B, rather than just unit-tested for its own mechanics?
+`DEFN_STRIP=starter-bundle` (see `#209` above) exists for exactly this.
+Separately, a one-shot-per-turn design has a real structural ceiling: it
+can only help the first few calls of a turn, not sustained efficiency
+across a long one — which the 0.7% aggregate may partly reflect
+regardless of the bundle's presence.
+
+**The A/B (2026-08-24), and a real caveat about where it ran.** Answered
+the "still open" question above with `DEFN_STRIP=starter-bundle` against 2
+prometheus tasks (a 3rd, prometheus-19114, failed identically in both
+conditions on a local ingest error unrelated to the bundle — dropped, not
+counted). This should have run on the defn-bench EC2 box per the standing
+instruction below — it was run locally instead (caught only when asked
+directly "did you run that locally or on ec2?"), pegged an 8-core laptop
+to load average 8+, and is exactly the 5th occurrence of that same
+mistake. `hooks/defn-bench-guard.sh` now blocks local `agent_driver.py`/
+`launch_arm(_parallel).sh` invocations at the harness level (escape hatch:
+`DEFN_BENCH_LOCAL_OK=1`) since memory alone had failed to stick 4 times
+running. Take the numbers below as a real but small, not-EC2-clean signal.
+
+Result: NOT a clean "bundle helps" story, and not even consistently
+directional.
+- `prometheus-18712`: no meaningful bundle effect. Both conditions
+  produced the same correctly-scoped fix (added the one flag/field the
+  issue asked for); OFF was slightly noisier only because of an
+  unrelated transient DB-lock retry.
+- `prometheus-16766`: bundle ON caused real scope creep. The actual gold
+  patch is a 1-line fix (one `time.Duration` missing `.String()` before
+  a slog call). WITHOUT the bundle: 4 calls, $0.10, fixed exactly that
+  line. WITH the bundle: 32 calls, $0.49, and the model used the
+  bundle's broader "related definitions" context to go hunting for every
+  similar `time.Since(...)` call across the whole `tsdb` package,
+  finding 7 more occurrences elsewhere and fixing all 8 — arguably a more
+  thorough change in isolation, but 8x the touched surface the actual
+  issue called for, and worse on any correctness metric scored against
+  the real gold patch's file/line scope.
+
+**Correction to the correction, same day**: the "bundle causes scope
+creep" reading above does not survive a check against data that was
+already sitting in the repo. `bench/prometheus-repo/arm_defn/
+prometheus__prometheus-16766.json` is a PRIOR recorded run of this exact
+same task, bundle ON (the shipped default, no DEFN_STRIP set), from
+earlier bench work — 6 calls, $0.13, 58s, fixed exactly the 1 gold-patch
+line, no scope creep at all. That's nearly identical to THIS session's
+fresh "bundle OFF" run, not its "bundle ON" run. Same task, same
+bundle-ON condition, two runs 8x apart in call count (6 vs 32) — that is
+ordinary Sonnet run-to-run variance (lessons-learned.md already has a
+prior instance of this: "one task went from F1 1.00 to 0.00 between
+runs"), not a reproducible effect of the bundle's presence. A single
+before/after pair can't distinguish "the bundle caused this" from
+"this task happens to have high run-to-run variance regardless of the
+bundle" — and this one turned out to be the latter.
+
+Separately, the EXISTING correctness_scores.json for all 15 prometheus
+tasks (all bundle-ON, already scored, zero new cost to check) argues
+against scope creep being a common effect in aggregate: 14 of 15 tasks
+score precision=1.00 (every touched file was in the gold patch, no
+extras); only one (`prometheus-12024`, 7 touched vs 5 gold, precision
+0.71) shows the touched-files-exceed-gold pattern at all. If broad
+scope creep were a frequent side effect of the bundle, this existing
+data would very likely already show it more than 1/15 times.
+
+Net: no reliable evidence either way from this session's A/B. Don't act
+on it as a product signal in either direction (don't remove the bundle,
+don't "fix" scope creep that may not be a real bundle effect). If this
+question is worth resolving for real, it needs enough REPEATS per
+task per condition (not one run each) to separate a genuine bundle
+effect from Sonnet's own run-to-run variance, which this correction
+shows can be large enough on its own to fully explain what looked like
+a dramatic effect. That's a bigger, EC2-run ask than what ran here.
+
 ## Key Design Decisions
 
 - **SQLite for storage.** Migrated from Dolt in v0.27 (Phase 4 big-bang,
