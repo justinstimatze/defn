@@ -681,7 +681,7 @@ type applyOp struct {
 	Name        string `json:"name,omitempty"`
 	Receiver    string `json:"receiver,omitempty"` // disambiguates same-named methods across types (#219), mirrors nameParam/editParam's Receiver
 	NewName     string `json:"new_name,omitempty"` // rename: new symbol name (op.Name is resolved as the OLD name for rename -- see its handleApply case)
-	OldName     string `json:"old_name,omitempty"` // patch: old text to replace with new_name (patch resolves the target via op.Name/op.Receiver/op.Module/op.File like every other op, unlike rename)
+	OldName     string `json:"old_name,omitempty"` // patch: old text to replace with new_name (patch resolves the target via op.Name/op.Receiver/op.Module/op.File like every other op, unlike rename). Also accepted as an alias for name on rename ops (matches the standalone op:"rename"'s own old_name/new_name field names) when name is empty.
 	Body        string `json:"body,omitempty"`
 	NewBody     string `json:"new_body,omitempty"`
 	Module      string `json:"module,omitempty"`
@@ -1395,6 +1395,15 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "create":
 		if r, o, e := need(args.Body, "body"); r != nil {
 			return r, o, e
+		}
+		// name: is a real codeParam field, but create always infers the
+		// definition's name/kind/receiver from body itself (via
+		// inferFromBody) -- createParam has no Name field at all, so
+		// name: was silently dropped with no error and no note. Same
+		// silent-no-op class as #298 (edit's import_path/alias) and #250
+		// (search's include) -- reject instead of accepting and ignoring.
+		if args.Name != "" {
+			return errResult(fmt.Errorf("create: name has no effect -- the definition's name is always inferred from body's own declaration (e.g. `func Foo(...) {...}` creates a def named Foo), not from a separate name: param; remove name: or make body declare the name you want"))
 		}
 	case "rename":
 		if r, o, e := need(args.OldName, "old_name"); r != nil {
@@ -2679,6 +2688,26 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		}
 		defs = filtered
 		mcpDebugf("search pattern=%q file-filtered by %q: %d result(s): %s", args.Pattern, args.File, len(defs), debugDefIDs(defs))
+	}
+
+	// receiver: is a real codeParam field (used to disambiguate
+	// same-named methods across types everywhere else -- read/outline/
+	// edit/impact/rename/move/test/similar all accept it), but search
+	// never applied it -- every search returned every matching def
+	// regardless of receiver, same silent-no-op class file: itself had
+	// before #241. Exact match on the bare (pointer-unwrapped) receiver
+	// name, mirroring the pointer-prefix tolerance GetDefinitionByNameAndReceiver
+	// callers elsewhere in this file already use.
+	if args.Receiver != "" {
+		filtered := defs[:0]
+		want := strings.TrimPrefix(args.Receiver, "*")
+		for _, d := range defs {
+			if strings.TrimPrefix(d.Receiver, "*") == want {
+				filtered = append(filtered, d)
+			}
+		}
+		defs = filtered
+		mcpDebugf("search pattern=%q receiver-filtered by %q: %d result(s): %s", args.Pattern, args.Receiver, len(defs), debugDefIDs(defs))
 	}
 
 	// #299 followup: bodyScanResult's go-doc hint only fires on a hard
@@ -4548,6 +4577,13 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		for _, op := range args.Operations {
 			switch op.Op {
 			case "create":
+				// Same silent no-op as handleCode's op:"create" validation --
+				// see its comment for the full rationale. create always infers
+				// the definition's name from body itself, in this apply path too.
+				if op.Name != "" {
+					errors = append(errors, "create: name has no effect -- the definition's name is always inferred from body's own declaration; remove name: or make body declare the name you want")
+					continue
+				}
 				if n := countTopLevelDecls(op.Body); n > 1 {
 					if op.File == "" {
 						errors = append(errors, fmt.Sprintf("create: body has %d top-level decls — set file: to author a whole file in one call, or split into %d create ops", n, n))
@@ -4613,8 +4649,20 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 					sb.WriteString(fmt.Sprintf("- would delete %s\n", op.Name))
 				}
 			case "rename":
+				// old_name is the standalone op:"rename"'s own field name for
+				// this exact value (renameParam/codeParam both use old_name/
+				// new_name) -- a caller batching rename inside apply naturally
+				// reaches for the same field name and got a generic "both name
+				// and new_name are required" error instead, since apply's own
+				// OldName field is separately bound to patch's old-text (see
+				// applyOp's doc comment). Accept it as a same-op-scoped alias
+				// for name here, same precedent as replace-hunk accepting
+				// old_fragment/new_fragment for old/new in handleCode.
+				if op.Name == "" && op.OldName != "" {
+					op.Name = op.OldName
+				}
 				if op.Name == "" || op.NewName == "" {
-					errors = append(errors, "rename: both name and new_name are required")
+					errors = append(errors, "rename: both name (or old_name) and new_name are required")
 				} else if _, err := s.resolveApplyTarget(s.backend, op.Name, op.Receiver, op.Module, op.File); err != nil {
 					errors = append(errors, fmt.Sprintf("rename %s: not found", op.Name))
 				} else {
@@ -4927,6 +4975,12 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	for _, op := range args.Operations {
 		switch op.Op {
 		case "create":
+			// Same silent no-op as handleCode's op:"create" validation -- see
+			// its comment for the full rationale.
+			if op.Name != "" {
+				errors = append(errors, "create: name has no effect -- the definition's name is always inferred from body's own declaration; remove name: or make body declare the name you want")
+				continue
+			}
 			if n := countTopLevelDecls(op.Body); n > 1 {
 				if op.File == "" {
 					errors = append(errors, fmt.Sprintf("create: body has %d top-level decls — set file: to author a whole file in one call, or split into %d create ops", n, n))
@@ -5235,8 +5289,13 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			}
 
 		case "rename":
+			// Same old_name alias as the dry-run branch above -- see its
+			// comment for the full rationale.
+			if op.Name == "" && op.OldName != "" {
+				op.Name = op.OldName
+			}
 			if op.Name == "" || op.NewName == "" {
-				errors = append(errors, "rename: both name and new_name are required")
+				errors = append(errors, "rename: both name (or old_name) and new_name are required")
 				continue
 			}
 			d, err := s.resolveApplyTarget(tx, op.Name, op.Receiver, op.Module, op.File)

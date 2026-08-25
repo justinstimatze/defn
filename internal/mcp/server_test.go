@@ -15335,3 +15335,185 @@ func NewThing() string { return "b-marker" }
 		t.Errorf("file:-disambiguated NewThing (pkgb) should have its real body populated (containing %q), got body=%q", "b-marker", db2.Body)
 	}
 }
+
+// TestHandleApply_CreateNameParamRejected is the apply-batched
+// counterpart to TestHandleCode_CreateNameParamRejected -- same gap,
+// reached via handleApply's own "create" case (both the dry-run preview
+// and the real path each have their own independent create branch).
+func TestHandleApply_CreateNameParamRejected(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "create", Name: "WantedName", Body: "func ActualName() string { return \"x\" }"},
+		},
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "name has no effect") {
+		t.Fatalf("expected a rejection explaining name: has no effect on create, got: %s", text)
+	}
+
+	dryRun, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		DryRun: true,
+		Operations: []applyOp{
+			{Op: "create", Name: "WantedName", Body: "func ActualName() string { return \"x\" }"},
+		},
+	})
+	dryText := resultText(t, dryRun)
+	if !strings.Contains(dryText, "name has no effect") {
+		t.Fatalf("expected dry-run to also reject name:, got: %s", dryText)
+	}
+}
+
+// TestHandleApply_RenameAcceptsOldNameAlias guards apply's rename sub-op
+// accepting old_name as an alias for name when name is empty -- the
+// standalone op:"rename" (renameParam/codeParam) names this same value
+// old_name, so a caller batching rename inside apply naturally reaches
+// for the same field and previously got a generic "both name and
+// new_name are required" error, since apply's own OldName field is
+// separately bound to patch's old-text.
+func TestHandleApply_RenameAcceptsOldNameAlias(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	dryRun, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		DryRun: true,
+		Operations: []applyOp{
+			{Op: "rename", OldName: "Greet", NewName: "Salute"},
+		},
+	})
+	dryText := resultText(t, dryRun)
+	if strings.Contains(dryText, "required") {
+		t.Fatalf("expected old_name alias to satisfy the dry-run rename validation, got: %s", dryText)
+	}
+	if !strings.Contains(dryText, "Greet") || !strings.Contains(dryText, "Salute") {
+		t.Fatalf("expected a would-rename preview naming Greet and Salute, got: %s", dryText)
+	}
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "rename", OldName: "Greet", NewName: "Salute"},
+		},
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "required") {
+		t.Fatalf("expected old_name alias to satisfy the real rename validation, got: %s", text)
+	}
+
+	read, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "read", Name: "Salute", Full: true})
+	readText := resultText(t, read)
+	if !strings.Contains(readText, "func Salute") {
+		t.Fatalf("expected Greet to actually be renamed to Salute via the old_name alias, got: %s", readText)
+	}
+}
+
+// TestHandleCode_CreateNameParamRejected guards against create's silent
+// name: no-op: createParam has no Name field at all, so a caller
+// passing name: alongside body (reasonably expecting it to name the new
+// def, the way it names the target for every other op) got it silently
+// dropped -- the name inferred from body's own declaration won the
+// tiebreak with no error and no note. Same silent-no-op class as #298
+// (edit's import_path/alias).
+func TestHandleCode_CreateNameParamRejected(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op:   "create",
+		Name: "WantedName",
+		Body: "func ActualName() string { return \"x\" }",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "name has no effect") {
+		t.Fatalf("expected a rejection explaining name: has no effect on create, got: %s", text)
+	}
+
+	// #241's own "no matches for %q" message echoes the queried pattern
+	// back verbatim, so a bare Contains(text, "WantedName") on that
+	// message would false-positive here even with no def created --
+	// check for the search summary's actual JSON name field instead.
+	searchResult, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "search", Pattern: "WantedName"})
+	if strings.Contains(resultText(t, searchResult), "\"name\":\"WantedName\"") {
+		t.Errorf("rejected create must not have created a def under the ignored name: param")
+	}
+}
+
+// TestHandleSearch_ReceiverFiltersResults guards against search silently
+// ignoring receiver:, a real codeParam field used to disambiguate
+// same-named methods across types everywhere else (read/outline/edit/
+// impact/rename/move/test/similar all honor it) -- search returned every
+// matching def regardless of receiver, the same silent-no-op class file:
+// itself had before #241.
+func TestHandleSearch_ReceiverFiltersResults(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package main
+
+type Alpha struct{}
+
+// Run executes the alpha banana workflow.
+func (a *Alpha) Run() {}
+
+type Beta struct{}
+
+// Run executes the beta banana workflow.
+func (b *Beta) Run() {}
+`), 0644)
+
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+
+	// Unscoped: both Alpha.Run and Beta.Run match "banana".
+	result, _, err := s.handleSearch(context.Background(), nil, codeParam{Pattern: "banana"})
+	if err != nil {
+		t.Fatalf("handleSearch: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Alpha") || !strings.Contains(text, "Beta") {
+		t.Fatalf("expected both Alpha and Beta unscoped, got: %s", text)
+	}
+
+	// Scoped to receiver Alpha: only Alpha.Run should survive.
+	result, _, err = s.handleSearch(context.Background(), nil, codeParam{Pattern: "banana", Receiver: "Alpha"})
+	if err != nil {
+		t.Fatalf("handleSearch with receiver: %v", err)
+	}
+	text = resultText(t, result)
+	if !strings.Contains(text, "Alpha") {
+		t.Errorf("receiver:\"Alpha\" should still include Alpha.Run, got: %s", text)
+	}
+	if strings.Contains(text, "Beta") {
+		t.Errorf("receiver:\"Alpha\" should have excluded Beta.Run, got: %s", text)
+	}
+
+	// Pointer-prefixed receiver form should match the same way.
+	result, _, err = s.handleSearch(context.Background(), nil, codeParam{Pattern: "banana", Receiver: "*Alpha"})
+	if err != nil {
+		t.Fatalf("handleSearch with pointer receiver: %v", err)
+	}
+	text = resultText(t, result)
+	if !strings.Contains(text, "Alpha") || strings.Contains(text, "Beta") {
+		t.Errorf("receiver:\"*Alpha\" should match the same as bare \"Alpha\", got: %s", text)
+	}
+}
