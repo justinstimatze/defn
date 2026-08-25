@@ -191,7 +191,16 @@ var C1Renamed = Claim{Subject: "s1", Object: "OldTarget"}
 func main() {}
 `), 0644)
 
-	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+	// Call the handler directly rather than through handleCode: handleCode
+	// now runs ensureFresh (the auto-freshness gate, internal/mcp/
+	// freshness.go) before every op, which would re-ingest claims.go and
+	// heal exactly the drift this test manually induces above -- correctly
+	// so; that's the gate doing its job. This test's actual target is
+	// deeper: handleRetargetFieldValue's OWN #218 emit-time drift check,
+	// the safety net for drift the gate can't see (e.g. a change landing
+	// between the gate's probe and this call's own emit). Bypassing
+	// handleCode isolates that from the newer, coarser gate.
+	result, _, _ := s.handleRetargetFieldValue(context.Background(), nil, codeParam{
 		Op:    "retarget-field-value",
 		Name:  "Claim",
 		Field: "Object",

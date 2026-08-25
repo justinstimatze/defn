@@ -98,6 +98,10 @@ type Backend interface {
 	GetImpact(defID int64) (*Impact, error)
 	RefCountsByTarget(targetIDs []int64) (map[int64]int, map[int64]int, error)
 	Traverse(startID int64, direction string, refKinds []string, maxDepth int) ([]TraverseResult, error)
+	// EdgesAmong returns every refs edge where BOTH endpoints are in ids --
+	// a bounded subgraph among a candidate set, used to seed the
+	// search/context rankers' personalized-PageRank re-rank.
+	EdgesAmong(ids []int64) ([][2]int64, error)
 
 	// Imports (per-module)
 	GetImports(moduleID int64) ([]Import, error)
@@ -129,6 +133,10 @@ type Backend interface {
 	// sibling _test.go), not their content.
 	ListFileSourceNames(moduleID int64) ([]string, error)
 	DistinctSourceFiles() ([]string, error)
+	// AllFileHashes returns every known source file's last-ingested content
+	// hash, keyed by source_file, across all modules -- the cheap baseline
+	// the MCP freshness probe diffs the working tree against.
+	AllFileHashes() (map[string]string, error)
 	PruneStaleFileSources(live map[int64]map[string]bool) (int, error)
 	DeleteFile(sourceFile string) error
 

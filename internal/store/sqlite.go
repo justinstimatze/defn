@@ -2469,7 +2469,7 @@ func (s *SQLiteDB) AllDefSummaryMinHashes() (map[int64][]byte, error) {
 }
 
 // migrateAddSummaryColumns idempotently adds the #160 columns
-// (one_line, summary_body_hash, summary_model) to def_summaries for
+// (one_line, summary_body_hash, summary_model, crux) to def_summaries for
 // existing DBs. Fresh DBs already have them from CREATE TABLE; this
 // only matters when opening a DB created before this change.
 //
@@ -2481,6 +2481,7 @@ func migrateAddSummaryColumns(db *sql.DB) error {
 		`ALTER TABLE def_summaries ADD COLUMN one_line TEXT`,
 		`ALTER TABLE def_summaries ADD COLUMN summary_body_hash TEXT`,
 		`ALTER TABLE def_summaries ADD COLUMN summary_model TEXT`,
+		`ALTER TABLE def_summaries ADD COLUMN crux TEXT`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.ExecContext(context.Background(), stmt); err != nil {
@@ -2498,11 +2499,11 @@ func migrateAddSummaryColumns(db *sql.DB) error {
 // worker hasn't populated one, or the schema was populated before
 // #160 landed. Missing one_line is normalized to empty string.
 func (s *SQLiteDB) GetDefSummary(defID int64) (*DefSummary, error) {
-	var oneLine, bodyHash, model sql.NullString
+	var oneLine, bodyHash, model, crux sql.NullString
 	err := s.db.QueryRowContext(s.Ctx(),
-		`SELECT COALESCE(one_line,''), COALESCE(summary_body_hash,''), COALESCE(summary_model,'')
+		`SELECT COALESCE(one_line,''), COALESCE(summary_body_hash,''), COALESCE(summary_model,''), COALESCE(crux,'')
 		 FROM def_summaries WHERE def_id = ?`, defID,
-	).Scan(&oneLine, &bodyHash, &model)
+	).Scan(&oneLine, &bodyHash, &model, &crux)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -2514,6 +2515,7 @@ func (s *SQLiteDB) GetDefSummary(defID int64) (*DefSummary, error) {
 	}
 	return &DefSummary{
 		OneLine:  oneLine.String,
+		Crux:     crux.String,
 		BodyHash: bodyHash.String,
 		Model:    model.String,
 	}, nil
@@ -2532,13 +2534,14 @@ func (s *SQLiteDB) SetDefSummary(defID int64, sum *DefSummary) error {
 	// ON CONFLICT DO UPDATE ensures we don't lose the minhash column
 	// when the row already exists from the #151 backfill pass.
 	_, err := s.db.ExecContext(s.Ctx(),
-		`INSERT INTO def_summaries(def_id, one_line, summary_body_hash, summary_model)
-		 VALUES (?, ?, ?, ?)
+		`INSERT INTO def_summaries(def_id, one_line, summary_body_hash, summary_model, crux)
+		 VALUES (?, ?, ?, ?, ?)
 		 ON CONFLICT(def_id) DO UPDATE SET
 		   one_line          = excluded.one_line,
 		   summary_body_hash = excluded.summary_body_hash,
-		   summary_model     = excluded.summary_model`,
-		defID, sum.OneLine, sum.BodyHash, sum.Model)
+		   summary_model     = excluded.summary_model,
+		   crux              = excluded.crux`,
+		defID, sum.OneLine, sum.BodyHash, sum.Model, sum.Crux)
 	if err != nil {
 		return fmt.Errorf("sqlite: set def summary %d: %w", defID, err)
 	}
@@ -2865,4 +2868,63 @@ func (s *SQLiteDB) CountDefinitionsByNameAndReceiver(name, receiver string) (int
 		return 0, err
 	}
 	return n, nil
+}
+
+// AllFileHashes returns every known source file's last-ingested content
+// hash, keyed by source_file (module-relative path), across ALL modules.
+// A source_file that happens to collide across two modules keeps whichever
+// row the query visits last -- acceptable here because the caller (the MCP
+// freshness probe) only uses this as a cheap "did this file change since
+// last ingest" heuristic; the actual re-ingest it triggers re-resolves the
+// correct module on its own.
+func (s *SQLiteDB) AllFileHashes() (map[string]string, error) {
+	rows, err := s.db.QueryContext(s.Ctx(), `SELECT source_file, file_hash FROM file_sources`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var sf, hash string
+		if err := rows.Scan(&sf, &hash); err != nil {
+			return nil, err
+		}
+		out[sf] = hash
+	}
+	return out, rows.Err()
+}
+
+// EdgesAmong returns every refs edge (from_def, to_def) where BOTH
+// endpoints are in ids -- a bounded, cheap subgraph among a candidate set
+// (e.g. a search result pool), not a walk of the whole project's refs
+// table. Used by the search/context rankers to seed a personalized
+// PageRank re-rank (see internal/rank.GraphRerank) restricted to the
+// candidates actually being ranked.
+func (s *SQLiteDB) EdgesAmong(ids []int64) ([][2]int64, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, len(ids)*2)
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	in := "(" + strings.Join(placeholders, ",") + ")"
+	q := `SELECT from_def, to_def FROM refs WHERE from_def IN ` + in + ` AND to_def IN ` + in
+	args = append(args, args...)
+	rows, err := s.db.QueryContext(s.Ctx(), q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out [][2]int64
+	for rows.Next() {
+		var from, to int64
+		if err := rows.Scan(&from, &to); err != nil {
+			return nil, err
+		}
+		out = append(out, [2]int64{from, to})
+	}
+	return out, rows.Err()
 }

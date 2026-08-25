@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/justinstimatze/defn/internal/embed"
+	"github.com/justinstimatze/defn/internal/rank"
 	"github.com/justinstimatze/defn/internal/store"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -438,7 +439,7 @@ func (s *server) gatherContextCandidates(question string) ([]contextCandidate, [
 	for _, c := range seen {
 		cands = append(cands, c)
 	}
-	return contextRank(cands, tokens, tokenDF), tokens, nil
+	return s.graphRerankContext(contextRank(cands, tokens, tokenDF)), tokens, nil
 }
 
 // truncateForHeader caps a display label to maxLen runes, appending an
@@ -485,4 +486,53 @@ func contextTokenWeight(df int) float64 {
 		return 1.0
 	}
 	return float64(contextRareTokenCeiling) / float64(df)
+}
+
+// contextGraphBonusScale converts a PersonalizedPageRank score (normalized
+// to [0,1], top candidate = 1) into the same points scale contextRank's
+// other signals use (nameHits*8, sigHits*3, summaryHits*6, embedding*8) --
+// comparable to summaryHits' weight, "pending tune" like those.
+const contextGraphBonusScale = 6.0
+
+// graphRerankContext is context's version of search's rank.GraphRerank:
+// "lexical proposes, graph disposes" (see internal/rank/graphrank.go). Seeds
+// a personalized-PageRank walk with contextRank's own scores, restricted to
+// the refs among just this candidate set (bounded, cheap), so a candidate
+// structurally central to the matched cluster can outrank one that merely
+// shares a token. cands must already be contextRank's output (sorted,
+// scored); a nil/empty edge set leaves the order unchanged.
+func (s *server) graphRerankContext(cands []contextCandidate) []contextCandidate {
+	if len(cands) == 0 || s.backend == nil {
+		return cands
+	}
+	ids := make([]int64, len(cands))
+	seeds := make(map[int64]float64, len(cands))
+	for i, c := range cands {
+		ids[i] = c.Def.ID
+		if c.Score > 0 {
+			seeds[c.Def.ID] = float64(c.Score)
+		}
+	}
+	edges, err := s.backend.EdgesAmong(ids)
+	if err != nil || len(edges) == 0 {
+		return cands
+	}
+	pr := rank.PersonalizedPageRank(edges, seeds, 0, 0)
+	if len(pr) == 0 {
+		return cands
+	}
+	out := make([]contextCandidate, len(cands))
+	copy(out, cands)
+	for i := range out {
+		if g := pr[out[i].Def.ID]; g > 0 {
+			out[i].Score += int(g * contextGraphBonusScale)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Score != out[j].Score {
+			return out[i].Score > out[j].Score
+		}
+		return out[i].Def.Name < out[j].Def.Name
+	})
+	return out
 }

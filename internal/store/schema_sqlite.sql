@@ -241,6 +241,15 @@ CREATE TABLE IF NOT EXISTS def_summaries (
     -- Provenance for A/B experiments and forced regeneration on model
     -- upgrade.
     summary_model     TEXT,
+    -- The single most load-bearing contiguous span of the body (the
+    -- guard, branch, or state change a reviewer must actually read),
+    -- stored VERBATIM as text rather than a line range -- a line range
+    -- drifts the moment unrelated code above it shifts, but the text
+    -- itself stays correct until the def is actually re-summarized.
+    -- NULL/empty means either no summary yet or the model found no
+    -- single focal span worth calling out (a trivial getter, a plain
+    -- data holder).
+    crux              TEXT,
     FOREIGN KEY (def_id) REFERENCES definitions(id) ON DELETE CASCADE
 );
 

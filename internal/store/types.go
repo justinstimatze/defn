@@ -149,7 +149,12 @@ type SimulationStep struct {
 // which LLM produced it. Empty OneLine means "no summary yet" — the
 // fire-and-forget worker fills these asynchronously after ingest.
 type DefSummary struct {
-	OneLine  string
+	OneLine string
+	// Crux is the single most load-bearing contiguous span of the body,
+	// stored verbatim as text (not a line range -- see the def_summaries
+	// schema comment for why). Empty means no summary yet, or the model
+	// found no single focal span worth calling out.
+	Crux     string
 	BodyHash string
 	Model    string
 }

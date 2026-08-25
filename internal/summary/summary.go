@@ -34,8 +34,13 @@ type Request struct {
 // couldn't produce a summary for this def; callers must not persist
 // failed results (they'd overwrite a good prior summary with junk).
 type Result struct {
-	DefID    int64
-	OneLine  string
+	DefID   int64
+	OneLine string
+	// Crux is the single most load-bearing contiguous span of Body,
+	// sliced verbatim from it -- empty when the backend found no single
+	// focal span worth calling out (a trivial getter, a plain data
+	// holder). Stub never sets this.
+	Crux     string
 	BodyHash string
 	Model    string
 	Err      error
@@ -80,6 +85,7 @@ func (Stub) Generate(_ context.Context, reqs []Request) []Result {
 func toStoreSummary(r Result) *store.DefSummary {
 	return &store.DefSummary{
 		OneLine:  r.OneLine,
+		Crux:     r.Crux,
 		BodyHash: r.BodyHash,
 		Model:    r.Model,
 	}

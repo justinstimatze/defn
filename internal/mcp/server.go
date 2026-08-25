@@ -28,6 +28,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode"
@@ -92,6 +93,7 @@ type server struct {
 	hint               *mutationHint          // #158: apply-batching nudge on serial mutations to one file
 	summaryWorker      *summary.Worker        // #160: async model-summary generation for def_summaries
 	explainClient      *summary.ExplainClient // #186: Sonnet co-processor for op:"explain" with question
+	freshnessMu        sync.Mutex             // serializes ensureFresh's probe-and-heal against concurrent handleCode calls
 }
 
 // Run starts the MCP server over stdio. projDir is the project root where
@@ -1029,6 +1031,13 @@ func (s *server) modulePath(moduleID int64) string {
 // handleCode is the single entry point for all operations.
 // It dispatches based on the "op" field to the appropriate handler.
 func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, args codeParam) (result *sdkmcp.CallToolResult, structured any, err error) {
+	// Auto-freshness gate (internal/mcp/freshness.go): probes the working
+	// tree against the last-known file hashes and re-ingests any file that
+	// changed outside the code tool before this op reads the database.
+	// Declared before the dedup defer below so that closure can prepend
+	// the note once ensureFresh actually runs, further down.
+	var freshnessNote string
+
 	// #77/#152: post-dispatch dedup. Read ops that return byte-identical
 	// content on repeat get replaced with a compact "already served" stub;
 	// write ops invalidate the session cache so the next read is a clean
@@ -1107,6 +1116,17 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if op, argKey, ok := dedupOpKey(args); ok {
 			result = s.respCache.dedup(req.Session, op, argKey, result)
 		}
+		// Auto-freshness note: prepended after dedup (not before), same
+		// reasoning as the starter bundle just below -- dedup hashes the
+		// response text, and this note's presence/content varies call to
+		// call (non-empty only when ensureFresh actually healed something),
+		// so baking it in before hashing would poison the dedup entry for
+		// every later identical call.
+		if freshnessNote != "" && len(result.Content) > 0 {
+			if tc, ok := result.Content[0].(*sdkmcp.TextContent); ok {
+				tc.Text = freshnessNote + tc.Text
+			}
+		}
 		// #303: the one-shot starter bundle used to be appended inline,
 		// per-op, BEFORE dedup ran -- which meant dedup's sha256 hash of
 		// the response text included whatever bundle got appended to
@@ -1159,6 +1179,14 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 
 	if canonical, ok := opAliases[args.Op]; ok {
 		args.Op = canonical
+	}
+
+	// Skip for op:"sync" itself (already does a real, explicit resync --
+	// probing first would be redundant and could double up autoCommit).
+	// ensureFresh no-ops on its own when there's no backend/project, so no
+	// separate guard is needed for bare CLI/test use.
+	if args.Op != "sync" {
+		freshnessNote = s.ensureFresh()
 	}
 
 	switch args.Op {
@@ -2900,6 +2928,18 @@ func (s *server) rankedSearchResult(query string, defs []store.Definition, limit
 		}
 	}
 	scored := rank.Rank(query, cands, s.idf, rank.DefaultWeights)
+
+	// #NEW: graph re-rank -- "lexical proposes, graph disposes" (see
+	// internal/rank/graphrank.go). Seeded by the lexical/graph-signal
+	// scores Rank already computed, walked over the refs edges among just
+	// this candidate set (bounded, cheap -- not the whole project's refs
+	// table), so a candidate structurally central to the matched cluster
+	// can outrank one that merely shares a keyword. graphRerankWeight is
+	// equal-footing with Rank's other DefaultWeights entries (1.0,
+	// "pending tune" per DefaultWeights' own doc comment).
+	if edges, err := s.backend.EdgesAmong(ids); err == nil {
+		scored = rank.GraphRerank(scored, edges, graphRerankWeight, 0, 0)
+	}
 
 	type rankedSummary struct {
 		Name       string  `json:"name"`
@@ -9841,6 +9881,17 @@ func renderSummaryOnly(d *store.Definition, sum *store.DefSummary) *sdkmcp.CallT
 		sb.WriteString("\n\n")
 	}
 	sb.WriteString(fmt.Sprintf("_intent (%s):_ %s\n", sum.Model, sum.OneLine))
+	// The crux is the one excerpt worth showing even in summary mode: the
+	// few lines that actually carry the logic (the guard, the branch,
+	// the state change), not a restatement of what the signature already
+	// says. Omitted entirely when the model found no single focal span
+	// (a trivial getter, a plain data holder) -- see the def_summaries
+	// schema comment for why it's stored as text, not a line range.
+	if sum.Crux != "" {
+		sb.WriteString("\n_crux:_\n```go\n")
+		sb.WriteString(sum.Crux)
+		sb.WriteString("\n```\n")
+	}
 	sb.WriteString("\n_summary mode — omit `mode:\"summary\"` for the full body._\n")
 	out := sb.String()
 	return withUsage(textResult(out), usageStats{
@@ -12729,3 +12780,8 @@ func debugDefIDs(defs []store.Definition) string {
 	}
 	return out
 }
+
+// graphRerankWeight is how much rank.GraphRerank's centrality bonus can
+// move search's final order, equal-footing with Rank's other
+// DefaultWeights entries (1.0, "pending tune" per that var's own doc).
+const graphRerankWeight = 1.0
