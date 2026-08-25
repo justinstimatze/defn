@@ -120,7 +120,12 @@ func PersonalizedPageRank(edges [][2]int64, seeds map[int64]float64, alpha float
 //
 // Each result's Reasons gains a "graph_centrality" entry (0 for a def the
 // walk didn't reach) alongside the lexical/graph-signal features Rank
-// already recorded, so the breakdown stays fully explainable.
+// already recorded, so the breakdown stays fully explainable. Returns a
+// genuinely independent copy -- each Reasons map is cloned, not aliased --
+// so mutating the result never reaches back into the caller's original
+// scored slice (a plain `copy` of []ScoredRef only copies the map HEADER,
+// leaving out[i].Reasons pointing at the same underlying map as
+// scored[i].Reasons).
 func GraphRerank(scored []ScoredRef, edges [][2]int64, graphWeight, alpha float64, iters int) []ScoredRef {
 	if graphWeight <= 0 || len(edges) == 0 || len(scored) == 0 {
 		return scored
@@ -133,11 +138,14 @@ func GraphRerank(scored []ScoredRef, edges [][2]int64, graphWeight, alpha float6
 	}
 	pr := PersonalizedPageRank(edges, seeds, alpha, iters)
 	out := make([]ScoredRef, len(scored))
-	copy(out, scored)
-	for i := range out {
-		g := pr[out[i].Def.ID]
-		out[i].Reasons["graph_centrality"] = g
-		out[i].Score += g * graphWeight
+	for i, sr := range scored {
+		reasons := make(map[string]float64, len(sr.Reasons)+1)
+		for k, v := range sr.Reasons {
+			reasons[k] = v
+		}
+		g := pr[sr.Def.ID]
+		reasons["graph_centrality"] = g
+		out[i] = ScoredRef{Def: sr.Def, Score: sr.Score + g*graphWeight, Reasons: reasons}
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].Score > out[j].Score

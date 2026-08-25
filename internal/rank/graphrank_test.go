@@ -101,3 +101,27 @@ func TestGraphRerank_ZeroWeightIsNoOp(t *testing.T) {
 		t.Fatal("expected no graph_centrality reason to be added when graphWeight=0")
 	}
 }
+
+// TestGraphRerank_DoesNotMutateCallersOriginalReasonsMap is the regression
+// for a real bug a code review caught: `copy(out, scored)` only copies the
+// map HEADER, leaving out[i].Reasons aliased to the exact same underlying
+// map as scored[i].Reasons -- so writing out[i].Reasons["graph_centrality"]
+// silently mutated the caller's original slice too, despite GraphRerank
+// looking like it returns an independent copy.
+func TestGraphRerank_DoesNotMutateCallersOriginalReasonsMap(t *testing.T) {
+	originalReasons := map[string]float64{"name_match": 1.0}
+	scored := []ScoredRef{
+		{Def: store.Definition{ID: 1}, Score: 10, Reasons: originalReasons},
+		{Def: store.Definition{ID: 2}, Score: 10, Reasons: map[string]float64{"name_match": 1.0}},
+	}
+	edges := [][2]int64{{1, 2}}
+
+	_ = GraphRerank(scored, edges, 5.0, 0.25, 25)
+
+	if _, ok := originalReasons["graph_centrality"]; ok {
+		t.Errorf("expected the caller's original Reasons map to be untouched, but graph_centrality leaked into it: %v", originalReasons)
+	}
+	if len(originalReasons) != 1 {
+		t.Errorf("expected the caller's original Reasons map to keep its original single entry, got %v", originalReasons)
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"github.com/justinstimatze/defn/internal/ingest"
 	"github.com/justinstimatze/defn/internal/resolve"
 	"github.com/justinstimatze/defn/internal/store"
+	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func freshnessFingerprintPath(projectDir string) string {
@@ -78,7 +79,11 @@ func writeFreshnessFingerprint(projectDir string, fp *freshnessFingerprint) {
 // never ingested -- discovering those still requires op:"sync", exactly as
 // today, so this closes the common "forgot to sync after editing" case
 // without taking on a full repo-wide file walk on every call.
-func (s *server) ensureFresh() string {
+//
+// req may be nil (some test/measurement call paths construct a server
+// without a real session) -- session-cache invalidation below is skipped
+// in that case, same as every other req-nil-safe site in this file.
+func (s *server) ensureFresh(req *sdkmcp.CallToolRequest) string {
 	if s.backend == nil || s.projectDir == "" {
 		return ""
 	}
@@ -103,6 +108,11 @@ func (s *server) ensureFresh() string {
 		fp = &freshnessFingerprint{Files: make(map[string]freshnessPrint, len(knownHashes))}
 	}
 
+	// dirty tracks whether fp actually changed this probe -- distinct from
+	// changed/removed (which drive healing). A steady-state probe where
+	// every file is stat-trusted mutates nothing and must not pay a full
+	// JSON marshal+write just to re-persist an unchanged fingerprint.
+	dirty := false
 	var changed, removed []string
 	seen := make(map[string]bool, len(knownHashes))
 	for rel, dbHash := range knownHashes {
@@ -113,7 +123,16 @@ func (s *server) ensureFresh() string {
 		}
 		info, statErr := os.Stat(abs)
 		if statErr != nil {
-			removed = append(removed, rel)
+			// Only a genuine "no such file" means the file is actually
+			// gone. Any other stat error -- EACCES from an AV/backup
+			// scan, an NFS/EIO blip, a symlink loop, a stat racing an
+			// atomic-rename save -- is not evidence of deletion, and
+			// treating it as such would permanently prune real,
+			// still-existing definitions via DeleteFile below. Leave the
+			// cached print alone and let the next probe retry.
+			if os.IsNotExist(statErr) {
+				removed = append(removed, rel)
+			}
 			continue
 		}
 		if print, ok := fp.Files[rel]; ok &&
@@ -130,6 +149,7 @@ func (s *server) ensureFresh() string {
 		}
 		if diskHash == dbHash {
 			fp.Files[rel] = freshnessPrint{Size: size, MTime: mtime, Hash: dbHash}
+			dirty = true
 			continue
 		}
 		changed = append(changed, rel)
@@ -140,11 +160,14 @@ func (s *server) ensureFresh() string {
 	for rel := range fp.Files {
 		if !seen[rel] {
 			delete(fp.Files, rel)
+			dirty = true
 		}
 	}
 
 	if len(changed) == 0 && len(removed) == 0 {
-		writeFreshnessFingerprint(s.projectDir, fp)
+		if dirty {
+			writeFreshnessFingerprint(s.projectDir, fp)
+		}
 		return ""
 	}
 
@@ -175,6 +198,24 @@ func (s *server) ensureFresh() string {
 
 	if healed > 0 || pruned > 0 {
 		_ = s.autoCommit()
+		// The heal just changed what the DB says for these files' defs --
+		// any session-cached "already read, hasn't changed" state
+		// (respCache's bodyServed/dedup/readDowngraded) or reachability
+		// snapshot (s.reach) now describes a world that no longer exists.
+		// Without this, the very next read of a def this heal just
+		// updated can still hit the pre-heal dedup/bodyServed stub and
+		// silently serve the STALE body in the same breath this note
+		// claims something changed -- defeating the whole feature. Full
+		// wipe (not the write-ops' narrower invalidateNames) because a
+		// heal's blast radius is per-FILE, and invalidateNames' file
+		// param is currently a no-op (see dedup.go) -- there is no scoped
+		// alternative to fall back to here.
+		if req != nil && s.respCache != nil {
+			s.respCache.invalidate(req.Session)
+		}
+		if s.reach != nil {
+			s.reach.invalidate()
+		}
 	}
 	writeFreshnessFingerprint(s.projectDir, fp)
 

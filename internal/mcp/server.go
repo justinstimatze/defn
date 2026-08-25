@@ -1186,7 +1186,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	// ensureFresh no-ops on its own when there's no backend/project, so no
 	// separate guard is needed for bare CLI/test use.
 	if args.Op != "sync" {
-		freshnessNote = s.ensureFresh()
+		freshnessNote = s.ensureFresh(req)
 	}
 
 	switch args.Op {
@@ -2937,8 +2937,13 @@ func (s *server) rankedSearchResult(query string, defs []store.Definition, limit
 	// can outrank one that merely shares a keyword. graphRerankWeight is
 	// equal-footing with Rank's other DefaultWeights entries (1.0,
 	// "pending tune" per DefaultWeights' own doc comment).
-	if edges, err := s.backend.EdgesAmong(ids); err == nil {
-		scored = rank.GraphRerank(scored, edges, graphRerankWeight, 0, 0)
+	// A rerank can't change anything with fewer than 2 candidates -- skip
+	// the query entirely rather than issue it just to have GraphRerank's
+	// own len(scored)==0 guard discard the result.
+	if len(ids) >= 2 {
+		if edges, err := s.backend.EdgesAmong(ids); err == nil {
+			scored = rank.GraphRerank(scored, edges, graphRerankWeight, 0, 0)
+		}
 	}
 
 	type rankedSummary struct {

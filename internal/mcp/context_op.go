@@ -502,7 +502,7 @@ const contextGraphBonusScale = 6.0
 // shares a token. cands must already be contextRank's output (sorted,
 // scored); a nil/empty edge set leaves the order unchanged.
 func (s *server) graphRerankContext(cands []contextCandidate) []contextCandidate {
-	if len(cands) == 0 || s.backend == nil {
+	if len(cands) < 2 || s.backend == nil {
 		return cands
 	}
 	ids := make([]int64, len(cands))
