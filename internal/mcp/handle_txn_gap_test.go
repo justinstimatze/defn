@@ -276,3 +276,75 @@ func TestHandleCode_RetargetFieldValueFailureStillInvalidatesCache(t *testing.T)
 		t.Fatalf("expected the FAILED retarget-field-value call to still invalidate respCache, got: %s", text)
 	}
 }
+
+// TestHandleCode_RetargetFieldValueSuccessInvalidatesTouchedDefsCache is
+// the regression for a real pre-existing bug found while restoring
+// coverage for this op: writeTargets used to scope retarget-field-value's
+// cache invalidation to args.Name -- the struct TYPE name ("Claim") -- not
+// any def actually rewritten (e.g. "C1"). A session that read C1 via
+// full:true, then ran a SUCCESSFUL retarget that changed C1's body, would
+// keep serving C1's stale pre-retarget cached body afterward, because
+// "Claim" (not "C1") was the only name ever invalidated. writeTargets now
+// reports retarget-field-value's blast radius as undeterminable, falling
+// back to a full session invalidate, same as rename already does for the
+// same class of problem.
+func TestHandleCode_RetargetFieldValueSuccessInvalidatesTouchedDefsCache(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "claims.go"), []byte(`package main
+
+type Claim struct {
+	Subject string
+	Object  string
+}
+
+var C1 = Claim{Subject: "s1", Object: "OldTarget"}
+
+func main() {}
+`), 0644)
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
+	ctx := context.Background()
+
+	first, _, err := s.handleCode(ctx, req, codeParam{Op: "read", Name: "C1", Full: true})
+	if err != nil {
+		t.Fatalf("initial full read: %v", err)
+	}
+	if !strings.Contains(resultText(t, first), "OldTarget") {
+		t.Fatalf("expected the original body, got: %s", resultText(t, first))
+	}
+
+	retargetResult, _, _ := s.handleCode(ctx, req, codeParam{
+		Op: "retarget-field-value", Name: "Claim", Field: "Object", Old: "OldTarget", New: "NewTarget",
+	})
+	if retargetResult == nil || retargetResult.IsError {
+		t.Fatalf("expected retarget to succeed, got: %+v", retargetResult)
+	}
+
+	second, _, err := s.handleCode(ctx, req, codeParam{Op: "read", Name: "C1"})
+	if err != nil {
+		t.Fatalf("re-read after retarget: %v", err)
+	}
+	text := resultText(t, second)
+	if strings.Contains(text, "already read") || strings.Contains(text, "hasn't changed") {
+		t.Fatalf("expected the retarget to invalidate C1's cache, got: %s", text)
+	}
+	if !strings.Contains(text, "NewTarget") {
+		t.Errorf("expected the re-read to show the retargeted body (\"NewTarget\"), got: %s", text)
+	}
+}

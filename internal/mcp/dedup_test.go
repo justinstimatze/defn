@@ -373,6 +373,15 @@ func TestWriteTargets(t *testing.T) {
 			wantOK: false,
 		},
 		{
+			// args.Name for retarget-field-value is the struct TYPE name,
+			// not any def actually mutated -- the real targets (every def
+			// whose body holds a matching composite literal) aren't
+			// knowable from args alone, same class of gap as rename above.
+			name:   "retarget_field_value_is_not_determinable",
+			args:   codeParam{Op: "retarget-field-value", Name: "Claim", Field: "Object", Old: "a", New: "b"},
+			wantOK: false,
+		},
+		{
 			name: "apply_batch_mixes_names_and_files",
 			args: codeParam{Op: "apply", Operations: []applyOp{
 				{Op: "edit", Name: "Foo"},
@@ -395,6 +404,14 @@ func TestWriteTargets(t *testing.T) {
 			args: codeParam{Op: "apply", Operations: []applyOp{
 				{Op: "edit", Name: "Foo"},
 				{Op: "rename", Name: "Baz", NewName: "Qux"},
+			}},
+			wantOK: false,
+		},
+		{
+			name: "apply_batch_with_retarget_field_value_is_not_determinable",
+			args: codeParam{Op: "apply", Operations: []applyOp{
+				{Op: "edit", Name: "Foo"},
+				{Op: "retarget-field-value", Name: "Claim", Field: "Object", Old: "a", New: "b"},
 			}},
 			wantOK: false,
 		},

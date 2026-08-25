@@ -435,12 +435,24 @@ var readOpsWithNameKey = []string{"read", "outline", "slice", "impact", "expand"
 func writeTargets(args codeParam) (names, files []string, ok bool) {
 	switch args.Op {
 	case "edit", "insert", "insert-precondition", "replace-slice",
-		"replace-hunk", "wrap-in-defer", "rename-param",
-		"retarget-field-value", "patch":
+		"replace-hunk", "wrap-in-defer", "rename-param", "patch":
 		if args.Name == "" {
 			return nil, nil, false
 		}
 		return []string{args.Name}, nil, true
+	case "retarget-field-value":
+		// args.Name here is the STRUCT TYPE name (typeName in
+		// handleRetargetFieldValue), not the name of any def actually
+		// mutated -- the real targets are every def, of ANY name, whose
+		// body holds a matching composite literal, which isn't knowable
+		// from args alone (only after tx.GetModuleDefinitions runs inside
+		// the handler). Scoping to args.Name would invalidate a def
+		// merely SHARING that name with the type (rare) while leaving the
+		// actually-rewritten defs' stale bodyServed/dedup entries in
+		// place -- same class of gap "rename" below guards against, for
+		// the same reason. Report undeterminable so the caller falls back
+		// to a full invalidate.
+		return nil, nil, false
 	case "delete":
 		// #284: file:-only delete (no name) is the bulk "delete every def
 		// in this file" path -- unlike the other name-scoped write ops
@@ -484,11 +496,16 @@ func writeTargets(args codeParam) (names, files []string, ok bool) {
 			switch op.Op {
 			case "edit", "insert", "insert-precondition", "replace-slice",
 				"replace-hunk", "wrap-in-defer", "rename-param", "delete",
-				"retarget-field-value", "patch":
+				"patch":
 				if op.Name == "" {
 					return nil, nil, false
 				}
 				allNames = append(allNames, op.Name)
+			case "retarget-field-value":
+				// Same reasoning as the top-level "retarget-field-value"
+				// case above -- op.Name is the struct type, not any def
+				// actually touched.
+				return nil, nil, false
 			case "rename":
 				// Same reasoning as the top-level "rename" case above --
 				// a rename's real blast radius (rewritten callers, and for
