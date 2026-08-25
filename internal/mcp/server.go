@@ -1396,15 +1396,6 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if r, o, e := need(args.Body, "body"); r != nil {
 			return r, o, e
 		}
-		// name: is a real codeParam field, but create always infers the
-		// definition's name/kind/receiver from body itself (via
-		// inferFromBody) -- createParam has no Name field at all, so
-		// name: was silently dropped with no error and no note. Same
-		// silent-no-op class as #298 (edit's import_path/alias) and #250
-		// (search's include) -- reject instead of accepting and ignoring.
-		if args.Name != "" {
-			return errResult(fmt.Errorf("create: name has no effect -- the definition's name is always inferred from body's own declaration (e.g. `func Foo(...) {...}` creates a def named Foo), not from a separate name: param; remove name: or make body declare the name you want"))
-		}
 	case "rename":
 		if r, o, e := need(args.OldName, "old_name"); r != nil {
 			return r, o, e
@@ -1713,6 +1704,24 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case "insert":
 		return s.handleInsert(ctx, req, args)
 	case "create":
+		// name: is a real codeParam field, but create always infers the
+		// definition's name/kind/receiver from body itself (via
+		// inferFromBody) -- createParam has no Name field at all, so a
+		// name: that merely echoed body's own declared name (a natural
+		// thing to pass in an apply batch alongside sibling ops that DO
+		// key off name:, e.g. TestHandleApply_RenamePointerReceiverMethod-
+		// ThenEditSameBatch's real-trajectory shape) was harmless -- but a
+		// name: that DISAGREED with body was silently dropped with no
+		// error and no note, same silent-no-op class as #298 (edit's
+		// import_path/alias) and #250 (search's include). Only reject the
+		// genuine mismatch, not every presence of name:; skip multi-decl
+		// bodies, where a single name: can't unambiguously mean any one
+		// of several declarations anyway.
+		if args.Name != "" && countTopLevelDecls(args.Body) <= 1 {
+			if inferred, _, _, _ := s.inferFromBody(args.Body); inferred != "" && inferred != args.Name {
+				return errResult(fmt.Errorf("create: name:%q doesn't match %q, the name body actually declares -- create always infers the definition's name from body's own declaration, not from a separate name: param; make body declare %q or remove name:", args.Name, inferred, args.Name))
+			}
+		}
 		return s.handleCreate(ctx, req, createParam{Body: args.Body, Module: args.Module, File: args.File, DryRun: args.DryRun})
 	case "delete":
 		if strings.TrimSpace(args.Name) == "" && strings.TrimSpace(args.File) != "" {
@@ -4577,13 +4586,11 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		for _, op := range args.Operations {
 			switch op.Op {
 			case "create":
-				// Same silent no-op as handleCode's op:"create" validation --
-				// see its comment for the full rationale. create always infers
-				// the definition's name from body itself, in this apply path too.
-				if op.Name != "" {
-					errors = append(errors, "create: name has no effect -- the definition's name is always inferred from body's own declaration; remove name: or make body declare the name you want")
-					continue
-				}
+				// Same mismatch-only check as handleCode's op:"create" -- see
+				// its comment for the full rationale (a name: that merely
+				// echoes body's own declared name is harmless and common in a
+				// batch alongside sibling ops that key off name:; only a
+				// genuine disagreement is worth rejecting).
 				if n := countTopLevelDecls(op.Body); n > 1 {
 					if op.File == "" {
 						errors = append(errors, fmt.Sprintf("create: body has %d top-level decls — set file: to author a whole file in one call, or split into %d create ops", n, n))
@@ -4606,6 +4613,8 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 					} else {
 						errors = append(errors, "create: couldn't infer name from body")
 					}
+				} else if op.Name != "" && op.Name != name {
+					errors = append(errors, fmt.Sprintf("create: name:%q doesn't match %q, the name body actually declares -- create always infers the definition's name from body's own declaration, not from a separate name: param; make body declare %q or remove name:", op.Name, name, op.Name))
 				} else {
 					sb.WriteString(fmt.Sprintf("+ would create %s (%s)\n", name, kind))
 				}
@@ -4975,12 +4984,8 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	for _, op := range args.Operations {
 		switch op.Op {
 		case "create":
-			// Same silent no-op as handleCode's op:"create" validation -- see
-			// its comment for the full rationale.
-			if op.Name != "" {
-				errors = append(errors, "create: name has no effect -- the definition's name is always inferred from body's own declaration; remove name: or make body declare the name you want")
-				continue
-			}
+			// Same mismatch-only check as handleCode's op:"create" -- see its
+			// comment for the full rationale.
 			if n := countTopLevelDecls(op.Body); n > 1 {
 				if op.File == "" {
 					errors = append(errors, fmt.Sprintf("create: body has %d top-level decls — set file: to author a whole file in one call, or split into %d create ops", n, n))
@@ -5075,6 +5080,10 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				} else {
 					errors = append(errors, "create: couldn't infer name from body")
 				}
+				continue
+			}
+			if op.Name != "" && op.Name != name {
+				errors = append(errors, fmt.Sprintf("create: name:%q doesn't match %q, the name body actually declares -- create always infers the definition's name from body's own declaration, not from a separate name: param; make body declare %q or remove name:", op.Name, name, op.Name))
 				continue
 			}
 			// Mirrors handleCreate's precedence: file: is tried first (most

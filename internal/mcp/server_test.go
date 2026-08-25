@@ -15352,8 +15352,8 @@ func TestHandleApply_CreateNameParamRejected(t *testing.T) {
 		},
 	})
 	text := resultText(t, result)
-	if !strings.Contains(text, "name has no effect") {
-		t.Fatalf("expected a rejection explaining name: has no effect on create, got: %s", text)
+	if !strings.Contains(text, "doesn't match") {
+		t.Fatalf("expected a rejection explaining name: doesn't match body's declared name, got: %s", text)
 	}
 
 	dryRun, _, _ := s.handleApply(context.Background(), nil, applyParam{
@@ -15363,8 +15363,8 @@ func TestHandleApply_CreateNameParamRejected(t *testing.T) {
 		},
 	})
 	dryText := resultText(t, dryRun)
-	if !strings.Contains(dryText, "name has no effect") {
-		t.Fatalf("expected dry-run to also reject name:, got: %s", dryText)
+	if !strings.Contains(dryText, "doesn't match") {
+		t.Fatalf("expected dry-run to also reject a name: mismatch, got: %s", dryText)
 	}
 }
 
@@ -15431,8 +15431,8 @@ func TestHandleCode_CreateNameParamRejected(t *testing.T) {
 		Body: "func ActualName() string { return \"x\" }",
 	})
 	text := resultText(t, result)
-	if !strings.Contains(text, "name has no effect") {
-		t.Fatalf("expected a rejection explaining name: has no effect on create, got: %s", text)
+	if !strings.Contains(text, "doesn't match") {
+		t.Fatalf("expected a rejection explaining name: doesn't match body's declared name, got: %s", text)
 	}
 
 	// #241's own "no matches for %q" message echoes the queried pattern
@@ -15515,5 +15515,30 @@ func (b *Beta) Run() {}
 	text = resultText(t, result)
 	if !strings.Contains(text, "Alpha") || strings.Contains(text, "Beta") {
 		t.Errorf("receiver:\"*Alpha\" should match the same as bare \"Alpha\", got: %s", text)
+	}
+}
+
+// TestHandleCode_CreateNameParamMatchingBodyIsAllowed guards the other
+// side of TestHandleCode_CreateNameParamRejected: name: that merely
+// echoes what body already declares must NOT be rejected -- a real
+// recorded trajectory (see TestHandleApply_RenamePointerReceiver-
+// MethodThenEditSameBatch) passes name: on a create op inside a batch
+// alongside sibling ops that key off name:, and it happens to agree
+// with body. Only a genuine disagreement is a mistake worth flagging.
+func TestHandleCode_CreateNameParamMatchingBodyIsAllowed(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op:   "create",
+		Name: "Zorp",
+		Body: "func Zorp() string { return \"x\" }",
+		File: "main.go",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "Created") {
+		t.Fatalf("expected create to succeed when name: matches body's declared name, got: %s", text)
 	}
 }
