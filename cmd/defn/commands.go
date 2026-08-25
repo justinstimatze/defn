@@ -1513,32 +1513,6 @@ func countStaleFiles(db store.Backend, projectDir, dbPath string) (count int, sa
 	return len(stale), stale[0]
 }
 
-// countDBSourceFiles returns the number of distinct .go files ingested
-// into the database. Queries file_sources (the authoritative per-file
-// record written by ingest, including files with zero declarations like
-// package-only files) — querying definitions would undercount and miss
-// deletions of def-bearing files in projects that also contain
-// package-only files.
-func countDBSourceFiles(db store.Backend) (int, error) {
-	rows, err := db.Query("SELECT COUNT(DISTINCT source_file) AS n FROM file_sources")
-	if err != nil {
-		return 0, err
-	}
-	if len(rows) == 0 {
-		return 0, nil
-	}
-	switch v := rows[0]["n"].(type) {
-	case int64:
-		return int(v), nil
-	case int:
-		return v, nil
-	case uint64:
-		return int(v), nil
-	default:
-		return 0, fmt.Errorf("unexpected count type %T", v)
-	}
-}
-
 // incrementalIngestThreshold caps the per-file fast path. Above this
 // many stale files we fall through to a full packages.Load. Per-file
 // cost is roughly: IngestFile ~10ms (go/parser only) + ResolveFile
@@ -2352,57 +2326,6 @@ func cmdLint() {
 		fmt.Println(d.String())
 	}
 	os.Exit(1)
-}
-
-func printPrefixed(body, prefix string) {
-	for line := range strings.SplitSeq(body, "\n") {
-		fmt.Printf("%s%s\n", prefix, line)
-	}
-}
-
-// printUnifiedDiff shells out to diff(1) for proper unified output
-// matching git's format. Falls back to simple display if diff unavailable.
-func printUnifiedDiff(oldBody, newBody string) {
-	dir, err := os.MkdirTemp("", "defn-diff-*")
-	if err != nil {
-		printSimpleDiff(oldBody, newBody)
-		return
-	}
-	defer os.RemoveAll(dir)
-
-	oldFile := filepath.Join(dir, "old")
-	newFile := filepath.Join(dir, "new")
-	os.WriteFile(oldFile, []byte(oldBody+"\n"), 0644)
-	os.WriteFile(newFile, []byte(newBody+"\n"), 0644)
-
-	cmd := exec.Command("diff", "-u", "--label=old", "--label=new", oldFile, newFile)
-	out, _ := cmd.Output()
-	// diff exits 1 when files differ — that's expected.
-	if len(out) == 0 {
-		fmt.Println("    (no text difference)")
-		return
-	}
-
-	// Skip the first two header lines (--- old / +++ new) and print
-	// the hunks indented.
-	lines := strings.SplitSeq(string(out), "\n")
-	for line := range lines {
-		if strings.HasPrefix(line, "---") || strings.HasPrefix(line, "+++") {
-			continue
-		}
-		fmt.Printf("    %s\n", line)
-	}
-}
-
-func printSimpleDiff(oldBody, newBody string) {
-	fmt.Println("    --- old")
-	for line := range strings.SplitSeq(oldBody, "\n") {
-		fmt.Printf("    -%s\n", line)
-	}
-	fmt.Println("    +++ new")
-	for line := range strings.SplitSeq(newBody, "\n") {
-		fmt.Printf("    +%s\n", line)
-	}
 }
 
 func fatal(err error) {

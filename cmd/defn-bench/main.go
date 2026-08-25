@@ -21,7 +21,6 @@ import (
 type question struct {
 	project string       // project short name
 	kind    questionKind // graph vs lookup — for per-bucket splits in the summary
-	repoDir string       // path to cloned repo
 	query   string       // the question to ask
 	// Expected: what a correct answer should contain
 	expectContains []string

@@ -3518,41 +3518,6 @@ func (s *server) autoEmitAndBuild() string {
 	return s.autoEmitAndBuildWithOpts(emit.Opts{})
 }
 
-// autoEmitOnly emits without running `go build` — for projection ops
-// that are AST-guaranteed sig-stable (insert-precondition, replace-slice,
-// replace-hunk, wrap-in-defer, rename-param, add-import). Task #148:
-// on winze, rename+build was 187ms with 148ms of that in go build;
-// skipping the build takes the op to ~35ms and delivers the "faster
-// than native because the index is maintained" thesis as a
-// demonstrable fact rather than an aspiration.
-//
-// Safety: these ops preserve syntactic well-formedness by construction
-// (they transform an already-valid AST). They CAN produce type errors
-// (undefined identifier in a new precondition, wrong signature in a
-// hunk replacement) — those surface on the next op that builds, or on
-// an explicit code(op:"test") / native `go build`. The DB is
-// authoritative; the emitted file is a projection.
-//
-// autoResolveFile still runs downstream via the callers so the ref
-// graph stays consistent. Only the go-build gate is deferred.
-//
-// Set DEFN_STRICT_BUILD=1 to force the build (opt-out for users who
-// want the old per-mutation gate — bench harnesses, CI, cautious flows).
-func (s *server) autoEmitOnly(sourceFile string) string {
-	opts := emit.Opts{}
-	if sourceFile != "" {
-		opts.GoimportsFiles = []string{sourceFile}
-		opts.TouchedFiles = []string{sourceFile}
-	}
-	return s.autoEmitOnlyWithOpts(opts)
-}
-
-// autoEmitOnlyWithOpts is the multi-file variant used by handleRename,
-// which touches the def's own file plus each caller's file.
-func (s *server) autoEmitOnlyWithOpts(opts emit.Opts) string {
-	return s.emitOnlyAgainst(s.backend, opts)
-}
-
 // emitOnlyAgainst is autoEmitOnlyWithOpts generalized to accept the
 // store.Backend to emit against, mirroring emitAndBuildAgainst (#12).
 func (s *server) emitOnlyAgainst(backend store.Backend, opts emit.Opts) string {

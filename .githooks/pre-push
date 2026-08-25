@@ -15,6 +15,13 @@ CGO_ENABLED=1 go build ./cmd/defn/
 echo "-> vet"
 go vet ./...
 
+echo "-> staticcheck"
+if command -v staticcheck &> /dev/null; then
+  staticcheck ./...
+else
+  echo "staticcheck not installed -- skipping (install: go install honnef.co/go/tools/cmd/staticcheck@latest)"
+fi
+
 echo "-> unit tests"
 # 10m, not 5m: internal/mcp's suite alone now runs ~5m46s after the
 # wip-snapshot merge added its fuzz/differential tests (confirmed live

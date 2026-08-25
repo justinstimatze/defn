@@ -430,8 +430,6 @@ func parseStreamJSON(out []byte) streamStats {
 	return s
 }
 
-func countToolCalls(out []byte) int { return parseStreamJSON(out).ToolCalls }
-
 func intField(m map[string]any, key string) int {
 	v, ok := m[key]
 	if !ok {

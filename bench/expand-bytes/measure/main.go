@@ -27,11 +27,6 @@ import (
 	"github.com/justinstimatze/defn/internal/store"
 )
 
-type target struct {
-	Name     string
-	Receiver string
-}
-
 func main() {
 	if len(os.Args) < 3 {
 		fmt.Fprintln(os.Stderr, "usage: expand-bytes-measure <project-root> [--print] <target1> [target2 ...]")

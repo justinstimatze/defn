@@ -21,6 +21,12 @@ if [ -n "$staged_go_files" ]; then
     echo "\xe2\x9d\x8c go vet failed"
     exit 1
   fi
+  if command -v staticcheck &> /dev/null; then
+    if ! staticcheck ./...; then
+      echo "\xe2\x9d\x8c staticcheck failed"
+      exit 1
+    fi
+  fi
 fi
 
 # Run CodeScene delta analysis on staged changes (non-blocking)

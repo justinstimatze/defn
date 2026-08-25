@@ -411,13 +411,6 @@ func (c *respCache) invalidateNames(sess *sdkmcp.ServerSession, names, _ []strin
 	sc.lastTestRun = nil
 }
 
-// readOpsWithNameKey lists dedup ops whose cache key is anchored on a
-// def name, possibly followed by a "|"-separated suffix (read's
-// "|full" variant, slice's "|<kind>[|<index>]", expand's "|<include>")
-// -- used by invalidateNames to recognize which keys belong to a given
-// name without needing to reconstruct dedupOpKey's exact suffix rules.
-var readOpsWithNameKey = []string{"read", "outline", "slice", "impact", "expand", "methods", "explain"}
-
 // writeTargets returns the def names and files a write op is known to
 // touch, so invalidate can be scoped to just those dedup/bodyServed
 // entries instead of wiping the whole session cache on every mutation.

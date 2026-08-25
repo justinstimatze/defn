@@ -66,14 +66,3 @@ func sessionOf(req *sdkmcp.CallToolRequest) *sdkmcp.ServerSession {
 	}
 	return req.Session
 }
-
-// clear drops a session's counters. Called from the write-op branch that
-// already invalidates respCache — same session-lifetime shape.
-func (m *mutationHint) clear(session *sdkmcp.ServerSession) {
-	if session == nil {
-		return
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.sessions, session)
-}
