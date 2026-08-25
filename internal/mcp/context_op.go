@@ -495,37 +495,44 @@ func contextTokenWeight(df int) float64 {
 const contextGraphBonusScale = 6.0
 
 // graphRerankContext is context's version of search's rank.GraphRerank:
-// "lexical proposes, graph disposes" (see internal/rank/graphrank.go). Seeds
-// a personalized-PageRank walk with contextRank's own scores, restricted to
-// the refs among just this candidate set (bounded, cheap), so a candidate
-// structurally central to the matched cluster can outrank one that merely
-// shares a token. cands must already be contextRank's output (sorted,
-// scored); a nil/empty edge set leaves the order unchanged.
+// "lexical proposes, graph disposes" (see internal/rank/graphrank.go).
+// Delegates the actual seed -> walk -> bonus -> resort pipeline to
+// rank.GraphRerank itself (converting to/from []rank.ScoredRef) rather than
+// hand-rolling a second copy of it -- a prior version duplicated that
+// pipeline here with its own graphWeight application, which a code review
+// flagged as a real maintenance risk: a future fix to the seeding formula
+// or alpha/iters defaults could easily land on one call site and be
+// forgotten on the other. cands must already be contextRank's output
+// (sorted, scored); fewer than 2 candidates or no edges among them leaves
+// the order unchanged.
 func (s *server) graphRerankContext(cands []contextCandidate) []contextCandidate {
 	if len(cands) < 2 || s.backend == nil {
 		return cands
 	}
 	ids := make([]int64, len(cands))
-	seeds := make(map[int64]float64, len(cands))
+	scored := make([]rank.ScoredRef, len(cands))
 	for i, c := range cands {
 		ids[i] = c.Def.ID
-		if c.Score > 0 {
-			seeds[c.Def.ID] = float64(c.Score)
-		}
+		scored[i] = rank.ScoredRef{Def: c.Def, Score: float64(c.Score), Reasons: map[string]float64{}}
 	}
 	edges, err := s.backend.EdgesAmong(ids)
 	if err != nil || len(edges) == 0 {
 		return cands
 	}
-	pr := rank.PersonalizedPageRank(edges, seeds, 0, 0)
-	if len(pr) == 0 {
-		return cands
+	// The original int score is always a whole number, so
+	// int(score + bonus) here matches the old hand-rolled
+	// int(score) + int(bonus) bit-for-bit (floor(N+x) == N+floor(x) for
+	// integer N and x >= 0, which the PPR bonus always is).
+	reranked := rank.GraphRerank(scored, edges, contextGraphBonusScale, 0, 0)
+	scoreByID := make(map[int64]float64, len(reranked))
+	for _, r := range reranked {
+		scoreByID[r.Def.ID] = r.Score
 	}
 	out := make([]contextCandidate, len(cands))
 	copy(out, cands)
 	for i := range out {
-		if g := pr[out[i].Def.ID]; g > 0 {
-			out[i].Score += int(g * contextGraphBonusScale)
+		if sc, ok := scoreByID[out[i].Def.ID]; ok {
+			out[i].Score = int(sc)
 		}
 	}
 	sort.SliceStable(out, func(i, j int) bool {

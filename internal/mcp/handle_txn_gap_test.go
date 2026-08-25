@@ -10,6 +10,7 @@ import (
 	"github.com/justinstimatze/defn/internal/ingest"
 	"github.com/justinstimatze/defn/internal/resolve"
 	"github.com/justinstimatze/defn/internal/store"
+	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // TestHandleInsert_BuildFailureRollsBackBothDBAndFile
@@ -218,5 +219,60 @@ func main() {}
 	}
 	if after.Body != before.Body {
 		t.Errorf("DB was mutated despite a rolled-back retarget:\nbefore: %s\nafter:  %s", before.Body, after.Body)
+	}
+}
+
+// TestHandleCode_RetargetFieldValueFailureStillInvalidatesCache restores
+// the handleCode-path coverage TestHandleRetargetFieldValue_
+// DriftWarningRollsBackBothDBAndFile lost when that test was switched to
+// call handleRetargetFieldValue directly (to isolate it from the newer
+// auto-freshness gate, which now legitimately heals the drift that test
+// induces before the handler ever sees it -- see that test's own comment).
+//
+// This test covers the OTHER thing that was worth keeping: handleCode's
+// write-op defer must invalidate the session's respCache even when
+// retarget-field-value FAILS, not just on success (the #245 fix this
+// package's own comments describe -- invalidation must not be gated on
+// !result.IsError). Deliberately triggers the failure via a missing
+// required param (field is required) rather than drift/build machinery:
+// that failure path is unconditional and has zero interaction with
+// ensureFresh, so it stays robust regardless of how the freshness gate
+// evolves. Reads/retargets the SAME name ("Greet") -- writeTargets scopes
+// retarget-field-value's invalidation to args.Name (the struct type name),
+// so checking a name unrelated to the retarget call would test nothing;
+// the value in args.Name doesn't need to be a real struct type here since
+// the missing-field validation fails before any type lookup happens.
+func TestHandleCode_RetargetFieldValueFailureStillInvalidatesCache(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
+	ctx := context.Background()
+
+	first, _, err := s.handleCode(ctx, req, codeParam{Op: "read", Name: "Greet", Full: true})
+	if err != nil {
+		t.Fatalf("initial full read: %v", err)
+	}
+	if !strings.Contains(resultText(t, first), "Hello, ") {
+		t.Fatalf("expected the original body, got: %s", resultText(t, first))
+	}
+
+	// Field is deliberately omitted -- handleRetargetFieldValue rejects
+	// this immediately, before touching the DB/build machinery at all.
+	failResult, _, _ := s.handleCode(ctx, req, codeParam{
+		Op: "retarget-field-value", Name: "Greet", Old: "a", New: "b",
+	})
+	if failResult == nil || !failResult.IsError {
+		t.Fatalf("expected retarget-field-value with no field to fail, got: %+v", failResult)
+	}
+
+	second, _, err := s.handleCode(ctx, req, codeParam{Op: "read", Name: "Greet"})
+	if err != nil {
+		t.Fatalf("re-read after failed retarget: %v", err)
+	}
+	text := resultText(t, second)
+	if strings.Contains(text, "already read") || strings.Contains(text, "hasn't changed") {
+		t.Fatalf("expected the FAILED retarget-field-value call to still invalidate respCache, got: %s", text)
 	}
 }
