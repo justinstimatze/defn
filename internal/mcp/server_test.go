@@ -257,6 +257,16 @@ func TestInferFromBody(t *testing.T) {
 		{"const MaxRetries = 5", "MaxRetries", "const", "", false},
 		{"var ErrNotFound = errors.New(\"x\")", "ErrNotFound", "var", "", false},
 		{"// Doc comment\nfunc Foo() {}", "Foo", "function", "", false},
+		// A whole-file body naturally includes package + imports before
+		// the real declaration -- CLAUDE.md documents op:"create" for
+		// exactly this "New def / whole file" shape. Confirmed live in 3
+		// independent real bench trajectories (prometheus-12024, -17395,
+		// -18534): each hit this exact shape and got "couldn't infer
+		// definition name from body" despite the body clearly containing
+		// one, because f.Decls[0] was the import GenDecl, not the func.
+		{"package foo\n\nimport \"time\"\n\nfunc Foo() time.Duration { return 0 }", "Foo", "function", "", false},
+		{"package foo\n\nimport (\n\t\"fmt\"\n\t\"time\"\n)\n\nfunc (c *Context) Render() { fmt.Println(time.Now()) }", "Render", "method", "*Context", false},
+		{"package foo\n\nimport \"errors\"\n\ntype Config struct{}", "Config", "type", "", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.wantName, func(t *testing.T) {
@@ -272,6 +282,33 @@ func TestInferFromBody(t *testing.T) {
 			}
 			if isTest != tt.wantTest {
 				t.Errorf("isTest = %v, want %v", isTest, tt.wantTest)
+			}
+		})
+	}
+}
+
+// TestCountTopLevelDecls_ImportBlockNotCountedAsADecl guards the other
+// half of the same import-GenDecl bug inferFromBody's new test cases
+// cover: without nonImportDecls, a single-decl whole-file body (package +
+// imports + ONE real declaration) was miscounted as 2+ "top-level
+// declarations", which would incorrectly force op:"create" callers down
+// the multi-decl path (requiring file:, or erroring "split into N create
+// ops") for what is really just one ordinary create.
+func TestCountTopLevelDecls_ImportBlockNotCountedAsADecl(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"single_func_with_import", "package foo\n\nimport \"time\"\n\nfunc Foo() time.Duration { return 0 }", 1},
+		{"single_func_with_import_block", "package foo\n\nimport (\n\t\"fmt\"\n\t\"time\"\n)\n\nfunc Foo() { fmt.Println(time.Now()) }", 1},
+		{"two_funcs_with_import", "package foo\n\nimport \"fmt\"\n\nfunc Foo() { fmt.Println(\"a\") }\n\nfunc Bar() { fmt.Println(\"b\") }", 2},
+		{"no_import", "func Foo() {}", 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := countTopLevelDecls(tt.body); got != tt.want {
+				t.Errorf("countTopLevelDecls(%q) = %d, want %d", tt.body, got, tt.want)
 			}
 		})
 	}
@@ -315,6 +352,13 @@ func TestHandleCodeValidation(t *testing.T) {
 		{"replace-hunk missing name", codeParam{Op: "replace-hunk", Old: "x", New: "y"}, "name is required"},
 		{"replace-hunk missing old", codeParam{Op: "replace-hunk", Name: "F", New: "y"}, "old is required"},
 		{"replace-hunk missing new", codeParam{Op: "replace-hunk", Name: "F", Old: "x"}, "new is required"},
+		// format:"json" is a real codeParam field, but only op:"impact" and
+		// op:"traverse" honor it -- confirmed live in a real
+		// prometheus-18712 trajectory, the model tried outline(...,
+		// format:"json") expecting structured output and got the same
+		// markdown text back, no error, no signal the param did nothing.
+		{"format json rejected for outline", codeParam{Op: "outline", Name: "X", Format: "json"}, "format"},
+		{"format json rejected for read", codeParam{Op: "read", Name: "X", Format: "json"}, "format"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -1181,6 +1181,20 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		args.Op = canonical
 	}
 
+	// format is a real codeParam field, but only op:"impact" and
+	// op:"traverse" branch on it -- every other op silently ignored
+	// format:"json" and returned its normal markdown/text output instead,
+	// with no error or signal the param did nothing. Same "accepted but
+	// unwired" class as search's file:/test's module:/delete's dry_run
+	// gaps (see docs/lessons-learned.md) -- confirmed live in a real
+	// prometheus-18712 trajectory: the model tried outline(...,
+	// format:"json") twice expecting structured output (reasonable, since
+	// impact had just honored it moments earlier) and got the identical
+	// markdown text both times. Reject instead of silently no-opping.
+	if args.Format == "json" && args.Op != "impact" && args.Op != "traverse" {
+		return errResult(fmt.Errorf("%s: format:\"json\" has no effect on op:%q -- only op:\"impact\" and op:\"traverse\" currently return structured JSON", args.Op, args.Op))
+	}
+
 	// Skip for op:"sync" itself (already does a real, explicit resync --
 	// probing first would be redundant and could double up autoCommit).
 	// ensureFresh no-ops on its own when there's no backend/project, so no
@@ -4146,6 +4160,30 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 
 // countTopLevelDecls returns the number of top-level declarations in a Go body
 // fragment. Returns 0 if unparseable (caller surfaces a clearer error).
+// nonImportDecls filters top-level import declarations out of decls. Go
+// syntax requires every import to appear before any other top-level
+// declaration in a file, so filtering them out anywhere in the slice
+// (rather than only skipping a literal leading run) is equivalent and
+// simpler. A body authored as a whole file (`package X` + `import (...)`
+// + the actual decl) is a normal, documented shape for op:"create" --
+// without this, the import block counts as a "declaration" with no name,
+// which either miscounts a single-decl body as multi-decl (countTopLevelDecls)
+// or, when it lands at Decls[0], silently defeats name inference entirely
+// (inferFromBody). sliceDecls already skips import decls this same way;
+// this brings the other two decl-counting/-inspecting call sites in line
+// with that established convention instead of leaving them as a second,
+// inconsistent copy of the same logic.
+func nonImportDecls(decls []ast.Decl) []ast.Decl {
+	out := make([]ast.Decl, 0, len(decls))
+	for _, d := range decls {
+		if gd, ok := d.(*ast.GenDecl); ok && gd.Tok == token.IMPORT {
+			continue
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
 func countTopLevelDecls(body string) int {
 	src := "package x\n" + stripLeadingPackageDecl(strings.TrimSpace(body))
 	fset := token.NewFileSet()
@@ -4153,7 +4191,7 @@ func countTopLevelDecls(body string) int {
 	if err != nil {
 		return 0
 	}
-	return len(f.Decls)
+	return len(nonImportDecls(f.Decls))
 }
 
 // stripLeadingPackageDecl removes a leading `package X` declaration from a
@@ -4455,8 +4493,12 @@ func (s *server) inferFromBody(body string) (name, kind, receiver string, isTest
 	if err != nil || len(f.Decls) == 0 {
 		return // unparseable — caller will report error
 	}
+	decls := nonImportDecls(f.Decls)
+	if len(decls) == 0 {
+		return // imports only, no real declaration to infer from
+	}
 
-	switch d := f.Decls[0].(type) {
+	switch d := decls[0].(type) {
 	case *ast.FuncDecl:
 		name = d.Name.Name
 		if d.Recv != nil && len(d.Recv.List) > 0 {
