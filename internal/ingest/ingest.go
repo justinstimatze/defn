@@ -328,6 +328,20 @@ func ingestEmbedFiles(db store.Backend, pkg *packages.Package, modulePath string
 			if err != nil {
 				continue
 			}
+			// #357 (2026-08-29 winze bug report): a nested-module or
+			// relative `//go:embed ../...` pattern can resolve to a
+			// file outside modulePath, producing a relPath with a
+			// leading `../` -- emit's project-files write path has no
+			// way to safely re-create such a path under a fresh outDir
+			// (and previously, storing it there broke emit for the
+			// WHOLE project on every subsequent call, not just this
+			// file -- see emit's own #357 fix). Skip it here instead of
+			// ever storing an unrepresentable path; same "best effort
+			// for embeds" precedent as the other skip conditions in
+			// this loop.
+			if filepath.IsAbs(relPath) || strings.HasPrefix(filepath.ToSlash(relPath), "../") {
+				continue
+			}
 			if err := db.SetProjectFile(relPath, string(content)); err != nil {
 				continue // best effort for embeds
 			}

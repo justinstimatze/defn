@@ -201,10 +201,22 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, []
 		if err != nil {
 			return nil, nil, fmt.Errorf("get project file %s: %w", pf, err)
 		}
-		// Sanitize path to prevent directory traversal.
+		// Sanitize path to prevent directory traversal. #357 (2026-08-29
+		// winze bug report): this used to hard-error the WHOLE emit call
+		// for any invalid path found among every project file ever
+		// tracked -- this loop runs unconditionally, even for a scoped
+		// emit touching one unrelated def -- so one corrupted row (e.g.
+		// an ingestEmbedFiles-derived path that escaped the module root
+		// via a nested-module or relative embed pattern) permanently
+		// blocked every future create/edit/apply in the whole project
+		// until someone manually repaired the DB row. Skip just the one
+		// bad entry instead -- it was never going to be safely writable
+		// anyway, and every other def/project-file in this emit is
+		// unrelated to it.
 		clean := filepath.Clean(pf)
 		if filepath.IsAbs(clean) || strings.Contains(clean, "..") {
-			return nil, nil, fmt.Errorf("invalid project file path: %s", pf)
+			fmt.Fprintf(os.Stderr, "[emit] skipping invalid project file path (escapes project root): %q\n", pf)
+			continue
 		}
 		dst := filepath.Join(outDir, clean)
 		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {

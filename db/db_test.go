@@ -300,3 +300,58 @@ func TestStaleFiles_StillDetectsGenuinelyStaleFile(t *testing.T) {
 		t.Fatalf("expected 1 genuinely stale file, got %v", stale)
 	}
 }
+
+// TestStaleFiles_DetectsSameSecondSubSecondModification is the #357
+// regression (2026-08-29 winze bug report): StaleFiles truncated both
+// the DB's mtime and each .go file's mtime to whole Unix seconds via
+// .Unix() before comparing with strict `>`. A file written in the same
+// wall-clock second as the last ingest -- entirely plausible for any
+// fast automated write-then-verify sequence -- was never reported
+// stale, and this isn't a transient race that clears on retry: both
+// timestamps are already-fixed past values, so no amount of waiting
+// before the next query changes the comparison. Root-caused live via a
+// winze_remember-then-winze_recall sequence where defn_meta.last_ingest
+// and the just-written file's mtime were numerically identical down to
+// the second.
+func TestStaleFiles_DetectsSameSecondSubSecondModification(t *testing.T) {
+	modDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(modDir, "go.mod"), []byte("module example.com/greet\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	goFile := filepath.Join(modDir, "greet.go")
+	if err := os.WriteFile(goFile, []byte("package greet\n\nfunc Hello() string { return \"hi\" }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dbDir := t.TempDir()
+	dbPath := filepath.Join(dbDir, ".defn")
+	d, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	if err := d.Sync(modDir); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	info, err := os.Stat(filepath.Join(dbPath, "defn.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same whole second as defn.db's mtime, but genuinely later at
+	// nanosecond resolution -- exactly the shape StaleFiles's old
+	// .Unix()-truncated comparison could never distinguish.
+	sameSecondLater := info.ModTime().Add(1 * time.Millisecond)
+	if err := os.Chtimes(goFile, sameSecondLater, sameSecondLater); err != nil {
+		t.Fatal(err)
+	}
+
+	stale, err := d.StaleFiles(modDir)
+	if err != nil {
+		t.Fatalf("StaleFiles: %v", err)
+	}
+	if len(stale) != 1 {
+		t.Fatalf("#357: expected the same-second-but-later write to be detected stale, got %v", stale)
+	}
+}

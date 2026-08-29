@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/justinstimatze/defn/internal/store"
+	"golang.org/x/tools/go/packages"
 )
 
 func testDB(t *testing.T) store.Backend {
@@ -592,5 +593,49 @@ func (w *Widget) init() {
 	}
 	if methodInit == nil {
 		t.Fatal("expected (*Widget).init() to be found, ALSO named bare \"init\" (disambiguated by receiver, not a synthetic suffix)")
+	}
+}
+
+// TestIngestEmbedFiles_SkipsPathsThatEscapeModuleRoot is the ingest-side
+// half of the #357 fix (2026-08-29 winze bug report): an EmbedPatterns
+// match that resolves outside modulePath (e.g. a nested-module or
+// relative `//go:embed ../...` pattern computed against the wrong
+// module root) produced a stored project-file path with a leading
+// `../`. That row alone then permanently broke emit's project-files
+// loop for the WHOLE project (see internal/emit's own #357 fix) --
+// this locks in the complementary root-cause fix: never store such a
+// path in the first place.
+func TestIngestEmbedFiles_SkipsPathsThatEscapeModuleRoot(t *testing.T) {
+	tmp := t.TempDir()
+	modulePath := filepath.Join(tmp, "moduleA")
+	pkgDir := filepath.Join(tmp, "moduleB", "pkg")
+	if err := os.MkdirAll(modulePath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(pkgDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	embeddedFile := filepath.Join(pkgDir, "embedded.txt")
+	if err := os.WriteFile(embeddedFile, []byte("hello"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	db := testDB(t)
+	pkg := &packages.Package{
+		GoFiles:       []string{filepath.Join(pkgDir, "file.go")},
+		EmbedPatterns: []string{"embedded.txt"},
+	}
+	if err := ingestEmbedFiles(db, pkg, modulePath); err != nil {
+		t.Fatalf("ingestEmbedFiles: %v", err)
+	}
+
+	files, err := db.ListProjectFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		if strings.Contains(filepath.ToSlash(f), "..") {
+			t.Fatalf("#357: stored an escaping project file path: %q", f)
+		}
 	}
 }

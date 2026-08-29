@@ -363,10 +363,17 @@ func (db *DB) StaleFiles(projectDir string) ([]string, error) {
 	// fresh checkout (whose .go files carry the checkout's OWN mtime, not
 	// the original ingest time) would otherwise see every file as
 	// modified-since-ingest even though content matches exactly.
+	// #357 (2026-08-29 winze bug report): compare at nanosecond
+	// resolution, not .Unix()-truncated whole seconds -- a .go file
+	// written in the same wall-clock second as defn.db's own mtime
+	// (entirely plausible for any fast automated write-then-verify
+	// sequence) was silently invisible to this check forever, since
+	// both timestamps floor to the identical integer second and the
+	// comparison below is strict >.
 	var lastIngest int64
 	for _, name := range []string{"defn.db", "defn.db-wal", "defn.db-shm"} {
 		if info, err := os.Stat(filepath.Join(dbPath, name)); err == nil {
-			if t := info.ModTime().Unix(); t > lastIngest {
+			if t := info.ModTime().UnixNano(); t > lastIngest {
 				lastIngest = t
 			}
 		}
@@ -395,7 +402,7 @@ func (db *DB) StaleFiles(projectDir string) ([]string, error) {
 		if err != nil {
 			return nil // skip unreadable files
 		}
-		if info.ModTime().Unix() > lastIngest {
+		if info.ModTime().UnixNano() > lastIngest {
 			stale = append(stale, path)
 		}
 		return nil

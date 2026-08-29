@@ -2491,3 +2491,44 @@ func TestSafeWriteGoFile_ConcurrentWritesToSameFileNeverProduceUnparseableConten
 		t.Fatalf("concurrent writes to the same file produced unparseable content (non-atomic write race in safeWriteGoFile): %v\n\n--- final content (%d bytes) ---\n%s", perr, len(final), final)
 	}
 }
+
+// TestEmitInvalidProjectFilePathDoesNotBlockUnrelatedEmit is a repro for
+// a 2026-08-29 winze bug report: one bad project_files row (an embedded
+// file whose stored path escaped the module root with a leading `../`,
+// e.g. from a nested-module or relative-pattern `//go:embed` case)
+// makes emit's project-files loop hard-error out of the WHOLE emit call
+// -- not just refuse that one file. Since this loop runs unconditionally
+// on every emit (including a scoped emit for a totally unrelated def),
+// one corrupted embed-tracked path permanently blocks every future
+// create/edit/apply in the project, project-wide, until someone
+// manually repairs the DB row. Emit should skip the one invalid path
+// (with a diagnostic) and still write everything else.
+func TestEmitInvalidProjectFilePathDoesNotBlockUnrelatedEmit(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true,
+		Body: "func Foo() {}", SourceFile: "test.go",
+	})
+	if err := db.SetProjectFile("go.mod", "module example.com/test\n\ngo 1.22\n"); err != nil {
+		t.Fatal(err)
+	}
+	// Simulates the corrupted embed-tracked row: a path that escaped the
+	// module root, same shape as winze's "../town/winze/cmd/metabolize/
+	// units/winze-metabolize@.service".
+	if err := db.SetProjectFile("../outside/escaped.service", "junk"); err != nil {
+		t.Fatal(err)
+	}
+
+	outDir := t.TempDir()
+	if err := Emit(db, outDir); err != nil {
+		t.Fatalf("Emit should skip the one invalid project file and still succeed, got error: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(outDir, "go.mod")); err != nil {
+		t.Fatalf("go.mod should still have been written despite the unrelated invalid project file: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outDir, "test.go")); err != nil {
+		t.Fatalf("test.go should still have been written despite the unrelated invalid project file: %v", err)
+	}
+}
