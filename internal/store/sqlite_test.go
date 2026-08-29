@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 
@@ -805,5 +806,182 @@ func TestGetDefinitionByName_ExcludesStructFieldsFromBareNameLookup(t *testing.T
 	}
 	if d.ID != typeID {
 		t.Fatalf("expected the top-level type (id=%d), got id=%d kind=%q", typeID, d.ID, d.Kind)
+	}
+}
+
+// TestMigrateDefinitionsSourceFileUniqueConstraint_RebuildsOldSchema
+// guards #363: a DB created before commit 7d66258 keeps its original
+// 5-column UNIQUE(module_id, name, kind, receiver, test) constraint on
+// definitions forever -- CREATE TABLE IF NOT EXISTS is a no-op once the
+// table exists. Opening such a DB must rebuild that constraint to the
+// current 6-column form (source_file included), preserving every row
+// and every FK-linked child row (bodies, refs, comments) untouched.
+func TestMigrateDefinitionsSourceFileUniqueConstraint_RebuildsOldSchema(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "defn.db")
+
+	raw, err := sql.Open("sqlite", dbPath+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	oldSchema := `
+	CREATE TABLE modules (
+	    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+	    path TEXT UNIQUE NOT NULL,
+	    name TEXT NOT NULL,
+	    doc  TEXT
+	);
+	CREATE TABLE definitions (
+	    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	    module_id   INTEGER NOT NULL,
+	    name        TEXT NOT NULL,
+	    kind        TEXT NOT NULL,
+	    exported    INTEGER NOT NULL,
+	    test        INTEGER NOT NULL DEFAULT 0,
+	    receiver    TEXT,
+	    signature   TEXT,
+	    doc         TEXT,
+	    start_line  INTEGER,
+	    end_line    INTEGER,
+	    source_file TEXT DEFAULT '',
+	    hash        TEXT NOT NULL,
+	    UNIQUE(module_id, name, kind, receiver, test),
+	    FOREIGN KEY (module_id) REFERENCES modules(id)
+	);
+	CREATE TABLE bodies (
+	    def_id INTEGER PRIMARY KEY,
+	    body   TEXT NOT NULL,
+	    FOREIGN KEY (def_id) REFERENCES definitions(id) ON DELETE CASCADE
+	);
+	CREATE TABLE refs (
+	    from_def INTEGER NOT NULL,
+	    to_def   INTEGER NOT NULL,
+	    kind     TEXT NOT NULL,
+	    PRIMARY KEY (from_def, to_def, kind),
+	    FOREIGN KEY (from_def) REFERENCES definitions(id),
+	    FOREIGN KEY (to_def)   REFERENCES definitions(id)
+	);
+	CREATE TABLE comments (
+	    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	    def_id       INTEGER,
+	    source_file  TEXT NOT NULL,
+	    line         INTEGER NOT NULL,
+	    text         TEXT NOT NULL,
+	    kind         TEXT NOT NULL,
+	    pragma_key   TEXT,
+	    pragma_value TEXT,
+	    FOREIGN KEY (def_id) REFERENCES definitions(id) ON DELETE CASCADE
+	);
+	`
+	if _, err := raw.Exec(oldSchema); err != nil {
+		t.Fatalf("apply old schema: %v", err)
+	}
+
+	res, err := raw.Exec(`INSERT INTO modules (path, name, doc) VALUES (?, ?, ?)`,
+		"example.com/greet", "greet", "")
+	if err != nil {
+		t.Fatalf("insert module: %v", err)
+	}
+	modID, _ := res.LastInsertId()
+
+	res, err = raw.Exec(`INSERT INTO definitions
+	    (module_id, name, kind, exported, test, receiver, signature, doc,
+	     start_line, end_line, source_file, hash)
+	    VALUES (?, 'Hello', 'function', 1, 0, '', 'func Hello() string', '', 3, 5, '', 'h1')`,
+		modID)
+	if err != nil {
+		t.Fatalf("insert definition: %v", err)
+	}
+	defID, _ := res.LastInsertId()
+
+	if _, err := raw.Exec(`INSERT INTO bodies (def_id, body) VALUES (?, ?)`,
+		defID, `func Hello() string { return "hi" }`); err != nil {
+		t.Fatalf("insert body: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO refs (from_def, to_def, kind) VALUES (?, ?, 'calls')`,
+		defID, defID); err != nil {
+		t.Fatalf("insert ref: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO comments (def_id, source_file, line, text, kind) VALUES (?, ?, 1, 'note', 'line')`,
+		defID, "greet.go"); err != nil {
+		t.Fatalf("insert comment: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	sq, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer sq.Close()
+
+	has, err := definitionsUniqueConstraintHasSourceFile(context.Background(), sq.pool)
+	if err != nil {
+		t.Fatalf("definitionsUniqueConstraintHasSourceFile: %v", err)
+	}
+	if !has {
+		t.Fatal("expected the definitions unique constraint to include source_file after migration")
+	}
+
+	var gotName, gotHash string
+	var gotID int64
+	if err := sq.pool.QueryRow(`SELECT id, name, hash FROM definitions WHERE id = ?`, defID).
+		Scan(&gotID, &gotName, &gotHash); err != nil {
+		t.Fatalf("original definition row missing after migration: %v", err)
+	}
+	if gotID != defID || gotName != "Hello" || gotHash != "h1" {
+		t.Fatalf("definition row corrupted: id=%d name=%q hash=%q", gotID, gotName, gotHash)
+	}
+
+	var gotBody string
+	if err := sq.pool.QueryRow(`SELECT body FROM bodies WHERE def_id = ?`, defID).Scan(&gotBody); err != nil {
+		t.Fatalf("body row lost after migration: %v", err)
+	}
+	if gotBody != `func Hello() string { return "hi" }` {
+		t.Fatalf("body content corrupted: %q", gotBody)
+	}
+
+	var refCount int
+	if err := sq.pool.QueryRow(`SELECT COUNT(*) FROM refs WHERE from_def = ? AND to_def = ?`, defID, defID).Scan(&refCount); err != nil {
+		t.Fatalf("query refs: %v", err)
+	}
+	if refCount != 1 {
+		t.Fatalf("ref row lost after migration: count=%d", refCount)
+	}
+
+	var commentCount int
+	if err := sq.pool.QueryRow(`SELECT COUNT(*) FROM comments WHERE def_id = ?`, defID).Scan(&commentCount); err != nil {
+		t.Fatalf("query comments: %v", err)
+	}
+	if commentCount != 1 {
+		t.Fatalf("comment row lost after migration: count=%d", commentCount)
+	}
+
+	// The whole point: a second, genuinely distinct definition sharing
+	// every column except source_file must now be insertable -- this is
+	// exactly the #157-class case (two files, one func init() each) the
+	// old 5-column constraint on this DB could never allow.
+	if _, err := sq.pool.Exec(`INSERT INTO definitions
+	    (module_id, name, kind, exported, test, receiver, signature, doc,
+	     start_line, end_line, source_file, hash)
+	    VALUES (?, 'Hello', 'function', 1, 0, '', 'func Hello() string', '', 9, 11, 'other.go', 'h2')`,
+		modID); err != nil {
+		t.Fatalf("expected a second same-named def with a different source_file to succeed post-migration, got: %v", err)
+	}
+
+	// AUTOINCREMENT continuity: a fresh insert must not collide with a
+	// preserved id from before the rebuild.
+	res, err = sq.pool.Exec(`INSERT INTO definitions
+	    (module_id, name, kind, exported, test, receiver, signature, doc,
+	     start_line, end_line, source_file, hash)
+	    VALUES (?, 'World', 'function', 1, 0, '', 'func World() string', '', 1, 1, 'world.go', 'h3')`,
+		modID)
+	if err != nil {
+		t.Fatalf("insert after migration: %v", err)
+	}
+	newID, _ := res.LastInsertId()
+	if newID <= defID {
+		t.Fatalf("expected a fresh id greater than the preserved id %d, got %d", defID, newID)
 	}
 }

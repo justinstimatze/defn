@@ -149,6 +149,13 @@ func OpenSQLite(path string) (*SQLiteDB, error) {
 		return nil, fmt.Errorf("sqlite: migrate: %w", err)
 	}
 
+	// #363: rebuild definitions' UNIQUE constraint for DBs predating
+	// 7d66258 (fresh DBs already have it from CREATE TABLE above).
+	if err := migrateDefinitionsSourceFileUniqueConstraint(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("sqlite: migrate definitions unique constraint: %w", err)
+	}
+
 	// Backfill FTS if this is an existing DB predating the FTS5 addition
 	// (task #137). The CREATE VIRTUAL TABLE IF NOT EXISTS runs above but
 	// doesn't populate — triggers only fire on future writes. If the
@@ -2939,4 +2946,179 @@ func (s *SQLiteDB) EdgesAmong(ids []int64) ([][2]int64, error) {
 		out = append(out, [2]int64{from, to})
 	}
 	return out, rows.Err()
+}
+
+// definitionsUniqueConstraintHasSourceFile reports whether the on-disk
+// definitions table's UNIQUE constraint (a SQLite autoindex, since it's
+// declared inline in CREATE TABLE) already includes source_file. False
+// for any DB whose definitions table was first created before commit
+// 7d66258.
+func definitionsUniqueConstraintHasSourceFile(ctx context.Context, db *sql.DB) (bool, error) {
+	rows, err := db.QueryContext(ctx, `PRAGMA index_list('definitions')`)
+	if err != nil {
+		return false, err
+	}
+	var uniqueIdxNames []string
+	for rows.Next() {
+		var seq, unique, partial int
+		var name, origin string
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			rows.Close()
+			return false, err
+		}
+		if unique == 1 {
+			uniqueIdxNames = append(uniqueIdxNames, name)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return false, err
+	}
+
+	for _, name := range uniqueIdxNames {
+		cols, err := db.QueryContext(ctx, fmt.Sprintf(`PRAGMA index_info(%q)`, name))
+		if err != nil {
+			return false, err
+		}
+		found := false
+		count := 0
+		for cols.Next() {
+			var seqno, cid int
+			var colName string
+			if err := cols.Scan(&seqno, &cid, &colName); err != nil {
+				cols.Close()
+				return false, err
+			}
+			count++
+			if colName == "source_file" {
+				found = true
+			}
+		}
+		if err := cols.Close(); err != nil {
+			return false, err
+		}
+		if found && count == 6 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// migrateDefinitionsSourceFileUniqueConstraint rebuilds the definitions
+// table for existing DBs created before source_file joined its UNIQUE
+// constraint (commit 7d66258, #157-class fix). Fresh DBs already get the
+// 6-column UNIQUE(module_id, name, kind, receiver, test, source_file)
+// from CREATE TABLE; a pre-existing DB keeps whatever narrower constraint
+// was baked in when its table was first created, forever -- CREATE TABLE
+// IF NOT EXISTS is a full no-op once the table exists, so the schema
+// text changing underneath it has zero effect on already-created DBs.
+//
+// #363 (2026-08-29 winze report): an unmigrated DB is exposed to two
+// distinct failure modes. First, the exact corruption 7d66258 was meant
+// to prevent -- two legitimately distinct definitions that agree on
+// module/name/kind/receiver/test but differ only in source_file (e.g.
+// two files each with their own func init()) still collide on the old
+// 5-column constraint. Second, newer app code now keys its upsert
+// lookup on all 6 columns; when that lookup misses (the stored
+// source_file no longer matches what's freshly computed for what is
+// really the same definition -- e.g. a row predating source_file being
+// populated at all), the code falls through to a plain INSERT, which
+// then hits the real, narrower on-disk constraint and hard-fails the
+// entire sync with a UNIQUE constraint violation.
+//
+// This follows SQLite's own documented 12-step table-rebuild recipe:
+// disable foreign key enforcement for the duration (must happen before
+// the transaction starts -- the pragma is a no-op inside one), rebuild
+// in a transaction so any failure rolls back cleanly, verify with
+// PRAGMA foreign_key_check before committing, then reapply the schema
+// DDL to recreate the indexes/triggers that DROP TABLE removes along
+// with the old table object. Idempotent: a no-op once the constraint
+// already includes source_file.
+func migrateDefinitionsSourceFileUniqueConstraint(db *sql.DB) error {
+	ctx := context.Background()
+
+	ok, err := definitionsUniqueConstraintHasSourceFile(ctx, db)
+	if err != nil {
+		return fmt.Errorf("check definitions unique constraint: %w", err)
+	}
+	if ok {
+		return nil
+	}
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire dedicated connection: %w", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys=OFF`); err != nil {
+		return fmt.Errorf("disable foreign keys: %w", err)
+	}
+	defer conn.ExecContext(context.Background(), `PRAGMA foreign_keys=ON`)
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	rebuild := []string{
+		`CREATE TABLE definitions_new (
+		    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+		    module_id   INTEGER NOT NULL,
+		    name        TEXT NOT NULL,
+		    kind        TEXT NOT NULL,
+		    exported    INTEGER NOT NULL,
+		    test        INTEGER NOT NULL DEFAULT 0,
+		    receiver    TEXT,
+		    signature   TEXT,
+		    doc         TEXT,
+		    start_line  INTEGER,
+		    end_line    INTEGER,
+		    source_file TEXT DEFAULT '',
+		    hash        TEXT NOT NULL,
+		    UNIQUE(module_id, name, kind, receiver, test, source_file),
+		    FOREIGN KEY (module_id) REFERENCES modules(id)
+		)`,
+		`INSERT INTO definitions_new
+		    (id, module_id, name, kind, exported, test, receiver, signature,
+		     doc, start_line, end_line, source_file, hash)
+		 SELECT id, module_id, name, kind, exported, test, receiver, signature,
+		        doc, start_line, end_line, source_file, hash
+		 FROM definitions`,
+		`DROP TABLE definitions`,
+		`ALTER TABLE definitions_new RENAME TO definitions`,
+	}
+	for _, stmt := range rebuild {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migrate definitions unique constraint: %w", err)
+		}
+	}
+
+	fkRows, err := tx.QueryContext(ctx, `PRAGMA foreign_key_check`)
+	if err != nil {
+		return fmt.Errorf("foreign_key_check: %w", err)
+	}
+	var violations int
+	for fkRows.Next() {
+		violations++
+	}
+	if cerr := fkRows.Close(); cerr != nil {
+		return fmt.Errorf("foreign_key_check: %w", cerr)
+	}
+	if violations > 0 {
+		return fmt.Errorf("migrate definitions unique constraint: foreign_key_check found %d violation(s), aborting", violations)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+
+	// DROP TABLE removed every index/trigger bound to the old table
+	// object (idx_def_name, idx_def_source_file, definitions_ai/ad/au,
+	// etc.) -- they're all CREATE ... IF NOT EXISTS, so reapplying the
+	// full schema just recreates the missing ones on the new table.
+	if _, err := conn.ExecContext(ctx, sqliteSchemaSQL); err != nil {
+		return fmt.Errorf("reapply schema after migration: %w", err)
+	}
+	return nil
 }
