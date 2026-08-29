@@ -355,3 +355,63 @@ func TestStaleFiles_DetectsSameSecondSubSecondModification(t *testing.T) {
 		t.Fatalf("#357: expected the same-second-but-later write to be detected stale, got %v", stale)
 	}
 }
+
+// TestStaleFiles_NotFooledByReadOnlyReopenBetweenWriteAndCheck guards the
+// #362 regression: a genuine edit made after Sync must still be detected
+// as stale even if the DB connection gets closed and reopened (read-only,
+// no writes) in between -- e.g. a separate "recall" process starting up
+// after an earlier "remember" process already wrote and exited. Before
+// the #362 fix, including defn.db-wal/defn.db-shm in the freshness
+// baseline meant this read-only reopen alone pushed the baseline to
+// "now", masking the real edit made just before it.
+func TestStaleFiles_NotFooledByReadOnlyReopenBetweenWriteAndCheck(t *testing.T) {
+	modDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(modDir, "go.mod"), []byte("module example.com/greet\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	goFile := filepath.Join(modDir, "greet.go")
+	if err := os.WriteFile(goFile, []byte("package greet\n\nfunc Hello() string { return \"hi\" }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dbDir := t.TempDir()
+	dbPath := filepath.Join(dbDir, ".defn")
+	d, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := d.Sync(modDir); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// A genuine edit after the connection closed -- this is what a
+	// subsequent recall should detect as needing re-ingest.
+	time.Sleep(2 * time.Millisecond)
+	if err := os.WriteFile(goFile, []byte("package greet\n\nfunc Hello() string { return \"hi there\" }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a separate read-only process reopening the DB afterward,
+	// with no new writes -- this is exactly what advanced defn.db-wal's
+	// mtime past the edit under the #362 bug.
+	time.Sleep(2 * time.Millisecond)
+	d2, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer d2.Close()
+	if _, err := d2.StaleFiles(modDir); err != nil {
+		t.Fatalf("warm-up StaleFiles: %v", err)
+	}
+
+	stale, err := d2.StaleFiles(modDir)
+	if err != nil {
+		t.Fatalf("StaleFiles: %v", err)
+	}
+	if len(stale) != 1 || stale[0] != goFile {
+		t.Fatalf("expected [%s] to be reported stale after the read-only reopen, got %v", goFile, stale)
+	}
+}

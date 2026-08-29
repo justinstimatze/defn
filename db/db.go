@@ -335,13 +335,6 @@ func (db *DB) Traverse(name, direction string, refKinds []string, maxDepth int) 
 //
 // Walks projectDir recursively, skipping .defn/, .git/, vendor/,
 // node_modules/, and testdata/ directories.
-//
-// #332-class fix: the freshness threshold is derived from defn.db's own
-// on-disk mtime, not the stored last_ingest meta value -- a caller that
-// restores a previously-ingested DB onto a fresh checkout (whose .go
-// files carry the checkout's OWN mtime, unrelated to the original
-// ingest time) would otherwise see every file as stale even when
-// content matches exactly.
 func (db *DB) StaleFiles(projectDir string) ([]string, error) {
 	db.mu.Lock()
 	lastIngestStr, err := db.s.GetMeta("last_ingest")
@@ -357,30 +350,30 @@ func (db *DB) StaleFiles(projectDir string) ([]string, error) {
 		return nil, fmt.Errorf("parse last_ingest: %w", err)
 	}
 
-	// #332-class fix: derive the freshness threshold from the DB's own
+	// #332-class fix: derive the freshness threshold from defn.db's own
 	// on-disk mtime rather than the stored meta value -- a caller that
 	// restores a previously-ingested DB from a cache/tarball onto a
 	// fresh checkout (whose .go files carry the checkout's OWN mtime, not
 	// the original ingest time) would otherwise see every file as
-	// modified-since-ingest even though content matches exactly.
-	// #357 (2026-08-29 winze bug report): compare at nanosecond
-	// resolution, not .Unix()-truncated whole seconds -- a .go file
-	// written in the same wall-clock second as defn.db's own mtime
-	// (entirely plausible for any fast automated write-then-verify
-	// sequence) was silently invisible to this check forever, since
-	// both timestamps floor to the identical integer second and the
-	// comparison below is strict >.
-	var lastIngest int64
-	for _, name := range []string{"defn.db", "defn.db-wal", "defn.db-shm"} {
-		if info, err := os.Stat(filepath.Join(dbPath, name)); err == nil {
-			if t := info.ModTime().UnixNano(); t > lastIngest {
-				lastIngest = t
-			}
-		}
-	}
-	if lastIngest == 0 {
+	// modified-since-ingest even though content matches exactly. A plain
+	// directory copy/restore touches defn.db's own mtime too, so this
+	// still satisfies that scenario.
+	//
+	// #362 (2026-08-29 winze regression, found right after the #357
+	// nanosecond fix made it worse): deliberately excludes defn.db-wal
+	// and defn.db-shm from this check. Opening a WAL-mode connection for
+	// reads alone -- no writes at all -- advances those sidecar files'
+	// mtimes on modernc.org/sqlite, so any process that merely opens the
+	// DB to check freshness (e.g. a read-only "recall" after a separate
+	// "remember" process already wrote and exited) pushes the baseline
+	// to "now" and permanently masks real staleness. defn.db's own file
+	// is only touched by an actual write or checkpoint, which is the
+	// signal this check actually wants.
+	info, err := os.Stat(filepath.Join(dbPath, "defn.db"))
+	if err != nil {
 		return nil, nil
 	}
+	lastIngest := info.ModTime().UnixNano()
 
 	var stale []string
 	err = filepath.WalkDir(projectDir, func(path string, d fs.DirEntry, werr error) error {
