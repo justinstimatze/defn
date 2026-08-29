@@ -219,7 +219,24 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, []
 		// without file:) re-reads go:embed/project files from disk and
 		// refreshes this row before that would happen.
 		if onDisk, rerr := os.ReadFile(dst); rerr == nil && !bytes.Equal(onDisk, []byte(content)) {
-			fmt.Fprintf(os.Stderr, "[emit] disk drift: %s changed on disk since defn last recorded it -- overwriting with the database's stored content; run a full `defn ingest` (or code(op:\"sync\") with no file:) first if this was a manual edit you want kept.\n", dst)
+			// #217/#356: go.mod/go.sum are never intentionally edited by
+			// any `code` op (unlike .go defs, which the DB genuinely
+			// owns) -- the DB's blob here is just a passive echo of
+			// whatever was on disk at the last full ingest/sync. An
+			// existing, differing on-disk copy is presumed to be a
+			// legitimate out-of-band edit (a manual go.mod change, `go
+			// mod tidy`), so heal the DB's row from disk instead of
+			// clobbering disk with the stale blob -- same "disk wins,
+			// DB heals" precedent as ensureFresh uses for .go files. A
+			// fresh outDir with no pre-existing copy of pf is
+			// unaffected: rerr != nil there, so this branch never fires
+			// and the DB's content is written fresh, same as before
+			// (#117's fresh-tempdir case).
+			fmt.Fprintf(os.Stderr, "[emit] disk drift: %s changed on disk since defn last recorded it -- keeping the on-disk content and updating the database's record to match; the on-disk change is presumed intentional.\n", dst)
+			if err := db.SetProjectFile(pf, string(onDisk)); err != nil {
+				return nil, nil, fmt.Errorf("heal project file %s: %w", pf, err)
+			}
+			continue
 		}
 		if err := os.WriteFile(dst, []byte(content), 0644); err != nil {
 			return nil, nil, fmt.Errorf("write %s: %w", pf, err)

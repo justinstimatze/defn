@@ -1785,26 +1785,6 @@ func TestHandleCreateHonorsFileParam(t *testing.T) {
 	}
 }
 
-// Bug C: when file: maps to no known module, return an error rather than
-// silently falling back to the first module.
-func TestHandleCreateRejectsUnknownFile(t *testing.T) {
-	db, _ := setupTestDB(t)
-	defer db.Close()
-	s := &server{backend: db}
-
-	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
-		Body: "func Nope() int { return 0 }",
-		File: "no/such/package/file.go",
-	})
-	text := resultText(t, result)
-	if !strings.Contains(text, "does not map to any known module") {
-		t.Errorf("expected unknown-module error, got: %s", text)
-	}
-	if _, err := db.GetDefinitionByName("Nope", ""); err == nil {
-		t.Error("Nope should not have been created when file is unknown")
-	}
-}
-
 func TestHandleRename(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
@@ -15644,5 +15624,351 @@ func TestHandleCreate_ScaffoldFileDryRunDoesNotWrite(t *testing.T) {
 
 	if _, statErr := os.Stat(filepath.Join(projDir, "extra/scaffold.go")); statErr == nil {
 		t.Errorf("extra/scaffold.go should NOT have been written to disk under dry_run:true, but it exists")
+	}
+}
+
+// TestHandleApply_BuildFailureDoesNotRevertDriftedGoMod is the #356
+// regression: two real trajectories (2026-08-28/29 bug reports) found
+// that any failed create/edit/apply call reverts go.mod to defn's
+// stale DB blob -- even for a go.mod change already committed to HEAD
+// -- because emit's project-files loop overwrites go.mod on every
+// emit, unconditionally, including the emit that runs as part of a
+// build check that then rolls back. This locks in that a manual
+// go.mod edit (simulating a real dependency add + `go mod tidy`, with
+// no follow-up full ingest/sync) survives an unrelated operation's
+// build failure intact.
+func TestHandleApply_BuildFailureDoesNotRevertDriftedGoMod(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	goModPath := filepath.Join(projDir, "go.mod")
+	driftedGoMod := "module testproj\n\ngo 1.26\n\nrequire example.com/newdep v1.0.0\n"
+	if err := os.WriteFile(goModPath, []byte(driftedGoMod), 0644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+
+	result, _, _ := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "edit", Name: "Greet", NewBody: "func Greet(name string) string { return undefinedHelperFunc(name) }"},
+		},
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "BUILD FAILED") {
+		t.Fatalf("expected a build failure, got: %s", text)
+	}
+
+	finalGoMod, err := os.ReadFile(goModPath)
+	if err != nil {
+		t.Fatalf("read go.mod after failed build: %v", err)
+	}
+	if string(finalGoMod) != driftedGoMod {
+		t.Errorf("#356: go.mod reverted to defn's stale DB blob despite the manual edit and unrelated build failure -- got:\n%s\nwant (unchanged):\n%s", finalGoMod, driftedGoMod)
+	}
+}
+
+// TestHandleApply_CreateCommentSwallowedDeclRejectedWithHint is the
+// same #356 regression as TestHandleCreate_CommentSwallowedDeclRejectedWithHint,
+// but through op:"apply"'s own separate, independently-implemented
+// create case -- which had NEITHER doubleEscapedHint NOR this new
+// check wired in at all, unlike the standalone code(op:"create") path.
+func TestHandleApply_CreateCommentSwallowedDeclRejectedWithHint(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	body := "func FuncA() {\n\treturn\n}\n\n// trailing docstring for FuncB\\nfunc FuncB() {\\n\treturn\\n}\n"
+	result, _, err := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{{Op: "create", Body: body, File: "swallow.go"}},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "swallowed") {
+		t.Fatalf("expected a comment-swallowed-declaration hint, got: %s", text)
+	}
+
+	if _, lookErr := db.GetDefinitionByName("FuncB", ""); lookErr == nil {
+		t.Fatalf("FuncB should never have been created as a real definition -- it was swallowed into a comment")
+	}
+}
+
+// TestHandleCreate_CommentSwallowedDeclRejectedWithHint is the #356
+// regression (2026-08-28 gemot bug report): a create body whose TAIL
+// got double-escaped (a literal \n instead of a real newline) while
+// the rest of the body used real newlines throughout used to slip
+// past doubleEscapedHint's whole-body ratio heuristic entirely --
+// there were plenty of real newlines elsewhere in the body. Go's `//`
+// comment rule then silently swallowed the intended second function
+// into one harmless-looking comment line, and create reported success
+// with zero error even though the intended function was never really
+// declared -- only caught later by `go build: undefined: FuncB`.
+func TestHandleCreate_CommentSwallowedDeclRejectedWithHint(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	body := "func FuncA() {\n\treturn\n}\n\n// trailing docstring for FuncB\\nfunc FuncB() {\\n\treturn\\n}\n"
+	result, _, err := s.handleCreate(context.Background(), nil, createParam{Body: body, File: "swallow.go"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "swallowed") {
+		t.Fatalf("expected a comment-swallowed-declaration hint, got: %s", text)
+	}
+
+	if _, lookErr := db.GetDefinitionByName("FuncB", ""); lookErr == nil {
+		t.Fatalf("FuncB should never have been created as a real definition -- it was swallowed into a comment")
+	}
+}
+
+// TestHandleApply_CreateMultiDeclNewHyphenatedDirUsesBodyPackageName is
+// the #357 regression through op:"apply"'s own independently
+// implemented multi-decl create branch, which has the identical
+// filepath.Base(dir)-derived package name bug as handleCreateMultiDecl.
+func TestHandleApply_CreateMultiDeclNewHyphenatedDirUsesBodyPackageName(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	body := "package memtool\n\nfunc Run() {}\n\nfunc Stop() {}\n"
+	result, _, err := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{{Op: "create", Body: body, File: "integrations/anthropic-memtool/executor.go"}},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "Errors:") {
+		t.Fatalf("expected a clean create, got: %s", text)
+	}
+
+	written, readErr := os.ReadFile(filepath.Join(projDir, "integrations", "anthropic-memtool", "executor.go"))
+	if readErr != nil {
+		t.Fatalf("read created file: %v", readErr)
+	}
+	if !strings.Contains(string(written), "package memtool") {
+		t.Fatalf("#357: expected on-disk package clause to match the body's own `package memtool`, got:\n%s", written)
+	}
+}
+
+// TestHandleApply_CreateSingleDeclNewHyphenatedDirUsesBodyPackageName is
+// the #357 regression through op:"apply"'s independently implemented
+// single-decl create branch, which has the identical
+// filepath.Base(dir)-derived package name bug.
+func TestHandleApply_CreateSingleDeclNewHyphenatedDirUsesBodyPackageName(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	body := "package memtool\n\nfunc Run() {}\n"
+	result, _, err := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{{Op: "create", Body: body, File: "integrations/anthropic-memtool/executor.go"}},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "Errors:") {
+		t.Fatalf("expected a clean create, got: %s", text)
+	}
+
+	written, readErr := os.ReadFile(filepath.Join(projDir, "integrations", "anthropic-memtool", "executor.go"))
+	if readErr != nil {
+		t.Fatalf("read created file: %v", readErr)
+	}
+	if !strings.Contains(string(written), "package memtool") {
+		t.Fatalf("#357: expected on-disk package clause to match the body's own `package memtool`, got:\n%s", written)
+	}
+}
+
+// TestHandleCreateMultiDecl_NewHyphenatedDirUsesBodyPackageName is the
+// #357 regression (2026-08-29 winze bug report): creating a whole new
+// file (multi-decl body) into a not-yet-existing, hyphenated directory
+// derived the new module's package name from the directory's basename
+// ("anthropic-memtool", not a valid Go identifier) instead of the
+// body's own `package memtool` line, producing an uncompilable file.
+func TestHandleCreateMultiDecl_NewHyphenatedDirUsesBodyPackageName(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	body := "package memtool\n\nfunc Run() {}\n\nfunc Stop() {}\n"
+	result, _, err := s.handleCreate(context.Background(), nil, createParam{
+		Body: body,
+		File: "integrations/anthropic-memtool/executor.go",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "rolled back") {
+		t.Fatalf("expected a clean create, got: %s", text)
+	}
+
+	written, readErr := os.ReadFile(filepath.Join(projDir, "integrations", "anthropic-memtool", "executor.go"))
+	if readErr != nil {
+		t.Fatalf("read created file: %v", readErr)
+	}
+	if !strings.Contains(string(written), "package memtool") {
+		t.Fatalf("#357: expected on-disk package clause to match the body's own `package memtool`, got:\n%s", written)
+	}
+}
+
+// TestHandleCreate_NewHyphenatedDirSingleDeclUsesBodyPackageName is the
+// same #357 regression as TestHandleCreateMultiDecl_NewHyphenatedDirUsesBodyPackageName,
+// but through handleCreate's single-decl new-directory path (a body
+// with exactly one top-level decl, still led by its own `package X`
+// line) rather than the multi-decl path.
+func TestHandleCreate_NewHyphenatedDirSingleDeclUsesBodyPackageName(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	body := "package memtool\n\nfunc Run() {}\n"
+	result, _, err := s.handleCreate(context.Background(), nil, createParam{
+		Body: body,
+		File: "integrations/anthropic-memtool/executor.go",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "rolled back") {
+		t.Fatalf("expected a clean create, got: %s", text)
+	}
+
+	written, readErr := os.ReadFile(filepath.Join(projDir, "integrations", "anthropic-memtool", "executor.go"))
+	if readErr != nil {
+		t.Fatalf("read created file: %v", readErr)
+	}
+	if !strings.Contains(string(written), "package memtool") {
+		t.Fatalf("#357: expected on-disk package clause to match the body's own `package memtool`, got:\n%s", written)
+	}
+}
+
+// TestHandleCreate_LeadingPackageDocCommentDoesNotBreakInference is the
+// #357 regression (2026-08-29 winze bug report): a create body led by
+// an idiomatic `// Package X ...` GoDoc comment, then `package X`, then
+// declarations failed name inference outright ("couldn't infer
+// definition name from body") -- stripLeadingPackageDecl only
+// recognized a package clause as the very first thing in the body, so
+// the synthetic "package x\n" prefix inferFromBody adds for parsing
+// landed BEFORE the real package line instead of replacing it, and the
+// comment sat between the two, producing invalid Go with two package
+// clauses. Per-decl doc comments (not attached to the package clause)
+// already worked fine -- only this specific package-doc-comment shape
+// broke.
+func TestHandleCreate_LeadingPackageDocCommentDoesNotBreakInference(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	body := "// Package memtool provides tool execution helpers.\npackage memtool\n\nfunc Run() {}\n"
+	result, _, err := s.handleCreate(context.Background(), nil, createParam{
+		Body: body,
+		File: "integrations/memtool/executor.go",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "couldn't infer") || strings.Contains(text, "rolled back") {
+		t.Fatalf("#357: leading package-doc-comment broke create, got: %s", text)
+	}
+	if _, lookErr := db.GetDefinitionByName("Run", ""); lookErr != nil {
+		t.Fatalf("Run should have been created: %v", lookErr)
+	}
+
+	written, readErr := os.ReadFile(filepath.Join(projDir, "integrations", "memtool", "executor.go"))
+	if readErr != nil {
+		t.Fatalf("read created file: %v", readErr)
+	}
+	if !strings.Contains(string(written), "package memtool") {
+		t.Fatalf("#357: expected on-disk package clause to be memtool (from the body's own package line, past the doc comment), got:\n%s", written)
+	}
+}
+
+// TestEnsureFresh_HealsWholeDirectoryDeletion is a repro for the 4th,
+// unfiled bug in the 2026-08-29 winze dispatch message: after creating
+// a package then deleting every file under its directory (and rmdir'ing
+// the now-empty directory) from a live, never-restarted defn serve,
+// outline/read/overview calls kept resolving to a fully phantom module
+// with the old content. ensureFresh's own doc comment claims deleted
+// files ARE healed (pruned via DeleteFile) -- this locks in that claim
+// against the exact directory-deletion shape reported, rather than just
+// a single file's removal.
+func TestEnsureFresh_HealsWholeDirectoryDeletion(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	if _, _, err := s.handleCreate(context.Background(), nil, createParam{
+		Body: "package widget\n\nfunc Run() {}\n\nfunc Stop() {}\n",
+		File: "widget/exec.go",
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, lookErr := db.GetDefinitionByName("Run", ""); lookErr != nil {
+		t.Fatalf("Run should exist after create: %v", lookErr)
+	}
+
+	if err := os.RemoveAll(filepath.Join(projDir, "widget")); err != nil {
+		t.Fatalf("remove widget dir: %v", err)
+	}
+
+	s.ensureFresh(nil)
+
+	if _, lookErr := db.GetDefinitionByName("Run", ""); lookErr == nil {
+		t.Fatalf("#357: Run still present in DB after its file+directory were deleted from disk -- phantom module bug")
+	}
+
+	outResult, _, outErr := s.handleCode(context.Background(), nil, codeParam{Op: "overview"})
+	if outErr != nil {
+		t.Fatalf("overview: %v", outErr)
+	}
+	overviewText := resultText(t, outResult)
+	if strings.Contains(overviewText, "widget") {
+		t.Fatalf("#357: overview still lists phantom widget module after directory deletion, got: %s", overviewText)
+	}
+}
+
+// TestHandleCreateRejectsUnknownFile is the #357 update to the original
+// "Bug C" fix: file: naming a NESTED directory with no known module is
+// no longer an error -- #13 (added after Bug C) intentionally supports
+// this by creating a module scoped to the new directory, and #357 fixed
+// the bug that made #13's fallback dead code (an earlier unconditional
+// check always returned first). Bug C's actual concern -- never
+// silently fall back to some UNRELATED existing module -- is preserved:
+// a file: with no directory component to scope a new module to still
+// errors instead of guessing (see the newDirCandidate guard in
+// handleCreate).
+func TestHandleCreateRejectsUnknownFile(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleCreate(context.Background(), nil, createParam{
+		Body: "func Nope() int { return 0 }",
+		File: "no/such/newpkg/file.go",
+	})
+	text := resultText(t, result)
+	if strings.Contains(text, "does not map to any known module") {
+		t.Fatalf("expected create to succeed by scoping a new module to the new nested directory (#13/#357), got: %s", text)
+	}
+	if _, err := db.GetDefinitionByName("Nope", ""); err != nil {
+		t.Fatalf("Nope should have been created in a new module scoped to no/such/newpkg: %v", err)
 	}
 }

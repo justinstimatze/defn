@@ -3931,6 +3931,14 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	if hint := doubleEscapedHint(args.Body); hint != "" {
 		return errResult(fmt.Errorf("create: %s", hint))
 	}
+	// #356: doubleEscapedHint only catches a body that's escaped
+	// throughout -- see commentSwallowedDeclHint's doc comment for the
+	// mixed-escaping case it closes (only part of the body double-escaped,
+	// silently swallowing a declaration into a comment with no error at
+	// all).
+	if hint := commentSwallowedDeclHint(args.Body); hint != "" {
+		return errResult(fmt.Errorf("create: %s", hint))
+	}
 
 	// Multi-decl bodies: allowed when file: is set. Each top-level decl is
 	// upserted as its own Definition, all sharing the same SourceFile.
@@ -3986,16 +3994,27 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 			return errResult(fmt.Errorf("module %q not found", args.Module))
 		}
 	}
+	// #357: a file: whose directory doesn't map to any known module might
+	// still be resolvable by the "#13" new-directory fallback below, once
+	// inside the tx -- hard-erroring here unconditionally made that
+	// fallback dead code, since this always returned first. Only a file:
+	// with no directory component (project root) or no file: at all still
+	// falls through to the existing-modules guess immediately.
+	newDirCandidate := false
 	if mod == nil && args.File != "" {
-		return errResult(fmt.Errorf("file %q does not map to any known module — run defn ingest first, or pass module: explicitly", args.File))
+		if dir := filepath.ToSlash(filepath.Dir(args.File)); dir != "" && dir != "." {
+			newDirCandidate = true
+		} else {
+			return errResult(fmt.Errorf("file %q does not map to any known module — run defn ingest first, or pass module: explicitly", args.File))
+		}
 	}
-	if mod == nil {
+	if mod == nil && !newDirCandidate {
 		mods, _ := s.backend.ListModules() // best effort — nil is safe
 		if len(mods) > 0 {
 			mod = &mods[0]
 		}
 	}
-	if mod == nil {
+	if mod == nil && !newDirCandidate {
 		return errResult(fmt.Errorf("no modules found — run defn init first"))
 	}
 
@@ -4056,7 +4075,11 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 					newPath = root + "/" + dir
 				}
 			}
-			newMod, ensureErr := tx.EnsureModule(newPath, filepath.Base(dir), "")
+			pkgName := filepath.Base(dir)
+			if bodyPkg := packageNameFromBody(args.Body); bodyPkg != "" {
+				pkgName = bodyPkg
+			}
+			newMod, ensureErr := tx.EnsureModule(newPath, pkgName, "")
 			if ensureErr != nil {
 				return errResult(fmt.Errorf("create module for new directory %q: %w", dir, ensureErr))
 			}
@@ -4100,6 +4123,15 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		return dryRunResult(fmt.Sprintf("would create %s%s (kind=%s) in %s", recv, name, kind, loc))
 	}
 
+	// #357: strip a leading `package X` line before storing this as the
+	// definition's body -- same fixup sliceDecls already applies for the
+	// multi-decl path. Without it, a single-decl body naturally written
+	// with its own package clause (the model's default instinct when
+	// authoring what it thinks of as "a new file") landed verbatim in
+	// d.Body, and mergeDeclsIntoSource's real "package <mod.Name>"
+	// header plus this leftover one produced two package clauses in the
+	// same file -- "expected declaration, found 'package'" at emit time.
+	body := stripLeadingPackageDecl(args.Body)
 	exported := len(name) > 0 && name[0] >= 'A' && name[0] <= 'Z'
 	d := &store.Definition{
 		ModuleID:   mod.ID,
@@ -4108,8 +4140,8 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		Exported:   exported,
 		Test:       isTest,
 		Receiver:   receiver,
-		Signature:  extractSignature(args.Body),
-		Body:       args.Body,
+		Signature:  extractSignature(body),
+		Body:       body,
 		SourceFile: args.File,
 	}
 
@@ -4209,24 +4241,6 @@ func countTopLevelDecls(body string) int {
 		return 0
 	}
 	return len(nonImportDecls(f.Decls))
-}
-
-// stripLeadingPackageDecl removes a leading `package X` declaration from a
-// body fragment if present. The model naturally writes whole-file bodies
-// beginning with `package foo` when asked to author a new file; without
-// this the "package x\n" prefix we add for parsing produces two package
-// decls and a parse error. The package name is redundant with the target
-// file path anyway (defn derives package from module ingest).
-func stripLeadingPackageDecl(body string) string {
-	trimmed := strings.TrimLeft(body, " \t\n")
-	if !strings.HasPrefix(trimmed, "package ") {
-		return body
-	}
-	nl := strings.IndexByte(trimmed, '\n')
-	if nl == -1 {
-		return "" // whole body is just `package X`
-	}
-	return trimmed[nl+1:]
 }
 
 // slicedDecl is one top-level decl carved out of a multi-decl body.
@@ -4390,7 +4404,11 @@ func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult
 				newPath = root + "/" + dir
 			}
 		}
-		newMod, ensureErr := tx.EnsureModule(newPath, filepath.Base(dir), "")
+		pkgName := filepath.Base(dir)
+		if bodyPkg := packageNameFromBody(args.Body); bodyPkg != "" {
+			pkgName = bodyPkg
+		}
+		newMod, ensureErr := tx.EnsureModule(newPath, pkgName, "")
 		if ensureErr != nil {
 			return errResult(fmt.Errorf("create module for new directory %q: %w", dir, ensureErr))
 		}
@@ -4583,6 +4601,18 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		for _, op := range args.Operations {
 			switch op.Op {
 			case "create":
+				// #356: same double-escaping guards as the standalone
+				// code(op:"create") path (handleCreate) -- this dry-run branch
+				// had neither wired in at all, so a malformed body that would
+				// be rejected via the singleton path sailed through here.
+				if hint := doubleEscapedHint(op.Body); hint != "" {
+					errors = append(errors, "create: "+hint)
+					continue
+				}
+				if hint := commentSwallowedDeclHint(op.Body); hint != "" {
+					errors = append(errors, "create: "+hint)
+					continue
+				}
 				// Same mismatch-only check as handleCode's op:"create" -- see
 				// its comment for the full rationale (a name: that merely
 				// echoes body's own declared name is harmless and common in a
@@ -4981,6 +5011,20 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 	for _, op := range args.Operations {
 		switch op.Op {
 		case "create":
+			// #356: same double-escaping guards as the standalone
+			// code(op:"create") path (handleCreate) -- this real-write branch
+			// had neither wired in at all, so a malformed body that the
+			// singleton path would reject got silently accepted here,
+			// including inside a batch (worse: it can hide alongside
+			// otherwise-successful sibling ops).
+			if hint := doubleEscapedHint(op.Body); hint != "" {
+				errors = append(errors, "create: "+hint)
+				continue
+			}
+			if hint := commentSwallowedDeclHint(op.Body); hint != "" {
+				errors = append(errors, "create: "+hint)
+				continue
+			}
 			// Same mismatch-only check as handleCode's op:"create" -- see its
 			// comment for the full rationale.
 			if n := countTopLevelDecls(op.Body); n > 1 {
@@ -5019,7 +5063,11 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 							newPath = root + "/" + dir
 						}
 					}
-					newMod, ensureErr := tx.EnsureModule(newPath, filepath.Base(dir), "")
+					pkgName := filepath.Base(dir)
+					if bodyPkg := packageNameFromBody(op.Body); bodyPkg != "" {
+						pkgName = bodyPkg
+					}
+					newMod, ensureErr := tx.EnsureModule(newPath, pkgName, "")
 					if ensureErr != nil {
 						errors = append(errors, fmt.Sprintf("create: create module for new directory %q: %v", dir, ensureErr))
 						continue
@@ -5118,7 +5166,11 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 						newPath = root + "/" + dir
 					}
 				}
-				newMod, ensureErr := tx.EnsureModule(newPath, filepath.Base(dir), "")
+				pkgName := filepath.Base(dir)
+				if bodyPkg := packageNameFromBody(op.Body); bodyPkg != "" {
+					pkgName = bodyPkg
+				}
+				newMod, ensureErr := tx.EnsureModule(newPath, pkgName, "")
 				if ensureErr != nil {
 					errors = append(errors, fmt.Sprintf("create %s: create module for new directory %q: %v", name, dir, ensureErr))
 					continue
@@ -5155,10 +5207,13 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				errors = append(errors, fmt.Sprintf("create %s%s: already exists in %s (id=%d)", recv, name, mod.Path, existing.ID))
 				continue
 			}
+			// #357: same leading-package-decl strip as handleCreate's
+			// single-decl path -- see its comment for the full rationale.
+			body := stripLeadingPackageDecl(op.Body)
 			exported := len(name) > 0 && name[0] >= 'A' && name[0] <= 'Z'
 			d := &store.Definition{
 				ModuleID: mod.ID, Name: name, Kind: kind, Exported: exported,
-				Test: isTest, Receiver: receiver, Signature: extractSignature(op.Body), Body: op.Body,
+				Test: isTest, Receiver: receiver, Signature: extractSignature(body), Body: body,
 				SourceFile: op.File,
 			}
 			id, err := tx.UpsertDefinition(d)
@@ -7378,6 +7433,20 @@ func (s *server) projectOverview(ctx context.Context) (*sdkmcp.CallToolResult, a
 			if d.Kind != "field" {
 				defs = append(defs, d)
 			}
+		}
+		// #357: a module can end up with zero real defs -- most commonly
+		// every file under it was deleted from disk and ensureFresh
+		// correctly pruned their definitions, but the now-empty module
+		// row itself is never removed. Left unfiltered, this surfaced as
+		// a "phantom module" in the project's own orientation view: a
+		// deleted package kept showing up here forever, well after every
+		// def under it was correctly gone (confirmed via
+		// GetDefinitionByName failing for it) -- a real 2026-08-29 winze
+		// bug report. An empty module carries zero orientation value
+		// regardless of why it's empty, so skip it here rather than
+		// adding module-row deletion to the write path.
+		if len(defs) == 0 {
+			continue
 		}
 		totalDefs += len(defs)
 		if shown >= projectOverviewModuleCap {
@@ -12922,3 +12991,108 @@ func debugDefIDs(defs []store.Definition) string {
 // move search's final order, equal-footing with Rank's other
 // DefaultWeights entries (1.0, "pending tune" per that var's own doc).
 const graphRerankWeight = 1.0
+
+// commentSwallowedDeclHint detects a `//` line comment whose raw text
+// contains a literal \n escape sequence immediately followed by what
+// looks like a top-level Go declaration (func/type/const/var) -- the
+// #356 mixed-escaping trajectory (2026-08-28 bug report): only the
+// TAIL of a create body got double-escaped (a literal \n instead of a
+// real newline) while the rest of the body used real newlines
+// throughout, so doubleEscapedHint's whole-body ratio heuristic never
+// trips -- there are plenty of real newlines everywhere else. Because
+// Go's `//` comment rule runs to the next REAL newline, the literal \n
+// sequence and everything after it -- including an entire second
+// function -- gets silently swallowed into one comment line that still
+// parses as perfectly valid, useless Go. No error surfaces until a
+// later `go build` reports the intended function as undefined.
+func commentSwallowedDeclHint(body string) string {
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "//") || !strings.Contains(trimmed, `\n`) {
+			continue
+		}
+		if swallowedDeclRe.MatchString(trimmed) {
+			display := trimmed
+			if len(display) > 120 {
+				display = display[:120] + "…"
+			}
+			return fmt.Sprintf("a `//` comment line looks like it swallowed a declaration: %q -- this usually means a literal \\n (not a real newline) landed where a real newline should have ended the comment, so everything after it -- including a func/type/const/var -- became part of the comment instead of real code; pass an actual newline character there", display)
+		}
+	}
+	return ""
+}
+
+// swallowedDeclRe matches a literal \n escape sequence immediately
+// followed by a Go declaration keyword -- see commentSwallowedDeclHint.
+var swallowedDeclRe = regexp.MustCompile(`\\n\s*(func|type|const|var)\b`)
+
+// packageNameFromBody returns the package name declared by a `package
+// X` line in body -- skipping any leading GoDoc comment lines first,
+// same as stripLeadingPackageDecl -- or "" if body has none. Used when
+// creating a module for a brand-new directory: the body's OWN package
+// clause is the ground truth for what the file actually declares
+// itself to be, and must win over a guess derived from the directory's
+// basename -- #357 (2026-08-29 winze bug report): a hyphenated
+// directory name (a valid Go import-path segment, but not a valid Go
+// identifier) silently produced an uncompilable `package
+// anthropic-memtool` on disk even though the body correctly declared
+// `package memtool`.
+func packageNameFromBody(body string) string {
+	rest := body
+	for {
+		trimmed := strings.TrimLeft(rest, " \t\n")
+		if strings.HasPrefix(trimmed, "package ") {
+			pkg := strings.TrimPrefix(trimmed, "package ")
+			if nl := strings.IndexByte(pkg, '\n'); nl >= 0 {
+				pkg = pkg[:nl]
+			}
+			return strings.TrimSpace(pkg)
+		}
+		if !strings.HasPrefix(trimmed, "//") {
+			return ""
+		}
+		nl := strings.IndexByte(trimmed, '\n')
+		if nl == -1 {
+			return ""
+		}
+		rest = trimmed[nl+1:]
+	}
+}
+
+// stripLeadingPackageDecl removes a leading `package X` declaration --
+// and any GoDoc comment lines directly preceding it (the idiomatic
+// `// Package X provides ...` convention) -- from a body fragment if
+// present. The model naturally writes whole-file bodies beginning with
+// `package foo` (sometimes preceded by its own doc comment) when asked
+// to author a new file; without this the "package x\n" prefix we add
+// for parsing produces two package decls -- or, with a leading doc
+// comment, a parse error, since the comment then sits between the
+// synthetic and real package lines (#357, 2026-08-29 winze bug report:
+// this failed name inference outright with "couldn't infer definition
+// name from body"). The package name is redundant with the target file
+// path anyway (defn derives package from module ingest, or from the
+// body's own package line via packageNameFromBody for a brand-new
+// module). A leading comment NOT followed by a package line (i.e. a
+// normal decl's own doc comment) is left untouched -- the original
+// body is returned unchanged.
+func stripLeadingPackageDecl(body string) string {
+	rest := body
+	for {
+		trimmed := strings.TrimLeft(rest, " \t\n")
+		if strings.HasPrefix(trimmed, "package ") {
+			nl := strings.IndexByte(trimmed, '\n')
+			if nl == -1 {
+				return "" // whole body is just `package X`
+			}
+			return trimmed[nl+1:]
+		}
+		if !strings.HasPrefix(trimmed, "//") {
+			return body // no package decl to strip -- e.g. a decl's own leading doc comment
+		}
+		nl := strings.IndexByte(trimmed, '\n')
+		if nl == -1 {
+			return body // comment consumes the rest of body, no package line follows
+		}
+		rest = trimmed[nl+1:]
+	}
+}

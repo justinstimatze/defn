@@ -1675,14 +1675,16 @@ func Bar() {}
 	}
 }
 
-// TestEmitProjectFileDiskDriftWarning is the #217 regression: emit's
-// project-files loop (go.mod, go.sum, and any go:embed-tracked file
-// like schema_sqlite.sql) does a straight overwrite with zero merge
-// logic and, before this fix, zero warning -- a manually-edited tracked
-// project file got silently reverted to the DB's stale blob on the
-// next unrelated mutation's auto-emit. This mirrors
-// TestEmitLogsDiskDriftWarning's .go-file disk-drift warning, applied
-// to the project-files write path.
+// TestEmitProjectFileDiskDriftWarning is the #217/#356 regression:
+// emit's project-files loop (go.mod, go.sum, and any go:embed-tracked
+// file like schema_sqlite.sql) must never clobber a manually-edited
+// tracked project file with defn's own stale DB blob -- #217 initially
+// only added a warning for this (still logged here), but two real
+// trajectories (2026-08-28/29 bug reports) hit the actual data loss:
+// a legitimate go.mod edit (a new dependency, `go mod tidy`) silently
+// reverted on the very next unrelated mutation's auto-emit, discarding
+// even already-committed changes. Disk now wins on drift and the DB's
+// row heals to match, mirroring ensureFresh's treatment of .go files.
 func TestEmitProjectFileDiskDriftWarning(t *testing.T) {
 	db := testDB(t)
 	mod, _ := db.EnsureModule("example.com/test", "test", "")
@@ -1724,12 +1726,21 @@ func TestEmitProjectFileDiskDriftWarning(t *testing.T) {
 		t.Fatalf("expected disk-drift warning on stderr for clobbered project file, got: %q", buf.String())
 	}
 
-	// Document current behavior: #217 only asks for visibility, not a
-	// behavior change -- a fresh tempdir emit must still produce a
-	// buildable go.mod, so the DB's content still wins.
+	// #356: disk wins on drift -- the on-disk edit is preserved, not
+	// clobbered by the DB's stale blob.
 	final, _ := os.ReadFile(filepath.Join(outDir, "go.mod"))
-	if strings.Contains(string(final), "require foo") {
-		t.Fatalf("expected DB content to overwrite drifted disk content, got:\n%s", final)
+	if !strings.Contains(string(final), "require foo") {
+		t.Fatalf("expected on-disk content to survive drift, got:\n%s", final)
+	}
+
+	// And the DB's own row heals to match, so a later fresh-tempdir emit
+	// carries the corrected content forward instead of re-reverting it.
+	healed, err := db.GetProjectFile("go.mod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(healed, "require foo") {
+		t.Fatalf("expected DB's project_files row to heal from disk, got:\n%s", healed)
 	}
 }
 
