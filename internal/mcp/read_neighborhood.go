@@ -245,6 +245,15 @@ func bodyAlreadyShowsDoc(doc, body string) bool {
 	if doc == "" {
 		return false
 	}
+	return leadingCommentText(body) == doc
+}
+
+// leadingCommentText extracts body's leading "//"-prefixed comment
+// block, stripped of comment markers and surrounding whitespace --
+// empty when body has no leading comment. Breaks on the first
+// non-"//" line (including a blank one), matching how a doc comment
+// must directly abut its declaration with no blank line between.
+func leadingCommentText(body string) string {
 	var stripped []string
 	for _, line := range strings.Split(body, "\n") {
 		trimmed := strings.TrimSpace(line)
@@ -253,6 +262,5 @@ func bodyAlreadyShowsDoc(doc, body string) bool {
 		}
 		stripped = append(stripped, strings.TrimSpace(strings.TrimPrefix(trimmed, "//")))
 	}
-	reconstructed := strings.TrimSpace(strings.Join(stripped, "\n"))
-	return reconstructed == doc
+	return strings.TrimSpace(strings.Join(stripped, "\n"))
 }

@@ -3137,6 +3137,14 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 	// false-positives "sig changed" on every doc-adjacent edit).
 	oldBody := d.Body
 	oldSignature := extractSignature(d.Body)
+	// #365 (calque + own-session report, 2026-08-29/09-01): new_body
+	// silently drops the doc comment unless it's retyped into new_body
+	// itself -- op:"edit" reported success with no signal the doc was
+	// gone, caught only by a manual git diff afterward, 5+ times across
+	// two independent sessions. A warning here, not a hard refuse: a
+	// deliberate doc removal is a legitimate edit and shouldn't need a
+	// confirm param to get past.
+	docDropped := leadingCommentText(oldBody) != "" && leadingCommentText(args.NewBody) == ""
 	d.Body = args.NewBody
 	d.Signature = extractSignature(args.NewBody)
 
@@ -3246,6 +3254,9 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 		sb.WriteString(fmt.Sprintf("edit %s%s rolled back — nothing was saved\n\n%s%s", recv, d.Name, buildResult, s.coupledChangeHint(d.ID)))
 	} else {
 		sb.WriteString(fmt.Sprintf("Updated %s%s (id=%d, hash=%s)\n", recv, d.Name, id, store.HashBody(args.NewBody)[:12]))
+		if docDropped {
+			sb.WriteString(fmt.Sprintf("WARNING: %s%s had a leading doc comment before this edit; new_body has none, so it's gone now. If unintentional, re-add it to new_body -- op:\"edit\" only preserves a doc comment that's included in new_body itself.\n", recv, d.Name))
+		}
 	}
 
 	// Impact nudge: show callers if this definition has any. Only on
@@ -5237,6 +5248,10 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				errors = append(errors, fmt.Sprintf("edit %s: not found", op.Name))
 				continue
 			}
+			// #365: captured before any of the branches below mutate d.Body,
+			// so the doc-comment-dropped check after the identity guard can
+			// compare against what was really there before this op ran.
+			oldBody := d.Body
 			if msg := unsupportedFieldOp(d.Kind, "edit"); msg != "" {
 				errors = append(errors, fmt.Sprintf("edit %s: %s", op.Name, msg))
 				continue
@@ -5295,6 +5310,12 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				errors = append(errors, fmt.Sprintf("edit %s: new_body declares %s%s, which changes its name/receiver — use op:\"rename\" instead; op:\"edit\" only changes body content", op.Name, formatReceiver(newReceiver), newName))
 				continue
 			}
+			// #365 (calque + own-session report): same silent doc-comment
+			// drop as the standalone op:"edit" path -- see handleEdit's
+			// identical check for the full rationale. Computed against
+			// d.Body's final value, whichever branch above produced it
+			// (old_fragment or a plain new_body/body replace).
+			docDropped := leadingCommentText(oldBody) != "" && leadingCommentText(d.Body) == ""
 			d.Signature = extractSignature(d.Body)
 			if _, err := tx.UpsertDefinition(d); err != nil {
 				errors = append(errors, fmt.Sprintf("edit %s: %v", op.Name, err))
@@ -5307,6 +5328,9 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 					firstNonTestModuleID = d.ModuleID
 				}
 				sb.WriteString(fmt.Sprintf("~ edited %s\n", op.Name))
+				if docDropped {
+					sb.WriteString(fmt.Sprintf("  WARNING: %s had a leading doc comment before this edit; it's gone now -- re-add it to new_body if unintentional.\n", op.Name))
+				}
 			}
 
 		case "delete":

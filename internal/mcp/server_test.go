@@ -15972,3 +15972,51 @@ func TestHandleCreateRejectsUnknownFile(t *testing.T) {
 		t.Fatalf("Nope should have been created in a new module scoped to no/such/newpkg: %v", err)
 	}
 }
+
+// TestHandleEdit_NewBodyDropsDocCommentWarns guards #365 (reported
+// independently by calque and hit in this same defn session): op:"edit"
+// silently dropped a definition's leading doc comment whenever new_body
+// omitted it, with no signal in the response -- caught only by a manual
+// git diff. A dropped doc must now surface a WARNING in the success
+// message instead of silently disappearing.
+func TestHandleEdit_NewBodyDropsDocCommentWarns(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.handleEdit(context.Background(), nil, editParam{
+		Name:    "Greet",
+		NewBody: "func Greet(name string) string {\n\treturn \"Hi, \" + name\n}",
+	})
+	if err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "WARNING") || !strings.Contains(text, "doc comment") {
+		t.Fatalf("expected a doc-comment-dropped warning, got: %s", text)
+	}
+}
+
+// TestHandleApply_EditNewBodyDropsDocCommentWarns guards #365 for the
+// batched apply path -- same doc-comment-dropped detection as
+// handleEdit's identical fix, since op:"apply"'s own "edit" case has
+// its own separate inline body-swap logic rather than delegating to
+// handleEdit.
+func TestHandleApply_EditNewBodyDropsDocCommentWarns(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "edit", Name: "Greet", NewBody: "func Greet(name string) string {\n\treturn \"Hi, \" + name\n}"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "WARNING") || !strings.Contains(text, "doc comment") {
+		t.Fatalf("expected a doc-comment-dropped warning, got: %s", text)
+	}
+}
