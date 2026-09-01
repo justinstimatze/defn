@@ -639,3 +639,79 @@ func TestIngestEmbedFiles_SkipsPathsThatEscapeModuleRoot(t *testing.T) {
 		}
 	}
 }
+
+// TestIngest_PackageWithTypeErrorsSkippedNotWholeIngestAborted guards a
+// severe real-world gap found via a go-zero bench trajectory
+// (zeromicro/go-zero-2463, 2026-09): go-zero's nested tools/goctl
+// module loads fine (valid go.mod, unlike
+// TestIngest_BrokenNestedModuleDoesNotFailWholeIngest's unparseable
+// go.mod case) but one of its own test files
+// (model/sql/gen/gen_test.go) had a genuine, pre-existing
+// signature-mismatch compile error, unrelated to the task at hand. A
+// plain `go build ./...` from the repo root succeeds cleanly (Go
+// itself never even compiles that test file outside `go vet`/`go
+// test`), but `defn ingest .` collected package errors via
+// packages.Visit across the WHOLE dependency graph and hard-aborted
+// before storing a single definition -- losing every definition in
+// the entire repo (core/, rest/, zrpc/, gateway/, everything) to one
+// broken test file in one unrelated nested-module subpackage. This
+// test reproduces the same shape at a small scale: a root module, a
+// nested module with one healthy package and one package whose test
+// file has a real type error. Ingest must still succeed and still
+// index the root module and the nested module's healthy package; only
+// the broken package itself is skipped.
+func TestIngest_PackageWithTypeErrorsSkippedNotWholeIngestAborted(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/root\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n\nfunc RootFunc() {}\n\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	nested := filepath.Join(root, "nested")
+	if err := os.MkdirAll(nested, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "go.mod"), []byte("module example.com/nested\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	good := filepath.Join(nested, "good")
+	if err := os.MkdirAll(good, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(good, "good.go"), []byte("package good\n\nfunc GoodFunc() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	bad := filepath.Join(nested, "bad")
+	if err := os.MkdirAll(bad, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bad, "bad.go"), []byte("package bad\n\nfunc BadFunc(s string) string { return s }\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Real signature-mismatch shape: the test file calls BadFunc with
+	// the wrong number of arguments -- a genuine type error confined to
+	// this one package, matching gen_test.go's own
+	// "not enough arguments in call to g.StartFromDDL" shape exactly.
+	if err := os.WriteFile(filepath.Join(bad, "bad_test.go"), []byte("package bad\n\nimport \"testing\"\n\nfunc TestBad(t *testing.T) {\n\tBadFunc(\"a\", \"b\", \"c\")\n}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	db := testDB(t)
+	if err := Ingest(db, root); err != nil {
+		t.Fatalf("Ingest should succeed despite one broken package in a nested module, got: %v", err)
+	}
+
+	if _, err := db.GetDefinitionByName("RootFunc", "example.com/root"); err != nil {
+		t.Errorf("root module should still ingest despite an unrelated broken package elsewhere: %v", err)
+	}
+	if _, err := db.GetDefinitionByName("GoodFunc", "example.com/nested"); err != nil {
+		t.Errorf("nested module's own healthy package should still ingest despite its sibling package being broken: %v", err)
+	}
+	if _, err := db.GetDefinitionByName("BadFunc", "example.com/nested"); err == nil {
+		t.Errorf("expected BadFunc's package (genuine type error in its test file) to be skipped, not ingested")
+	}
+}

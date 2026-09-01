@@ -39,16 +39,48 @@ func Ingest(db store.Backend, modulePath string) error {
 func IngestPackages(db store.Backend, pkgs []*packages.Package, modulePath string) error {
 	clearSourceFileCache()
 
-	// Check for load errors.
-	var errs []string
-	packages.Visit(pkgs, nil, func(pkg *packages.Package) {
-		for _, e := range pkg.Errors {
-			errs = append(errs, e.Error())
+	// Packages with their own load/type errors (a pre-existing compile
+	// error in a nested module's test file, an unrelated broken
+	// subtree) used to poison the ENTIRE ingest -- packages.Visit
+	// walked the whole graph and a single error anywhere aborted before
+	// a single definition was stored, even for root-module packages
+	// with zero relation to the broken one. Confirmed live: a real
+	// go-zero trajectory hit a signature-mismatch compile error in a
+	// test file under the nested tools/goctl module and lost every
+	// definition in the entire repo (core/, rest/, zrpc/, gateway/, all
+	// of it) to one unrelated broken test file, while a plain `go
+	// build ./...` from the same root succeeded cleanly. Skip just the
+	// packages that are themselves broken -- the same best-effort
+	// philosophy LoadAll already applies to a nested module that fails
+	// to LOAD at all (see discoverNestedModuleDirs's doc comment).
+	filtered := goload.FilterPackages(pkgs)
+	var ingestable []*packages.Package
+	var brokenErrs []string
+	for _, pkg := range filtered {
+		if len(pkg.Errors) > 0 {
+			var errs []string
+			for _, e := range pkg.Errors {
+				errs = append(errs, e.Error())
+			}
+			brokenErrs = append(brokenErrs, errs...)
+			fmt.Fprintf(os.Stderr, "ingest: warning: skipping %s (package errors):\n%s\n", pkg.PkgPath, strings.Join(errs, "\n"))
+			continue
 		}
-	})
-	if len(errs) > 0 {
-		return fmt.Errorf("package errors:\n%s", strings.Join(errs, "\n"))
+		ingestable = append(ingestable, pkg)
 	}
+	// A stale/moved projectDir (captured at startup, then renamed or
+	// deleted on disk -- the exact isStaleProjectDirError shape) makes
+	// EVERY package fail to load, leaving nothing ingestable at all --
+	// that's not "one broken subtree among many good ones," it's "there
+	// is nothing here to index," and silently returning nil with zero
+	// definitions stored would hide a real, actionable problem behind
+	// what looks like a successful, empty ingest. Only hard-fail in
+	// exactly that all-broken case; a partial failure (something DID
+	// load) takes the best-effort path above instead.
+	if len(filtered) > 0 && len(ingestable) == 0 {
+		return fmt.Errorf("package errors:\n%s", strings.Join(brokenErrs, "\n"))
+	}
+	filtered = ingestable
 
 	state := &ingestState{
 		initCounter:     make(map[string]int),
@@ -83,7 +115,6 @@ func IngestPackages(db store.Backend, pkgs []*packages.Package, modulePath strin
 	// against the SQLite backend's WAL checkpoint cost, which is
 	// typically far cheaper than Dolt's chunk-store GC was.
 	const midLoopGCThresholdBytes = 1 << 30 // 1 GB
-	filtered := goload.FilterPackages(pkgs)
 	var m runtime.MemStats
 
 	// #125 winze methodology: split the walk timer from the flush timer so
