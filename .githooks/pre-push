@@ -23,12 +23,26 @@ else
 fi
 
 echo "-> unit tests"
-# 10m, not 5m: internal/mcp's suite alone now runs ~5m46s after the
-# wip-snapshot merge added its fuzz/differential tests (confirmed live
-# 2026-08-20 -- 5m was cutting it close enough to fail outright under
-# ordinary load variance, not hung, just genuinely slower). ci.yml
-# needs the same bump or CI starts flaking at the same boundary.
-CGO_ENABLED=1 go test ./... -count=1 -timeout 10m
+# -short AND a bigger timeout, not just a bigger number: the 5m->10m
+# bump on 2026-08-20 was a reactive patch for the SAME problem
+# recurring here again 2026-09-01 (internal/mcp's suite crept back up
+# against the new 10m ceiling too). Two DISTINCT causes compound this,
+# so both get a fix instead of one number chase:
+#   (1) unbounded growth -- every Fuzz corpus (FuzzRoundTrip,
+#       FuzzMultiModuleIngest, FuzzMutationSequence) permanently
+#       accumulates one seed per crasher ever found and replays the
+#       WHOLE corpus on every plain `go test`, so this slice of runtime
+#       has no ceiling and can only grow as more bugs get fixed. Fixed
+#       structurally: each Fuzz function now skips its own corpus
+#       replay under -short (`if testing.Short() { f.Skip(...) }`).
+#   (2) baseline volume -- ~500+ tests in internal/mcp alone, many
+#       genuinely subprocess-heavy (real go build/goimports calls),
+#       sensitive to ordinary load variance on this shared machine.
+#       -short doesn't touch this part; only real margin does. Full,
+#       non-short suite still runs in CI (ci.yml) on a dedicated
+#       GitHub Actions runner, unaffected by this machine's own load.
+# replay via `if testing.Short() { f.Skip(...) }`.
+CGO_ENABLED=1 go test ./... -count=1 -timeout 20m -short
 
 echo "-> self-hosting round-trip"
 # Isolated tempdir DB, not the repo's own .defn -- that one is

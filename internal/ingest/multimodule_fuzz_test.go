@@ -51,6 +51,14 @@ func TestMultiModuleIngest_IsolatesBrokenPackages(t *testing.T) {
 // a permanent regression seed the next time `go test ./...` runs it as
 // part of the corpus.
 func FuzzMultiModuleIngest(f *testing.F) {
+	// -short skips corpus replay entirely: this corpus only ever grows
+	// (every crasher Go's fuzzer finds becomes a permanent seed), so its
+	// replay cost has no ceiling over time. Keeps it out of the fast,
+	// push-gating path (.githooks/pre-push runs -short) while CI's full,
+	// non-short run still exercises the whole accumulated corpus.
+	if testing.Short() {
+		f.Skip("skipping FuzzMultiModuleIngest corpus replay in -short mode")
+	}
 	f.Add(uint64(1), uint8(2), uint8(2), uint8(30))
 	f.Add(uint64(2), uint8(4), uint8(3), uint8(60))
 	f.Add(uint64(3), uint8(1), uint8(1), uint8(100))

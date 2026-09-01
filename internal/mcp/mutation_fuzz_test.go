@@ -278,6 +278,14 @@ type liveDef struct {
 // testdata/fuzz/FuzzMutationSequence/ automatically on any crasher, same
 // as FuzzRoundTrip.
 func FuzzMutationSequence(f *testing.F) {
+	// -short skips corpus replay entirely: this corpus only ever grows
+	// (every crasher Go's fuzzer finds becomes a permanent seed), so its
+	// replay cost has no ceiling over time. Keeps it out of the fast,
+	// push-gating path (.githooks/pre-push runs -short) while CI's full,
+	// non-short run still exercises the whole accumulated corpus.
+	if testing.Short() {
+		f.Skip("skipping FuzzMutationSequence corpus replay in -short mode")
+	}
 	f.Add(uint64(1), uint16(6))
 	f.Add(uint64(2), uint16(10))
 	f.Add(uint64(42), uint16(15))

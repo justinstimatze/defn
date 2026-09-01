@@ -12,6 +12,14 @@ import (
 // permanent regression seed the next time `go test ./...` runs it as
 // part of the corpus -- found bugs become permanent tests for free.
 func FuzzRoundTrip(f *testing.F) {
+	// -short skips corpus replay entirely: this corpus only ever grows
+	// (every crasher Go's fuzzer finds becomes a permanent seed), so its
+	// replay cost has no ceiling over time. Keeps it out of the fast,
+	// push-gating path (.githooks/pre-push runs -short) while CI's full,
+	// non-short run still exercises the whole accumulated corpus.
+	if testing.Short() {
+		f.Skip("skipping FuzzRoundTrip corpus replay in -short mode")
+	}
 	f.Add(uint64(1))
 	f.Add(uint64(2))
 	f.Add(uint64(42))

@@ -26,7 +26,14 @@ jobs:
         run: CGO_ENABLED=1 go build ./cmd/defn/
 
       - name: Unit tests
-        run: CGO_ENABLED=1 go test ./... -count=1 -timeout 10m
+        # 15m, not 10m: CI intentionally runs the FULL suite (no -short,
+        # unlike .githooks/pre-push) including every Fuzz corpus's full
+        # replay -- that corpus only ever grows over time (one seed per
+        # crasher ever found, permanent), so this runtime has no
+        # ceiling and 10m already proved too tight once for the local
+        # hook. Extra margin here since a GitHub-hosted runner isn't
+        # necessarily faster than a dedicated box either.
+        run: CGO_ENABLED=1 go test ./... -count=1 -timeout 15m
 
       - name: Vet
         run: go vet ./...
