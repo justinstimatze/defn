@@ -15703,6 +15703,136 @@ func TestHandleCode_CreateNameParamMatchingBodyIsAllowed(t *testing.T) {
 	}
 }
 
+// TestHandleCode_CreateReceiverQualifiedNameParamIsAllowed is #371: a
+// real grpc-go-3476 bench trajectory called create(name:"(builder).Equal",
+// receiver:"builder", body:"func (b builder) Equal(...) {...}") inside an
+// apply batch -- the receiver-qualified "(*T).Method"/"(T).Method" form
+// read/outline/rename/GetDefinitionByName all already accept elsewhere in
+// this same tool. create's name-mismatch check compared the qualified
+// string literally against the body's bare declared name ("Equal") and
+// rejected it as a false mismatch, rolling back the WHOLE batch --
+// including an already-valid sibling edit. Only a genuine disagreement
+// (wrong bare name, or a receiver that doesn't match the body's own) is a
+// real mistake worth flagging.
+func TestHandleCode_CreateReceiverQualifiedNameParamIsAllowed(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "builder.go"), []byte("package main\n\ntype builder struct{}\n"), 0644)
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op:       "create",
+		Name:     "(builder).Equal",
+		Receiver: "builder",
+		Body:     "func (b builder) Equal(other builder) bool { return true }",
+		File:     "builder.go",
+	})
+	if err != nil {
+		t.Fatalf("handleCode: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Created") {
+		t.Fatalf("expected create to succeed when the receiver-qualified name: matches body's own receiver+name, got: %s", text)
+	}
+}
+
+// TestHandleCode_CreateReceiverQualifiedNameParamWrongReceiverRejected
+// guards the other side of the #371 fix above: a receiver-qualified
+// name: whose RECEIVER genuinely disagrees with body's own declared
+// receiver must still be rejected -- normalizing away the qualifier
+// syntax must not also silently ignore a real receiver mismatch.
+func TestHandleCode_CreateReceiverQualifiedNameParamWrongReceiverRejected(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "builder.go"), []byte("package main\n\ntype builder struct{}\ntype wrongType struct{}\n"), 0644)
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op:       "create",
+		Name:     "(wrongType).Equal",
+		Receiver: "wrongType",
+		Body:     "func (b builder) Equal(other builder) bool { return true }",
+		File:     "builder2.go",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "receiver") {
+		t.Fatalf("expected a rejection naming the receiver mismatch, got: %s", text)
+	}
+}
+
+// TestHandleApply_CreateReceiverQualifiedNameParamIsAllowed is the
+// batch-apply sibling of TestHandleCode_CreateReceiverQualifiedName-
+// ParamIsAllowed: the real bench trajectory's create call was inside an
+// apply batch alongside another op, and the false rejection rolled back
+// the WHOLE batch, not just the create.
+func TestHandleApply_CreateReceiverQualifiedNameParamIsAllowed(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "builder.go"), []byte("package testpkg\n\ntype builder struct{}\n"), 0644)
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{
+				Op:       "create",
+				Name:     "(builder).Equal",
+				Receiver: "builder",
+				Body:     "func (b builder) Equal(other builder) bool { return true }",
+				File:     "builder.go",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleApply: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "doesn't match") || strings.Contains(text, "rolled back") {
+		t.Fatalf("expected the batch to succeed with a receiver-qualified create name:, got: %s", text)
+	}
+}
+
 // TestHandleCode_ExplainBareNamesLoopsOverEachName guards explain's bare
 // (non-question) path silently dropping names: -- the validation switch
 // accepts names: as an acceptable scope for explain (mirroring the

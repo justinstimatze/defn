@@ -1738,8 +1738,30 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		// bodies, where a single name: can't unambiguously mean any one
 		// of several declarations anyway.
 		if args.Name != "" && countTopLevelDecls(args.Body) <= 1 {
-			if inferred, _, _, _ := s.inferFromBody(args.Body); inferred != "" && inferred != args.Name {
-				return errResult(fmt.Errorf("create: name:%q doesn't match %q, the name body actually declares -- create always infers the definition's name from body's own declaration, not from a separate name: param; make body declare %q or remove the name: param", args.Name, inferred, args.Name))
+			if inferred, _, inferredRecv, _ := s.inferFromBody(args.Body); inferred != "" {
+				// #371: name: may legitimately be the receiver-qualified
+				// "(*T).Method"/"(T).Method" form GetDefinitionByName/
+				// rename/read all already accept elsewhere in this same
+				// tool -- a strict literal comparison against the body's
+				// bare declared name rejected that valid, already-
+				// established convention as a false mismatch. Confirmed
+				// live (grpc-go-3476 bench trajectory): create(name:
+				// "(builder).Equal", receiver:"builder", body:"func (b
+				// builder) Equal(...) {...}") was rejected outright,
+				// rolling back the WHOLE apply batch (including an
+				// already-valid sibling edit), even though receiver:
+				// carried the exact same, correct information the
+				// qualified name: was redundantly restating.
+				wantName, wantRecv, qualified := splitReceiverQualifiedName(args.Name)
+				if !qualified {
+					wantName = args.Name
+				}
+				if wantName != inferred {
+					return errResult(fmt.Errorf("create: name:%q doesn't match %q, the name body actually declares -- create always infers the definition's name from body's own declaration, not from a separate name: param; make body declare %q or remove the name: param", args.Name, inferred, args.Name))
+				}
+				if qualified && strings.TrimPrefix(wantRecv, "*") != strings.TrimPrefix(inferredRecv, "*") {
+					return errResult(fmt.Errorf("create: name:%q declares receiver %q, but body's own receiver is %q -- make body's receiver match or remove the name: param", args.Name, wantRecv, inferredRecv))
+				}
 			}
 		}
 		return s.handleCreate(ctx, req, createParam{Body: args.Body, Module: args.Module, File: args.File, DryRun: args.DryRun})
@@ -4747,14 +4769,23 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 					}
 					continue
 				}
-				name, kind, _, _ := s.inferFromBody(op.Body)
+				name, kind, receiver, _ := s.inferFromBody(op.Body)
 				if name == "" {
 					if hint := inferFailureHint(op.Body); hint != "" {
 						errors = append(errors, "create: couldn't infer name from body -- "+hint)
 					} else {
 						errors = append(errors, "create: couldn't infer name from body")
 					}
-				} else if op.Name != "" && op.Name != name {
+				} else if op.Name != "" && func() bool {
+					// #371: op.Name may legitimately be the receiver-qualified
+					// "(*T).Method" form -- see the sibling fix in
+					// handleCode's standalone "create" dispatch.
+					wantName, wantRecv, qualified := splitReceiverQualifiedName(op.Name)
+					if !qualified {
+						wantName = op.Name
+					}
+					return wantName != name || (qualified && strings.TrimPrefix(wantRecv, "*") != strings.TrimPrefix(receiver, "*"))
+				}() {
 					errors = append(errors, fmt.Sprintf("create: name:%q doesn't match %q, the name body actually declares -- create always infers the definition's name from body's own declaration, not from a separate name: param; make body declare %q or remove name:", op.Name, name, op.Name))
 				} else {
 					sb.WriteString(fmt.Sprintf("+ would create %s (%s)\n", name, kind))
@@ -5252,9 +5283,22 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				}
 				continue
 			}
-			if op.Name != "" && op.Name != name {
-				errors = append(errors, fmt.Sprintf("create: name:%q doesn't match %q, the name body actually declares -- create always infers the definition's name from body's own declaration, not from a separate name: param; make body declare %q or remove name:", op.Name, name, op.Name))
-				continue
+			if op.Name != "" {
+				// #371: op.Name may legitimately be the receiver-qualified
+				// "(*T).Method" form -- see the sibling fix in handleCode's
+				// standalone "create" dispatch for the full story.
+				wantName, wantRecv, qualified := splitReceiverQualifiedName(op.Name)
+				if !qualified {
+					wantName = op.Name
+				}
+				if wantName != name {
+					errors = append(errors, fmt.Sprintf("create: name:%q doesn't match %q, the name body actually declares -- create always infers the definition's name from body's own declaration, not from a separate name: param; make body declare %q or remove name:", op.Name, name, op.Name))
+					continue
+				}
+				if qualified && strings.TrimPrefix(wantRecv, "*") != strings.TrimPrefix(receiver, "*") {
+					errors = append(errors, fmt.Sprintf("create: name:%q declares receiver %q, but body's own receiver is %q -- make body's receiver match or remove name:", op.Name, wantRecv, receiver))
+					continue
+				}
 			}
 			// Mirrors handleCreate's precedence: file: is tried first (most
 			// specific) but a miss there falls through to module:, not an
