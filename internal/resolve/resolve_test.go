@@ -948,6 +948,72 @@ func buildLiteral() Opts {
 	}
 }
 
+// TestResolveDisambiguatesSameNamedFuncAcrossFiles is the regression for
+// the "file goes missing after init edit" bug (grpc-go dialoptions.go /
+// pickfirst.go trajectory). Go allows multiple files in one package to
+// each declare their own func init() -- a common, valid pattern. Before
+// the fix, lookupFuncDefID resolved callers by bare name only
+// (defIndex.byName), so a reference made from inside one file's init()
+// could be attributed to the WRONG file's init() definition (whichever
+// one happened to win the name collision), corrupting the ref graph for
+// an ordinary, valid multi-init() package. The fix adds a
+// file-qualified lookup (defIndex.byNameFile) tried first, falling back
+// to the ambiguous bare-name lookup only when no file-scoped match
+// exists.
+func TestResolveDisambiguatesSameNamedFuncAcrossFiles(t *testing.T) {
+	dir := writeModule(t, map[string]string{
+		"a.go": `package multiinit
+
+var registry func()
+
+func Target() {}
+
+func init() {
+	registry = Target
+}
+`,
+		"b.go": `package multiinit
+
+var unrelated bool
+
+func init() {
+	unrelated = true
+}
+`,
+	})
+
+	db := testDB(t)
+	if err := ingest.Ingest(db, dir); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if err := Resolve(db, dir); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	target, err := db.GetDefinitionByName("Target", "example.com/refsbug")
+	if err != nil {
+		t.Fatalf("get target def: %v", err)
+	}
+
+	callers, err := db.GetCallers(target.ID)
+	if err != nil {
+		t.Fatalf("get callers: %v", err)
+	}
+
+	var initFromA bool
+	for _, c := range callers {
+		if c.Name == "init" && c.SourceFile == "a.go" {
+			initFromA = true
+		}
+	}
+	if !initFromA {
+		t.Errorf("expected init() in a.go (which references Target) to be attributed as a caller, got: %+v", callers)
+	}
+	if len(callers) != 1 {
+		t.Errorf("expected exactly 1 caller (a.go's init, not b.go's unrelated init), got %d: %+v", len(callers), callers)
+	}
+}
+
 // TestResolveTracksCrossPackageStructFieldReferences is the second half of
 // the struct-field-ref regression (see
 // TestResolveTracksStructFieldReferences for the same-package case).

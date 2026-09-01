@@ -10,6 +10,7 @@ import (
 	"go/token"
 	"go/types"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -498,10 +499,20 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 			continue
 		}
 		for _, file := range pkg.Syntax {
+			// #372: matches ingestFunc's own sourceFile computation
+			// (internal/ingest/ingest.go) exactly, so byNameFile's keys
+			// line up with the SourceFile values actually stored on
+			// definitions -- see lookupFuncDefID's doc comment.
+			fileSource := ""
+			if file.Pos().IsValid() {
+				if rel, err := filepath.Rel(projectDir, pkg.Fset.Position(file.Pos()).Filename); err == nil {
+					fileSource = rel
+				}
+			}
 			for _, decl := range file.Decls {
 				switch d := decl.(type) {
 				case *ast.FuncDecl:
-					fromID := lookupFuncDefID(db, pkgPath, d, cache)
+					fromID := lookupFuncDefID(db, pkgPath, d, fileSource, cache)
 					if fromID <= 0 {
 						continue
 					}
@@ -716,6 +727,17 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 type defIndex struct {
 	byName   map[string]int64            // top-level defs (no receiver)
 	byMethod map[string]map[string]int64 // methodName → receiver → def ID
+	// byNameFile disambiguates top-level defs that legitimately share a
+	// bare name across different files in the same package -- Go
+	// explicitly allows multiple func init() declarations per package
+	// (one of the most common real-world shapes; every grpc-go/etcd/
+	// caddy-scale repo has dozens), and build-tag-gated per-platform
+	// files (foo_linux.go/foo_windows.go) can do the same for an
+	// ordinary function name. byName's plain name->ID map can only hold
+	// one entry per name -- whichever def loadDefIndex iterates last
+	// silently wins, and every OTHER same-named def's own references
+	// get misattributed to that one winner. Keyed "name\x00sourceFile".
+	byNameFile map[string]int64
 }
 
 func (i *defIndex) lookupName(name string) int64 {
@@ -723,6 +745,16 @@ func (i *defIndex) lookupName(name string) int64 {
 		return 0
 	}
 	return i.byName[name]
+}
+
+// lookupNameFile resolves a top-level def by name AND its exact source
+// file, disambiguating the same-bare-name-multiple-files case byName
+// alone can't. See defIndex.byNameFile's doc comment.
+func (i *defIndex) lookupNameFile(name, sourceFile string) int64 {
+	if i == nil || sourceFile == "" {
+		return 0
+	}
+	return i.byNameFile[name+"\x00"+sourceFile]
 }
 
 func (i *defIndex) lookupMethod(name, receiver string) int64 {
@@ -750,8 +782,9 @@ func loadDefIndex(db store.Backend, pkgPath string) *defIndex {
 		return nil
 	}
 	idx := &defIndex{
-		byName:   make(map[string]int64, len(defs)),
-		byMethod: make(map[string]map[string]int64),
+		byName:     make(map[string]int64, len(defs)),
+		byMethod:   make(map[string]map[string]int64),
+		byNameFile: make(map[string]int64, len(defs)),
 	}
 	for _, d := range defs {
 		if d.Receiver != "" {
@@ -763,6 +796,7 @@ func loadDefIndex(db store.Backend, pkgPath string) *defIndex {
 			m[d.Receiver] = d.ID
 		} else {
 			idx.byName[d.Name] = d.ID
+			idx.byNameFile[d.Name+"\x00"+d.SourceFile] = d.ID
 		}
 	}
 	return idx
@@ -1197,7 +1231,13 @@ func lookupDefID(db store.Backend, pkgPath string, ident *ast.Ident, obj types.O
 	return d.ID
 }
 
-func lookupFuncDefID(db store.Backend, pkgPath string, fn *ast.FuncDecl, cache pkgIndexCache) int64 {
+// lookupFuncDefID resolves fn (a *ast.FuncDecl currently being scanned
+// for outgoing references) to its own def ID -- the "from" side of
+// every reference edge collected from its signature/body. sourceFile
+// is fn's own file, relative to the module root (matching
+// Definition.SourceFile's convention); pass "" when unknown, which
+// falls back to the pre-#372 bare-name-only behavior.
+func lookupFuncDefID(db store.Backend, pkgPath string, fn *ast.FuncDecl, sourceFile string, cache pkgIndexCache) int64 {
 	// For methods, include receiver in lookup.
 	if fn.Recv != nil && len(fn.Recv.List) > 0 {
 		recv := astutil.BareReceiverName(fn.Recv.List[0].Type)
@@ -1208,6 +1248,26 @@ func lookupFuncDefID(db store.Backend, pkgPath string, fn *ast.FuncDecl, cache p
 		if err == nil {
 			return d.ID
 		}
+	}
+	// #372: a bare top-level name is not always unique within a
+	// package -- Go explicitly allows multiple func init() declarations
+	// per package (one of the most common real-world shapes: every
+	// grpc-go/etcd/caddy-scale repo has dozens across different files),
+	// and build-tag-gated per-platform files (foo_linux.go/
+	// foo_windows.go) can do the same for an ordinary function name.
+	// byName's plain name->ID map can only hold one entry per name, so
+	// EVERY reference collected from any OTHER same-named function's
+	// body silently got attributed to whichever one happened to be
+	// indexed last -- confirmed live via a real grpc-go-2629 bench
+	// trajectory: renaming a function referenced from one file's
+	// init() left that init() unchanged (attributed instead to a
+	// DIFFERENT file's own unrelated init()), shipping a build that
+	// doesn't compile with no error or warning. Try the file-qualified
+	// match first; it's exact whenever available, and only degrades to
+	// the ambiguous bare-name match when sourceFile is unknown or the
+	// index predates this fix.
+	if id := cache.get(db, pkgPath).lookupNameFile(fn.Name.Name, sourceFile); id > 0 {
+		return id
 	}
 	if id := cache.get(db, pkgPath).lookupName(fn.Name.Name); id > 0 {
 		return id
