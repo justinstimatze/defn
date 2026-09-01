@@ -3050,6 +3050,7 @@ func (s *server) rankedSearchResult(query string, defs []store.Definition, limit
 		SourceFile string  `json:"file,omitempty"`
 		Score      float64 `json:"score"`
 		Preview    string  `json:"preview,omitempty"`
+		Match      string  `json:"match,omitempty"`
 	}
 	out := make([]rankedSummary, 0, limit)
 	for i, r := range scored {
@@ -3072,6 +3073,11 @@ func (s *server) rankedSearchResult(query string, defs []store.Definition, limit
 		if i < searchPreviewCount {
 			rs.Preview = topLinesOfBody(r.Def.Body, searchPreviewLines)
 		}
+		// #367 (prometheus-16766 fork finding): every result, not just
+		// the top-N, gets a one-line "why this matched" snippet -- see
+		// matchingLineSnippet's doc comment. Cheap enough to attach
+		// everywhere, unlike the 5-line Preview above.
+		rs.Match = matchingLineSnippet(r.Def.Body, query)
 		out = append(out, rs)
 	}
 	text, err := toJSON(out)
@@ -6973,7 +6979,8 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeoutFor(0, target))
+	timeout := testTimeoutFor(0, target)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "go", "test", "-run", pattern, "-count=1", "-v", target)
 	cmd.Dir = s.projectDir
@@ -6989,7 +6996,7 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 	case err != nil && testPanicked(outStr):
 		sb.WriteString("\nTEST BINARY PANICKED -- not a normal assertion failure; likely caused by state unrelated to your edit (e.g. duplicate flag/command registration shared across tests in one binary). Investigate the panic trace above before assuming your edit is wrong")
 	case err != nil && ctx.Err() == context.DeadlineExceeded:
-		sb.WriteString(fmt.Sprintf("\nTIMED OUT after %s -- this is NOT a pass; the run was killed before finishing. This may be a hang from your edit, or simply a large/slow test package -- set DEFN_TEST_TIMEOUT=<duration> (e.g. \"5m\") to allow more time before assuming a hang", testTimeout))
+		sb.WriteString(fmt.Sprintf("\nTIMED OUT after %s -- this is NOT a pass; the run was killed before finishing. This may be a hang from your edit, or simply a large/slow test package -- set DEFN_TEST_TIMEOUT=<duration> (e.g. \"5m\") to allow more time before assuming a hang", timeout))
 	case err != nil:
 		sb.WriteString("\nSOME TESTS FAILED")
 	case testMatchedNothing(outStr):
@@ -7104,7 +7111,8 @@ func (s *server) handleTest(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	if len(targets) > 0 {
 		timeoutTarget = targets[0]
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeoutFor(len(testNames), timeoutTarget))
+	timeout := testTimeoutFor(len(testNames), timeoutTarget)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmdArgs := append([]string{"test", "-run", runPattern, "-count=1", "-v"}, targets...)
 	cmd := exec.CommandContext(ctx, "go", cmdArgs...)
@@ -7137,7 +7145,7 @@ func (s *server) handleTest(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 	case err != nil && testPanicked(outStr):
 		sb.WriteString("\nTEST BINARY PANICKED -- not a normal assertion failure; likely caused by state unrelated to your edit (e.g. duplicate flag/command registration shared across tests in one binary). Investigate the panic trace above before assuming your edit is wrong")
 	case err != nil && ctx.Err() == context.DeadlineExceeded:
-		sb.WriteString(fmt.Sprintf("\nTIMED OUT after %s -- this is NOT a pass; the run was killed before finishing. This may be a hang from your edit, or simply a large/slow test package -- set DEFN_TEST_TIMEOUT=<duration> (e.g. \"5m\") to allow more time before assuming a hang", testTimeout))
+		sb.WriteString(fmt.Sprintf("\nTIMED OUT after %s -- this is NOT a pass; the run was killed before finishing. This may be a hang from your edit, or simply a large/slow test package -- set DEFN_TEST_TIMEOUT=<duration> (e.g. \"5m\") to allow more time before assuming a hang", timeout))
 	case err != nil:
 		sb.WriteString("\nSOME TESTS FAILED")
 	case noneMatched:
@@ -13305,4 +13313,39 @@ func runGoimportsOnFile(absPath string) error {
 		return fmt.Errorf("goimports: %s", out)
 	}
 	return nil
+}
+
+// matchingLineSnippet returns the first line in body containing any
+// token from query (case-insensitive), trimmed and length-capped, or ""
+// if query has no usable tokens or no line matches. #157 fork finding:
+// rankedSearchResult's existing Preview field (topLinesOfBody) is
+// gated to the top searchPreviewCount hits and shows the body's HEAD
+// regardless of where the match actually is -- results ranked below
+// that cutoff got no indication of why they matched at all. Confirmed
+// live (prometheus-16766 trajectory): a 21-result ranked search
+// correctly surfaced the actual functions files-mode later edited, but
+// the model only ever investigated the one result it already knew
+// about, plausibly because nothing showed why the other 20 mattered.
+// Unlike topLinesOfBody's 5-line preview (deliberately gated by cost --
+// see searchPreviewCount's own doc comment), a single matching line is
+// cheap enough to attach to every result, not just the top few.
+func matchingLineSnippet(body, query string) string {
+	tokens := extractQueryTokensLower(query)
+	if len(tokens) == 0 {
+		return ""
+	}
+	const maxLen = 160
+	for _, line := range strings.Split(body, "\n") {
+		low := strings.ToLower(line)
+		for _, tok := range tokens {
+			if strings.Contains(low, tok) {
+				trimmed := strings.TrimSpace(line)
+				if len(trimmed) > maxLen {
+					trimmed = trimmed[:maxLen] + "…"
+				}
+				return trimmed
+			}
+		}
+	}
+	return ""
 }

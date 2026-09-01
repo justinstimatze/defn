@@ -16288,3 +16288,211 @@ func UseWidget() *widgetTypes.Detail {
 		t.Fatalf("expected the parent package import to survive, got:\n%s", src)
 	}
 }
+
+// TestRankedSearchResult_EveryHitGetsMatchSnippetNotJustTopThree guards
+// #367 (prometheus-16766 fork finding): rankedSearchResult's existing
+// Preview field (topLinesOfBody) is gated to the top searchPreviewCount
+// (3) hits and shows the body's HEAD regardless of where the query
+// actually matched -- everything ranked below that cutoff got no
+// indication of why it matched at all. A real trajectory confirmed
+// this: a 21-result ranked search correctly surfaced the functions
+// files-mode later edited, but the model only ever investigated the
+// one result it already knew about. Every result must now carry a
+// one-line "match" snippet showing the actual matching line, not just
+// the top 3.
+func TestRankedSearchResult_EveryHitGetsMatchSnippetNotJustTopThree(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, idf: newIDF(db)}
+
+	mods, err := db.ListModules()
+	if err != nil || len(mods) == 0 {
+		t.Fatalf("list modules: %v (mods=%d)", err, len(mods))
+	}
+	mod := mods[0]
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("Candidate%d", i)
+		body := fmt.Sprintf("func %s() {\n\tfmt.Println(\"padding\")\n\tfmt.Println(\"findme marker %d\")\n}", name, i)
+		if _, err := db.UpsertDefinition(&store.Definition{
+			ModuleID: mod.ID, Name: name, Kind: "function", Exported: true,
+			Body: body, Signature: fmt.Sprintf("func %s()", name),
+		}); err != nil {
+			t.Fatalf("upsert %s: %v", name, err)
+		}
+	}
+
+	// FindDefinitions is a lightweight name-lookup query that deliberately
+	// returns "" for Body (see its own SQL) -- GetModuleDefinitions joins
+	// bodies, matching what handleSearch's real ranked path actually
+	// passes to rankedSearchResult.
+	allDefs, err := db.GetModuleDefinitions(mod.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var defs []store.Definition
+	for _, d := range allDefs {
+		if strings.HasPrefix(d.Name, "Candidate") {
+			defs = append(defs, d)
+		}
+	}
+	if len(defs) < 5 {
+		t.Fatalf("expected 5 fixture defs, got %d", len(defs))
+	}
+
+	result, _, err := s.rankedSearchResult("findme", defs, 5)
+	if err != nil {
+		t.Fatalf("rankedSearchResult: %v", err)
+	}
+	text := resultText(t, result)
+
+	var out []struct {
+		Name  string `json:"name"`
+		Match string `json:"match"`
+	}
+	jsonStart := strings.Index(text, "[")
+	if jsonStart < 0 {
+		t.Fatalf("no JSON array found in result: %s", text)
+	}
+	if err := json.Unmarshal([]byte(text[jsonStart:]), &out); err != nil {
+		t.Fatalf("unmarshal: %v\ntext: %s", err, text)
+	}
+	if len(out) < 4 {
+		t.Fatalf("expected at least 4 ranked results, got %d", len(out))
+	}
+	for i, r := range out {
+		if r.Match == "" {
+			t.Errorf("result %d (%s) has no match snippet, expected one for every result including beyond the top-%d preview cutoff", i, r.Name, searchPreviewCount)
+		}
+		if !strings.Contains(r.Match, "findme") {
+			t.Errorf("result %d (%s) match snippet %q doesn't contain the query term", i, r.Name, r.Match)
+		}
+	}
+}
+
+// TestHandleTest_TimedOutMessageReportsScaledDurationNotFlatDefault
+// guards a real prometheus-16766 bench trajectory: code(op:"test",
+// name:"Init") selected 1712 covering tests (far past testTimeoutFor's
+// nTests>50 scaling threshold) and printed "TIMED OUT after 1m0s" --
+// looking like the scaling logic never engaged. It actually had: the
+// TIMED OUT message hardcoded the package-level testTimeout var
+// instead of the actual (possibly scaled) duration passed to
+// context.WithTimeout, so the printed number was always the flat
+// default regardless of what deadline the run genuinely got. This
+// misleads the agent into thinking scaling silently failed, when the
+// real deadline may have already been 3x longer. Force nTests>50 via
+// 51 covering tests and assert the message reports the SCALED
+// duration, not the flat default.
+func TestHandleTest_TimedOutMessageReportsScaledDurationNotFlatDefault(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "target.go"), []byte("package testproj\n\nfunc Target() string { return \"x\" }\n"), 0644)
+
+	var sb strings.Builder
+	sb.WriteString("package testproj\n\nimport (\n\t\"testing\"\n\t\"time\"\n)\n\n")
+	sb.WriteString("func TestHang(t *testing.T) {\n\tTarget()\n\ttime.Sleep(2 * time.Second)\n}\n\n")
+	for i := 0; i < 50; i++ {
+		fmt.Fprintf(&sb, "func TestCovering%d(t *testing.T) {\n\tTarget()\n}\n\n", i)
+	}
+	os.WriteFile(filepath.Join(projDir, "target_test.go"), []byte(sb.String()), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	orig := testTimeout
+	testTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { testTimeout = orig })
+
+	result, _, err := s.handleTest(context.Background(), nil, nameParam{Name: "Target"})
+	if err != nil {
+		t.Fatalf("handleTest(Target): %v", err)
+	}
+	text := resultText(t, result)
+	t.Logf("output:\n%s", text)
+
+	if !strings.Contains(text, "TIMED OUT") {
+		t.Fatalf("expected a genuine hang past the scaled deadline to report TIMED OUT, got: %s", text)
+	}
+	if strings.Contains(text, fmt.Sprintf("TIMED OUT after %s", testTimeout)) {
+		t.Errorf("message reported the flat unscaled default %s instead of the actual scaled timeout given to context.WithTimeout for 51 covering tests, got: %s", testTimeout, text)
+	}
+	wantScaled := testTimeout * 3
+	if !strings.Contains(text, fmt.Sprintf("TIMED OUT after %s", wantScaled)) {
+		t.Errorf("expected message to report the scaled timeout %s actually given to the run, got: %s", wantScaled, text)
+	}
+}
+
+// TestHandleTestByName_TimedOutMessageReportsScaledDurationNotFlatDefault
+// is handleTestByName's sibling case for the same bug guarded by
+// TestHandleTest_TimedOutMessageReportsScaledDurationNotFlatDefault:
+// testTimeoutFor also scales up to 3x the default for a "./..."
+// whole-repo scope (see
+// TestTestTimeoutFor_ScalesForLargeRunsRespectsExplicitOverride's
+// "whole-repo scope scales up even with few tests" case), but the
+// TIMED OUT message printed the flat package-level testTimeout instead
+// of the scaled duration actually passed to context.WithTimeout. An
+// alternation with one resolvable and one unresolvable segment forces
+// the "./..." fallback scope here.
+func TestHandleTestByName_TimedOutMessageReportsScaledDurationNotFlatDefault(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main_test.go"), []byte("package main\n\nimport (\n\t\"testing\"\n\t\"time\"\n)\n\nfunc TestSlowHang(t *testing.T) {\n\ttime.Sleep(2 * time.Second)\n}\n"), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	orig := testTimeout
+	testTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { testTimeout = orig })
+
+	result, _, err := s.handleTestByName(context.Background(), nil, "TestSlowHang|TestDoesNotExistXYZ", "", "")
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	text := resultText(t, result)
+	t.Logf("output:\n%s", text)
+
+	if !strings.Contains(text, "./...") {
+		t.Fatalf("expected the unresolvable alternation segment to force the './...' fallback scope, got: %s", text)
+	}
+	if !strings.Contains(text, "TIMED OUT") {
+		t.Fatalf("expected a genuine hang past the scaled deadline to report TIMED OUT, got: %s", text)
+	}
+	if strings.Contains(text, fmt.Sprintf("TIMED OUT after %s", testTimeout)) {
+		t.Errorf("message reported the flat unscaled default %s instead of the actual scaled timeout given to context.WithTimeout for a './...' scope, got: %s", testTimeout, text)
+	}
+	wantScaled := testTimeout * 3
+	if !strings.Contains(text, fmt.Sprintf("TIMED OUT after %s", wantScaled)) {
+		t.Errorf("expected message to report the scaled timeout %s actually given to the run, got: %s", wantScaled, text)
+	}
+}
