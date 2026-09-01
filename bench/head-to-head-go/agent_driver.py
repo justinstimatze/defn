@@ -26,6 +26,44 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load_dotenv_once():
+    """Load KEY=VALUE lines from the repo's own .env into os.environ,
+    without overriding anything already set there.
+
+    Structural fix for a recurring gotcha (hit at least 5 times across
+    sessions, per winze-memory "Always use .env API key for bench"):
+    `claude -p` defaults to OAuth login state, which expires between
+    sessions and can't complete an interactive browser /login from a
+    headless script -- the symptom is a ~1s "Not logged in" failure that
+    looks exactly like a defn correctness bug at a glance. The fix
+    (source ANTHROPIC_API_KEY from the project's own .env) was
+    previously something a human/agent had to remember to do before
+    every ad hoc ssh/nohup invocation -- easy to forget precisely because
+    a bare/non-interactive shell doesn't inherit it automatically. Doing
+    it here instead, once, at import time, means every subprocess this
+    script spawns gets it regardless of how agent_driver.py itself was
+    invoked (interactive shell, bare ssh, nohup, cron) -- nothing left to
+    remember.
+    """
+    env_path = os.path.join(HERE, "..", "..", ".env")
+    if not os.path.isfile(env_path):
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+_load_dotenv_once()
+
 # --corpus-dir (default: this script's own directory) picks which
 # tasks.jsonl / arm_defn / arm_files to use -- lets the same driver run
 # against any hand-curated or Multi-SWE-bench-sourced task set that
