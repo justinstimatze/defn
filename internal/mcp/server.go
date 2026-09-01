@@ -2465,7 +2465,24 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 			)
 		}
 	}
-	if strings.TrimSpace(args.Query) != "" {
+	// #366 (calque-mined trajectory, 2026-09-01): query filters at
+	// TOP-LEVEL statement granularity only (see FilterBodyByQuery's own
+	// doc comment). A table-driven test -- the single most common shape
+	// of a body large enough to need this in the first place -- has
+	// exactly 2 top-level statements: the `tests := []struct{...}{...}`
+	// literal and the `for _, tt := range tests {...}` loop. Query can
+	// only ever choose "keep the whole loop, elide the whole table" or
+	// vice versa; it structurally cannot narrow WITHIN either one.
+	// Confirmed live: 3 different queries against the same
+	// TestMSKDiscoveryRefresh body all returned the byte-identical
+	// truncated slice, since the filter was a no-op every time (elided
+	// == 0 or kept == 0) and truncation below silently proceeded on the
+	// full unfiltered body regardless. queryTried/queryApplied track
+	// this so the truncation message below can say so honestly instead
+	// of repeating the same "use query instead" hint that just failed.
+	queryTried := strings.TrimSpace(args.Query) != ""
+	queryApplied := false
+	if queryTried {
 		filtered, kept, elided := projection.FilterBodyByQuery(body, args.Query)
 		if elided > 0 && kept > 0 {
 			candidateHint := fmt.Sprintf(
@@ -2478,6 +2495,7 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 			if len(filtered)+len(candidateHint) < len(body) {
 				body = filtered
 				queryHint = candidateHint
+				queryApplied = true
 			}
 		}
 	}
@@ -2495,10 +2513,17 @@ func (s *server) handleGetDefinition(_ context.Context, req *sdkmcp.CallToolRequ
 			cut = readFullBodyHardCap
 		}
 		body = body[:cut]
-		queryHint += fmt.Sprintf(
-			"[body truncated at %d of %d bytes -- too large to return in full. Use read(name:%q, query:\"<keyword>\") to see only the statements matching a keyword instead of a truncated arbitrary slice.]\n\n",
-			cut, len(d.Body), args.Name,
-		)
+		if queryTried && !queryApplied {
+			queryHint += fmt.Sprintf(
+				"[body truncated at %d of %d bytes -- too large to return in full, and query=%q had no effect (query only filters top-level statements; a body with very few top-level statements -- e.g. a table-driven test's slice-literal + for-loop -- can't be narrowed this way). Try op:\"outline\" or line_range instead.]\n\n",
+				cut, len(d.Body), args.Query,
+			)
+		} else {
+			queryHint += fmt.Sprintf(
+				"[body truncated at %d of %d bytes -- too large to return in full. Use read(name:%q, query:\"<keyword>\") to see only the statements matching a keyword instead of a truncated arbitrary slice.]\n\n",
+				cut, len(d.Body), args.Name,
+			)
+		}
 	}
 
 	var sb strings.Builder
@@ -4518,6 +4543,46 @@ func (s *server) handleCreateMultiDecl(args createParam) (*sdkmcp.CallToolResult
 		addNames[i] = emit.FuncIdentity(d.Name, d.Receiver)
 	}
 	buildResult := s.autoEmitAndBuildForCreate(args.File, addNames)
+	// #367: a build failure here MAY be an explicitly-aliased import
+	// sliceDecls discarded and goimports couldn't reconstruct from
+	// usage alone -- see extractAliasedImports' doc comment for the
+	// full mechanism. Patch any such alias directly onto the
+	// already-emitted file (NOT another emit call, which would
+	// regenerate the file from stored bodies and erase the patch) and
+	// re-verify with a build-only check. Only attempted when the first
+	// build actually failed -- patching a genuinely-unused alias in
+	// unconditionally would trade one compile error for another
+	// ("imported and not used").
+	if buildResult != "" {
+		if aliased := extractAliasedImports(args.Body); len(aliased) > 0 {
+			patched := false
+			for _, ai := range aliased {
+				if changed, perr := s.patchImportOnDisk(mod.ID, args.File, ai.path, ai.alias); perr == nil && changed {
+					patched = true
+				} else if perr != nil {
+					fmt.Fprintf(os.Stderr, "defn: re-add aliased import %s (%q) to %s failed: %v\n", ai.alias, ai.path, args.File, perr)
+				}
+			}
+			if patched {
+				// goimports withholds EVERY fix (not just the
+				// unresolvable one) unless it can resolve every missing
+				// symbol in one pass -- see extractAliasedImports' doc
+				// comment. Patching the alias directly means goimports
+				// no longer has an unresolvable symbol to give up on, so
+				// give it one more real pass to pick up anything else
+				// (e.g. an unaliased sibling import) it withheld the
+				// first time, before re-checking the build.
+				if gerr := runGoimportsOnFile(filepath.Join(s.projectDir, args.File)); gerr != nil {
+					fmt.Fprintf(os.Stderr, "defn: goimports re-run after aliased-import patch failed for %s: %v\n", args.File, gerr)
+				}
+				if out, berr := s.runScopedBuild(context.Background(), []string{args.File}); berr == nil {
+					buildResult = ""
+				} else {
+					buildResult = out
+				}
+			}
+		}
+	}
 	s.autoResolveFile(args.File, mod.Path)
 
 	var sb strings.Builder
@@ -13150,4 +13215,81 @@ func stripLeadingPackageDecl(body string) string {
 		}
 		rest = trimmed[nl+1:]
 	}
+}
+
+// aliasedImport is one explicitly-aliased entry from a multi-decl
+// create body's import block (path plus its chosen alias).
+type aliasedImport struct {
+	path  string
+	alias string
+}
+
+// extractAliasedImports finds explicitly-aliased import specs in a
+// multi-decl create body. sliceDecls silently discards the whole
+// import block on the assumption goimports reconstructs everything
+// from usage at emit time -- true for an unaliased import (goimports
+// can match the bare identifier to the package's own real name), but
+// never true for an EXPLICIT alias (e.g. `lightsailTypes
+// "github.com/aws/aws-sdk-go-v2/service/lightsail/types"`, chosen
+// specifically because the real package name "types" collides with
+// other same-named packages) -- goimports has no way to guess a
+// custom alias from usage alone. Confirmed live (calque-mined
+// trajectory, 2026-09-01): a create call submitting exactly this
+// import alongside the unaliased parent ".../lightsail" import lost
+// only the aliased one, landing 10 "undefined: lightsailTypes" compile
+// errors -- the parent survived because goimports could resolve it
+// from its own real name, the alias could not be resolved the same
+// way. Blank ("_") and dot (".") imports are skipped -- neither is a
+// goimports-reconstructable named identifier this mechanism needs to
+// restore.
+func extractAliasedImports(body string) []aliasedImport {
+	trimmed := stripLeadingPackageDecl(strings.TrimSpace(body))
+	src := "package x\n" + trimmed
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	if err != nil {
+		return nil
+	}
+	var out []aliasedImport
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.IMPORT {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			imp, ok := spec.(*ast.ImportSpec)
+			if !ok || imp.Name == nil {
+				continue
+			}
+			alias := imp.Name.Name
+			if alias == "_" || alias == "." {
+				continue
+			}
+			path, uerr := strconv.Unquote(imp.Path.Value)
+			if uerr != nil {
+				continue
+			}
+			out = append(out, aliasedImport{path: path, alias: alias})
+		}
+	}
+	return out
+}
+
+// runGoimportsOnFile invokes the real goimports binary on one absolute
+// path, in place ("-w"). Deliberately separate from internal/emit's own
+// goimports invocation (which always runs as part of a full DB-body
+// regeneration pass): this is used specifically to give goimports a
+// SECOND chance at resolving imports it withheld on the first pass --
+// see extractAliasedImports' doc comment for why. Re-running defn's own
+// emit here instead would regenerate the file from stored bodies and
+// erase whatever was just patched directly onto disk.
+func runGoimportsOnFile(absPath string) error {
+	goimports, err := exec.LookPath("goimports")
+	if err != nil {
+		return fmt.Errorf("goimports not found — install with: go install golang.org/x/tools/cmd/goimports@latest")
+	}
+	if out, err := exec.Command(goimports, "-w", absPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("goimports: %s", out)
+	}
+	return nil
 }

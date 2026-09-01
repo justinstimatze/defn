@@ -16115,3 +16115,101 @@ func TestHandleEdit_NewBodyDropsDocCommentAutoPreserved(t *testing.T) {
 		t.Fatalf("expected the new body content to actually land, got: %s", d.Body)
 	}
 }
+
+// TestHandleCreate_ParentAndSubpackageImportsBothSurvive guards #367
+// (calque-mined trajectory, 2026-09-01): a multi-decl op:"create" body
+// silently dropped an explicitly-authored, actually-used import from
+// the submitted body whenever it was ALIASED alongside an unaliased
+// sibling import -- confirmed live against a real prometheus
+// lightsail_test.go create call: `lightsailTypes
+// "github.com/aws/aws-sdk-go-v2/service/lightsail/types"` vanished
+// from the written file while the unaliased sibling
+// `"github.com/aws/aws-sdk-go-v2/service/lightsail"` survived --
+// confirmed defn-specific via a natural experiment: the files-mode arm
+// wrote the identical import line via plain Write and it landed
+// correctly. Root cause: sliceDecls (the multi-decl create path)
+// silently discards the ENTIRE import block, relying on goimports to
+// reconstruct everything from usage -- which works for an unaliased
+// import ONLY when goimports can resolve it (either from its own
+// static package-name database, or -- as here -- by finding a sibling
+// file in the same package that already imports the same path;
+// confirmed directly against the real goimports binary: it cannot
+// resolve an unpublished local package from a bare identifier alone,
+// but succeeds once a sibling file already imports it). It can never
+// work for an explicit alias, since goimports has no way to guess a
+// custom alias from usage alone -- worse, per the real x/tools source
+// (internal/imports/fix.go), goimports withholds EVERY fix, not just
+// the unresolvable one, unless it can resolve every missing symbol in
+// one pass, so the unaliased sibling import can silently vanish too.
+// This models the same shape: an existing sibling file already
+// importing the parent "widget" package (matching lightsail.go), plus
+// a SECOND func decl in the new file to force the multi-decl create
+// path the real trajectory actually hit.
+func TestHandleCreate_ParentAndSubpackageImportsBothSurvive(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	if err := os.MkdirAll(filepath.Join(projDir, "widget", "types"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projDir, "widget", "widget.go"),
+		[]byte("package widget\n\ntype Widget struct{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projDir, "widget", "types", "types.go"),
+		[]byte("package types\n\ntype Detail struct{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The pre-existing sibling file (matching lightsail.go) that
+	// already imports the parent package -- goimports needs this to
+	// resolve "widget" via same-package candidate collection, since it
+	// can't resolve an unpublished local package from a bare
+	// identifier alone (confirmed directly against the real binary).
+	if err := os.WriteFile(filepath.Join(projDir, "widgetsibling.go"),
+		[]byte("package main\n\nimport \"testproj/widget\"\n\nfunc SiblingUse() widget.Widget {\n\treturn widget.Widget{}\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `import (
+	"testproj/widget"
+	widgetTypes "testproj/widget/types"
+)
+
+func newDetail() *widgetTypes.Detail {
+	return &widgetTypes.Detail{}
+}
+
+func UseWidget() *widgetTypes.Detail {
+	_ = widget.Widget{}
+	return newDetail()
+}`
+
+	result, _, err := s.handleCreate(context.Background(), nil, createParam{
+		Body: body,
+		File: "usewidget.go",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Created 2 defs") {
+		t.Fatalf("expected 'Created 2 defs' (multi-decl path), got: %s", text)
+	}
+	if strings.Contains(text, "rolled back") {
+		t.Fatalf("expected the build to succeed after the aliased-import patch, got: %s", text)
+	}
+
+	final, err := os.ReadFile(filepath.Join(projDir, "usewidget.go"))
+	if err != nil {
+		t.Fatalf("read usewidget.go: %v", err)
+	}
+	src := string(final)
+	if !strings.Contains(src, `widgetTypes "testproj/widget/types"`) {
+		t.Fatalf("expected the aliased subpackage import to survive, got:\n%s", src)
+	}
+	if !strings.Contains(src, `"testproj/widget"`) {
+		t.Fatalf("expected the parent package import to survive, got:\n%s", src)
+	}
+}

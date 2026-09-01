@@ -269,3 +269,66 @@ func TestHandleGetDefinition_QueryFilterOnHugeBodyAvoidsTruncation(t *testing.T)
 		t.Errorf("expected the query-matched statement to survive filtering, got: %.300s...", text)
 	}
 }
+
+// TestHandleGetDefinition_TableDrivenTestQueryHasNoEffectSaysWhy guards
+// #366: a table-driven test has exactly 2 top-level statements (the
+// `tests := []struct{...}{...}` literal and the `for _, tt := range
+// tests {...}` loop) -- FilterBodyByQuery can only choose "keep the
+// whole loop, elide the whole table" or vice versa, so a query term
+// appearing in BOTH (like the table's own variable name, "tests") is a
+// guaranteed no-op: both statements match, elided stays 0, and the
+// filter falls through unchanged. Before this fix, truncation then
+// silently proceeded on the full unfiltered body with the SAME "use
+// query instead" hint that had just failed -- confirmed live against a
+// real TestMSKDiscoveryRefresh trajectory where 3 different queries all
+// returned the byte-identical truncated slice. The truncation note must
+// now say query had no effect, not repeat the hint that already failed.
+func TestHandleGetDefinition_TableDrivenTestQueryHasNoEffectSaysWhy(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.OpenBackend(filepath.Join(dir, ".defn"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := &server{backend: db}
+
+	mod, _ := db.EnsureModule("example.com/svc", "svc", "")
+	var b strings.Builder
+	b.WriteString("func TestTableDriven(t *testing.T) {\n")
+	b.WriteString("\ttests := []struct{\n\t\tname string\n\t}{\n")
+	for i := 0; i < 600; i++ {
+		fmt.Fprintf(&b, "\t\t{name: \"tests case %04d padding padding padding padding\"},\n", i)
+	}
+	b.WriteString("\t}\n")
+	b.WriteString("\tfor _, tt := range tests {\n")
+	b.WriteString("\t\tt.Run(tt.name, func(t *testing.T) {\n")
+	for i := 0; i < 250; i++ {
+		fmt.Fprintf(&b, "\t\t\t_ = tests // padding padding padding padding %04d\n", i)
+	}
+	b.WriteString("\t\t})\n")
+	b.WriteString("\t}\n")
+	b.WriteString("}\n")
+	body := b.String()
+	if len(body) <= readFullBodyHardCap {
+		t.Fatalf("fixture body (%d bytes) must exceed readFullBodyHardCap (%d)", len(body), readFullBodyHardCap)
+	}
+
+	d := &store.Definition{
+		ModuleID: mod.ID, Name: "TestTableDriven", Kind: "function", Test: true,
+		Body: body, Signature: "func TestTableDriven(t *testing.T)",
+	}
+	d.Hash = store.HashBody(d.Body)
+	if _, err := db.UpsertDefinition(d); err != nil {
+		t.Fatal(err)
+	}
+
+	result, _, _ := s.handleGetDefinition(context.Background(), nil, nameParam{Name: "TestTableDriven", Query: "tests"})
+	text := resultText(t, result)
+
+	if !strings.Contains(text, "had no effect") {
+		t.Fatalf("expected an honest 'query had no effect' note since both top-level statements reference \"tests\", got: %.400s...", text)
+	}
+	if strings.Contains(text, `Use read(name:"TestTableDriven", query:"<keyword>")`) {
+		t.Fatalf("must not repeat the generic 'use query' hint when query was already tried and failed, got: %.400s...", text)
+	}
+}
