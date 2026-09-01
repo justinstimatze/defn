@@ -1145,14 +1145,14 @@ func (s *SQLiteDB) DeleteDefinition(id int64) error {
 	return nil
 }
 
-func (s *SQLiteDB) RenameDefinition(id int64, newName, newBody, newSignature string, exported bool) error {
+func (s *SQLiteDB) RenameDefinition(id int64, newName, newBody, newSignature, newDoc string, exported bool) error {
 	hash := HashBody(newBody)
 	ctx := s.Ctx()
 	if _, err := s.db.ExecContext(ctx,
 		`UPDATE definitions
-		 SET name = ?, signature = ?, exported = ?, hash = ?
+		 SET name = ?, signature = ?, doc = ?, exported = ?, hash = ?
 		 WHERE id = ?`,
-		newName, newSignature, exported, hash, id,
+		newName, newSignature, newDoc, exported, hash, id,
 	); err != nil {
 		return fmt.Errorf("sqlite: rename definition: %w", err)
 	}

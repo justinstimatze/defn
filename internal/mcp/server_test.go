@@ -1346,6 +1346,43 @@ func TestHandleSearch(t *testing.T) {
 	}
 }
 
+// TestHandleSearch_ScoreFieldPresentEvenWhenResultsFitWithinLimit guards
+// a real bench-trajectory finding (etcd-20929): search(pattern:"Greet")
+// (2+ results, fitting well within the default limit) used to fall
+// through to the plain unranked summary shape -- no score field at all
+// -- because ranking only triggered when len(defs) > limit. Raising
+// limit further (e.g. limit:100) only made this WORSE: a caller asking
+// for more results got LESS information (every score silently
+// vanished) purely because the larger limit no longer exceeded the
+// (unchanged) result count. Score is now present whenever there's more
+// than one candidate to differentiate, regardless of limit.
+func TestHandleSearch_ScoreFieldPresentEvenWhenResultsFitWithinLimit(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, idf: newIDF(db)}
+
+	for _, limit := range []int{0, 100} {
+		result, _, err := s.handleSearch(context.Background(), nil, codeParam{Pattern: "Greet", Limit: limit})
+		if err != nil {
+			t.Fatalf("handleSearch(limit:%d): %v", limit, err)
+		}
+		text := resultText(t, result)
+		var results []map[string]any
+		dec := json.NewDecoder(strings.NewReader(text))
+		if err := dec.Decode(&results); err != nil {
+			t.Fatalf("unmarshal (limit:%d): %v (text=%s)", limit, err, text)
+		}
+		if len(results) < 2 {
+			t.Fatalf("expected at least 2 results for a meaningful rank check (limit:%d), got %d: %s", limit, len(results), text)
+		}
+		for i, r := range results {
+			if _, ok := r["score"]; !ok {
+				t.Errorf("limit:%d: result %d missing score field even though the %d-item set fits within the limit: %v", limit, i, len(results), r)
+			}
+		}
+	}
+}
+
 func TestSearchBodiesLike(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
@@ -1805,6 +1842,148 @@ func TestHandleRename(t *testing.T) {
 	d, _ := db.GetDefinitionByName("Farewell", "")
 	if !strings.Contains(d.Body, "SayHi") {
 		t.Error("caller not updated after rename")
+	}
+}
+
+// TestHandleRename_UpdatesLeadingDocCommentWord is #370: astRename only
+// renames *ast.Ident nodes -- deliberately preserving comments and
+// string literals -- so a doc comment following Go's near-universal
+// "// Foo does X" convention (the exported def's own name repeated as
+// the comment's first word) used to stay stale after a rename, both in
+// the emitted file text and in the separately-indexed Doc column
+// (outline/read display). Confirmed live via an etcd-20006 bench
+// trajectory: renaming etcdClientDebugLevel -> ClientLogLevel left "//
+// etcdClientDebugLevel translates..." unchanged, forcing a manual
+// read+edit round-trip to fix what should have been atomic.
+func TestHandleRename_UpdatesLeadingDocCommentWord(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "logger.go"), []byte(`package main
+
+// etcdClientDebugLevel translates a numeric debug level into a logging
+// verbosity the client understands.
+func etcdClientDebugLevel(n int) string {
+	return "debug"
+}
+
+func main() {
+	_ = etcdClientDebugLevel(1)
+}
+`), 0644)
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleRename(context.Background(), nil, renameParam{
+		OldName: "etcdClientDebugLevel",
+		NewName: "ClientLogLevel",
+	})
+	if err != nil {
+		t.Fatalf("handleRename: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Renamed") {
+		t.Fatalf("expected 'Renamed', got: %s", text)
+	}
+
+	renamed, err := db.GetDefinitionByName("ClientLogLevel", "")
+	if err != nil {
+		t.Fatalf("GetDefinitionByName: %v", err)
+	}
+	if strings.Contains(renamed.Body, "etcdClientDebugLevel") {
+		t.Errorf("expected zero remaining mentions of the old name in the renamed def's own body, got:\n%s", renamed.Body)
+	}
+	firstLine := strings.TrimSpace(strings.SplitN(renamed.Body, "\n", 2)[0])
+	if !strings.HasPrefix(firstLine, "// ClientLogLevel") {
+		t.Errorf("expected the emitted body's leading doc comment to start with the NEW name, got first line: %q", firstLine)
+	}
+	if !strings.HasPrefix(renamed.Doc, "ClientLogLevel") {
+		t.Errorf("expected the separate indexed Doc column to also start with the NEW name, got: %q", renamed.Doc)
+	}
+
+	mainDef, err := db.GetDefinitionByName("main", "")
+	if err != nil {
+		t.Fatalf("GetDefinitionByName(main): %v", err)
+	}
+	if !strings.Contains(mainDef.Body, "ClientLogLevel") {
+		t.Error("caller not updated after rename")
+	}
+}
+
+// TestHandleRename_DoesNotMangleDocCommentNotStartingWithOldName guards
+// the safety scope of the #370 fix above: renameLeadingDocComment only
+// ever touches the doc comment's OWN leading word, matching Go's
+// declared-subject convention exactly. A doc comment that merely
+// MENTIONS the old name later in its prose (not as the very first
+// word) must be left byte-for-byte unchanged -- astRename's own
+// "preserves comments" contract still holds everywhere except that one
+// narrow, safe spot.
+func TestHandleRename_DoesNotMangleDocCommentNotStartingWithOldName(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "helper.go"), []byte(`package main
+
+// Helper wraps Foo for legacy callers that still expect the old shape.
+func Foo() string {
+	return "x"
+}
+
+func main() {
+	_ = Foo()
+}
+`), 0644)
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleRename(context.Background(), nil, renameParam{
+		OldName: "Foo",
+		NewName: "Bar",
+	})
+	if err != nil {
+		t.Fatalf("handleRename: %v", err)
+	}
+	if !strings.Contains(resultText(t, result), "Renamed") {
+		t.Fatalf("expected 'Renamed', got: %s", resultText(t, result))
+	}
+
+	renamed, err := db.GetDefinitionByName("Bar", "")
+	if err != nil {
+		t.Fatalf("GetDefinitionByName: %v", err)
+	}
+	wantDocLine := "// Helper wraps Foo for legacy callers that still expect the old shape."
+	firstLine := strings.TrimSpace(strings.SplitN(renamed.Body, "\n", 2)[0])
+	if firstLine != wantDocLine {
+		t.Errorf("expected the doc comment's non-leading mention of Foo to be left untouched, got first line: %q", firstLine)
+	}
+	if strings.TrimSpace(renamed.Doc) != "Helper wraps Foo for legacy callers that still expect the old shape." {
+		t.Errorf("expected the separate Doc column to also be left untouched, got: %q", renamed.Doc)
 	}
 }
 

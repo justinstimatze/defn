@@ -2809,12 +2809,24 @@ func (s *server) handleSearch(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		}
 	}
 
-	// Auto-rank when the candidate set exceeds `limit`. Alphabetical
-	// truncation buries the useful defs behind whatever sorts first,
-	// so trigger the caller-count/text-overlap ranker so the head of
-	// the list is actually informative. Explicit rank:true still works.
-	if args.Rank || len(defs) > limit {
+	// Auto-rank whenever there's more than one candidate to meaningfully
+	// differentiate -- not just when the set exceeds `limit`. Originally
+	// gated on len(defs) > limit alone (truncation-avoidance only), but
+	// score/ranking is useful DISPLAY GUIDANCE (which result to look at
+	// first) even when nothing gets truncated. Confirmed live (etcd-20929
+	// bench trajectory): search(pattern:"putResponse") returned scored
+	// results, then the very next call, search(pattern:"putResponse",
+	// limit:100), returned the same 96-item set with EVERY score field
+	// silently missing -- raising limit:100 alone made len(defs) (96) no
+	// longer exceed limit, an undocumented shape change triggered by
+	// nothing more than a caller asking for more results. Alphabetical/
+	// DB-order truncation still buries useful defs behind whatever sorts
+	// first, so this also still catches that case; ranking a 1-result
+	// (or empty) set is meaningless, so the plain path below still
+	// serves those trivial cases.
+	if args.Rank || len(defs) > 1 {
 		r, o, e := s.rankedSearchResult(args.Pattern, defs, limit)
+		mcpDebugf("search pattern=%q FINAL returned (ranked) %d of %d result(s): %s", args.Pattern, min(len(defs), limit), len(defs), debugDefIDs(defs))
 		if includeNote != "" {
 			r = prependNote(r, includeNote)
 		}
@@ -5551,6 +5563,8 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			allowedRemovals = append(allowedRemovals, qualifiedOld)
 			addTouched(d.SourceFile)
 			newBody, _ := astRename(d.Body, oldBareName, op.NewName)
+			newBody = renameLeadingDocComment(newBody, oldBareName, op.NewName)
+			newDoc := replaceLeadingWord(d.Doc, oldBareName, op.NewName)
 			newSig := extractSignature(newBody)
 			exported := len(op.NewName) > 0 && op.NewName[0] >= 'A' && op.NewName[0] <= 'Z'
 			// RenameDefinition updates BY ID, preserving row identity --
@@ -5565,12 +5579,13 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			// match anything on disk), surfacing as a false "database and
 			// disk have diverged" warning that trips #218's whole-batch
 			// rollback on an otherwise perfectly valid rename+edit combo.
-			if err := tx.RenameDefinition(d.ID, op.NewName, newBody, newSig, exported); err != nil {
+			if err := tx.RenameDefinition(d.ID, op.NewName, newBody, newSig, newDoc, exported); err != nil {
 				errors = append(errors, fmt.Sprintf("rename %s: %v", op.Name, err))
 				continue
 			}
 			d.Name = op.NewName
 			d.Body = newBody
+			d.Doc = newDoc
 			d.Signature = newSig
 			d.Exported = exported
 			s.enqueueSummary(d)
@@ -6578,6 +6593,14 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// being renamed unchanged would otherwise report success with no
 	// signal anything was wrong.
 	totalSkipped += defSkipped
+	// #370: astRename's own identifiers-only scope leaves the doc
+	// comment's leading word (the "// Foo does X" convention almost
+	// every exported decl follows) stale -- fix just that one safe,
+	// well-scoped spot, both in the emitted body text and the separate
+	// indexed Doc column (outline/read display) so they stay consistent
+	// with each other.
+	newBody = renameLeadingDocComment(newBody, oldBareName, args.NewName)
+	newDoc := replaceLeadingWord(d.Doc, oldBareName, args.NewName)
 	newSig := extractSignature(newBody)
 	exported := len(args.NewName) > 0 && args.NewName[0] >= 'A' && args.NewName[0] <= 'Z'
 
@@ -6585,7 +6608,7 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// Do NOT use UpsertDefinition here: it looks up by (module,name,kind,recv,test)
 	// and would INSERT a new row for the new name, leaving the old row orphaned
 	// in the DB and both defs in the emitted file.
-	if err := tx.RenameDefinition(originalID, args.NewName, newBody, newSig, exported); err != nil {
+	if err := tx.RenameDefinition(originalID, args.NewName, newBody, newSig, newDoc, exported); err != nil {
 		return errResult(err)
 	}
 
@@ -8114,6 +8137,58 @@ func astRename(body, oldName, newName string) (string, int) {
 		return body, 0
 	}
 	return result, skipped
+}
+
+// replaceLeadingWord rewrites s's leading word to newWord when it
+// exactly equals oldWord (after skipping leading whitespace), preserving
+// everything else byte-for-byte. Returns s unchanged if the leading word
+// doesn't match or is itself a prefix of a longer identifier.
+func replaceLeadingWord(s, oldWord, newWord string) string {
+	trimmed := strings.TrimLeft(s, " \t")
+	prefixLen := len(s) - len(trimmed)
+	rest, ok := strings.CutPrefix(trimmed, oldWord)
+	if !ok {
+		return s
+	}
+	if len(rest) > 0 && isIdentByte(rest[0]) {
+		return s
+	}
+	return s[:prefixLen] + newWord + rest
+}
+
+// renameLeadingDocComment rewrites the leading identifier of a def's
+// OWN leading doc comment (the "// Foo does X" convention almost every
+// exported Go declaration follows) when it exactly matches oldName.
+// astRename deliberately never touches comment text (see its own doc
+// comment) -- blindly substituting oldName anywhere in prose risks
+// mangling an unrelated mention -- but the doc's very first word is
+// safe: it's the comment's own declared subject, not incidental prose.
+// Confirmed live (etcd-20006 bench trajectory): a rename left "//
+// etcdClientDebugLevel translates..." unchanged after renaming to
+// ClientLogLevel, forcing the caller into a manual read+edit round-trip
+// to fix what should have been an atomic operation. body is expected to
+// carry the doc comment as literal leading text (renderNode's ingest
+// convention -- see its own doc comment), so only the FIRST line is
+// ever a candidate; a multi-line doc's later lines are left untouched.
+func renameLeadingDocComment(body, oldName, newName string) string {
+	nl := strings.IndexByte(body, '\n')
+	firstLine := body
+	rest := ""
+	if nl >= 0 {
+		firstLine = body[:nl]
+		rest = body[nl:]
+	}
+	trimmed := strings.TrimLeft(firstLine, " \t")
+	prefixLen := len(firstLine) - len(trimmed)
+	commentText, ok := strings.CutPrefix(trimmed, "//")
+	if !ok {
+		return body
+	}
+	newCommentText := replaceLeadingWord(commentText, oldName, newName)
+	if newCommentText == commentText {
+		return body
+	}
+	return firstLine[:prefixLen] + "//" + newCommentText + rest
 }
 
 func (s *server) handleFind(_ context.Context, _ *sdkmcp.CallToolRequest, args findParam) (*sdkmcp.CallToolResult, any, error) {
@@ -11981,9 +12056,11 @@ func (s *server) handleFieldRename(d *store.Definition, args renameParam) (*sdkm
 
 	oldBareName := d.Name
 	newBody, _ := astRename(d.Body, oldBareName, args.NewName)
+	newBody = renameLeadingDocComment(newBody, oldBareName, args.NewName)
+	newDoc := replaceLeadingWord(d.Doc, oldBareName, args.NewName)
 	newSig := extractSignature(newBody)
 	exported := len(args.NewName) > 0 && args.NewName[0] >= 'A' && args.NewName[0] <= 'Z'
-	if err := tx.RenameDefinition(d.ID, args.NewName, newBody, newSig, exported); err != nil {
+	if err := tx.RenameDefinition(d.ID, args.NewName, newBody, newSig, newDoc, exported); err != nil {
 		return errResult(err)
 	}
 

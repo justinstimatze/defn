@@ -63,7 +63,7 @@ type Backend interface {
 	UpsertDefinition(d *Definition) (int64, error)
 	UpsertDefinitionsBulk(defs []*Definition) ([]int64, error)
 	DeleteDefinition(id int64) error
-	RenameDefinition(id int64, newName, newBody, newSignature string, exported bool) error
+	RenameDefinition(id int64, newName, newBody, newSignature, newDoc string, exported bool) error
 	// UpdateDefinitionReceiver rewrites a method's receiver clause (plus
 	// the body/signature an AST rename of the old receiver identifier
 	// necessarily also touches) by ID. UpsertDefinition can't be reused
