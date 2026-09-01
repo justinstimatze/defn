@@ -787,6 +787,12 @@ type editParam struct {
 	// codeParam schema but silently dropped before reaching handleEdit
 	// -- a caller asking for a preview got a real edit instead.
 	DryRun bool `json:"dry_run,omitempty"`
+	// Force overrides the #365 doc-comment-removal refusal: new_body
+	// with no leading comment where the old body had one is refused by
+	// default (see handleEdit's comment for why a warning alone wasn't
+	// enough). Same convention as delete's force:true for its
+	// caller-safety check.
+	Force bool `json:"force,omitempty"`
 }
 
 type createParam struct {
@@ -1714,7 +1720,7 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		if body == "" {
 			body = args.Body
 		}
-		return s.handleEdit(ctx, req, editParam{Name: args.Name, NewBody: body, Receiver: args.Receiver, Module: args.Module, File: args.File, DryRun: args.DryRun})
+		return s.handleEdit(ctx, req, editParam{Name: args.Name, NewBody: body, Receiver: args.Receiver, Module: args.Module, File: args.File, DryRun: args.DryRun, Force: args.Force})
 	case "insert":
 		return s.handleInsert(ctx, req, args)
 	case "create":
@@ -3138,15 +3144,29 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 	oldBody := d.Body
 	oldSignature := extractSignature(d.Body)
 	// #365 (calque + own-session report, 2026-08-29/09-01): new_body
-	// silently drops the doc comment unless it's retyped into new_body
-	// itself -- op:"edit" reported success with no signal the doc was
-	// gone, caught only by a manual git diff afterward, 5+ times across
-	// two independent sessions. A warning here, not a hard refuse: a
-	// deliberate doc removal is a legitimate edit and shouldn't need a
-	// confirm param to get past.
-	docDropped := leadingCommentText(oldBody) != "" && leadingCommentText(args.NewBody) == ""
-	d.Body = args.NewBody
-	d.Signature = extractSignature(args.NewBody)
+	// silently dropped the doc comment unless it's retyped into new_body
+	// itself, 5+ times across two independent sessions. Two designs
+	// tried and rejected before this one: a warning rides the exact
+	// advisory-text channel ("Updated X -- FYI: N callers affected")
+	// that already sat unread through all 5 incidents; a hard refuse
+	// (force:true required) broke 15 of this repo's OWN pre-existing
+	// edit tests, which turned out to be real evidence that "new_body
+	// with no doc" is the COMMON shape (any edit where the caller
+	// doesn't bother retyping an unrelated doc comment), not the rare
+	// destructive one. Auto-preserve instead: splice the old comment
+	// back onto new_body silently when it's missing. The common case
+	// (forgot to retype the doc) now just works correctly with zero
+	// added friction; genuine intentional removal needs force:true to
+	// actually take effect -- unlike the warning, correctness here
+	// doesn't depend on anyone reading the note.
+	finalBody := args.NewBody
+	docAutoRestored := false
+	if rawDoc := leadingCommentBlockRaw(oldBody); rawDoc != "" && leadingCommentText(args.NewBody) == "" && !args.Force {
+		finalBody = rawDoc + "\n" + args.NewBody
+		docAutoRestored = true
+	}
+	d.Body = finalBody
+	d.Signature = extractSignature(finalBody)
 
 	// #12: write and build/emit-gate through a transaction so a failure
 	// leaves neither the DB nor the file changed. Previously this wrote
@@ -3183,7 +3203,7 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 	// byte-identical body is provably safe to fast-path; any real change
 	// forces the real build gate below.
 	if d.Kind == "type" || d.Kind == "interface" {
-		sigStable = oldBody == args.NewBody
+		sigStable = oldBody == finalBody
 	}
 	var buildResult string
 	if sigStable {
@@ -3197,7 +3217,7 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 			// subprocess spawn entirely rather than running it as a
 			// guaranteed no-op. See Opts.SkipGoimports and
 			// bodyImportFootprintUnchanged.
-			opts.SkipGoimports = bodyImportFootprintUnchanged(oldBody, args.NewBody)
+			opts.SkipGoimports = bodyImportFootprintUnchanged(oldBody, finalBody)
 		}
 		// #148's whole point is skipping go build here for perf --
 		// commitOrRollbackOnEmit preserves that (emit-only, no build)
@@ -3253,9 +3273,9 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 		// while chasing a signature change across call sites).
 		sb.WriteString(fmt.Sprintf("edit %s%s rolled back — nothing was saved\n\n%s%s", recv, d.Name, buildResult, s.coupledChangeHint(d.ID)))
 	} else {
-		sb.WriteString(fmt.Sprintf("Updated %s%s (id=%d, hash=%s)\n", recv, d.Name, id, store.HashBody(args.NewBody)[:12]))
-		if docDropped {
-			sb.WriteString(fmt.Sprintf("WARNING: %s%s had a leading doc comment before this edit; new_body has none, so it's gone now. If unintentional, re-add it to new_body -- op:\"edit\" only preserves a doc comment that's included in new_body itself.\n", recv, d.Name))
+		sb.WriteString(fmt.Sprintf("Updated %s%s (id=%d, hash=%s)\n", recv, d.Name, id, store.HashBody(finalBody)[:12]))
+		if docAutoRestored {
+			sb.WriteString(fmt.Sprintf("(kept %s%s's existing doc comment -- new_body didn't include it. Pass force:true if you meant to remove it.)\n", recv, d.Name))
 		}
 	}
 
@@ -5310,12 +5330,23 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				errors = append(errors, fmt.Sprintf("edit %s: new_body declares %s%s, which changes its name/receiver — use op:\"rename\" instead; op:\"edit\" only changes body content", op.Name, formatReceiver(newReceiver), newName))
 				continue
 			}
-			// #365 (calque + own-session report): same silent doc-comment
-			// drop as the standalone op:"edit" path -- see handleEdit's
-			// identical check for the full rationale. Computed against
+			// #365 (calque + own-session report): same doc-comment
+			// auto-preserve as the standalone op:"edit" path -- see
+			// handleEdit's identical logic for the full rationale (a
+			// warning rides the same advisory channel that went unread 5+
+			// times; a hard refuse broke 15 of this repo's own pre-existing
+			// edit tests -- real evidence "forgot to retype the doc" is the
+			// common shape, not the rare destructive one). Computed against
 			// d.Body's final value, whichever branch above produced it
-			// (old_fragment or a plain new_body/body replace).
-			docDropped := leadingCommentText(oldBody) != "" && leadingCommentText(d.Body) == ""
+			// (old_fragment or a plain new_body/body replace). op.Force
+			// already exists for delete's caller-safety override -- same
+			// per-op "override this op's safety check" convention opts out
+			// of the auto-preserve here.
+			docAutoRestored := false
+			if rawDoc := leadingCommentBlockRaw(oldBody); rawDoc != "" && leadingCommentText(d.Body) == "" && !op.Force {
+				d.Body = rawDoc + "\n" + d.Body
+				docAutoRestored = true
+			}
 			d.Signature = extractSignature(d.Body)
 			if _, err := tx.UpsertDefinition(d); err != nil {
 				errors = append(errors, fmt.Sprintf("edit %s: %v", op.Name, err))
@@ -5328,8 +5359,8 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 					firstNonTestModuleID = d.ModuleID
 				}
 				sb.WriteString(fmt.Sprintf("~ edited %s\n", op.Name))
-				if docDropped {
-					sb.WriteString(fmt.Sprintf("  WARNING: %s had a leading doc comment before this edit; it's gone now -- re-add it to new_body if unintentional.\n", op.Name))
+				if docAutoRestored {
+					sb.WriteString(fmt.Sprintf("  (kept %s's existing doc comment -- new_body didn't include it. Pass force:true if you meant to remove it.)\n", op.Name))
 				}
 			}
 

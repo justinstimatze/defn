@@ -15973,13 +15973,12 @@ func TestHandleCreateRejectsUnknownFile(t *testing.T) {
 	}
 }
 
-// TestHandleEdit_NewBodyDropsDocCommentWarns guards #365 (reported
-// independently by calque and hit in this same defn session): op:"edit"
-// silently dropped a definition's leading doc comment whenever new_body
-// omitted it, with no signal in the response -- caught only by a manual
-// git diff. A dropped doc must now surface a WARNING in the success
-// message instead of silently disappearing.
-func TestHandleEdit_NewBodyDropsDocCommentWarns(t *testing.T) {
+// TestHandleEdit_ForceTrueAllowsDocCommentRemoval confirms force:true
+// opts into the one destructive path #365's refusal guards -- a
+// deliberate doc-comment removal stays a normal edit, no confirm
+// param required for the overwhelming majority of edits that don't
+// touch the comment at all.
+func TestHandleEdit_ForceTrueAllowsDocCommentRemoval(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
 	s := &server{backend: db}
@@ -15987,22 +15986,62 @@ func TestHandleEdit_NewBodyDropsDocCommentWarns(t *testing.T) {
 	result, _, err := s.handleEdit(context.Background(), nil, editParam{
 		Name:    "Greet",
 		NewBody: "func Greet(name string) string {\n\treturn \"Hi, \" + name\n}",
+		Force:   true,
 	})
 	if err != nil {
 		t.Fatalf("edit: %v", err)
 	}
 	text := resultText(t, result)
-	if !strings.Contains(text, "WARNING") || !strings.Contains(text, "doc comment") {
-		t.Fatalf("expected a doc-comment-dropped warning, got: %s", text)
+	if !strings.Contains(text, "Updated") {
+		t.Fatalf("expected the edit to succeed with force:true, got: %s", text)
+	}
+
+	d, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(d.Body, "Greet returns a greeting") {
+		t.Fatal("expected the doc comment to actually be removed with force:true")
 	}
 }
 
-// TestHandleApply_EditNewBodyDropsDocCommentWarns guards #365 for the
-// batched apply path -- same doc-comment-dropped detection as
+// TestHandleApply_EditForceTrueAllowsDocCommentRemoval confirms
+// op.Force -- already used for delete's caller-safety override --
+// also opts into #365's doc-comment-removal refusal on the apply
+// edit path.
+func TestHandleApply_EditForceTrueAllowsDocCommentRemoval(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "edit", Name: "Greet", NewBody: "func Greet(name string) string {\n\treturn \"Hi, \" + name\n}", Force: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "edited Greet") {
+		t.Fatalf("expected the edit to succeed with force:true, got: %s", text)
+	}
+
+	d, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(d.Body, "Greet returns a greeting") {
+		t.Fatal("expected the doc comment to actually be removed with force:true")
+	}
+}
+
+// TestHandleApply_EditNewBodyDropsDocCommentAutoPreserved guards #365
+// for the batched apply path -- same auto-preserve behavior as
 // handleEdit's identical fix, since op:"apply"'s own "edit" case has
 // its own separate inline body-swap logic rather than delegating to
 // handleEdit.
-func TestHandleApply_EditNewBodyDropsDocCommentWarns(t *testing.T) {
+func TestHandleApply_EditNewBodyDropsDocCommentAutoPreserved(t *testing.T) {
 	db, _ := setupTestDB(t)
 	defer db.Close()
 	s := &server{backend: db}
@@ -16016,7 +16055,63 @@ func TestHandleApply_EditNewBodyDropsDocCommentWarns(t *testing.T) {
 		t.Fatalf("apply: %v", err)
 	}
 	text := resultText(t, result)
-	if !strings.Contains(text, "WARNING") || !strings.Contains(text, "doc comment") {
-		t.Fatalf("expected a doc-comment-dropped warning, got: %s", text)
+	if !strings.Contains(text, "edited Greet") {
+		t.Fatalf("expected the edit to succeed normally, got: %s", text)
+	}
+	if !strings.Contains(text, "kept") || !strings.Contains(text, "doc comment") {
+		t.Fatalf("expected an informational note that the doc comment was kept, got: %s", text)
+	}
+
+	d, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(d.Body, "Greet returns a greeting") {
+		t.Fatalf("expected the doc comment to be auto-preserved in the stored body, got: %s", d.Body)
+	}
+	if !strings.Contains(d.Body, "Hi, ") {
+		t.Fatalf("expected the new body content to actually land, got: %s", d.Body)
+	}
+}
+
+// TestHandleEdit_NewBodyDropsDocCommentAutoPreserved guards #365
+// (reported independently by calque and hit in this same defn
+// session): op:"edit" must silently re-attach the old body's leading
+// doc comment when new_body omits it, rather than deleting it -- a
+// hard refuse was tried and rejected first (it broke 15 of this
+// repo's own pre-existing edit tests, real evidence that dropping the
+// doc unintentionally is the common shape, not a rare destructive
+// one). The edit still succeeds normally; only a genuine force:true
+// removal actually loses the comment (see the companion ForceTrue
+// test).
+func TestHandleEdit_NewBodyDropsDocCommentAutoPreserved(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	result, _, err := s.handleEdit(context.Background(), nil, editParam{
+		Name:    "Greet",
+		NewBody: "func Greet(name string) string {\n\treturn \"Hi, \" + name\n}",
+	})
+	if err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "Updated") {
+		t.Fatalf("expected the edit to succeed normally, got: %s", text)
+	}
+	if !strings.Contains(text, "kept") || !strings.Contains(text, "doc comment") {
+		t.Fatalf("expected an informational note that the doc comment was kept, got: %s", text)
+	}
+
+	d, err := db.GetDefinitionByName("Greet", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(d.Body, "Greet returns a greeting") {
+		t.Fatalf("expected the doc comment to be auto-preserved in the stored body, got: %s", d.Body)
+	}
+	if !strings.Contains(d.Body, "Hi, ") {
+		t.Fatalf("expected the new body content to actually land, got: %s", d.Body)
 	}
 }

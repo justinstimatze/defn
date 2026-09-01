@@ -264,3 +264,24 @@ func leadingCommentText(body string) string {
 	}
 	return strings.TrimSpace(strings.Join(stripped, "\n"))
 }
+
+// leadingCommentBlockRaw returns body's leading "//"-prefixed comment
+// block verbatim -- original markers, original per-line spacing --
+// joined by "\n", or "" if body has no leading comment. Unlike
+// leadingCommentText (which strips markers for content comparison),
+// this preserves the exact original text so it can be spliced back
+// onto a replacement body that dropped it.
+func leadingCommentBlockRaw(body string) string {
+	var raw []string
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "//") {
+			break
+		}
+		raw = append(raw, line)
+	}
+	if len(raw) == 0 {
+		return ""
+	}
+	return strings.Join(raw, "\n")
+}
