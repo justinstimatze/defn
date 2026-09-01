@@ -5042,6 +5042,14 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 		file, body string
 	}
 	var pendingHeaders []pendingHeader
+	// #367: same aliased-import mechanism as the standalone multi-decl
+	// create path, but pre-injected into emit.Opts rather than patched
+	// reactively after a build failure -- see extractAliasedImports' and
+	// Opts.PreImports' doc comments. A batch's build failure here
+	// restores the pre-emit file from its snapshot (commitOrRollbackOn),
+	// so there's no post-emit file left to patch after the fact the way
+	// the standalone path does.
+	var pendingPreImports []emit.PreImport
 	addTouched := func(f string) {
 		if f != "" {
 			touchedFiles[f] = true
@@ -5211,6 +5219,9 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 						firstNonTestModuleID = mod.ID
 					}
 					sb.WriteString(fmt.Sprintf("+ created %s (id=%d)\n", d.Name, id))
+				}
+				for _, ai := range extractAliasedImports(op.Body) {
+					pendingPreImports = append(pendingPreImports, emit.PreImport{File: op.File, Path: ai.path, Alias: ai.alias})
 				}
 				continue
 			}
@@ -6009,6 +6020,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 			GoimportsFiles:  goimportsFiles,
 			TouchedFiles:    goimportsFiles,
 			IntendedNames:   intendedNames,
+			PreImports:      pendingPreImports,
 		})
 		if buildResult == "" {
 			if needsFullResolve {
@@ -6081,6 +6093,7 @@ func (s *server) handleApply(_ context.Context, _ *sdkmcp.CallToolRequest, args 
 				AllowedAdds:     allowedAdds,
 				GoimportsFiles:  goimportsFiles,
 				TouchedFiles:    goimportsFiles,
+				PreImports:      pendingPreImports,
 			})
 			if needsFullResolve {
 				s.autoResolve("")

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/justinstimatze/defn/internal/astutil"
+	"github.com/justinstimatze/defn/internal/projection"
 	"github.com/justinstimatze/defn/internal/store"
 )
 
@@ -114,6 +115,28 @@ type Opts struct {
 	// original conservative behavior exactly -- any non-empty warning
 	// still rolls back.
 	IntendedNames []string
+
+	// PreImports lists explicitly-aliased imports to splice directly
+	// into a file's content BEFORE goimports runs on it. #367: a
+	// multi-decl create body's import block is discarded on the
+	// assumption goimports reconstructs everything from usage --
+	// true for an unaliased import (goimports can resolve it from its
+	// own package-name heuristic, or a sibling file's existing import),
+	// never true for an explicit alias (e.g. `lightsailTypes
+	// ".../lightsail/types"`, chosen specifically because the real
+	// package name collides with something else), since goimports has
+	// no way to guess a custom alias from usage alone. Worse, per
+	// goimports' own source, it withholds EVERY fix (not just the
+	// unresolvable one) unless it can resolve every missing symbol in
+	// one pass, so an otherwise-resolvable sibling import can silently
+	// vanish too. Pre-injecting the alias here means goimports never
+	// has an unresolvable symbol to give up on in the first place --
+	// unlike the standalone create path's reactive
+	// patch-after-failure-then-rebuild recovery (which doesn't fit
+	// this package's commit-or-rollback-the-whole-batch contract: a
+	// build failure here restores the pre-emit file from its snapshot,
+	// so there's no post-emit file left to patch after the fact).
+	PreImports []PreImport
 }
 
 // Emit writes all definitions from the database as .go files into outDir.
@@ -282,6 +305,43 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, []
 		warnings = append(warnings, modWarnings...)
 	}
 	timeIt("module-writes", t)
+
+	// #367: splice explicitly-aliased imports directly into their
+	// target file's content BEFORE goimports runs -- see Opts.PreImports'
+	// doc comment for the full rationale. Resolves each file the same
+	// joined/baseJoined way GoimportsFiles does below, since emit's
+	// output path for a source_file can diverge from its project-
+	// relative path.
+	t = time.Now()
+	for _, pi := range opts.PreImports {
+		clean := filepath.Clean(pi.File)
+		if filepath.IsAbs(clean) || strings.Contains(clean, "..") {
+			continue
+		}
+		target := filepath.Join(outDir, clean)
+		if _, statErr := os.Stat(target); statErr != nil {
+			base := filepath.Join(outDir, filepath.Base(clean))
+			if _, statErr := os.Stat(base); statErr != nil {
+				continue
+			}
+			target = base
+		}
+		content, rerr := os.ReadFile(target)
+		if rerr != nil {
+			continue
+		}
+		updated, aerr := projection.AddImport(string(content), pi.Path, pi.Alias)
+		if aerr != nil {
+			warnings = append(warnings, fmt.Sprintf("pre-import %s (%q) into %s: %v", pi.Alias, pi.Path, pi.File, aerr))
+			continue
+		}
+		if updated != string(content) {
+			if werr := os.WriteFile(target, []byte(updated), 0644); werr != nil {
+				return nil, nil, fmt.Errorf("pre-import write %s: %w", pi.File, werr)
+			}
+		}
+	}
+	timeIt("pre-imports", t)
 
 	// Run goimports to fix unused imports and formatting -- unless the
 	// caller has proven this edit can't need it (Opts.SkipGoimports).
@@ -1884,4 +1944,13 @@ func atomicWriteFile(path string, content []byte, perm os.FileMode) error {
 	}
 	succeeded = true
 	return nil
+}
+
+// PreImport is one entry for Opts.PreImports -- see its doc comment.
+type PreImport struct {
+	// File is a project-relative path, same space as GoimportsFiles/
+	// TouchedFiles.
+	File  string
+	Path  string
+	Alias string
 }

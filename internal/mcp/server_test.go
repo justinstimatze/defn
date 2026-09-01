@@ -16213,3 +16213,78 @@ func UseWidget() *widgetTypes.Detail {
 		t.Fatalf("expected the parent package import to survive, got:\n%s", src)
 	}
 }
+
+// TestHandleApply_CreateParentAndSubpackageImportsBothSurvive guards
+// #367 for the batch-apply path -- same bug as
+// TestHandleCreate_ParentAndSubpackageImportsBothSurvive (the
+// standalone multi-decl create path), but via op:"apply", which has
+// its own separate inline multi-decl create branch sharing sliceDecls.
+// This path can't use the standalone path's reactive
+// patch-after-failure recovery (a build failure here restores the
+// pre-emit file from its snapshot -- see commitOrRollbackOn), so the
+// fix is Opts.PreImports: splice the alias in BEFORE goimports runs,
+// instead of after a failure.
+func TestHandleApply_CreateParentAndSubpackageImportsBothSurvive(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	if err := os.MkdirAll(filepath.Join(projDir, "widget", "types"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projDir, "widget", "widget.go"),
+		[]byte("package widget\n\ntype Widget struct{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projDir, "widget", "types", "types.go"),
+		[]byte("package types\n\ntype Detail struct{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projDir, "widgetsibling.go"),
+		[]byte("package main\n\nimport \"testproj/widget\"\n\nfunc SiblingUse() widget.Widget {\n\treturn widget.Widget{}\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `import (
+	"testproj/widget"
+	widgetTypes "testproj/widget/types"
+)
+
+func newDetail() *widgetTypes.Detail {
+	return &widgetTypes.Detail{}
+}
+
+func UseWidget() *widgetTypes.Detail {
+	_ = widget.Widget{}
+	return newDetail()
+}`
+
+	result, _, err := s.handleApply(context.Background(), nil, applyParam{
+		Operations: []applyOp{
+			{Op: "create", Body: body, File: "usewidget.go"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "+ created") {
+		t.Fatalf("expected the batch create to succeed, got: %s", text)
+	}
+	if strings.Contains(text, "rolled back") {
+		t.Fatalf("expected the build to succeed with the pre-injected alias, got: %s", text)
+	}
+
+	final, err := os.ReadFile(filepath.Join(projDir, "usewidget.go"))
+	if err != nil {
+		t.Fatalf("read usewidget.go: %v", err)
+	}
+	src := string(final)
+	if !strings.Contains(src, `widgetTypes "testproj/widget/types"`) {
+		t.Fatalf("expected the aliased subpackage import to survive, got:\n%s", src)
+	}
+	if !strings.Contains(src, `"testproj/widget"`) {
+		t.Fatalf("expected the parent package import to survive, got:\n%s", src)
+	}
+}

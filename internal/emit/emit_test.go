@@ -2532,3 +2532,39 @@ func TestEmitInvalidProjectFilePathDoesNotBlockUnrelatedEmit(t *testing.T) {
 		t.Fatalf("test.go should still have been written despite the unrelated invalid project file: %v", err)
 	}
 }
+
+// TestEmitPreImportsSplicesAliasedImportBeforeGoimports guards #367:
+// Opts.PreImports must land in the emitted file's content regardless of
+// whether goimports could have resolved it on its own -- goimports has
+// no way to guess a custom alias from usage alone (see Opts.PreImports'
+// doc comment for the full mechanism this closes for handleApply's
+// batch create path, which can't use the standalone create path's
+// reactive patch-after-failure recovery).
+func TestEmitPreImportsSplicesAliasedImportBeforeGoimports(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test/pkg", "pkg", "")
+	db.EnsureModule("example.com/test/other", "other", "")
+
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "UseWidget", Kind: "function", Exported: true,
+		Body: "func UseWidget() *widgetTypes.Detail { return &widgetTypes.Detail{} }",
+	})
+
+	outDir := t.TempDir()
+	if _, err := EmitWithMapAndOpts(db, outDir, Opts{
+		PreImports: []PreImport{
+			{File: "pkg/pkg.go", Path: "example.com/test/pkg/types", Alias: "widgetTypes"},
+		},
+	}); err != nil {
+		t.Fatalf("EmitWithMapAndOpts: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(outDir, "pkg", "pkg.go"))
+	if err != nil {
+		t.Fatalf("file not found: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, `widgetTypes "example.com/test/pkg/types"`) {
+		t.Fatalf("expected the pre-injected aliased import to survive goimports, got:\n%s", content)
+	}
+}
