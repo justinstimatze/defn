@@ -257,7 +257,21 @@ func (s *server) handleContext(ctx context.Context, _ *sdkmcp.CallToolRequest, a
 	if s.explainClient != nil {
 		source := strings.Join(refBodies, "\n\n")
 		if answer, err := s.explainClient.Explain(ctx, question, source); err == nil {
-			sb.WriteString("### Synthesis\n\n")
+			// #370: the synthesis is grounded ONLY in the top-N defs
+			// selected above by gatherContextCandidates' own token-overlap
+			// scoring against the full captured question -- a genuinely
+			// DIFFERENT selection than whatever ranked list a caller's own
+			// search/read call surfaces in the SAME combined response
+			// (different query, different ranking algorithm entirely).
+			// Confirmed live (etcd-20929 bench trajectory): the
+			// synthesis flatly asserted "putResponse is not found in the
+			// provided source" while the ranked search list a few lines
+			// above the SAME response already contained it -- the
+			// synthesis was telling the truth about its own narrow N-def
+			// slice, but read as a confident claim about the whole repo.
+			// Label the scope explicitly so a "not found" here doesn't
+			// get mistaken for "not found anywhere".
+			sb.WriteString(fmt.Sprintf("### Synthesis (grounded ONLY in the %d def(s) listed below -- a \"not found\" claim here is scoped to just those, not the whole repo; check any ranked list elsewhere in this response too)\n\n", len(top)))
 			sb.WriteString(answer)
 			sb.WriteString("\n\n")
 		}

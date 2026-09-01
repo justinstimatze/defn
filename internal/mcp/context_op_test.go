@@ -2,9 +2,62 @@ package mcp
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/justinstimatze/defn/internal/summary"
 )
+
+// TestHandleContext_SynthesisHeaderDisclosesItsOwnScope guards a real
+// bench-trajectory finding (etcd-20929): the co-processor synthesis is
+// grounded ONLY in the top-N defs gatherContextCandidates itself
+// selected for the full captured question -- a genuinely different
+// selection than whatever a caller's own separate search/read call
+// surfaces in the SAME combined response (different query, different
+// ranking algorithm entirely). Confirmed live: the synthesis flatly
+// asserted "putResponse is not found in the provided source" while a
+// ranked search list a few lines above the SAME response already
+// contained it. The synthesis header must now explicitly disclose its
+// own narrow scope so a "not found" claim there doesn't read as
+// authoritative over a wider list shown elsewhere in the response.
+func TestHandleContext_SynthesisHeaderDisclosesItsOwnScope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"id": "msg_test",
+			"type": "message",
+			"role": "assistant",
+			"model": "claude-sonnet-4-6",
+			"content": [{"type": "text", "text": "The provided source does not contain the answer."}],
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 100, "output_tokens": 10}
+		}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, explainClient: summary.NewExplain(summary.ExplainOptions{
+		APIKey:     "test-key",
+		BaseURL:    srv.URL,
+		HTTPClient: srv.Client(),
+	})}
+
+	result, _, err := s.handleContext(context.Background(), nil, codeParam{Question: "how does Greet work"})
+	if err != nil {
+		t.Fatalf("handleContext: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "### Synthesis") {
+		t.Fatalf("expected a Synthesis section, got: %s", text)
+	}
+	if !strings.Contains(text, "grounded ONLY in the") {
+		t.Errorf("expected the Synthesis header to disclose its own narrow scope, got: %s", text)
+	}
+}
 
 // TestHandleContext_BundlesTopHits verifies the #195 vertical: given
 // a question, the op finds relevant defs, outlines each with callers
