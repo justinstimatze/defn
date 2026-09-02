@@ -16874,3 +16874,109 @@ func UseC(e *Engine) string { return e.Protocol }
 		t.Errorf("chess's Engine should NOT have been touched by a refused ambiguous fragment edit, got:\n%s", chessSrc)
 	}
 }
+
+// TestHandleRename_UpdatesBareFunctionValueAssignedToCrossPackageVar
+// investigates (but does NOT reproduce) a real anomaly found mining a
+// grpc-go bench trajectory (grpc__grpc-go-2629, 2026-09-01): renaming
+// withContextDialer -> WithContextDialer reported "Renamed ... Updated 1
+// callers", then hit a "undefined: withContextDialer" build failure a
+// few calls later, forcing the model to manually re-edit init() by
+// hand. The real base commit (32559e2)'s dialoptions.go has the renamed
+// function referenced from at least TWO same-file call sites: a
+// bare-value assignment inside init() (internal.WithContextDialer =
+// withContextDialer, an internal "friend function" hook var of func
+// type) and a direct call inside a sibling function (WithDialer ->
+// return withContextDialer(...)) -- confirmed via `git show` on the
+// pristine base commit, not guesswork. "Updated 1 callers" against 2+
+// real call sites is consistent with rename under-counting/missing one.
+//
+// This fixture reproduces that exact shape (same collision: a
+// pre-existing internal.WithContextDialer var of a DIFFERENT kind
+// sharing the target bare name, plus both the init()-assignment and
+// sibling-call reference forms in one file) -- and it passes cleanly,
+// correctly reporting "Updated 2 callers" and rewriting both sites. So
+// the real gap is NOT this shape in isolation; it likely needs the
+// real grpc-go module's full scale/dependency graph to reproduce (a
+// third caller elsewhere in the repo, or something else the minimal
+// version doesn't capture). Kept as a real regression test for the
+// shape it DOES cover (which must keep working); the actual
+// undercounting root cause is still open -- see the mining notes for
+// grpc__grpc-go-2629 before assuming this test closes that finding.
+func TestHandleRename_UpdatesBareFunctionValueAssignedToCrossPackageVar(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	if err := os.MkdirAll(filepath.Join(projDir, "internal"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "internal", "internal.go"), []byte(`package internal
+
+var WithContextDialer any
+`), 0644)
+	// Faithful to the real grpc-go dialoptions.go shape (base commit
+	// 32559e2, grpc__grpc-go-2629 bench task): the renamed function has
+	// TWO real same-file callers -- a bare-value assignment inside
+	// init() (internal.WithContextDialer = withContextDialer) AND a
+	// direct call inside a sibling function (WithDialer -> return
+	// withContextDialer(...)).
+	os.WriteFile(filepath.Join(projDir, "dialoptions.go"), []byte(`package testproj
+
+import "testproj/internal"
+
+func withContextDialer(f func(string) int) func() int {
+	return func() int { return f("x") }
+}
+
+func init() {
+	internal.WithContextDialer = withContextDialer
+}
+
+func WithDialer(f func(string) int) func() int {
+	return withContextDialer(f)
+}
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	// Deliberately NO file:/module: qualifier -- the real trajectory's
+	// rename call was bare (old_name/new_name only), matching this.
+	result, _, _ := s.handleRename(context.Background(), nil, renameParam{
+		OldName: "withContextDialer",
+		NewName: "WithContextDialer",
+	})
+	text := resultText(t, result)
+	t.Logf("rename result: %s", text)
+	if !strings.Contains(text, "Renamed") {
+		t.Fatalf("expected 'Renamed', got: %s", text)
+	}
+
+	onDisk, err := os.ReadFile(filepath.Join(projDir, "dialoptions.go"))
+	if err != nil {
+		t.Fatalf("read emitted dialoptions.go: %v", err)
+	}
+	src := string(onDisk)
+	t.Logf("emitted dialoptions.go:\n%s", src)
+	if strings.Contains(src, "= withContextDialer") {
+		t.Errorf("init() still assigns the OLD unrenamed function value -- rename missed the bare-value reference, got:\n%s", src)
+	}
+	if strings.Contains(src, "return withContextDialer(") {
+		t.Errorf("WithDialer still calls the OLD unrenamed function -- rename missed the direct-call reference, got:\n%s", src)
+	}
+	if strings.Contains(src, "func withContextDialer(") {
+		t.Errorf("old function declaration should have been renamed too, got:\n%s", src)
+	}
+}

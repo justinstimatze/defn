@@ -636,3 +636,46 @@ and the query-layer ambiguity #352's family lives in
 (`GetDefinitionByName`), which is a wholly different mechanism from
 `collectRefs`/`lookupFuncDefID` and would need its own from-scratch
 branch-reading pass, not an assumption that the same axes transfer.
+
+## Open finding (2026-09-01): rename may under-count callers on a real grpc-go file — not yet reproduced
+
+Mining a fresh `grpc__grpc-go-2629` head-to-head-go trajectory (run
+earlier the same day by this same session, `bench/head-to-head-go/
+bench/small-slice-6/arm_defn/grpc__grpc-go-2629.json`): `rename(old_name:
+"withContextDialer", new_name:"WithContextDialer")` reported "Renamed
+withContextDialer → WithContextDialer / Updated 1 callers", then a
+`test`/build call several messages later hit `dialoptions.go:332:31:
+undefined: withContextDialer` — a stale reference to the OLD name that
+should have been rewritten. Confirmed via `git show <base_commit>:
+dialoptions.go` (not guesswork) that the pristine file has the renamed
+function referenced from at least two same-file call sites: a bare-value
+assignment inside `init()` (`internal.WithContextDialer =
+withContextDialer` — grpc-go's internal "friend function" hook var
+idiom) and a direct call inside a sibling function (`WithDialer -> return
+withContextDialer(...)`). "Updated 1 callers" against 2+ real call sites
+is consistent with rename missing one.
+
+Built a minimal, faithful synthetic repro of this exact shape (same
+pre-existing name collision with an unrelated `internal.WithContextDialer`
+var of a different kind, same two same-file caller forms) —
+`TestHandleRename_UpdatesBareFunctionValueAssignedToCrossPackageVar`
+(internal/mcp/server_test.go). It does **not** reproduce the
+undercounting: defn correctly reports "Updated 2 callers" and rewrites
+both sites. So the real gap needs something the minimal repro doesn't
+capture — most likely a third real caller elsewhere in grpc-go's much
+larger real module (a test file, or another production file), or some
+interaction specific to the file's actual size/complexity (492 lines,
+many sibling declarations) that a 12-line fixture can't trigger.
+
+**Next step, not yet done:** either (a) reproduce directly against the
+real grpc-go checkout at the exact base commit (`32559e2175a5c793c47df
+0b214775affde5ac35e`) rather than a hand-written fixture — check
+`GetCallers` on `withContextDialer`'s real definition ID before the
+rename to see the actual full caller list defn computed, which would
+show directly whether a real 3rd+ caller was missed from the count or
+whether the count itself is wrong despite a complete caller list; or (b)
+mine the other 6 already-completed small-slice trajectories first (free,
+no new API cost) in case one of them narrows this down or turns up a
+cleaner repro shape. Do not mark this closed based on the one clean
+synthetic test above — that test confirms a *different*, correctly-
+working shape, not the absence of the bug.
