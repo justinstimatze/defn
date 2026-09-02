@@ -191,6 +191,300 @@ func buildCrossCallHazards() []Hazard {
 	return hazards
 }
 
+// hazardMethodOnDifferentTypesSameMethodName puts TWO distinct types in
+// the same package, each with a method of the SAME name (a very common,
+// always-legal Go shape -- e.g. two types both implementing the same
+// interface method). Distinct from hazardMethodNamedInit/#354's
+// method-vs-FUNCTION collision and collisionMethodVsFunction's
+// cross-file variant: this is method-vs-METHOD, the shape that
+// actually dominates real Go code (any two types satisfying the same
+// interface), and was previously untested -- every existing hazard
+// with same-named methods keeps them on the SAME type.
+func hazardMethodOnDifferentTypesSameMethodName(_ *rand.Rand, m *SyntheticModule) {
+	src := `package methodclash
+
+import "errors"
+
+var errInvalid = errors.New("invalid")
+
+type Widget struct{ N int }
+
+func (w *Widget) Validate() error {
+	if w.N < 0 {
+		return errInvalid
+	}
+	return nil
+}
+
+type Gadget struct{ N int }
+
+func (g *Gadget) Validate() error {
+	if g.N > 100 {
+		return errInvalid
+	}
+	return nil
+}
+`
+	m.AddFile("pkg/methodclash/types.go", src)
+}
+
+// hazardSameFieldNameAcrossTypes puts TWO distinct struct types in the
+// same package, each with a field of the SAME name (e.g. two unrelated
+// configs both having a "Name" field) -- always legal (field namespace
+// is per-type), always common, and untested until now: every existing
+// field-collision hazard (hazardFieldNamedAfterOwnType, #352) collides
+// a field name against a TYPE name, never against another type's field
+// of the same name.
+func hazardSameFieldNameAcrossTypes(_ *rand.Rand, m *SyntheticModule) {
+	src := `package fieldclash
+
+type Person struct {
+	Name string
+}
+
+type Company struct {
+	Name string
+}
+
+func Describe(p Person, c Company) string {
+	return p.Name + " works at " + c.Name
+}
+`
+	m.AddFile("pkg/fieldclash/types.go", src)
+}
+
+// hazardPromotedFieldShadowing exercises Go's field-shadowing rule: an
+// embedded type's field is "promoted" onto the embedding type UNLESS
+// the embedding type declares its own field of the same name, in which
+// case the direct field wins and the promoted one is only reachable via
+// the embedded type's own name (d.Base.Label, not just d.Label).
+// hazardEmbeddedFields already covers plain (non-colliding) embedding;
+// this is the identity-confusion variant -- untested until now.
+func hazardPromotedFieldShadowing(_ *rand.Rand, m *SyntheticModule) {
+	src := `package shadowfield
+
+type Base struct {
+	Label string
+}
+
+type Derived struct {
+	Base
+	Label string
+}
+
+func Describe(d Derived) string {
+	return d.Label + "/" + d.Base.Label
+}
+`
+	m.AddFile("pkg/shadowfield/types.go", src)
+}
+
+// hazardGenericTypeParamShadowsNamedType exercises a generic function
+// whose type parameter identifier is the SAME bare name as an unrelated
+// package-level named type -- legal Go (the type parameter shadows the
+// named type within the generic func's own scope), and exactly the
+// "type-overwriting" mutation class Hephaestus (PLDI 2022) targets for
+// generics/type-checker fuzzing. The lit review in this doc's own
+// "grammar-driven synthetic Go generation" section found ZERO existing
+// coverage of generics anywhere in this fuzzer; this is the first.
+func hazardGenericTypeParamShadowsNamedType(_ *rand.Rand, m *SyntheticModule) {
+	src := `package genericsclash
+
+type T struct {
+	X int
+}
+
+func Wrap[T any](v T) []T {
+	return []T{v}
+}
+
+func UseT() T {
+	return T{X: 1}
+}
+`
+	m.AddFile("pkg/genericsclash/types.go", src)
+}
+
+// hazardPromotedMethodShadowing is hazardPromotedFieldShadowing's
+// method counterpart: an embedded type's method is normally promoted
+// onto the embedding type, UNLESS the embedding type declares its own
+// method of the same name, in which case the outer method wins and the
+// embedded one is only reachable by qualifying through the embedded
+// type's own name (d.Base.Greet(), not just d.Greet()). A very common
+// Go idiom (wrapping/overriding embedded behavior); untested until now.
+func hazardPromotedMethodShadowing(_ *rand.Rand, m *SyntheticModule) {
+	src := `package shadowmethod
+
+type Base struct{}
+
+func (Base) Greet() string {
+	return "base"
+}
+
+type Derived struct {
+	Base
+}
+
+func (Derived) Greet() string {
+	return "derived"
+}
+
+func UseGreet(d Derived) string {
+	return d.Greet() + "/" + d.Base.Greet()
+}
+`
+	m.AddFile("pkg/shadowmethod/types.go", src)
+}
+
+// hazardEmbeddedInterfaceComposition exercises interface EMBEDDING
+// (ReadWriter embeds Reader and Writer) -- a distinct ast.InterfaceType
+// shape from hazardInterfaceSatisfaction's flat interface: an embedded
+// interface entry in Methods is a bare Ident/SelectorExpr with no
+// Names/Func signature of its own, which a naive interface-methods
+// walker could easily mishandle by assuming every entry is a named
+// method. Untested until now.
+func hazardEmbeddedInterfaceComposition(_ *rand.Rand, m *SyntheticModule) {
+	src := `package ifacecompose
+
+type Reader interface {
+	Read() string
+}
+
+type Writer interface {
+	Write(s string)
+}
+
+type ReadWriter interface {
+	Reader
+	Writer
+}
+
+type Buffer struct {
+	data string
+}
+
+func (b *Buffer) Read() string {
+	return b.data
+}
+
+func (b *Buffer) Write(s string) {
+	b.data = s
+}
+
+func UseReadWriter(rw ReadWriter) string {
+	rw.Write("hello")
+	return rw.Read()
+}
+`
+	m.AddFile("pkg/ifacecompose/types.go", src)
+}
+
+// hazardCrossPackageQualifiedCall exercises the most basic cross-package
+// reference shape (producer package exports a func, consumer package
+// imports it and calls it qualified as producer.Helper()) -- checked
+// against every existing hazard and found to be completely absent:
+// hazardMultiPackage only adds independent leaf funcs with no calls
+// BETWEEN them, and hazardCollidingBasenames' packages never call each
+// other either. Cross-package identifier resolution was entirely
+// untested by this fuzzer before this hazard.
+func hazardCrossPackageQualifiedCall(_ *rand.Rand, m *SyntheticModule) {
+	m.AddFile("pkg/crosspkgcall/producer/producer.go", `package producer
+
+func Helper() int {
+	return 42
+}
+`)
+	m.AddFile("pkg/crosspkgcall/consumer/consumer.go", `package consumer
+
+import "example.com/synth/pkg/crosspkgcall/producer"
+
+func UseHelper() int {
+	return producer.Helper()
+}
+`)
+}
+
+// hazardConstIotaBlankSkip is a variant of hazardGroupedConstIota's
+// sequential iota block: a leading blank identifier "_ = iota" skips
+// the first iota value entirely, a common idiom for reserving 0 as an
+// invalid/unset sentinel. Distinct declaration shape (a ValueSpec whose
+// Names[0] is "_") from the plain sequential block already covered.
+func hazardConstIotaBlankSkip(_ *rand.Rand, m *SyntheticModule) {
+	src := `package iotaskip
+
+type Level int
+
+const (
+	_ Level = iota
+	LevelLow
+	LevelMedium
+	LevelHigh
+)
+`
+	m.AddFile("pkg/iotaskip/level.go", src)
+}
+
+// hazardSelfReferencingPointerField exercises the ordinary linked-list/
+// tree idiom -- a struct field whose type is a pointer to the struct's
+// OWN type (Node.Next *Node) -- extremely common in real Go, and a
+// simpler, more frequent variant than hazardFieldNamedAfterOwnType's
+// cross-type "Foo *Foo" shape (which names a field after an UNRELATED
+// type). Cheap defense-in-depth for a shape real corpora are full of.
+func hazardSelfReferencingPointerField(_ *rand.Rand, m *SyntheticModule) {
+	src := `package selfref
+
+type Node struct {
+	Value int
+	Next  *Node
+}
+
+func Sum(n *Node) int {
+	if n == nil {
+		return 0
+	}
+	return n.Value + Sum(n.Next)
+}
+`
+	m.AddFile("pkg/selfref/node.go", src)
+}
+
+// hazardBlankStructFields exercises Go's one real exception to "no two
+// fields in a struct share a name": the blank identifier "_" may be
+// repeated as a field name arbitrarily many times (a common padding/
+// alignment idiom), unlike every other identifier in the same
+// namespace. A field-uniqueness assumption anywhere in ingest/store
+// (e.g. a map keyed by (type, field name)) would silently collide or
+// drop these; untested until now.
+func hazardBlankStructFields(_ *rand.Rand, m *SyntheticModule) {
+	src := `package blankfields
+
+type Padded struct {
+	A int
+	_ int
+	_ int
+	B int
+}
+
+func NewPadded(a, b int) Padded {
+	return Padded{A: a, B: b}
+}
+`
+	m.AddFile("pkg/blankfields/types.go", src)
+}
+
+// hazardDotImportUnqualifiedCall is hazardCrossPackageQualifiedCall's
+// dot-import variant: "import . \"path\"" injects the imported package's
+// exported identifiers directly into the importing file's scope, so the
+// call site is UNQUALIFIED (Helper(), not producer.Helper()) despite
+// being a genuine cross-package reference. Rare in real code but fully
+// legal Go, and a plausible blind spot for any reference-resolution
+// logic that assumes an unqualified call always resolves within the
+// current package.
+func hazardDotImportUnqualifiedCall(_ *rand.Rand, m *SyntheticModule) {
+	m.AddFile("pkg/dotimport/producer/producer.go", "package producer\n\nfunc Helper() int {\n\treturn 7\n}\n")
+	m.AddFile("pkg/dotimport/consumer/consumer.go", "package consumer\n\nimport . \"example.com/synth/pkg/dotimport/producer\"\n\nfunc UseHelper() int {\n\treturn Helper()\n}\n")
+}
+
 // hazardSplitMethods puts one type's methods across multiple files with
 // unrelated basenames in the same package, exercising method-set
 // reassembly during emit.
@@ -237,6 +531,17 @@ func buildAllHazards() []Hazard {
 		{"field_named_after_own_type", hazardFieldNamedAfterOwnType},
 		{"multi_name_var_decl", hazardMultiNameVarDecl},
 		{"type_alias", hazardTypeAlias},
+		{"method_on_different_types_same_name", hazardMethodOnDifferentTypesSameMethodName},
+		{"same_field_name_across_types", hazardSameFieldNameAcrossTypes},
+		{"promoted_field_shadowing", hazardPromotedFieldShadowing},
+		{"generic_type_param_shadows_named_type", hazardGenericTypeParamShadowsNamedType},
+		{"promoted_method_shadowing", hazardPromotedMethodShadowing},
+		{"embedded_interface_composition", hazardEmbeddedInterfaceComposition},
+		{"cross_package_qualified_call", hazardCrossPackageQualifiedCall},
+		{"dot_import_unqualified_call", hazardDotImportUnqualifiedCall},
+		{"const_iota_blank_skip", hazardConstIotaBlankSkip},
+		{"self_referencing_pointer_field", hazardSelfReferencingPointerField},
+		{"blank_struct_fields", hazardBlankStructFields},
 	}
 	return append(hazards, CrossCallHazards...)
 }
