@@ -239,6 +239,20 @@ func emitWithOpts(db store.Backend, outDir string, opts Opts) ([]DefLocation, []
 		clean := filepath.Clean(pf)
 		if filepath.IsAbs(clean) || strings.Contains(clean, "..") {
 			fmt.Fprintf(os.Stderr, "[emit] skipping invalid project file path (escapes project root): %q\n", pf)
+			// #13 winze followup (field report): skipping the write
+			// alone left the poisoned row in project_files forever --
+			// even after the operator fixed the actual symlinked-root
+			// cause, this same row kept warning on every future emit,
+			// and its escaping path can point at a location that no
+			// longer exists on disk once the environment is repaired,
+			// which reads as impossible and sends you hunting for a
+			// symlink that's already gone. Delete it now so the DB
+			// self-heals permanently instead of nagging forever;
+			// best-effort since a delete failure here shouldn't also
+			// hard-fail an otherwise-fine emit.
+			if derr := db.DeleteProjectFile(pf); derr != nil {
+				fmt.Fprintf(os.Stderr, "[emit] failed to remove stale project file row %q: %v\n", pf, derr)
+			}
 			continue
 		}
 		dst := filepath.Join(outDir, clean)

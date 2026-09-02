@@ -6542,7 +6542,9 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// nothing else in the API would clean up (prometheus-19236 hit this
 	// exact wall, burning ~8 calls before reissuing as a file:-only
 	// delete). Mirror handleDeleteFile's zero-remaining-defs removal.
-	if args.RemoveFile && d.SourceFile != "" && s.projectDir != "" {
+	if args.RemoveFile && d.SourceFile != "" && s.projectDir != "" && pathEscapesProjectRoot(d.SourceFile) {
+		sb.WriteString(fmt.Sprintf("remove_file:true was set, but %s escapes the project root -- refusing to remove it from disk.\n", d.SourceFile))
+	} else if args.RemoveFile && d.SourceFile != "" && s.projectDir != "" {
 		dir := ""
 		if idx := strings.LastIndex(d.SourceFile, "/"); idx >= 0 {
 			dir = d.SourceFile[:idx]
@@ -10784,6 +10786,15 @@ func (s *server) backfillNarratives(ctx context.Context) {
 // implementation. Idempotent: changed=false and no write when the
 // import is already present.
 func (s *server) patchImportOnDisk(moduleID int64, file, importPath, alias string) (changed bool, err error) {
+	if s.projectDir != "" && pathEscapesProjectRoot(file) {
+		// #13 winze followup: file here traces back to a Definition's
+		// SourceFile (via FindDefinitionsByFile in each caller), which
+		// can carry a stale escaping value from a pre-#13 corrupted
+		// ingest. Without this check, both the os.ReadFile fallback and
+		// the os.WriteFile below would silently operate on whatever
+		// that escaping path resolves to outside s.projectDir.
+		return false, fmt.Errorf("%s: escapes the project root -- refusing to touch it on disk", file)
+	}
 	var fileSrc []byte
 	if s.projectDir != "" {
 		diskPath := filepath.Join(s.projectDir, file)
@@ -12392,6 +12403,19 @@ func (s *server) handleVersion(_ context.Context, _ *sdkmcp.CallToolRequest, _ c
 // before giving up; one wrote itself a persistent memory note
 // documenting defn's inability to delete files at all. RemoveFile:true
 // is the explicit opt-in fix.
+// pathEscapesProjectRoot reports whether rel, once cleaned, is absolute
+// or contains a ".." component -- i.e. would resolve outside
+// s.projectDir if joined with it. #13 winze followup: the os.Remove
+// call sites below join a caller- or DB-supplied relative path against
+// s.projectDir with no such check, so a corrupted SourceFile (the same
+// symlinked-root shape #13 fixed) or a client-supplied file: value
+// that happens to contain "../" would delete whatever that escaping
+// path resolves to on disk instead of just failing loudly.
+func pathEscapesProjectRoot(rel string) bool {
+	clean := filepath.Clean(rel)
+	return filepath.IsAbs(clean) || strings.Contains(clean, "..")
+}
+
 func (s *server) handleDeleteFile(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	dir := ""
 	if idx := strings.LastIndex(args.File, "/"); idx >= 0 {
@@ -12410,6 +12434,9 @@ func (s *server) handleDeleteFile(_ context.Context, _ *sdkmcp.CallToolRequest, 
 		// this file, then remove it" required two separate calls with
 		// different error-handling paths for no real reason.
 		if args.RemoveFile && s.projectDir != "" {
+			if pathEscapesProjectRoot(args.File) {
+				return errResult(fmt.Errorf("delete: file %q escapes the project root -- refusing to touch it on disk", args.File))
+			}
 			diskPath := filepath.Join(s.projectDir, args.File)
 			if _, statErr := os.Stat(diskPath); statErr == nil {
 				if args.DryRun {
@@ -12538,6 +12565,10 @@ func (s *server) handleDeleteFile(_ context.Context, _ *sdkmcp.CallToolRequest, 
 		sb.WriteString("remove_file:true was set, but no project directory is configured -- could not remove the file from disk.\n")
 		return textResult(sb.String()), nil, nil
 	}
+	if pathEscapesProjectRoot(args.File) {
+		sb.WriteString(fmt.Sprintf("remove_file:true was set, but %s escapes the project root -- refusing to remove it from disk.\n", args.File))
+		return textResult(sb.String()), nil, nil
+	}
 	diskPath := filepath.Join(s.projectDir, args.File)
 	if rmErr := os.Remove(diskPath); rmErr != nil && !os.IsNotExist(rmErr) {
 		sb.WriteString(fmt.Sprintf("remove_file:true was set, but removing %s failed: %v\n", args.File, rmErr))
@@ -12642,6 +12673,13 @@ func (s *server) handleInsertHeader(_ context.Context, _ *sdkmcp.CallToolRequest
 func (s *server) patchInsertHeaderOnDisk(moduleID int64, file, body string) (changed bool, err error) {
 	if s.projectDir == "" {
 		return false, fmt.Errorf("insert-header: no project directory configured")
+	}
+	if pathEscapesProjectRoot(file) {
+		// #13 winze followup: same class as patchImportOnDisk -- file
+		// traces back to a Definition's SourceFile (or a fresh scaffold
+		// path), either of which can carry a stale escaping value from a
+		// pre-#13 corrupted ingest.
+		return false, fmt.Errorf("%s: escapes the project root -- refusing to touch it on disk", file)
 	}
 	diskPath := filepath.Join(s.projectDir, file)
 	orig, rerr := os.ReadFile(diskPath)

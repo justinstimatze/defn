@@ -3122,3 +3122,8 @@ func migrateDefinitionsSourceFileUniqueConstraint(db *sql.DB) error {
 	}
 	return nil
 }
+
+func (s *SQLiteDB) DeleteProjectFile(path string) error {
+	_, err := s.db.ExecContext(s.Ctx(), `DELETE FROM project_files WHERE path = ?`, path)
+	return err
+}

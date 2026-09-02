@@ -806,6 +806,127 @@ claim. Next real evidence would come from mining more of the
 already-completed small-slice-3/4/5 trajectories the same way (cheap —
 they're already run, just need a fresh post-fix rerun each), not from
 launching a new bench batch.
+
+## Reranked backlog (2026-09-02) + item 3 closed without code, item 1 widened
+
+Re-asked "what's blocking superior-to-files-mode" and reranked the open
+backlog against two live threads: the recurring correctness-bug class
+(two same-shape bugs fixed same day — `#357` project_files, today's
+emitModule def-driven path) and the still-unproven n=1 search-fix
+result above. Agreed order: (1) proactively audit for more instances of
+"one bad row hard-fails the whole call" before a third winze report
+finds one; (2) mine the remaining already-completed small-slice-3/4/5
++ small-slice-6 trajectories against the search fix; (3) fix the two
+payload-bloat drivers named in the original plan; watch (5) write-side
+round-trip granularity for angles while doing 1-3. Saved to winze-memory
+as `RankedBacklog20260902`.
+
+**Item 3 verified already closed — no code changed.** Before touching
+anything (the exact check skipped once already this session, corrected
+after direct user feedback), read the actual current source instead of
+trusting the 2026-08-19 etcd-21620 memory:
+- The circuit-breaker "auto-batch dumps full bodies" mechanism the plan
+  named is not live code to fix — `#312` already reverted the whole
+  hijack to instrumentation-only. `circuitBreakerCheck`'s return value
+  reaches only `mcpDebugf`; the response is never touched. Confirmed by
+  reading `handleCode`'s actual call site, not the old memory.
+- `impact`'s unbounded test-list is also already fixed: `impactJSONTestsCap
+  = 20` (internal/mcp/server.go), shipped under `#279` specifically
+  citing the etcd-21620 45KB incident by name, separate from and much
+  lower than `impactJSONCap = 200` (callers/interface-dispatch stay
+  higher since seeing many production callers is often the actual point
+  of a blast-radius check; tests are rarely read individually).
+Both fixes predate this session by two weeks. The plan was stale, not
+the code — exactly the failure mode the user's own prior feedback this
+session ("check whether things were done before you made a plan to do
+them") warned about, caught this time by verifying first.
+
+**Item 1 audit found 5 real fixes, one more severe than the rest.** All
+guarded by one new shared helper, `pathEscapesProjectRoot` (checks
+`filepath.Clean` + `IsAbs`/contains `".."`):
+1. `handleDeleteFile`'s two `os.Remove` sites — reachable via a bare
+   client-supplied `file:` value with no DB row match at all (falls
+   into the zero-defs branch), not just a corrupted DB row.
+2. `handleDelete`'s name-scoped `os.Remove` — via a corrupted
+   `Definition.SourceFile`.
+3. **`patchInsertHeaderOnDisk` (op:"insert-header") — the most severe.**
+   Unlike every other write op, this one never requires a DB-matched
+   definition (`moduleID` silently stays 0 when nothing matches) — `file`
+   passes straight through with no gate at all. A bare
+   `op:"insert-header", file:"../../anything"` call, zero DB corruption
+   needed, would read then overwrite whatever that path resolved to
+   outside the project root. Found by auditing every `filepath.Join(s.projectDir,`
+   site in server.go for a write/remove with no escape check, not
+   reported by anyone.
+4. `patchImportOnDisk` (op:"add-import") — same shape, gated behind a
+   DB match (lower severity than #3).
+5. Per winze's live field report (moved out from behind the symlink,
+   rebuilt, still got the identical stale error naming a path that no
+   longer existed on disk): emit's project_files loop now **deletes**
+   an escaping-path row on detection (`Backend.DeleteProjectFile`, new
+   interface method) instead of skip-and-warn-forever. Skip-with-warning
+   stays as-is for definitions/file_sources — deleting a Definition row
+   would drop real code, not just an inert path string.
+7 new/extended regression tests, all passing; full tree builds and
+vets clean. Not yet committed — bundling with the earlier
+symlink-root/emitModule/search-count fixes into one release per user
+direction, given nothing is tagged yet.
+
+**Item 2 (n=9 trajectory mining) result: does NOT replicate the n=1
+win — inconclusive, not a regression.** Reran the defn arm (fixed
+binary, `232491283fa4`) for every already-completed small-slice-3/4/5/6
+task that had a genuine pre-fix baseline (9 tasks; 2 more in
+small-slice-3 had no prior arm_defn run at all, so no paired
+comparison exists for those). Recovered the exact pre-fix cost/duration
+per task from the raw `.claude-stream.jsonl` streams already saved
+locally in scratchpad from earlier this session (each stream's final
+`result` event carries `costUSD`/`duration_ms`) — the on-box
+`arm_defn/*.json` summaries were deleted before rerunning (needed to
+clear agent_driver.py's skip-if-exists guard) without backing them up
+first, which could have lost the comparison data entirely; caught in
+time only because the raw streams happened to already be mirrored
+locally. Worth a harder habit going forward: back up before deleting
+comparison baselines, don't rely on a fallback copy existing by luck.
+
+| task | cost before→after | wall before→after |
+|---|---|---|
+| grpc-go-2996 | $0.088→$0.089 (+2%) | 55.5s→43.4s (−22%) |
+| etcd-21620 | $0.312→$0.546 (+75%) | 101.4s→521.5s (+414%) |
+| etcd-20929 | $0.380→$0.393 (+3%) | 90.3s→89.3s (−1%) |
+| etcd-20006 | $0.164→$0.061 (−63%) | 236.6s→39.5s (−83%) |
+| cli-1069 | $0.287→$0.472 (+64%) | 79.5s→127.3s (+60%) |
+| grpc-go-3476 | $0.244→$0.163 (−33%) | 92.6s→61.1s (−34%) |
+| go-zero-1907 | $0.160→$0.228 (+43%) | 74.5s→69.9s (−6%) |
+| grpc-go-2629 | $0.583→$0.158 (−73%) | 149.0s→52.5s (−65%) |
+| go-zero-2787 | $0.084→$0.063 (−25%) | 79.3s→24.5s (−69%) |
+| **total** | **$2.302→$2.173 (−5.6%)** | **958.7s→1029.0s (+7.3%)** |
+
+5 tasks improved (2 substantially), 3 got worse (1 substantially:
+etcd-21620), 1 flat. Net aggregate is a wash on cost and slightly
+worse on wall time — not a clean win like cli-3461's n=1 result.
+Correctness held steady: all 9 paired tasks succeeded (`rc=0`) both
+before and after.
+
+Dug into the etcd-21620 outlier specifically rather than waving it
+off: pre-fix made 24 `mcp__defn__code` calls ($0.312, 101s); post-fix
+made 33 + 3 `Grep` = 36 calls ($0.546, 521s) — *more* tool calls
+post-fix, the opposite direction the search fix should push. This
+isn't the fix backfiring mechanically; it's the model taking a
+longer, different problem-solving path this run (both `rc=0`, both
+genuinely solved the task) — ordinary LLM sampling variance at n=1
+per task, which is exactly the kind of noise this project's own
+repeated lesson ([[DefnBeatsFilesmodeFirstTimeV02621]],
+[[PrometheusBatchDefnLoses20]]) warns swamps small real effects.
+
+**Conclusion: keep the fix (it's free — a few bytes/hit, no extra
+queries, and still mechanistically sound), but stop treating the
+earlier n=1 result as evidence of a real session-cost win.** This is
+the correct, if less satisfying, scientific outcome for item 2: it
+correctly tempers the initial optimistic single sample rather than
+confirming it. Real evidence, if it exists, needs a properly powered
+repeat-trial protocol (the same rigor gap flagged and then explicitly
+dropped as "overkill" for this specific investigation) — not more
+one-off small-slice reruns.
 Cloned grpc-go fresh at the exact base commit
 (`32559e2175a5c793c47df0b214775affde5ac35e`) and ran two independent
 clean-room checks directly against it:

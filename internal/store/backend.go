@@ -143,6 +143,12 @@ type Backend interface {
 	// Project files (go.mod / go.sum / embedded files)
 	GetProjectFile(path string) (string, error)
 	SetProjectFile(path, content string) error
+	// DeleteProjectFile removes one project_files row by path. Used
+	// when emit detects a stored path escaping the project root (a
+	// pre-#13 symlinked-root ingest, or any other corruption) -- this
+	// lets emit self-heal the DB permanently instead of the row
+	// warning on every future emit forever.
+	DeleteProjectFile(path string) error
 	ListProjectFiles() ([]string, error)
 
 	// Meta / arbitrary key-value

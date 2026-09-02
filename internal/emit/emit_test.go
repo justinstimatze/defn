@@ -2531,6 +2531,22 @@ func TestEmitInvalidProjectFilePathDoesNotBlockUnrelatedEmit(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(outDir, "test.go")); err != nil {
 		t.Fatalf("test.go should still have been written despite the unrelated invalid project file: %v", err)
 	}
+
+	// #13 winze field report (2026-09-02): skipping the write alone left
+	// the poisoned row in project_files forever -- it kept warning on
+	// every future emit, even after the operator fixed the underlying
+	// symlinked-root cause, and its escaping path can point at a
+	// location that no longer exists on disk once repaired. Emit must
+	// delete the row so the DB self-heals permanently.
+	remaining, err := db.ListProjectFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pf := range remaining {
+		if pf == "../outside/escaped.service" {
+			t.Errorf("expected the escaping project_files row to be deleted, but it still exists: %v", remaining)
+		}
+	}
 }
 
 // TestEmitPreImportsSplicesAliasedImportBeforeGoimports guards #367:

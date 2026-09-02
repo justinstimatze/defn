@@ -11899,6 +11899,80 @@ func TestHandleTestByName_AlternationPatternScopesEmitToBothResolvedFiles(t *tes
 // model with no way to actually get rid of a throwaway file it created
 // -- burning 40-90 tool calls across delete/move/patch/emit/gc before
 // giving up, since none of those ops remove a file either.
+// TestHandleDeleteFile_RefusesRemoveFileEscapingProjectRoot is a winze-
+// followup regression test for the #13 symlinked-root fix: the same
+// escaping-path corruption that broke emit could also reach os.Remove
+// directly through a caller-supplied file: value, with no escape check
+// at all -- joining it against s.projectDir and removing whatever it
+// resolved to on disk instead of just failing loudly. file: here
+// doesn't match any indexed def, so remove_file:true falls through to
+// the bare zero-defs disk-removal branch; the escaping value happens
+// to point at a real file outside the project root, which must
+// survive.
+func TestHandleDeleteFile_RefusesRemoveFileEscapingProjectRoot(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	outside := filepath.Join(filepath.Dir(projDir), "outside-deletefile.go")
+	if err := os.WriteFile(outside, []byte("package outside\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(outside)
+
+	result, _, _ := s.handleCode(context.Background(), nil, codeParam{
+		Op: "delete", File: "../outside-deletefile.go", RemoveFile: true,
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "escapes the project root") {
+		t.Errorf("expected an escape-root refusal, got: %s", text)
+	}
+	if _, statErr := os.Stat(outside); statErr != nil {
+		t.Fatalf("the file outside the project root must survive untouched, stat err: %v", statErr)
+	}
+}
+
+// TestHandleDelete_RefusesRemoveFileEscapingSourceFile is the name-
+// scoped-delete counterpart: a definition ingested under the pre-#13
+// symlinked-root bug can carry a SourceFile that escapes the project
+// root. Deleting it by name with remove_file:true must not join that
+// corrupted value against s.projectDir and remove whatever it resolves
+// to on disk.
+func TestHandleDelete_RefusesRemoveFileEscapingSourceFile(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	mods, err := db.ListModules()
+	if err != nil || len(mods) == 0 {
+		t.Fatalf("expected at least one module, err=%v", err)
+	}
+
+	outside := filepath.Join(filepath.Dir(projDir), "outside-corrupted.go")
+	if err := os.WriteFile(outside, []byte("package outside\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(outside)
+
+	if _, err := db.UpsertDefinition(&store.Definition{
+		ModuleID: mods[0].ID, Name: "Corrupted", Kind: "function", Exported: true,
+		Body: "func Corrupted() {}", SourceFile: "../outside-corrupted.go",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, _, _ := s.handleDelete(context.Background(), nil, nameParam{Name: "Corrupted", RemoveFile: true})
+	text := resultText(t, result)
+	if !strings.Contains(text, "escapes the project root") {
+		t.Errorf("expected an escape-root refusal, got: %s", text)
+	}
+	if _, statErr := os.Stat(outside); statErr != nil {
+		t.Fatalf("the file outside the project root must survive untouched, stat err: %v", statErr)
+	}
+}
+
 func TestHandleDeleteFile_RemoveFileActuallyRemovesFileFromDisk(t *testing.T) {
 	db, projDir := setupTestDB(t)
 	defer db.Close()
@@ -17008,5 +17082,107 @@ func TestRankedSearchResult_ResultsIncludeCallerAndTestCounts(t *testing.T) {
 	}
 	if !strings.Contains(text, `"tests"`) {
 		t.Errorf("expected ranked search results to include test counts, got:\n%s", text)
+	}
+}
+
+// TestHandleAddImport_RefusesEscapingSourceFile is a winze-followup
+// regression test for the #13 symlinked-root fix: patchImportOnDisk
+// (shared by handleAddImport/handleApply/handleCreateMultiDecl) joined
+// a Definition's SourceFile against s.projectDir with no escape check,
+// so a corrupted SourceFile from a pre-#13 ingest could read from --
+// and, worse, WRITE to -- whatever that escaping path resolved to
+// outside the project root.
+func TestHandleAddImport_RefusesEscapingSourceFile(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	mods, err := db.ListModules()
+	if err != nil || len(mods) == 0 {
+		t.Fatalf("expected at least one module, err=%v", err)
+	}
+
+	outside := filepath.Join(filepath.Dir(projDir), "outside-addimport.go")
+	original := "package outside\n"
+	if err := os.WriteFile(outside, []byte(original), 0644); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(outside)
+
+	if _, err := db.UpsertDefinition(&store.Definition{
+		ModuleID: mods[0].ID, Name: "Corrupted", Kind: "function", Exported: true,
+		Body: "func Corrupted() {}", SourceFile: "../outside-addimport.go",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, _, err := s.handleAddImport(context.Background(), nil, codeParam{
+		File:       "../outside-addimport.go",
+		ImportPath: "hash/fnv",
+	})
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	text := resultText(t, result)
+	if !result.IsError {
+		t.Fatalf("expected an error result refusing the escaping path, got success: %s", text)
+	}
+	if !strings.Contains(text, "escapes the project root") {
+		t.Errorf("expected an escape-root refusal, got: %s", text)
+	}
+
+	content, rerr := os.ReadFile(outside)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if string(content) != original {
+		t.Errorf("the file outside the project root must not have been modified, got:\n%s", content)
+	}
+}
+
+// TestHandleInsertHeader_RefusesEscapingProjectRoot is a winze-followup
+// regression test for the #13 symlinked-root fix, and the most severe
+// instance found in this audit: unlike handleAddImport, handleInsertHeader
+// never requires a DB-matched definition -- moduleID silently defaults to
+// 0 when FindDefinitionsByFile finds nothing, and file is still passed
+// straight through to patchInsertHeaderOnDisk. Before pathEscapesProjectRoot,
+// a bare op:"insert-header", file:"../../outside.go" call (no DB
+// corruption needed at all) would read, then WRITE, whatever that
+// escaping path resolved to outside the project root.
+func TestHandleInsertHeader_RefusesEscapingProjectRoot(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	outside := filepath.Join(filepath.Dir(projDir), "outside-header.go")
+	original := "package outside\n"
+	if err := os.WriteFile(outside, []byte(original), 0644); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(outside)
+
+	result, _, err := s.handleInsertHeader(context.Background(), nil, codeParam{
+		File: "../outside-header.go",
+		Body: "// injected header",
+	})
+	if err != nil {
+		t.Fatalf("unexpected Go error: %v", err)
+	}
+	text := resultText(t, result)
+	if !result.IsError {
+		t.Fatalf("expected an error result refusing the escaping path, got success: %s", text)
+	}
+	if !strings.Contains(text, "escapes the project root") {
+		t.Errorf("expected an escape-root refusal, got: %s", text)
+	}
+
+	content, rerr := os.ReadFile(outside)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if string(content) != original {
+		t.Errorf("the file outside the project root must not have been modified, got:\n%s", content)
 	}
 }
