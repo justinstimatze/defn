@@ -1065,7 +1065,7 @@ dependency — lowest priority, do whenever.
        came out of, just automated instead of found by hand).
 7. [ ] Refactor-shaped corpus (10 tasks, gold = upstream commit diff);
        Sonnet pilot on EC2 (~$10) to validate before any powered run.
-       Only run this after item 3 lands.
+       Only run this after item 5 lands.
 8. [ ] ONE powered A/B after 5+7 land (and item 3 is fixed): ≥3
        repeats/task/arm, prom-15 + refactor-10, Opus, EC2 (~$300). Not
        before — this is the one run that has to count.
