@@ -16980,3 +16980,33 @@ func WithDialer(f func(string) int) func() int {
 		t.Errorf("old function declaration should have been renamed too, got:\n%s", src)
 	}
 }
+
+// TestRankedSearchResult_ResultsIncludeCallerAndTestCounts guards the #1
+// (adoption-gap) fix: caller/test counts were already computed for ranking
+// (RefCountsByTarget, no extra query) but never surfaced in the response --
+// a dead-code hit (0 callers) looked identical to a load-bearing one until
+// a separate impact call. Every ranked hit now reports both counts inline.
+func TestRankedSearchResult_ResultsIncludeCallerAndTestCounts(t *testing.T) {
+	db, _ := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db}
+
+	defs, err := db.FindDefinitions("%")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defs) == 0 {
+		t.Fatal("expected at least one definition in the fixture")
+	}
+	result, _, err := s.rankedSearchResult("Greet", defs, 1)
+	if err != nil {
+		t.Fatalf("rankedSearchResult: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, `"callers"`) {
+		t.Errorf("expected ranked search results to include caller counts, got:\n%s", text)
+	}
+	if !strings.Contains(text, `"tests"`) {
+		t.Errorf("expected ranked search results to include test counts, got:\n%s", text)
+	}
+}

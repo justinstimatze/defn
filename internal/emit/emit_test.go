@@ -2568,3 +2568,49 @@ func TestEmitPreImportsSplicesAliasedImportBeforeGoimports(t *testing.T) {
 		t.Fatalf("expected the pre-injected aliased import to survive goimports, got:\n%s", content)
 	}
 }
+
+// TestEmitInvalidDefinitionSourceFileDoesNotBlockUnrelatedEmit is the
+// definition-side counterpart to TestEmitInvalidProjectFilePathDoesNotBlockUnrelatedEmit.
+// #357 only patched the project_files loop; a Definition.SourceFile
+// corrupted the same way (e.g. stale rows from a symlinked project root
+// ingested before the resolveProjectDir fix, #13 winze dispatch) went
+// through emitModule's def-driven write path instead, which had no such
+// guard: filepath.Join(outDir, projRel) landed outside outDir and the
+// resulting write/MkdirAll error hard-failed emitModule -- and since
+// that's discovered while iterating every file in the module, it
+// blocked every OTHER def in the same module too, project-wide for a
+// single-module repo. emitModule must skip just the one corrupted file
+// and still write everything else.
+func TestEmitInvalidDefinitionSourceFileDoesNotBlockUnrelatedEmit(t *testing.T) {
+	db := testDB(t)
+	mod, _ := db.EnsureModule("example.com/test", "test", "")
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Foo", Kind: "function", Exported: true,
+		Body: "func Foo() {}", SourceFile: "test.go",
+	})
+	// Simulates a definition ingested under the pre-fix symlinked-root
+	// bug: SourceFile escaped the project root, same shape as winze's
+	// "../town/winze/cmd/metabolize/units/winze-metabolize@.service".
+	db.UpsertDefinition(&store.Definition{
+		ModuleID: mod.ID, Name: "Bar", Kind: "function", Exported: true,
+		Body: "func Bar() {}", SourceFile: "../outside/escaped.go",
+	})
+	if err := db.SetProjectFile("go.mod", "module example.com/test\n\ngo 1.22\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	outDir := t.TempDir()
+	if err := Emit(db, outDir); err != nil {
+		t.Fatalf("Emit should skip the one definition with an escaping SourceFile and still succeed, got error: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(outDir, "go.mod")); err != nil {
+		t.Fatalf("go.mod should still have been written despite the unrelated bad definition: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outDir, "test.go")); err != nil {
+		t.Fatalf("test.go should still have been written despite the unrelated bad definition: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outDir, "..", "outside", "escaped.go")); err == nil {
+		t.Fatalf("escaped.go should NOT have been written outside outDir")
+	}
+}

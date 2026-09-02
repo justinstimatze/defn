@@ -767,6 +767,23 @@ func emitModule(db store.Backend, mod *store.Module, outDir, moduleRoot string, 
 		// just "pkg.go" and rely on module.Path to fill in the directory).
 		var path string
 		projRel := projectRelByFile[file]
+		if projRel != "" {
+			if cleanRel := filepath.Clean(projRel); filepath.IsAbs(cleanRel) || strings.Contains(cleanRel, "..") {
+				// #13 winze followup: a SourceFile corrupted with an escaping
+				// "../" prefix (e.g. from a symlinked project root ingested
+				// before the resolveProjectDir fix) used to hard-fail this
+				// whole emitModule call -- and since it's found while
+				// iterating every file in the module, it blocked every OTHER
+				// def in the same module too, project-wide for single-module
+				// repos. Skip just this one file, matching #357's precedent
+				// for project_files: one corrupted row was never going to be
+				// safely writable anyway, and every other def/file in this
+				// emit is unrelated to it. Re-ingesting after the ingest-side
+				// fix clears the stale value on next write.
+				warnings = append(warnings, fmt.Sprintf("%s: skipped writing -- SourceFile %q escapes the project root (stale value from a pre-fix ingest; re-ingest to repair)", file, projRel))
+				continue
+			}
+		}
 		if projRel != "" && filepath.Dir(filepath.Clean(projRel)) != "." {
 			path = filepath.Join(outDir, projRel)
 			if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {

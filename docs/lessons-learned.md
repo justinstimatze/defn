@@ -668,6 +668,144 @@ interaction specific to the file's actual size/complexity (492 lines,
 many sibling declarations) that a 12-line fixture can't trigger.
 
 **Resolved (same day, later): does not reproduce against the real repo.**
+
+## Adoption gap (item #1): lit review + plan (2026-09-01), not yet built
+
+Standing finding restated: ~77% of a session's calls are read-shaped;
+`context`/`expand` (built to consolidate them) see ~0.7% spontaneous
+adoption; both in-band nudges tried show 0/7 and 0/19 follow-through —
+a confirmed dead lever. Ran two parallel lit-review passes (academic +
+industry prior art) before proposing a fix, per this project's own
+standing rule against building on unverified priors.
+
+**Load-bearing finding, changes the plan's shape:** the premise
+"additive tool adoption (using defn alongside Read/Bash instead of
+replacing it) is itself the failure" doesn't survive the prior-art
+check. Cursor's own published numbers (cursor.com/blog/semsearch, Nov
+2025) show grep + semantic search coexisting permanently by design,
+framed as a *strength* (+12.5% accuracy, +2.6% retention on large
+codebases), not a problem needing a fix. A hybrid coarse+fine split
+can legitimately beat forcing one path — so the target metric should
+be total weighted session cost (already the CLAUDE.md bar), not
+adoption percentage per se.
+
+**Directly corroborates this project's own #209 lesson, independently:**
+a 2026 paper on Codex-vs-Claude tool-batching divergence (arXiv
+2607.10569) found that restricting an agent to a consolidated tool
+surface backfires specifically for Claude on edit-heavy tasks (+14.4%
+cost) when the substitute tool can't yet absorb the redirected traffic
+with real batching — friction without consolidation benefit. Their
+fix, matching #209's own resolution order (intent-capture had to land
+before the circuit breaker stopped backfiring): **fix the consolidated
+tool's bundling quality and cost first, gate only afterward, and build
+the escape valve in from day one rather than reactively after a
+blowup.**
+
+Anthropic's own "Writing effective tools for AI agents" (2025)
+prescribes the same direction from the design side: don't nudge,
+redesign the surface so the consolidated path is the obvious one
+(their examples collapse multiple granular tools into one purpose-built
+tool, e.g. `search_logs` replacing `read_logs` narrowed to relevant
+lines only) — validates narrowing/cheapening the granular ops
+themselves as a first move, independent of whether substitution ever
+improves. PreToolUse-style hooks are confirmed the only deterministic
+(not probabilistic) lever, validating going structural over another
+prompt-level nudge.
+
+Ruled out / not actionable here: RLVR/GRPO tool-choice reward-shaping
+(assumes fine-tuning the underlying model, not available to a
+downstream MCP-server project); RAG-MCP-style tool-count filtering
+(defn has one dispatch tool with op-params, not a tool-count problem);
+"over-tooled agent" thresholds (inapplicable to defn's shape). No
+external vendor has published a comparable hard-gate backfire to
+defn's own #209 — flagged as under-published, not as evidence hard
+gating is broadly safe.
+
+**Plan, in order (nothing shipped yet):**
+1. **Measurement precondition.** Lock a repeated-trial A/B protocol
+   (≥15 repeats/condition, both arms, EC2) before touching anything —
+   the same rigor gap that let two earlier "defn wins" claims fail to
+   replicate at n=10 applies here. The starter-bundle's actual
+   downstream call-count/cost effect (flagged "still open" above) is
+   this same precondition, never actually answered.
+2. **Cheapen the granular path, harden the consolidated one — no
+   gating yet.** Fix the known circuit-breaker auto-batch payload
+   bloat (dumps full bodies for unrequested defs — the confirmed
+   dominant driver of the etcd-21620 2x cost gap) to outline-only by
+   default; cap/narrow `impact`'s unbounded lists (the 45KB single-call
+   case). Reduces the "additive tax" regardless of whether substitution
+   ever improves.
+3. **Server-side auto-consolidation, not model-side nudging.** Extend
+   the existing self-healing circuit breaker so detected repeat/blast-
+   radius access patterns route through a `context`/`expand`-shaped
+   bundle transparently, regardless of which verb the model typed —
+   sidesteps the confirmed-dead in-band-nudge lever entirely since it
+   doesn't require the model to change behavior. Only after step 2
+   makes the bundle itself cheap, per the Codex/Claude ordering
+   requirement.
+4. **Measure via step 1's protocol before considering hard gating.**
+   Only if total cost is still uncompetitive after 2+3, consider actual
+   op-availability gating on `read`/`outline`/`impact` — this time with
+   the escape valve built in from the start, sized against Claude's
+   real tool-batching limits (per the arXiv finding), not copied
+   verbatim from the `.go`-guard pattern.
+
+**Correction (same day, before implementing step 2): don't build what's
+already built or already reverted.** Checking the actual codebase before
+writing code (which should have been part of drafting the plan itself,
+not a step after "go" — see the user's own direct feedback on this)
+found step 2 was already tried and explicitly reverted: `#312`
+(`TestHandleCode_CircuitBreakerAutoBatchesInsteadOfRefusing`) shipped
+the circuit breaker's auto-batch hijack, measured it at 0/19
+follow-through (the exact number this plan's lit review cited
+independently), caught it bundling 4 unrelated names' full outlines
+into an already-narrowly-scoped response, and reverted to
+instrumentation-only — citing "lean on better primitives... rather
+than reactively overriding the model's own tool choice," the same
+conclusion Anthropic's own tool-design guidance and the Codex/Claude
+arXiv paper both point to. Step 1's auto-batch body-size-threshold
+fix was also already shipped (`TestHandleExpand_AutoBatchBodyOverrideRespectsSizeThreshold`).
+
+**What actually shipped instead (2026-09-01, commit pending):** the one
+real gap found — `rankedSearchResult` already computes caller/test
+counts per hit for ranking (`RefCountsByTarget`, no extra query) but
+never surfaced them in the response, so a dead-code hit (0 callers)
+was indistinguishable from a load-bearing one until a separate
+`impact` call. Added `callers`/`tests` int fields to the ranked
+search JSON, populated from data already in memory — zero new
+queries, negligible payload cost (a few bytes/hit, nothing like the
+45KB `impact` case). This is squarely in the "make the default
+response smarter" lane the research pointed to, not a re-attempt of
+the reverted hijack: it enriches the same hit already returned rather
+than redirecting into unrelated names or overriding tool choice.
+Regression test: `TestRankedSearchResult_ResultsIncludeCallerAndTestCounts`.
+Not yet measured against real trajectories — the next real step, per
+this plan's own step 1 lens, is watching whether this measurably cuts
+the search→outline/impact follow-up chain in a fresh mined trajectory,
+not assuming it does.
+
+**First real-trajectory check (2026-09-01), n=1 -- encouraging, not
+proven.** Reran `cli__cli-3461` (defn arm, sonnet, EC2) with the fixed
+binary and diffed against the pre-fix trajectory already sitting in
+`bench/small-slice-6/arm_defn/` for the same task, same model, same
+harness. Confirmed the mechanism fires live: `search(pattern:"GetJobs")`
+now returns `{"name":"GetJobs",...,"callers":2,"tests":0}` inline instead
+of a bare name/file/score. Result: 33→21 tool calls (-36%), $0.574→$0.339
+(-41%), 116.7s→82.3s (-29%), both `rc=0`. The after-run's final fix is
+also arguably more correct (parses `run.JobsURL` directly, handling
+GitHub Enterprise's `/api/v3` prefix; the before-run's fix never touched
+the enterprise-URL path the task is actually about) — a bonus, not
+something this single sample can credit to the search fix specifically.
+
+Per this project's own repeated lesson ([[DefnBeatsFilesmodeFirstTimeV02621]],
+[[PrometheusBatchDefnLoses20]] v3/v4) that a single-sample "win" has
+twice failed to replicate here — **do not treat this as a proven
+result**. It's one real, mechanistically-explained positive data point
+justifying keeping the fix and watching for more, not a benchmark
+claim. Next real evidence would come from mining more of the
+already-completed small-slice-3/4/5 trajectories the same way (cheap —
+they're already run, just need a fresh post-fix rerun each), not from
+launching a new bench batch.
 Cloned grpc-go fresh at the exact base commit
 (`32559e2175a5c793c47df0b214775affde5ac35e`) and ran two independent
 clean-room checks directly against it:

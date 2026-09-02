@@ -3085,6 +3085,8 @@ func (s *server) rankedSearchResult(query string, defs []store.Definition, limit
 		Score      float64 `json:"score"`
 		Preview    string  `json:"preview,omitempty"`
 		Match      string  `json:"match,omitempty"`
+		Callers    int     `json:"callers"`
+		Tests      int     `json:"tests"`
 	}
 	out := make([]rankedSummary, 0, limit)
 	for i, r := range scored {
@@ -3101,6 +3103,13 @@ func (s *server) rankedSearchResult(query string, defs []store.Definition, limit
 		rs := rankedSummary{
 			Name: r.Def.Name, Kind: r.Def.Kind, Receiver: r.Def.Receiver,
 			SourceFile: r.Def.SourceFile, Score: math.Round(r.Score*100) / 100,
+			// #1 (adoption gap): caller/test counts were already computed
+			// above for ranking (RefCountsByTarget, no extra query) but
+			// never surfaced -- a dead-code hit (0 callers) looked
+			// identical to a load-bearing one until a separate impact
+			// call. Exposing them lets the model tell them apart from
+			// this same response instead of a follow-up round-trip.
+			Callers: callers[r.Def.ID], Tests: tests[r.Def.ID],
 		}
 		// #159: preview the top-N ranked hits — model can identify the
 		// winner from body head without a follow-up read.

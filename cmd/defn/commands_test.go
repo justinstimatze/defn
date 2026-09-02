@@ -108,6 +108,40 @@ func TestResolveIngestDBPath(t *testing.T) {
 	})
 }
 
+// TestResolveProjectDir_ResolvesSymlinkedRoot is a winze-dispatch
+// regression test: serveProjectDir used to return the unresolved cwd
+// verbatim, so a symlinked project root (cwd is a symlink to its real
+// location -- a common layout) left every downstream filepath.Rel call
+// comparing that unresolved path against Go-tooling-reported
+// (already-resolved) paths. The mismatch produced a phantom
+// "../real/dir/..." relative path that tripped the project-path escape
+// validator and hard-failed emit for the whole module, breaking every
+// op:"edit"/"create" call project-wide. resolveProjectDir must collapse
+// the symlink so both sides agree.
+func TestResolveProjectDir_ResolvesSymlinkedRoot(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "real")
+	if err := os.Mkdir(real, 0755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unsupported on this platform: %v", err)
+	}
+
+	got := resolveProjectDir(link)
+	wantReal, err := filepath.EvalSymlinks(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != wantReal {
+		t.Errorf("resolveProjectDir(%q) = %q, want %q (the real, non-symlinked path)", link, got, wantReal)
+	}
+	if got == link {
+		t.Errorf("resolveProjectDir(%q) returned the unresolved symlink path unchanged -- this is the exact bug: downstream filepath.Rel calls against Go-tooling-resolved paths will mismatch", link)
+	}
+}
+
 func TestCollectStatus_NoDatabaseDoesNotCreateOne(t *testing.T) {
 	dir := t.TempDir()
 

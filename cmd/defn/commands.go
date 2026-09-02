@@ -234,9 +234,7 @@ func logMem(phase string) {
 // .mcp.json rather than clearing it on every plain re-ingest.
 func cmdIngest(modulePath string, reindex bool) {
 	origCwd, _ := os.Getwd()
-	if abs, err := filepath.Abs(modulePath); err == nil {
-		modulePath = abs
-	}
+	modulePath = resolveProjectDir(modulePath)
 	dbPath := resolveIngestDBPath(origCwd, modulePath)
 	if err := os.Chdir(modulePath); err != nil {
 		fatal(err)
@@ -1119,7 +1117,27 @@ func serveProjectDir() string {
 	if projDir == "." {
 		projDir, _ = os.Getwd()
 	}
-	return projDir
+	return resolveProjectDir(projDir)
+}
+
+// resolveProjectDir normalizes dir to an absolute, symlink-resolved path.
+// #13 winze dispatch: a symlinked project root (e.g. cwd is a symlink to
+// its real location) left every downstream filepath.Rel call comparing
+// this unresolved path against Go-tooling-reported (already-resolved)
+// paths -- producing a phantom "../real/dir/..." relative path that
+// trips the project-path escape validator and hard-fails emit for the
+// whole module, breaking every op:"edit"/"create" call project-wide.
+// Falls back to the best still-available form (abs, or the original
+// input) if the path doesn't exist yet or EvalSymlinks otherwise fails.
+func resolveProjectDir(dir string) string {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return dir
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return resolved
+	}
+	return abs
 }
 
 // portForDB derives a deterministic port from the database path.
