@@ -667,15 +667,37 @@ larger real module (a test file, or another production file), or some
 interaction specific to the file's actual size/complexity (492 lines,
 many sibling declarations) that a 12-line fixture can't trigger.
 
-**Next step, not yet done:** either (a) reproduce directly against the
-real grpc-go checkout at the exact base commit (`32559e2175a5c793c47df
-0b214775affde5ac35e`) rather than a hand-written fixture — check
-`GetCallers` on `withContextDialer`'s real definition ID before the
-rename to see the actual full caller list defn computed, which would
-show directly whether a real 3rd+ caller was missed from the count or
-whether the count itself is wrong despite a complete caller list; or (b)
-mine the other 6 already-completed small-slice trajectories first (free,
-no new API cost) in case one of them narrows this down or turns up a
-cleaner repro shape. Do not mark this closed based on the one clean
-synthetic test above — that test confirms a *different*, correctly-
-working shape, not the absence of the bug.
+**Resolved (same day, later): does not reproduce against the real repo.**
+Cloned grpc-go fresh at the exact base commit
+(`32559e2175a5c793c47df0b214775affde5ac35e`) and ran two independent
+clean-room checks directly against it:
+
+1. Isolated single `rename` call — correct: `GetCallers` on the real
+   pre-rename `withContextDialer` definition shows exactly the 2 real
+   callers (`WithDialer`, `init`, both in `dialoptions.go`); after
+   rename, 0 dangling lowercase references remain on disk, and both
+   real call sites are correctly rewritten.
+2. A faithful full replay of the trajectory's exact preceding call
+   sequence (`search` ×2, `read` ×5, `outline`, then `rename`, then
+   both of the model's own follow-up `edit` calls, then the real
+   `test(name:"WithDialer")`) through the actual dispatch entry point
+   (`handleCode`, not a shortcut) — also fully correct, and the real
+   `go test` run passed all 225 affected grpc-go tests clean.
+
+Neither replay reproduces the live trajectory's "init (pickfirst.go:108)"
+caller misattribution or the eventual "undefined: withContextDialer"
+build failure — pickfirst.go's own pristine source (confirmed via `git
+show`) doesn't even contain the string `withContextDialer` at this base
+commit, so that caller listing was wrong regardless of the rename bug
+theory. **Conclusion: this is not a live, reproducible defn correctness
+bug in the current codebase.** Best remaining explanation, not fully
+confirmed: `agent_driver.py` caches a `.defn` snapshot per `(instance_id,
+defn_binary_hash)` and restores it on a rerun; since the EC2 box
+rebuilt multiple times the same day always as a `-dirty` build (three
+different base commits, per the small-slice-3/5/6 version strings), a
+`-dirty` hash collision across two genuinely different commits could
+silently reuse a stale cached snapshot for a task — a harness-level
+caching gap, not a rename defect. Not chased further this session; the
+harness's own snapshot-invalidation logic (`_defn_cache_path` /
+`_defn_binary_hash` in `agent_driver.py`) would be the next place to
+look if this recurs.
