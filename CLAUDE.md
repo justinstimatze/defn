@@ -18,6 +18,15 @@ follow-through, measured twice). Full root-cause history, fix commits,
 and a live open question about the starter-bundle's actual downstream
 effect: see `docs/lessons-learned.md`.
 
+Current state of the gap and the ranked work order to close it:
+`docs/gap-analysis-2026-09-02.md` (pooled verdict: correctness tied,
+cost +24%). The schema tax is measured (~87% of the gap on prom-opus,
+~36% on etcd-multifile-v2) AND the fix has shipped: `DEFN_STRIP=verbose-tool-desc`
+opts into a lean `code` tool description (1,144 B vs the legacy
+8,950 B), default unchanged pending the powered A/B in the work order.
+The "Handoff" section at the end of `docs/lessons-learned.md` carries
+the checkbox TODO list — pick up there.
+
 ## Code Navigation and Editing
 
 **The database is authoritative. Files are an I/O projection.** For Go code, use the `code` MCP tool — not Edit/Write/Read. Edit/Write are for non-Go files (YAML, JSON, Markdown, shell scripts).

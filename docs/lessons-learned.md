@@ -668,6 +668,39 @@ interaction specific to the file's actual size/complexity (492 lines,
 many sibling declarations) that a 12-line fixture can't trigger.
 
 **Resolved (same day, later): does not reproduce against the real repo.**
+Cloned grpc-go fresh at the exact base commit
+(`32559e2175a5c793c47df0b214775affde5ac35e`) and ran two independent
+clean-room checks directly against it:
+
+1. Isolated single `rename` call — correct: `GetCallers` on the real
+   pre-rename `withContextDialer` definition shows exactly the 2 real
+   callers (`WithDialer`, `init`, both in `dialoptions.go`); after
+   rename, 0 dangling lowercase references remain on disk, and both
+   real call sites are correctly rewritten.
+2. A faithful full replay of the trajectory's exact preceding call
+   sequence (`search` ×2, `read` ×5, `outline`, then `rename`, then
+   both of the model's own follow-up `edit` calls, then the real
+   `test(name:"WithDialer")`) through the actual dispatch entry point
+   (`handleCode`, not a shortcut) — also fully correct, and the real
+   `go test` run passed all 225 affected grpc-go tests clean.
+
+Neither replay reproduces the live trajectory's "init (pickfirst.go:108)"
+caller misattribution or the eventual "undefined: withContextDialer"
+build failure — pickfirst.go's own pristine source (confirmed via `git
+show`) doesn't even contain the string `withContextDialer` at this base
+commit, so that caller listing was wrong regardless of the rename bug
+theory. **Conclusion: this is not a live, reproducible defn correctness
+bug in the current codebase.** Best remaining explanation, not fully
+confirmed: `agent_driver.py` caches a `.defn` snapshot per `(instance_id,
+defn_binary_hash)` and restores it on a rerun; since the EC2 box
+rebuilt multiple times the same day always as a `-dirty` build (three
+different base commits, per the small-slice-3/5/6 version strings), a
+`-dirty` hash collision across two genuinely different commits could
+silently reuse a stale cached snapshot for a task — a harness-level
+caching gap, not a rename defect. Not chased further this session; the
+harness's own snapshot-invalidation logic (`_defn_cache_path` /
+`_defn_binary_hash` in `agent_driver.py`) would be the next place to
+look if this recurs.
 
 ## Adoption gap (item #1): lit review + plan (2026-09-01), not yet built
 
@@ -927,36 +960,106 @@ confirming it. Real evidence, if it exists, needs a properly powered
 repeat-trial protocol (the same rigor gap flagged and then explicitly
 dropped as "overkill" for this specific investigation) — not more
 one-off small-slice reruns.
-Cloned grpc-go fresh at the exact base commit
-(`32559e2175a5c793c47df0b214775affde5ac35e`) and ran two independent
-clean-room checks directly against it:
 
-1. Isolated single `rename` call — correct: `GetCallers` on the real
-   pre-rename `withContextDialer` definition shows exactly the 2 real
-   callers (`WithDialer`, `init`, both in `dialoptions.go`); after
-   rename, 0 dangling lowercase references remain on disk, and both
-   real call sites are correctly rewritten.
-2. A faithful full replay of the trajectory's exact preceding call
-   sequence (`search` ×2, `read` ×5, `outline`, then `rename`, then
-   both of the model's own follow-up `edit` calls, then the real
-   `test(name:"WithDialer")`) through the actual dispatch entry point
-   (`handleCode`, not a shortcut) — also fully correct, and the real
-   `go test` run passed all 225 affected grpc-go tests clean.
+## Handoff (2026-09-02): gap analysis written, next-session TODO
 
-Neither replay reproduces the live trajectory's "init (pickfirst.go:108)"
-caller misattribution or the eventual "undefined: withContextDialer"
-build failure — pickfirst.go's own pristine source (confirmed via `git
-show`) doesn't even contain the string `withContextDialer` at this base
-commit, so that caller listing was wrong regardless of the rename bug
-theory. **Conclusion: this is not a live, reproducible defn correctness
-bug in the current codebase.** Best remaining explanation, not fully
-confirmed: `agent_driver.py` caches a `.defn` snapshot per `(instance_id,
-defn_binary_hash)` and restores it on a rerun; since the EC2 box
-rebuilt multiple times the same day always as a `-dirty` build (three
-different base commits, per the small-slice-3/5/6 version strings), a
-`-dirty` hash collision across two genuinely different commits could
-silently reuse a stale cached snapshot for a task — a harness-level
-caching gap, not a rename defect. Not chased further this session; the
-harness's own snapshot-invalidation logic (`_defn_cache_path` /
-`_defn_binary_hash` in `agent_driver.py`) would be the next place to
-look if this recurs.
+Items 1, 2, 3 of the reranked backlog above are closed (1: five
+escaping-path fixes shipped in `eb3420c`; 2: n=9 rerun is a wash, fix
+kept; 3: already fixed two weeks prior). Item 5 (write-side round-trip
+granularity) produced no new angle — multi-decl `create` already covers
+the 07-11 "13 creates vs 1 Write" shape on paper, but has never been
+re-measured.
+
+A separate, cheap analysis pass re-asked "what stands between defn and
+superior-to-files-mode" from the pooled numbers alone and wrote the
+answer to **`docs/gap-analysis-2026-09-02.md`** — read that first next
+session; it is the work order. One-paragraph version: defn is
+correctness-neutral and ~24% more expensive pooled; the gap is three
+deterministic costs, not model behaviour — (A) the `code` tool's real
+wire schema (13,915 B / 3,171 tokens, measured via an in-process
+`tools/list` probe, not the description string alone) cache-read on
+every call, **measured at ~87% of the pooled prom-opus gap and ~36% of
+the etcd-multifile-v2 gap** (2026-09-02, see item 1 below — done), (B)
+per-call enrichment the model doesn't consume, (C) tail events from
+failed writes. Also: no current corpus exercises defn's actual
+asymmetries (cross-package rename/move, def-scoped test) — a
+refactor-shaped corpus is proposed alongside, not instead of, the
+bug-fix ones.
+
+**TODO for next session, in order — do not reorder without a
+measurement reason:**
+1. [x] **Done 2026-09-02.** Quantified the schema tax exactly: real
+       `tools/list` wire JSON (in-process probe against the actual
+       `newMCPServer`, not the description string in isolation) is
+       13,915 B / 3,171 tokens. × real mean assistant-message count
+       from `bench/prometheus-repo-opus/arm_defn/*.json` (50.2/task)
+       × Opus cache-read ($1.50/M) = $0.239/task ≈ **87%** of the
+       pooled $0.274/task gap. Cross-checked against
+       `bench/etcd-multifile-v2/arm_defn/*.json` (27.3 calls/task,
+       Sonnet cache-read $0.30/M) = $0.026/task ≈ **36%** of that
+       corpus's $0.072/task gap. Two independent corpora agree: this
+       is the dominant lever. Full numbers in
+       `docs/gap-analysis-2026-09-02.md` §5 item 1.
+2. [x] **Done 2026-09-02, same session.** Shipped the lean tool
+       surface in `internal/mcp/tool_help.go`: 1,144 B description
+       (down from 8,950 B) + an `opHelp` map (47 real ops, including 7
+       never documented before — `context`, `test-coverage`,
+       `batch-impact`, `file-defs`, `methods`, `insert-header`,
+       `resummarize` — and correctly dropping the 5 dead Dolt-era ops
+       the old description still advertised) served via
+       `op:"help", topic:"<op>"`. Gated behind
+       `stripped("verbose-tool-desc")` (existing `DEFN_STRIP` plumbing)
+       — default unchanged until item 6's A/B confirms it end to end.
+       Measured (in-process probe, not estimated): total wire JSON
+       14,037 B → 6,121 B (56.4% smaller); description 8,950 B → 1,144 B
+       (87.2% smaller); ~3,171 → ~1,454 tokens/call. Projected saving
+       using item 1's real call counts: ≈$0.129/task on prom-opus
+       (≈47% of the pooled gap), ≈$0.014/task on etcd-multifile-v2
+       (≈20% of that gap) — projection, not yet a fresh bench
+       confirmation; that's item 6. All 142 tests statically affected
+       by `handleCode` pass. Cut from scope: did NOT add
+       "auto-append help to the first error per op" — `handleCode`'s
+       defer-based pipeline is 800+ lines and this needs its own,
+       separate change, not a blind patch alongside everything else
+       here. Full numbers: `docs/gap-analysis-2026-09-02.md` §5 item 2.
+       Also filed `bug-report-2026-09-02-create-duplicates-shared-import-alias.md`
+       — `code(op:"create")` into a file whose body imports an alias
+       already used elsewhere in the package emits it twice
+       (build-breaking); hit reproducibly twice while building this.
+3. [ ] Bytes-by-op histogram across every `arm_defn/*.json` on disk;
+       budget or opt-in any op whose median exceeds ~470 B (files-mode
+       baseline). Audit `read` Related footer, provenance tags, starter
+       bundle, ranked-search JSON, outline caller lists.
+4. [ ] Tail-event detector script: flag any defn error/no-op followed by
+       ≥5 calls before the next successful write; rank by calls burned.
+       This becomes the bug-hunt queue.
+5. [ ] Refactor-shaped corpus (10 tasks, gold = upstream commit diff);
+       Sonnet pilot on EC2 (~$10) to validate before any powered run.
+6. [ ] ONE powered A/B after 2+3 land: ≥3 repeats/task/arm, prom-15 +
+       refactor-10, Opus, EC2 (~$300). Not before.
+7. [ ] Harness: make `agent_driver.py`'s `.defn` snapshot cache key
+       include the git tree hash, not just a `-dirty`-colliding binary
+       hash (open theory from the grpc-go-2629 rename finding).
+8. [ ] Auto-append `opHelp[op]` to the FIRST error result for that op
+       per session (item 2's cut scope) — needs a per-session
+       "already shown" set threaded through `handleCode`'s existing
+       defer, right before the `if err != nil || result == nil ||
+       result.IsError { return }` early-return (that guard is the
+       reason nothing past it — dedup, freshness note, starter bundle —
+       currently fires on an error result; the new logic must sit
+       BEFORE it, not after). Do this as its own change, not bundled
+       into another one.
+9. [ ] Investigate and fix
+       `bug-report-2026-09-02-create-duplicates-shared-import-alias.md`
+       (`code(op:"create")` duplicates an already-shared import alias
+       at emit time) — root cause is somewhere in `internal/emit`'s
+       import-merging pass, not yet traced.
+
+Do not: add nudges, gate ops, build new discovery ops, rerun prom-opus
+a third time as-is, or report any n=1 win as a result.
+
+Housekeeping: the four untracked leftovers this note used to list
+(`bug-report-2026-08-28-*.md`, `bug-report-2026-08-29-*.md`,
+`internal/mcp/repro_scratch_test.go`, `internal/mcp/zzz_scratch_sibling_test.go`)
+are gone from the working tree as of 2026-09-02 — already resolved,
+nothing to do here.
