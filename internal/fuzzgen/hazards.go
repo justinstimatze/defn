@@ -80,81 +80,34 @@ func hazardScatteredInit(r *rand.Rand, m *SyntheticModule) {
 	}
 }
 
-// refSite is an AST-role boundary within a function body where a call
-// can occur -- the same regions code(op:"slice") names (signature/doc/
-// body/error-branch/return/loop). "signature" and "doc" are excluded
-// here: a call can't occur inside a signature, and doc-comment text
-// isn't a real go/types reference -- both are irrelevant to a
-// FUNCTION-target reference specifically.
-type refSite int
-
-const (
-	refSiteBody refSite = iota
-	refSiteErrorBranch
-	refSiteLoop
-	refSiteReturn
-)
-
-func (s refSite) name() string {
-	switch s {
-	case refSiteBody:
-		return "body"
-	case refSiteErrorBranch:
-		return "error_branch"
-	case refSiteLoop:
-		return "loop"
-	case refSiteReturn:
-		return "return"
-	default:
-		panic("fuzzgen: unknown refSite")
-	}
-}
-
-// callStmtNiladic renders this ref-site's call statement for an
-// enclosing function that takes no parameters and returns nothing
-// (func init()). refSiteReturn is invalid here -- a bare init() has no
-// result to hand back -- and must never be requested with this
-// renderer; collisionKind.validRefSites enforces that.
-func (s refSite) callStmtNiladic() string {
-	switch s {
-	case refSiteErrorBranch:
-		return "\tif err := Target(); err != nil {\n\t\tpanic(err)\n\t}\n"
-	case refSiteLoop:
-		return "\tfor i := 0; i < 1; i++ {\n\t\t_ = Target()\n\t}\n"
-	case refSiteBody:
-		return "\t_ = Target()\n"
-	default:
-		panic("fuzzgen: refSiteReturn is invalid for a niladic enclosing function")
-	}
-}
-
-// callStmtResult renders this ref-site's call statement for an
-// enclosing function with signature "func() error".
-func (s refSite) callStmtResult() string {
-	switch s {
-	case refSiteErrorBranch:
-		return "\tif err := Target(); err != nil {\n\t\treturn err\n\t}\n\treturn nil\n"
-	case refSiteLoop:
-		return "\tfor i := 0; i < 1; i++ {\n\t\tif err := Target(); err != nil {\n\t\t\treturn err\n\t\t}\n\t}\n\treturn nil\n"
-	case refSiteReturn:
-		return "\treturn Target()\n"
-	default: // refSiteBody
-		return "\t_ = Target()\n\treturn nil\n"
-	}
-}
-
 // collisionKind is a Go-legal mechanism by which two unrelated
 // declarations share the exact same bare name within one package --
 // the precondition for lookupFuncDefID's #372 bare-name lookup to ever
-// be ambiguous in the first place. A same-name-across-files collision
-// gated by mutually exclusive build tags was considered and dropped:
-// go/packages.Load (which internal/ingest uses) applies the host's
-// default build constraints when loading, so the tag-excluded file is
-// never parsed at all (see ingest.go's ingestPackage, "go/packages.Load
-// still returns a *packages.Package for directories whose Go files are
-// all excluded..." comment) -- a naive version would only ever ingest
-// ONE of the two same-named declarations, never actually colliding,
-// and would pass trivially without exercising anything.
+// be ambiguous in the first place. This is the ONLY enumeration axis
+// this family varies. An earlier version of this hazard also enumerated
+// a "refSite" axis (calling Target from the body/error-branch/loop/
+// return of the colliding declaration) -- dropped after reading
+// resolve.go closely: lookupFuncDefID computes fromID ONCE per
+// ast.FuncDecl (line ~515), then collectRefs walks the entire body via
+// a position-agnostic ast.Inspect and attributes EVERY reference found
+// inside -- regardless of where it sits -- to that single fromID
+// (line ~540). astRename's rewrite (server.go's astRename) is the same
+// blanket ast.Inspect. So whatever's inside the body, and wherever it
+// sits, is provably irrelevant to whether this bug class reproduces;
+// only WHICH declaration the bug misattributes the reference to
+// (collisionKind) matters. The 4 refSite variants this produced added
+// zero marginal detection power for 4x the runtime -- see docs/
+// lessons-learned.md's "pareto horizon" note before adding a similar
+// axis to another hazard family.
+//
+// A same-name-across-files collision gated by mutually exclusive build
+// tags was also considered and dropped: go/packages.Load (which
+// internal/ingest uses) applies the host's default build constraints
+// when loading, so the tag-excluded file is never parsed at all (see
+// ingest.go's ingestPackage, "go/packages.Load still returns a
+// *packages.Package for directories whose Go files are all excluded..."
+// comment) -- a naive version would only ever ingest ONE of the two
+// same-named declarations, never actually colliding.
 type collisionKind int
 
 const (
@@ -173,32 +126,20 @@ func (c collisionKind) name() string {
 	}
 }
 
-// validRefSites is the set of AST-role boundaries syntactically valid
-// for this collision kind's calling-declaration shape. initMulti's
-// calling declaration is always func init() -- niladic, no return --
-// so refSiteReturn (which needs a value to give back) is excluded.
-func (c collisionKind) validRefSites() []refSite {
-	if c == collisionInitMulti {
-		return []refSite{refSiteBody, refSiteErrorBranch, refSiteLoop}
-	}
-	return []refSite{refSiteBody, refSiteErrorBranch, refSiteLoop, refSiteReturn}
-}
-
 // apply materializes this collision kind's file set: one or more
 // unrelated declarations sharing the SAME bare name via a Go-legal
-// mechanism, with exactly one of them calling Target at the given ref
-// site.
-func (c collisionKind) apply(pkg string, site refSite, r *rand.Rand, m *SyntheticModule) {
+// mechanism, with exactly one of them calling Target.
+func (c collisionKind) apply(pkg string, r *rand.Rand, m *SyntheticModule) {
 	switch c {
 	case collisionInitMulti:
 		// N>=2 files in ONE package each declare their own unrelated
-		// func init(); one further file's init() calls Target at site.
+		// func init(); one further file's init() calls Target.
 		// Reproduces #372 directly: lookupFuncDefID resolved callers by
 		// bare name only, so a reference made from inside one file's
 		// init() could be attributed to a DIFFERENT file's unrelated
 		// same-named init().
 		n := 2 + r.IntN(3) // 2-4 unrelated init() files
-		m.AddFile(fmt.Sprintf("pkg/%s/caller.go", pkg), fmt.Sprintf("package %s\n\nfunc init() {\n%s}\n", pkg, site.callStmtNiladic()))
+		m.AddFile(fmt.Sprintf("pkg/%s/caller.go", pkg), fmt.Sprintf("package %s\n\nfunc init() {\n\t_ = Target()\n}\n", pkg))
 		for i := 0; i < n; i++ {
 			src := fmt.Sprintf("package %s\n\nvar unrelated%d bool\n\nfunc init() {\n\tunrelated%d = true\n}\n", pkg, i, i)
 			m.AddFile(fmt.Sprintf("pkg/%s/unrelated%d.go", pkg, i), src)
@@ -214,50 +155,38 @@ func (c collisionKind) apply(pkg string, site refSite, r *rand.Rand, m *Syntheti
 		// ordinary exported name, at the caller-attribution layer #372
 		// fixed rather than the ingest-counter layer #354 fixed.
 		m.AddFile(fmt.Sprintf("pkg/%s/service.go", pkg), fmt.Sprintf("package %s\n\ntype Service struct{}\n\nfunc (s *Service) Run() error {\n\treturn nil\n}\n", pkg))
-		m.AddFile(fmt.Sprintf("pkg/%s/run.go", pkg), fmt.Sprintf("package %s\n\nfunc Run() error {\n%s}\n", pkg, site.callStmtResult()))
+		m.AddFile(fmt.Sprintf("pkg/%s/run.go", pkg), fmt.Sprintf("package %s\n\nfunc Run() error {\n\treturn Target()\n}\n", pkg))
 	default:
 		panic("fuzzgen: unknown collisionKind")
 	}
 }
 
-// crossCallHazard builds one member of the #372 "broad surface" family:
-// a Go-legal same-bare-name collision mechanism (collision), paired
-// with a specific AST-role boundary (site) at which one of the
-// colliding declarations calls a function (Target) defined elsewhere in
-// the package. Mechanically enumerated by CrossCallHazards below rather
-// than hand-transcribed one at a time -- see docs/lessons-learned.md's
-// "skeleton enumeration" recommendation.
-func crossCallHazard(pkg string, collision collisionKind, site refSite) Hazard {
-	name := fmt.Sprintf("cross_call_%s_%s", collision.name(), site.name())
+// crossCallHazard builds one member of the #372 hazard family: a
+// Go-legal same-bare-name collision mechanism (collision) in which one
+// of the colliding declarations calls a function (Target) defined
+// elsewhere in the package.
+func crossCallHazard(collision collisionKind) Hazard {
+	pkg := "crosscall_" + collision.name()
 	return Hazard{
-		Name: name,
+		Name: "cross_call_" + collision.name(),
 		Apply: func(r *rand.Rand, m *SyntheticModule) {
 			m.AddFile(fmt.Sprintf("pkg/%s/target.go", pkg), fmt.Sprintf("package %s\n\nfunc Target() error {\n\treturn nil\n}\n", pkg))
-			collision.apply(pkg, site, r, m)
+			collision.apply(pkg, r, m)
 		},
 	}
 }
 
-// CrossCallHazards is every (collisionKind, refSite) combination
-// enumerated by crossCallHazard -- the full #372 "broad surface" family,
-// exported so tests can drive a deliberate rename of Target through
-// each variant individually (TestMutationSequence_Hazards's random
-// pickMutation would only ever hit one of these by chance).
+// CrossCallHazards is every collisionKind enumerated by crossCallHazard
+// -- the full #372 hazard family, exported so tests can drive a
+// deliberate rename of Target through each variant individually
+// (TestMutationSequence_Hazards's random pickMutation would only ever
+// hit one of these by chance).
 var CrossCallHazards = buildCrossCallHazards()
 
 func buildCrossCallHazards() []Hazard {
 	var hazards []Hazard
 	for _, collision := range []collisionKind{collisionInitMulti, collisionMethodVsFunction} {
-		for _, site := range collision.validRefSites() {
-			// pkg must be unique per (collision, site) pair, not just per
-			// collision kind -- TestRoundTrip_Hazards's all_hazards_combined
-			// subtest folds every hazard into ONE module, so two variants
-			// sharing a package path would both try to write the same
-			// target.go/caller.go, panicking on AddFile's duplicate-path
-			// guard.
-			pkg := fmt.Sprintf("crosscall_%s_%s", collision.name(), site.name())
-			hazards = append(hazards, crossCallHazard(pkg, collision, site))
-		}
+		hazards = append(hazards, crossCallHazard(collision))
 	}
 	return hazards
 }

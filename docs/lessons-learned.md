@@ -485,3 +485,154 @@ package-scoped build.
 Set `DEFN_MEASURE_TIMING=1` for a per-phase breakdown inside emit
 (project-files / module-writes / goimports / refresh-file-sources /
 rebuild-loc-index).
+
+## Grammar-driven synthetic Go generation: lit review (2026-09-01), not yet built
+
+Prompted by an "isn't there an almanac of valid Go patterns we could turn
+into a test suite / synthetic sandbox" question. `internal/fuzzgen/hazards.go`
+already IS the informal version of this: 15 hand-authored declaration-shape
+hazards (colliding basenames, scattered `init()`, method named `init`, type
+alias, etc.) composed via `math/rand/v2`. A sibling agent (`documents-568515`
+over mcp-dispatch) ran 4 research passes on whether to go further —
+mechanically generating synthetic Go source across the language's full valid
+grammar — and reported back. Findings, kept here since no code shipped from
+this yet and the research would otherwise be lost:
+
+**Closest existing tool, and its gap:** GoSmith (github.com/dvyukov/gosmith)
+is a real csmith-for-Go, found 50+ gc/gccgo/llgo/spec bugs in 10 days. Its
+own docs admit no interfaces, no interface satisfaction, no type assertions,
+no methods, no constants — exactly defn's critical surface, since every one
+of the 15 existing hazards is about identity/kind confusion among those
+constructs. Dormant project; golang/go#7985 proposed folding it into the
+toolchain, closed unadopted. Reusable trick regardless: each var carries
+`used bool`, and `leaveBlock()` synthesizes `_ = varname` for anything unused
+(context.go:579-585) — solves Go's "declared and not used" / "imported and
+not used" compile errors deterministically, no retry loop needed. Worth
+lifting into hazards.go even if we never go full-grammar, since some
+hand-written hazards already work around this by hand.
+
+**Grammar base**, if this is ever built: antlr/grammars-v4/golang — verified
+current (last commit 2026-06-20, GPG-signed, was a typeParameters fix) and
+generics-complete. Safe to build on instead of hand-transcribing the spec
+EBNF.
+
+**Coverage criterion:** Purdom's algorithm (1972) gives 1x-per-production
+coverage — too weak for Go's nested expr/type grammar. Havrikov & Zeller's
+k-path coverage (ASE 2019) is the real formalization: every depth-k path
+through the derivation tree. Fuzzing Book's `GrammarCoverageFuzzer`
+(fuzzingbook.org) is a runnable reference impl, ports onto an EBNF dict
+directly.
+
+**Bounded deterministic enumeration** (closest structural match to
+"mechanical/deterministic," the framing the question was actually asking
+for): Skeletal Program Enumeration (Zhang/Sun/Su, PLDI 2017,
+arXiv:1610.03148) — fix a small skeleton + var set, exhaustively enumerate
+binding/usage patterns within it rather than random-sampling. 217 real
+GCC/Clang bugs from small exhaustive sets beating large random ones. Maps
+onto defn's declaration shapes almost directly.
+
+**Type-checker bug-class match:** Hephaestus (Chaliasos et al., PLDI 2022) —
+Java/Kotlin/Groovy type-checker fuzzer via two mutations (type-erasure,
+type-overwriting) tuned for generics/inference bugs. Relevant because
+`internal/resolve` sits on `go/types` and generics is its least
+battle-tested corner — zero existing systematic Go-generics-fuzzing work
+was found anywhere.
+
+**Validity mechanism — the load-bearing correction from the research
+pass:** the first pass proposed grammar-generate-then-go/types-reject-and-
+retry. Wrong model. Csmith threads a live points-to/range analysis through
+construction and locally backtracks on unsafe choices — never a full-program
+external check-and-discard. Pałka/Claessen/Russo/Hughes (ICFP 2011, DOI
+10.1145/2034773.2034801) did the same for well-typed lambda terms fuzzing
+GHC's optimizer — type-directed construction, not generate-then-check. If
+this is ever built: thread a live symbol/type/usage env through generation
+(Csmith/GoSmith/Pałka-style), synthesize blank-identifier uses for anything
+unused, run `go/types` ONCE at the end to confirm — not in a retry loop.
+
+**Corpus-mining alternative:** LangFuzz (Holler/Herzig/Zeller, USENIX Sec
+2012) — tags real-code subtrees by grammar nonterminal, recombines across
+programs. This is a systematized version of what hazards.go already does by
+hand; the natural extension is mining defn's own gin/hugo/chi bench corpora,
+tagging by AST node kind, recombining by grammar-slot.
+
+**Pressure-test finding that reshapes scope, and the actual recommendation:**
+defn doesn't parse — `go/parser` and `go/types` do, and both are already
+exhaustively fuzzed upstream by the Go project and by GoSmith. Full-grammar
+k-path coverage burns most of its budget proving defn correctly ingests
+`a + b * (c - d)`, which was never in question — every existing hazard is a
+declaration-shape bug, not an expression-grammar bug. Recommended scope, if
+this is picked up: skeleton enumeration + k-path coverage applied only to
+declaration shapes × file/package arrangement × the AST-role boundaries the
+`slice` op already names (signature/doc/body/error-branch/return/loop) —
+reserve full grammar breadth for literal/composite-literal edge cases that
+actually touch the emit/printer path, since that's the one place defn's own
+code (not go/parser's) does real work.
+
+**False friends, ruled out:** go-fuzz, `go test -fuzz`,
+AdaLogics/go-fuzz-headers, OSS-Fuzz's Go integration — all mutation/
+byte-to-value fuzzers for testing a function's input handling; none has ever
+generated Go source itself.
+
+**Theoretical footnote, not actionable alone:** Feat (Duregård/Jansson/Wang,
+Haskell Symposium 2012) — bijective size-indexed enumeration closed under
+sums/products, matches `go/ast` being a sum-of-products type. No Go port
+exists; the recipe transfers, the artifact doesn't.
+
+**Where this actually lands, for now:** not building the full grammar-driven
+generator. The nearer, higher-ROI move (matches the "meaningfully cheaper
+than not-using-defn" bar much better) is extending `hazards.go` with more
+skeleton-enumerated declaration shapes instead of hand-authoring one-offs —
+see the pending "add a deliberate (non-random) `TestMutationSequence_Hazards`
+case for a scattered-`init()` rename" task, which is the direct, concrete
+first step toward systematizing this. Revisit full-grammar generation only
+if declaration-shape enumeration stops finding new bugs.
+
+**Update (2026-09-01), the pareto horizon for one enumerated family, found
+by reading the code instead of guessing:** built the scattered-`init()` task
+above as `internal/fuzzgen`'s `crossCallHazard`/`collisionKind` family (the
+#372 caller-misattribution bug). First cut enumerated 2 dimensions:
+`collisionKind` (the Go-legal mechanism letting two declarations share a
+bare name — multiple `func init()`, or a function/method name collision
+across files) crossed with `refSite` (which AST-role boundary within the
+calling declaration's body makes the call — body/error-branch/loop/return,
+matching `code(op:"slice")`'s regions) — 7 hazards from one template.
+
+`refSite` turned out to be dead weight. Reading `resolve.go` closely:
+`lookupFuncDefID` computes `fromID` **once per `ast.FuncDecl`**
+(~line 515), then `collectRefs` walks the *entire* body via a
+position-agnostic `ast.Inspect` and attributes **every** reference it
+finds inside — call, field access, constructor, anything — to that one
+`fromID` (~line 540). `astRename` (internal/mcp/server.go) rewrites via
+the same blanket `ast.Inspect`. So for any bug in this class, *where*
+inside a function body something sits is provably irrelevant to whether
+the bug reproduces — only *which declaration the misattribution assigns
+the reference to* (`collisionKind`) can possibly matter. Confirmed
+empirically too: stripping the #372 fix and re-running the fail-without
+check on all 7 variants failed exactly the 3 `init_multi` ones and passed
+all 4 `method_vs_function` ones regardless of the fix (method lookup is
+keyed by receiver+name, a different index entirely, so #372 was never
+reachable through that collision kind at all) — `refSite` never changed
+the verdict for either collision kind. Collapsed back to 2 hazards (one
+per `collisionKind`, no `refSite` axis at all); re-ran fail-without/
+pass-with on the collapsed set and got identical discriminating power at
+2/7 the runtime.
+
+**The general rule this sets, for the next family:** before enumerating an
+axis, check whether the code path under test actually branches on it — a
+single `ast.Inspect`/`ast.Walk` over a whole subtree, or any other
+whole-tree fold, means position/nesting-within-the-tree is *not* a real
+axis for whatever bug lives at the fold's granularity (per-`FuncDecl`
+here). The horizon sits wherever the target code stops branching on the
+dimension — past that point every extra enumerated variant is pure
+runtime with zero marginal detection power. Grep the actual resolve/
+ingest/emit function first (as done here); don't assume more combinations
+always buys more coverage. Dimensions that likely DO clear this bar for
+other families, because the underlying code demonstrably branches on
+them: which *kind* of reference is made (`collectRefs`'s own switch has
+distinct branches for `CompositeLit`/constructor, `SelectorExpr`/
+`field_ref`, and plain calls, each hitting a different lookup —
+`objToDef` direct hit vs `crossPkgTypeFallback` vs `lookupFieldDefID`);
+and the query-layer ambiguity #352's family lives in
+(`GetDefinitionByName`), which is a wholly different mechanism from
+`collectRefs`/`lookupFuncDefID` and would need its own from-scratch
+branch-reading pass, not an assumption that the same axes transfer.
