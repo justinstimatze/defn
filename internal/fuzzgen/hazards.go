@@ -80,6 +80,28 @@ func hazardScatteredInit(r *rand.Rand, m *SyntheticModule) {
 	}
 }
 
+// hazardScatteredInitCrossCall reproduces the #372 caller-misattribution
+// bug: N>=2 files in ONE package each declare their own unrelated
+// func init(), and a THIRD, separate file's init() calls a function
+// defined elsewhere in the same package. Before the fix, lookupFuncDefID
+// resolved callers by bare name only, so the reference could be
+// attributed to the WRONG file's init() (whichever happened to win the
+// "init" name collision) instead of the file that actually makes the
+// call -- corrupting the ref graph for an ordinary, valid multi-init()
+// package. Distinct from hazardScatteredInit (the v0.26.26 keying bug):
+// that hazard's init()s only ever touch their OWN package-scoped var,
+// with no cross-file call for a caller to misattribute in the first
+// place.
+func hazardScatteredInitCrossCall(r *rand.Rand, m *SyntheticModule) {
+	n := 2 + r.IntN(3) // 2-4 unrelated init() files
+	m.AddFile("pkg/initcross/target.go", "package initcross\n\nfunc Target() {}\n")
+	m.AddFile("pkg/initcross/caller.go", "package initcross\n\nvar registry func()\n\nfunc init() {\n\tregistry = Target\n}\n")
+	for i := 0; i < n; i++ {
+		src := fmt.Sprintf("package initcross\n\nvar unrelated%d bool\n\nfunc init() {\n\tunrelated%d = true\n}\n", i, i)
+		m.AddFile(fmt.Sprintf("pkg/initcross/unrelated%d.go", i), src)
+	}
+}
+
 // hazardSplitMethods puts one type's methods across multiple files with
 // unrelated basenames in the same package, exercising method-set
 // reassembly during emit.
@@ -110,6 +132,7 @@ type Hazard struct {
 var AllHazards = []Hazard{
 	{"colliding_basenames", hazardCollidingBasenames},
 	{"scattered_init", hazardScatteredInit},
+	{"scattered_init_cross_call", hazardScatteredInitCrossCall},
 	{"method_named_init", hazardMethodNamedInit},
 	{"multi_package", hazardMultiPackage},
 	{"grouped_const_iota", hazardGroupedConstIota},
