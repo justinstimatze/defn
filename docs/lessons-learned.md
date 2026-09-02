@@ -1026,21 +1026,50 @@ measurement reason:**
        — `code(op:"create")` into a file whose body imports an alias
        already used elsewhere in the package emits it twice
        (build-breaking); hit reproducibly twice while building this.
-3. [ ] Bytes-by-op histogram across every `arm_defn/*.json` on disk;
+**Reranked 2026-09-02, after items 1-2 landed** — the remaining items
+were originally numbered in write-order, not dependency/risk order.
+Two things earned a move up: (a) items 5 and 6 both spend real money on
+EC2, and the open snapshot-cache-collision theory (old item 7) means
+any EC2 result today is unverifiable — fixing that BEFORE the next EC2
+spend, not after, is the only way item 6's "no more single-run reruns"
+rule is actually enforceable; (b) the create-duplicates-import bug (old
+item 9) is cheap, confirmed, reproducible, and directly undermines the
+"write atomicity, not yet trusted" line in the gap-analysis scorecard —
+worth closing before it silently bites the NEXT `create` call (possibly
+inside item 3's own histogram tooling or anything else that authors a
+new file). Items 3/4 stay $0-cost analysis-from-existing-data and keep
+their relative order (3 explicitly gates item 6; 4 doesn't gate
+anything, it just feeds the same bug-hunt queue item 9 came out of).
+Item 8 is pure polish on an already-shipped feature with no downstream
+dependency — lowest priority, do whenever.
+
+3. [ ] Harness: make `agent_driver.py`'s `.defn` snapshot cache key
+       include the git tree hash, not just a `-dirty`-colliding binary
+       hash (open theory from the grpc-go-2629 rename finding). Do this
+       before any further EC2 spend (items 5, 6) — an unresolved cache
+       collision makes any EC2 result from this point on unverifiable.
+4. [ ] Investigate and fix
+       `bug-report-2026-09-02-create-duplicates-shared-import-alias.md`
+       (`code(op:"create")` duplicates an already-shared import alias
+       at emit time) — root cause is somewhere in `internal/emit`'s
+       import-merging pass, not yet traced. Cheap, confirmed,
+       reproducible; close it before it bites another `create` call.
+5. [ ] Bytes-by-op histogram across every `arm_defn/*.json` on disk;
        budget or opt-in any op whose median exceeds ~470 B (files-mode
        baseline). Audit `read` Related footer, provenance tags, starter
-       bundle, ranked-search JSON, outline caller lists.
-4. [ ] Tail-event detector script: flag any defn error/no-op followed by
+       bundle, ranked-search JSON, outline caller lists. Gates item 7
+       (below) same as before.
+6. [ ] Tail-event detector script: flag any defn error/no-op followed by
        ≥5 calls before the next successful write; rank by calls burned.
-       This becomes the bug-hunt queue.
-5. [ ] Refactor-shaped corpus (10 tasks, gold = upstream commit diff);
+       This becomes the bug-hunt queue (the same kind of queue item 4
+       came out of, just automated instead of found by hand).
+7. [ ] Refactor-shaped corpus (10 tasks, gold = upstream commit diff);
        Sonnet pilot on EC2 (~$10) to validate before any powered run.
-6. [ ] ONE powered A/B after 2+3 land: ≥3 repeats/task/arm, prom-15 +
-       refactor-10, Opus, EC2 (~$300). Not before.
-7. [ ] Harness: make `agent_driver.py`'s `.defn` snapshot cache key
-       include the git tree hash, not just a `-dirty`-colliding binary
-       hash (open theory from the grpc-go-2629 rename finding).
-8. [ ] Auto-append `opHelp[op]` to the FIRST error result for that op
+       Only run this after item 3 lands.
+8. [ ] ONE powered A/B after 5+7 land (and item 3 is fixed): ≥3
+       repeats/task/arm, prom-15 + refactor-10, Opus, EC2 (~$300). Not
+       before — this is the one run that has to count.
+9. [ ] Auto-append `opHelp[op]` to the FIRST error result for that op
        per session (item 2's cut scope) — needs a per-session
        "already shown" set threaded through `handleCode`'s existing
        defer, right before the `if err != nil || result == nil ||
@@ -1048,12 +1077,8 @@ measurement reason:**
        reason nothing past it — dedup, freshness note, starter bundle —
        currently fires on an error result; the new logic must sit
        BEFORE it, not after). Do this as its own change, not bundled
-       into another one.
-9. [ ] Investigate and fix
-       `bug-report-2026-09-02-create-duplicates-shared-import-alias.md`
-       (`code(op:"create")` duplicates an already-shared import alias
-       at emit time) — root cause is somewhere in `internal/emit`'s
-       import-merging pass, not yet traced.
+       into another one. No dependency on anything else here — lowest
+       priority, do whenever there's spare time.
 
 Do not: add nudges, gate ops, build new discovery ops, rerun prom-opus
 a third time as-is, or report any n=1 win as a result.

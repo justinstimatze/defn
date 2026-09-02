@@ -169,24 +169,48 @@ win there either, the thesis is wrong, not the bench.
    used elsewhere in the package emits a duplicated import line
    (build-breaking) — hit twice reproducibly while building this
    change; root cause not yet traced into `internal/emit`.
-3. **Payload diet from existing data** (~2 h, $0). Bytes-by-op histogram
+**Reranked 2026-09-02, after items 1-2 landed** (see the matching note
+in `docs/lessons-learned.md`'s Handoff section for the full rationale):
+items 5/6 below both spend real EC2 money, and the harness
+snapshot-cache-collision theory (formerly an open question in §6)
+means any EC2 result today is unverifiable — fixed before that spend,
+not after, or item 6's "no more single-run reruns" rule can't actually
+be enforced. The create-duplicates-import bug (found while building
+item 2) is cheap and confirmed, so it jumps ahead of the two $0
+analysis items too — closing it now is cheaper than risking it
+silently corrupting something item 3's own tooling touches.
+
+3. **Harness: fix the snapshot-cache-collision risk** (open question,
+   formerly §6). Make `agent_driver.py`'s `.defn` snapshot cache key
+   include the git tree hash, not just a `-dirty`-colliding binary hash
+   (theory from the grpc-go-2629 rename finding, never confirmed root
+   cause). Do this before any further EC2 spend (items 7, 8 below).
+4. **Fix `bug-report-2026-09-02-create-duplicates-shared-import-alias.md`**
+   — `code(op:"create")` duplicates an already-shared import alias at
+   emit time (build-breaking). Confirmed reproducible twice; root cause
+   not yet traced into `internal/emit`'s import-merging pass.
+5. **Payload diet from existing data** (~2 h, $0). Bytes-by-op histogram
    across all `arm_defn` trajectories on disk (prom-opus, etcd-v2,
    head-to-head-go, small-slice). For every op whose median result
    exceeds files-mode's ~470 B: make the enrichment opt-in or budgeted.
    Specifically audit: `read`'s Related footer, provenance tags, starter
    bundle size, ranked `search` JSON verbosity, `outline` caller lists.
-4. **Tail-event detector, mechanical** (~1 h). Script over trajectories:
+6. **Tail-event detector, mechanical** (~1 h). Script over trajectories:
    flag any defn error/no-op result followed by ≥5 calls before the next
    successful write. Rank by calls burned. That is the bug-hunt queue —
-   replaces reading trajectories by hand.
-5. **Refactor-shaped corpus** (§4) — build the 10 tasks, gold = the
+   replaces reading trajectories by hand (the same kind of queue item 4
+   above came out of, just automated).
+7. **Refactor-shaped corpus** (§4) — build the 10 tasks, gold = the
    actual upstream commit's diff. Run both arms once as a pilot on EC2
    (Sonnet, ~$10) purely to check the corpus is sane before any powered
-   run.
-6. **One powered A/B, once, after 2+3 land**: ≥3 repeats/task/arm on the
-   15 prom tasks + the 10 refactor tasks, Opus, EC2 (~$300). This is the
-   only run that can move the "parity is the floor" verdict. No more
+   run. Only run after item 5 lands.
+8. **One powered A/B, once, after 3+5+7 land**: ≥3 repeats/task/arm on
+   the 15 prom tasks + the 10 refactor tasks, Opus, EC2 (~$300). This is
+   the only run that can move the "parity is the floor" verdict. No more
    single-run reruns — they have failed to replicate twice.
+9. **Auto-append `opHelp[op]` to the first error per op** (item 2's cut
+   scope) — polish on an already-shipped feature, no downstream
+   dependency. Lowest priority, do whenever there's spare time.
 
 Explicitly do not: add nudges, gate ops, build new discovery ops, rerun
 prom-opus a third time as-is, or trust any n=1 win.
@@ -195,12 +219,9 @@ prom-opus a third time as-is, or trust any n=1 win.
 
 - Does Claude Code send the full tool description on every call, or is
   MCP tool listing cached differently from the system prompt? (Affects
-  R1's multiplier; measure, don't reason.)
+  R1's multiplier; measure, don't reason. Indirectly corroborated by
+  chi-explore's +12.6% at zero defn calls, but not directly observed on
+  the wire.)
 - Multi-decl `create` shipped after the 07-11 forced-arm finding — has
   the write-heavy authoring shape ever been re-measured? (No record of
   it.)
-- The rename "0 callers" / stale-snapshot harness theory
-  (`_defn_cache_path` / `_defn_binary_hash` `-dirty` collision in
-  `agent_driver.py`) is unresolved; any future EC2 result is suspect
-  until the cache key includes the git tree hash, not just a binary hash
-  that collides across `-dirty` builds.
