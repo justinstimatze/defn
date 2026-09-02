@@ -16805,3 +16805,72 @@ func TestHandleTestByName_TimedOutMessageReportsScaledDurationNotFlatDefault(t *
 		t.Errorf("expected message to report the scaled timeout %s actually given to the run, got: %s", wantScaled, text)
 	}
 }
+
+// TestHandleFragmentEdit_RefusesAmbiguousBareNameAcrossModules is the
+// replace-hunk counterpart to TestHandleEdit_RefusesAmbiguousBareNameAcrossModules
+// (#248/bug-report-2026-08-28 follow-up): handleFragmentEdit funnels
+// through the same resolveWriteTarget as handleEdit, so a bare-name
+// old_fragment/new_fragment call against an ambiguous name must refuse
+// with the same "is ambiguous" message rather than silently picking one
+// same-named definition via GetDefinitionByName's blast-radius tiebreak
+// and corrupting the wrong package's file.
+func TestHandleFragmentEdit_RefusesAmbiguousBareNameAcrossModules(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	if err := os.MkdirAll(filepath.Join(projDir, "bft"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(projDir, "chess"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "bft", "engine.go"), []byte("package bft\n\ntype Engine struct{ Replica string }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "chess", "engine.go"), []byte(`package chess
+
+type Engine struct{ Protocol string }
+
+func NewEngine() *Engine { return &Engine{} }
+func UseA(e *Engine) string { return e.Protocol }
+func UseB(e *Engine) string { return e.Protocol }
+func UseC(e *Engine) string { return e.Protocol }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, _ := s.handleFragmentEdit(context.Background(), nil, codeParam{
+		Name:        "Engine",
+		OldFragment: "Replica string",
+		NewFragment: "Replica string\n\tTransport string",
+	})
+	text := resultText(t, result)
+	if !strings.Contains(text, "ambiguous") {
+		t.Fatalf("expected an ambiguity refusal, got: %s", text)
+	}
+	if strings.Contains(text, "not found") {
+		t.Fatalf("expected an ambiguity refusal, not a not-found message, got: %s", text)
+	}
+
+	bftSrc, _ := os.ReadFile(filepath.Join(projDir, "bft", "engine.go"))
+	if strings.Contains(string(bftSrc), "Transport") {
+		t.Errorf("bft's Engine should NOT have been touched by a refused ambiguous fragment edit, got:\n%s", bftSrc)
+	}
+	chessSrc, _ := os.ReadFile(filepath.Join(projDir, "chess", "engine.go"))
+	if strings.Contains(string(chessSrc), "Transport") {
+		t.Errorf("chess's Engine should NOT have been touched by a refused ambiguous fragment edit, got:\n%s", chessSrc)
+	}
+}

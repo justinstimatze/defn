@@ -542,6 +542,8 @@ func buildAllHazards() []Hazard {
 		{"const_iota_blank_skip", hazardConstIotaBlankSkip},
 		{"self_referencing_pointer_field", hazardSelfReferencingPointerField},
 		{"blank_struct_fields", hazardBlankStructFields},
+		{"interface_dispatch_cross_package_test_variant", hazardInterfaceDispatchCrossPackageTestVariant},
+		{"field_ref_cross_package_test_variant", hazardFieldRefCrossPackageTestVariant},
 	}
 	return append(hazards, CrossCallHazards...)
 }
@@ -674,4 +676,102 @@ func ToFeet(m Meters) Feet {
 }
 `
 	m.AddFile("pkg/typealias/units.go", src)
+}
+
+// hazardFieldRefCrossPackageTestVariant is hazardInterfaceDispatchCrossPackageTestVariant's
+// field_ref counterpart: collectRefs resolves both a keyed composite
+// literal (Type{Field: val}) and a direct selector (x.Field) via the same
+// DB-backed lookupFieldDefID -- deliberately NOT via objToDef/object
+// identity, for the identical test-variant-identity reason documented on
+// both call sites in resolve.go. config has its own _test.go file; caller
+// exercises both entry points (a keyed composite literal in BuildConfig,
+// a direct selector in UseConfig) against it from a separate, non-test
+// package.
+func hazardFieldRefCrossPackageTestVariant(_ *rand.Rand, m *SyntheticModule) {
+	m.AddFile("pkg/fieldtestvariant/config/config.go", `package config
+
+type Config struct {
+	Name string
+}
+`)
+	m.AddFile("pkg/fieldtestvariant/config/config_test.go", `package config
+
+import "testing"
+
+func TestConfig(t *testing.T) {
+	c := Config{Name: "test"}
+	if c.Name != "test" {
+		t.Fail()
+	}
+}
+`)
+	m.AddFile("pkg/fieldtestvariant/caller/caller.go", `package caller
+
+import "example.com/synth/pkg/fieldtestvariant/config"
+
+func BuildConfig() config.Config {
+	return config.Config{Name: "prod"}
+}
+
+func UseConfig(c config.Config) string {
+	return c.Name
+}
+`)
+}
+
+// hazardInterfaceDispatchCrossPackageTestVariant exercises collectRefs's
+// interface_dispatch fallback (see its doc comment in resolve.go) across
+// the specific boundary that used to break it silently: the
+// interface-owning package (api) has its own _test.go file, so
+// packages.Load(Tests:true)'s FilterPackages prefers a "test variant"
+// *types.Object identity for api's own pass, while the non-test caller
+// package resolves the SAME interface method through a completely
+// different type-checking session's object identity. A naive
+// object-identity-keyed dispatch map misses this every time; the fix
+// (ifaceMethodKey, string-keyed by pkgPath+ifaceName+methodName) is only
+// exercised end-to-end when the interface's own package has _test.go
+// files -- no existing hazard combines cross-package interface dispatch
+// with a _test.go-having interface-owning package.
+func hazardInterfaceDispatchCrossPackageTestVariant(_ *rand.Rand, m *SyntheticModule) {
+	m.AddFile("pkg/ifacetestvariant/api/api.go", `package api
+
+type Doer interface {
+	Do() string
+}
+`)
+	m.AddFile("pkg/ifacetestvariant/api/api_test.go", `package api
+
+import "testing"
+
+type stubDoer struct{}
+
+func (stubDoer) Do() string { return "stub" }
+
+func TestDoer(t *testing.T) {
+	var d Doer = stubDoer{}
+	if d.Do() != "stub" {
+		t.Fail()
+	}
+}
+`)
+	m.AddFile("pkg/ifacetestvariant/worker/worker.go", `package worker
+
+type Worker struct{}
+
+func (Worker) Do() string {
+	return "work"
+}
+`)
+	m.AddFile("pkg/ifacetestvariant/caller/caller.go", `package caller
+
+import (
+	"example.com/synth/pkg/ifacetestvariant/api"
+	"example.com/synth/pkg/ifacetestvariant/worker"
+)
+
+func RunDoer() string {
+	var d api.Doer = worker.Worker{}
+	return d.Do()
+}
+`)
 }
