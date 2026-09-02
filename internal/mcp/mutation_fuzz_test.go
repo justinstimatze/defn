@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"math/rand/v2"
 	"os"
 	"os/exec"
@@ -30,90 +31,102 @@ func TestMutationSequence_Hazards(t *testing.T) {
 	}
 }
 
-// findHazard looks up one fuzzgen.Hazard by name, for tests that need a
-// specific hazard shape deliberately rather than the full AllHazards mix.
-func findHazard(t *testing.T, name string) fuzzgen.Hazard {
-	t.Helper()
-	for _, h := range fuzzgen.AllHazards {
-		if h.Name == name {
-			return h
-		}
-	}
-	t.Fatalf("hazard %q not found in fuzzgen.AllHazards", name)
-	return fuzzgen.Hazard{}
-}
-
-// TestMutationSequence_ScatteredInitRename is a deliberate (non-random)
-// regression for #372: renaming a function called from inside one
-// file's init(), in a package where several OTHER files each declare
-// their own unrelated init(), must update the actual calling file and
-// must not corrupt any of the unrelated init() files.
-// TestMutationSequence_Hazards's random pickMutation could in principle
-// exercise this same shape, but only by chance -- both by rolling
-// "rename" and by picking this exact def out of every live def in the
-// combined-hazards module. This test makes it unconditional, run
-// through the same handleCode dispatch a real agent uses (not
-// resolve.Resolve directly -- internal/resolve/resolve_test.go already
-// covers that layer; this is the integration-level companion).
-func TestMutationSequence_ScatteredInitRename(t *testing.T) {
+// TestMutationSequence_CrossCallHazards is a deliberate (non-random)
+// regression sweep for #372, run through the same handleCode dispatch a
+// real agent uses (not resolve.Resolve directly -- internal/resolve/
+// resolve_test.go already covers that layer; this is the integration-
+// level companion). TestMutationSequence_Hazards's random pickMutation
+// could in principle hit this shape too, but only by chance -- both by
+// rolling "rename" and by picking the right def out of every live def in
+// the combined-hazards module. This test drives every member of
+// fuzzgen.CrossCallHazards (every Go-legal name-collision mechanism x
+// every AST-role boundary the collision's call site can occur at)
+// unconditionally, one at a time.
+func TestMutationSequence_CrossCallHazards(t *testing.T) {
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("go not in PATH")
 	}
 
-	h := findHazard(t, "scattered_init_cross_call")
-	r := rand.New(rand.NewPCG(1, 1))
-	synth := fuzzgen.Generate(r, fuzzgen.GenOpts{Hazards: []fuzzgen.Hazard{h}})
+	for _, h := range fuzzgen.CrossCallHazards {
+		t.Run(h.Name, func(t *testing.T) {
+			r := rand.New(rand.NewPCG(1, 1))
+			synth := fuzzgen.Generate(r, fuzzgen.GenOpts{Hazards: []fuzzgen.Hazard{h}})
 
-	dbDir := t.TempDir()
-	db, err := store.OpenBackend(filepath.Join(dbDir, "test.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+			dbDir := t.TempDir()
+			db, err := store.OpenBackend(filepath.Join(dbDir, "test.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
 
-	projDir := t.TempDir()
-	if err := synth.WriteTo(projDir); err != nil {
-		t.Fatalf("write synthetic module: %v", err)
-	}
-	if err := ingest.Ingest(db, projDir); err != nil {
-		t.Fatalf("ingest: %v", err)
-	}
-	if err := resolve.Resolve(db, projDir); err != nil {
-		t.Fatalf("resolve: %v", err)
-	}
+			projDir := t.TempDir()
+			if err := synth.WriteTo(projDir); err != nil {
+				t.Fatalf("write synthetic module: %v", err)
+			}
+			if err := ingest.Ingest(db, projDir); err != nil {
+				t.Fatalf("ingest: %v", err)
+			}
+			if err := resolve.Resolve(db, projDir); err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
 
-	s := &server{backend: db, projectDir: projDir}
-	s.ready.Store(true)
+			s := &server{backend: db, projectDir: projDir}
+			s.ready.Store(true)
 
-	result, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "rename", OldName: "Target", NewName: "TargetRenamed"})
-	text := resultText(t, result)
-	if result.IsError || strings.Contains(text, "rolled back") || strings.Contains(text, "BUILD FAILED") {
-		t.Fatalf("rename of Target failed or was rolled back:\n%s", text)
-	}
+			result, _, _ := s.handleCode(context.Background(), nil, codeParam{Op: "rename", OldName: "Target", NewName: "TargetRenamed"})
+			text := resultText(t, result)
+			if result.IsError || strings.Contains(text, "rolled back") || strings.Contains(text, "BUILD FAILED") {
+				t.Fatalf("rename of Target failed or was rolled back:\n%s", text)
+			}
 
-	assertBuildStillPasses(t, projDir)
-	assertNoDuplicateDecls(t, db)
+			assertBuildStillPasses(t, projDir)
+			assertNoDuplicateDecls(t, db)
+			assertExactlyOneCallSite(t, projDir, "Target", "TargetRenamed")
+		})
+	}
+}
 
-	callerSrc, err := os.ReadFile(filepath.Join(projDir, "pkg", "initcross", "caller.go"))
-	if err != nil {
-		t.Fatalf("read caller.go: %v", err)
+// assertExactlyOneCallSite is the kind-agnostic #372 oracle: after
+// renaming oldName to newName, exactly one file in the emitted tree may
+// still contain a CALL to it (the file that actually calls it -- proven
+// updated to newName) and zero files may still call oldName (proving the
+// rename didn't miss the real caller, or wrongly leave it attributed to
+// a different same-named declaration). "Call" is distinguished from
+// "declaration" by excluding the "func "+name+"(" substring -- every
+// hazard in fuzzgen.CrossCallHazards defines the target as a bare
+// package-level func, so its own declaration line is the only thing
+// that would otherwise produce a false match.
+func assertExactlyOneCallSite(t *testing.T, projDir, oldName, newName string) {
+	t.Helper()
+	hasCall := func(src, name string) bool {
+		return strings.Contains(src, name+"(") && !strings.Contains(src, "func "+name+"(")
 	}
-	if !strings.Contains(string(callerSrc), "TargetRenamed") {
-		t.Fatalf("caller.go was not updated with the renamed identifier -- possible #372 misattribution regression:\n%s", callerSrc)
-	}
-	if strings.Contains(string(callerSrc), "= Target\n") {
-		t.Fatalf("caller.go still references the old name -- rename incomplete:\n%s", callerSrc)
-	}
-
-	for i := 0; i < 4; i++ {
-		unrelatedPath := filepath.Join(projDir, "pkg", "initcross", fmt.Sprintf("unrelated%d.go", i))
-		src, err := os.ReadFile(unrelatedPath)
+	var oldRefs, newRefs int
+	err := filepath.WalkDir(projDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") {
+			return err
+		}
+		src, err := os.ReadFile(path)
 		if err != nil {
-			continue // this hazard instance had fewer unrelated files; fine
+			return err
 		}
-		if strings.Contains(string(src), "Target") {
-			t.Fatalf("rename leaked into unrelated init() file %s (misattribution regression):\n%s", unrelatedPath, src)
+		if hasCall(string(src), oldName) {
+			oldRefs++
+			t.Logf("stale call to %s still present in %s:\n%s", oldName, path, src)
 		}
+		if hasCall(string(src), newName) {
+			newRefs++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk emitted tree: %v", err)
+	}
+	if oldRefs != 0 {
+		t.Fatalf("rename incomplete: %d file(s) still call %s (see log above)", oldRefs, oldName)
+	}
+	if newRefs != 1 {
+		t.Fatalf("possible #372 misattribution: expected exactly 1 file calling %s, got %d", newName, newRefs)
 	}
 }
 
