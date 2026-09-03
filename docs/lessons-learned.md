@@ -1026,6 +1026,28 @@ measurement reason:**
        — `code(op:"create")` into a file whose body imports an alias
        already used elsewhere in the package emits it twice
        (build-breaking); hit reproducibly twice while building this.
+**Same day, later: found + partially fixed a second, unrelated bug.**
+A sibling agent ("winze") reported over MCP Dispatch that editing one
+var in a grouped `var (...)` block in a different project came back
+as a 291-line diff — reordered every var alphabetically, deleted
+section comments. Reproduced against a minimal scratch package:
+confirmed two independent root causes. (1) `declOrderInSource`
+(`internal/emit/emit.go`) keyed every spec in a grouped block by the
+same enclosing-`GenDecl` offset instead of each spec's own position,
+so `writeFile`'s regenerate-path sort had nothing to disambiguate on
+and fell through to the DB's alphabetical fetch order — **fixed**,
+each spec now keys by its own `s.Pos()`; regression test
+`TestDeclOrderInSourceOrdersVarBlockMembersBySpecPosition`. (2) ingest
+never captures a var/const block's inter-spec section comments into
+any def's `Body` at all — invisible while the byte-splice AST-merge
+path succeeds (untouched bytes pass through raw), but the instant ANY
+def in the file forces the regenerate fallback, the whole block's
+comments are gone, not just the one that triggered it — **not yet
+fixed**, needs an ingest-side change; filed as
+`bug-report-2026-09-02-edit-var-block-reorder-drops-section-comments.md`
+with a narrower alternative (isolate one bad def's regenerate fallback
+instead of regenerating the whole file) worth considering too.
+
 **Reranked 2026-09-02, after items 1-2 landed** — the remaining items
 were originally numbered in write-order, not dependency/risk order.
 Two things earned a move up: (a) items 5 and 6 both spend real money on

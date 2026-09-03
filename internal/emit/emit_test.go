@@ -2630,3 +2630,36 @@ func TestEmitInvalidDefinitionSourceFileDoesNotBlockUnrelatedEmit(t *testing.T) 
 		t.Fatalf("escaped.go should NOT have been written outside outDir")
 	}
 }
+
+// TestDeclOrderInSourceOrdersVarBlockMembersBySpecPosition is the fix
+// for the bootstrap.go var-block bug reported by winze over dispatch:
+// editing one var in a grouped var(...) block, where the edit itself
+// (or an unrelated def in the same file) forces the writeFile
+// regenerate fallback, reordered every OTHER var in the block
+// alphabetically. Root cause: declOrderInSource keyed every spec in a
+// grouped GenDecl by the same enclosing-decl offset, so
+// sort.SliceStable's tie-break in writeFile's regenerate path fell
+// through to defs' incoming order -- alphabetical, matching how the
+// DB fetches them -- instead of preserving on-disk source order.
+// Each spec must get its OWN, distinct, monotonically-increasing
+// offset for the sort to have anything to key on.
+func TestDeclOrderInSourceOrdersVarBlockMembersBySpecPosition(t *testing.T) {
+	src := []byte(`package p
+
+var (
+	zebra = "1"
+	apple = "2"
+	mike  = 3
+	beet  = 4
+)
+`)
+	order := declOrderInSource(src)
+	for _, name := range []string{"zebra", "apple", "mike", "beet"} {
+		if _, ok := order[name]; !ok {
+			t.Fatalf("missing order entry for %q: %v", name, order)
+		}
+	}
+	if !(order["zebra"] < order["apple"] && order["apple"] < order["mike"] && order["mike"] < order["beet"]) {
+		t.Fatalf("var block member offsets not in source order (all collapsed to the same GenDecl offset?): %v", order)
+	}
+}

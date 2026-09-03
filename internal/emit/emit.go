@@ -1765,6 +1765,16 @@ func packageDeclStart(src []byte) int {
 // regenerate path can sort DB defs into the on-disk order. Returns
 // an empty map when src doesn't parse — treat absence as "no order
 // info available, leave as-is".
+//
+// Each spec's offset comes from the spec's OWN position (s.Pos()),
+// not the enclosing GenDecl's -- a grouped var(...)/const(...) block
+// otherwise maps every member to the same decl-start offset, so
+// sort.SliceStable's tie (equal iPos/jPos) falls back to whatever
+// order the DB query handed in, which is alphabetical by name. That
+// silently re-sorts a var block's members alphabetically the moment
+// the regenerate path runs (e.g. one unrelated def in the same file
+// fails to splice cleanly) -- see the bootstrap.go var-block
+// reorder-and-drop-section-comments bug report.
 func declOrderInSource(src []byte) map[string]int {
 	order := make(map[string]int)
 	fset := token.NewFileSet()
@@ -1773,23 +1783,23 @@ func declOrderInSource(src []byte) map[string]int {
 		return order
 	}
 	for _, decl := range f.Decls {
-		pos := fset.Position(decl.Pos()).Offset
 		switch d := decl.(type) {
 		case *ast.FuncDecl:
 			recv := ""
 			if d.Recv != nil && len(d.Recv.List) > 0 {
 				recv = recvTypeName(d.Recv.List[0].Type)
 			}
-			order[FuncIdentity(d.Name.Name, recv)] = pos
+			order[FuncIdentity(d.Name.Name, recv)] = fset.Position(d.Pos()).Offset
 		case *ast.GenDecl:
 			for _, spec := range d.Specs {
 				switch s := spec.(type) {
 				case *ast.TypeSpec:
-					order[s.Name.Name] = pos
+					order[s.Name.Name] = fset.Position(s.Pos()).Offset
 				case *ast.ValueSpec:
+					specPos := fset.Position(s.Pos()).Offset
 					for _, n := range s.Names {
 						if n.Name != "_" {
-							order[n.Name] = pos
+							order[n.Name] = specPos
 						}
 					}
 				}
