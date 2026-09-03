@@ -17186,3 +17186,65 @@ func TestHandleInsertHeader_RefusesEscapingProjectRoot(t *testing.T) {
 		t.Errorf("the file outside the project root must not have been modified, got:\n%s", content)
 	}
 }
+
+// TestHandleCreate_SingleDeclLeadingImportBlockNotDuplicatedInEmittedFile
+// guards #369 (bug-report-2026-09-02-create-duplicates-shared-import-
+// alias.md): a single-decl op:"create" body naturally opening with its
+// own import (...) block (the model's default instinct when authoring
+// what it thinks of as "a new file" -- same instinct the #357 leading
+// package-clause fix already handles) landed verbatim in the stored
+// def's Body, unlike the multi-decl path's sliceDecls, which already
+// discards import blocks for exactly this reason. At emit time this
+// literal text got written a SECOND time in addition to the canonical
+// per-module import block, producing "X redeclared in this block"
+// whenever the alias was already used elsewhere in the package.
+// Confirmed live against internal/mcp's own sdkmcp alias (already used
+// in server.go) before this fix landed.
+func TestHandleCreate_SingleDeclLeadingImportBlockNotDuplicatedInEmittedFile(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	if _, err := db.EnsureModule("testproj", "main", ""); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	body := `import (
+	"testing"
+
+	stubby "testproj/stub"
+)
+
+func UseStubby(t *testing.T) string {
+	return stubby.Marker
+}`
+
+	result, _, err := s.handleCreate(context.Background(), nil, createParam{
+		Body: body,
+		File: "usestubby.go",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "rolled back") {
+		t.Fatalf("create rolled back unexpectedly: %s", text)
+	}
+
+	stored, gerr := db.GetDefinitionByNameAndReceiver("UseStubby", "testproj", "")
+	if gerr != nil {
+		t.Fatalf("GetDefinitionByNameAndReceiver: %v", gerr)
+	}
+	if strings.Contains(stored.Body, "import (") {
+		t.Fatalf("stored def body still contains a leading import block -- not stripped:\n%s", stored.Body)
+	}
+
+	final, rerr := os.ReadFile(filepath.Join(projDir, "usestubby.go"))
+	if rerr != nil {
+		t.Fatalf("read usestubby.go: %v", rerr)
+	}
+	src := string(final)
+	if n := strings.Count(src, `stubby "testproj/stub"`); n != 1 {
+		t.Fatalf("expected exactly 1 occurrence of the aliased import, got %d:\n%s", n, src)
+	}
+}

@@ -78,11 +78,16 @@ DEFAULT_CORPUS_DIR = HERE
 # ~/.cache survives stop/start since it's on the persistent root volume.
 WORKDIR_ROOT = os.path.expanduser("~/.cache/defn-h2h-go")
 DISK_FREE_MIN_GB = 5.0
-# Cached fresh .defn/ per (instance_id, defn_binary_hash). Contamination
-# fix (6abe8e1) forces a fresh ingest per arm — ~30-90s of pure CPU per
-# arm. Snapshot after first ingest, restore on subsequent runs; hit path
-# is ~2s (tarball extract) vs full re-parse. Invalidates on defn binary
-# change so DB schema drift doesn't corrupt cached DBs.
+# Cached fresh .defn/ per (instance_id, defn_binary_hash, defn_source_tree_hash).
+# Contamination fix (6abe8e1) forces a fresh ingest per arm — ~30-90s of
+# pure CPU per arm. Snapshot after first ingest, restore on subsequent
+# runs; hit path is ~2s (tarball extract) vs full re-parse. Invalidates
+# on defn binary change so DB schema drift doesn't corrupt cached DBs;
+# the source-tree-hash component (see _defn_source_tree_hash) is a
+# second, independent invalidation signal added 2026-09-02 for the
+# grpc-go-2629 rename finding (a stale `which defn` PATH resolution
+# could otherwise make two different defn source states hash to the
+# same cached binary and silently reuse a stale snapshot).
 DEFN_CACHE_ROOT = os.path.expanduser("~/.cache/defn-h2h-go-cache")
 
 
@@ -98,8 +103,45 @@ def _defn_binary_hash():
         return "unknown"
 
 
-def _defn_cache_path(inst_id, binhash):
-    return os.path.join(DEFN_CACHE_ROOT, f"{inst_id}__{binhash}.tar")
+def _defn_source_tree_hash():
+    """sha256[:12] of the defn repo's own git state (HEAD commit + a hash
+    of any uncommitted diff against it) -- an independent, defense-in-
+    depth cache-key component alongside _defn_binary_hash().
+
+    Fixes the open theory from the grpc-go-2629 rename finding: this
+    script lives inside the defn repo itself (HERE/../.. is the repo
+    root), but _defn_binary_hash() only hashes whatever binary `which
+    defn` resolves to on PATH. If PATH resolves to a stale or
+    differently-built `defn` install (e.g. an old `go install`'d copy
+    shadowing a fresh `go build -o defn ./cmd/defn` from THIS checkout --
+    an easy shape to hit while iterating on a fix), two genuinely
+    different defn source states can silently hash to the same cached
+    binary and reuse a stale .defn snapshot with zero signal. Combining
+    the repo's actual git tree state into the cache key invalidates
+    correctly even when the binary-hash path is fooled by a stale PATH
+    resolution -- it can only ever cause MORE cache misses than the
+    binary hash alone, never fewer, so it's a strictly safer key.
+    """
+    repo_root = os.path.normpath(os.path.join(HERE, "..", ".."))
+    try:
+        head = subprocess.check_output(
+            ["git", "-C", repo_root, "rev-parse", "HEAD"], text=True
+        ).strip()
+        diff = subprocess.check_output(
+            ["git", "-C", repo_root, "diff", "HEAD", "--binary"]
+        )
+        import hashlib
+
+        h = hashlib.sha256()
+        h.update(head.encode())
+        h.update(diff)
+        return h.hexdigest()[:12]
+    except subprocess.CalledProcessError:
+        return "unknown"
+
+
+def _defn_cache_path(inst_id, binhash, srchash):
+    return os.path.join(DEFN_CACHE_ROOT, f"{inst_id}__{binhash}__{srchash}.tar")
 
 
 def _defn_version_string():
@@ -442,7 +484,8 @@ def setup_workspace(task, arm="defn", corpus_dir=DEFAULT_CORPUS_DIR):
         return workdir
 
     binhash = _defn_binary_hash()
-    cache_path = _defn_cache_path(inst, binhash)
+    srchash = _defn_source_tree_hash()
+    cache_path = _defn_cache_path(inst, binhash, srchash)
     os.makedirs(DEFN_CACHE_ROOT, exist_ok=True)
 
     if os.path.exists(cache_path):

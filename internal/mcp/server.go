@@ -4231,7 +4231,27 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// d.Body, and mergeDeclsIntoSource's real "package <mod.Name>"
 	// header plus this leftover one produced two package clauses in the
 	// same file -- "expected declaration, found 'package'" at emit time.
+	//
+	// #369: ALSO strip a leading `import (...)` block the same way
+	// sliceDecls's own multi-decl path already does. Without this, a
+	// single-decl body that (like the multi-decl case) naturally opens
+	// with its own import block landed verbatim in d.Body too, and at
+	// emit time got written TWICE: once from the canonical per-module
+	// import union (relevantImportsForFile), and again as literal text
+	// baked into this def's own stored body -- "X redeclared in this
+	// block" whenever the SAME alias is already used elsewhere in the
+	// package. Confirmed live: sdkmcp already aliased in server.go,
+	// re-declared verbatim by a new single-decl create's own leading
+	// import block -- see bug-report-2026-09-02-create-duplicates-
+	// shared-import-alias.md. sliceDecls(args.Body) reparses the same
+	// body countTopLevelDecls/inferFromBody already parsed successfully
+	// above, so it should always succeed here too; fall back to the
+	// package-only strip if it somehow doesn't, rather than erroring out
+	// on an otherwise-valid create.
 	body := stripLeadingPackageDecl(args.Body)
+	if decls, sderr := sliceDecls(args.Body); sderr == nil && len(decls) == 1 {
+		body = decls[0].Body
+	}
 	exported := len(name) > 0 && name[0] >= 'A' && name[0] <= 'Z'
 	d := &store.Definition{
 		ModuleID:   mod.ID,
@@ -4275,6 +4295,26 @@ func (s *server) handleCreate(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	if buildResult == "" {
 		s.enqueueSummary(d)
 		s.autoResolveFile(args.File, mod.Path)
+		// #369: an explicitly-aliased import in the ORIGINAL body (now
+		// stripped out of d.Body above) can never be reconstructed by
+		// goimports from usage alone -- see extractAliasedImports' doc
+		// comment. patchImportOnDisk is idempotent (a no-op when the
+		// import is already present via the canonical per-module union),
+		// so this is safe to run unconditionally rather than gated on a
+		// build-failure signal this path doesn't have -- commitOrRollbackOnEmit
+		// only runs a parse-level check here, not a real build, and a
+		// missing or duplicated import is a type-check-level error neither
+		// that check nor the old body-bake-in behavior it replaces ever
+		// actually caught.
+		if args.File != "" {
+			if aliased := extractAliasedImports(args.Body); len(aliased) > 0 {
+				for _, ai := range aliased {
+					if _, perr := s.patchImportOnDisk(mod.ID, args.File, ai.path, ai.alias); perr != nil {
+						fmt.Fprintf(os.Stderr, "defn: re-add aliased import %s (%q) to %s failed: %v\n", ai.alias, ai.path, args.File, perr)
+					}
+				}
+			}
+		}
 	}
 
 	var sb strings.Builder

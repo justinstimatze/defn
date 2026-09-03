@@ -180,15 +180,24 @@ item 2) is cheap and confirmed, so it jumps ahead of the two $0
 analysis items too — closing it now is cheaper than risking it
 silently corrupting something item 3's own tooling touches.
 
-3. **Harness: fix the snapshot-cache-collision risk** (open question,
-   formerly §6). Make `agent_driver.py`'s `.defn` snapshot cache key
-   include the git tree hash, not just a `-dirty`-colliding binary hash
-   (theory from the grpc-go-2629 rename finding, never confirmed root
-   cause). Do this before any further EC2 spend (items 7, 8 below).
-4. **Fix `bug-report-2026-09-02-create-duplicates-shared-import-alias.md`**
-   — `code(op:"create")` duplicates an already-shared import alias at
-   emit time (build-breaking). Confirmed reproducible twice; root cause
-   not yet traced into `internal/emit`'s import-merging pass.
+3. **DONE 2026-09-02, same day, later session.** Harness snapshot-cache-
+   collision risk: `agent_driver.py`'s `.defn` cache key now includes
+   `_defn_source_tree_hash()` (defn repo's own HEAD + uncommitted-diff
+   hash) alongside `_defn_binary_hash()` — an independent invalidation
+   signal for the grpc-go-2629 rename theory (a stale `which defn` PATH
+   resolution could otherwise make two different defn source states
+   hash to the same cached binary). Additive-only to the cache key, so
+   it can only cause more cache misses, never fewer.
+4. **DONE 2026-09-02, same day, later session.** Fixed
+   `bug-report-2026-09-02-create-duplicates-shared-import-alias.md` —
+   root cause was NOT `internal/emit`'s import-merging pass; it was
+   `handleCreate`'s single-decl path never stripping a leading
+   `import (...)` block (unlike the multi-decl path's `sliceDecls`).
+   Fixed by reusing `sliceDecls` for the strip and making the existing
+   `#367` aliased-import-patch mechanism run unconditionally (idempotent).
+   Confirmed via live repro against internal/mcp's own `sdkmcp` alias.
+   Regression test:
+   `TestHandleCreate_SingleDeclLeadingImportBlockNotDuplicatedInEmittedFile`.
 5. **Payload diet from existing data** (~2 h, $0). Bytes-by-op histogram
    across all `arm_defn` trajectories on disk (prom-opus, etcd-v2,
    head-to-head-go, small-slice). For every op whose median result

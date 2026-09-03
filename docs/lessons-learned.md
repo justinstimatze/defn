@@ -1065,17 +1065,38 @@ anything, it just feeds the same bug-hunt queue item 9 came out of).
 Item 8 is pure polish on an already-shipped feature with no downstream
 dependency — lowest priority, do whenever.
 
-3. [ ] Harness: make `agent_driver.py`'s `.defn` snapshot cache key
-       include the git tree hash, not just a `-dirty`-colliding binary
-       hash (open theory from the grpc-go-2629 rename finding). Do this
-       before any further EC2 spend (items 5, 6) — an unresolved cache
-       collision makes any EC2 result from this point on unverifiable.
-4. [ ] Investigate and fix
+3. [x] **Done 2026-09-02, same day, later session.** Harness:
+       `agent_driver.py`'s `.defn` snapshot cache key now includes
+       `_defn_source_tree_hash()` (the defn repo's own HEAD + hash of
+       any uncommitted diff) alongside the existing `_defn_binary_hash()`
+       — a second, independent invalidation signal for the open theory
+       from the grpc-go-2629 rename finding (a stale `which defn` PATH
+       resolution could make two different defn source states hash to
+       the same cached binary). Verified: hash is deterministic/repeatable
+       for the same tree state and changes when the tree is dirtied.
+       Strictly additive to the cache key — can only cause more misses,
+       never fewer, so no risk to existing correct cache hits.
+4. [x] **Done 2026-09-02, same day, later session.** Fixed
        `bug-report-2026-09-02-create-duplicates-shared-import-alias.md`
-       (`code(op:"create")` duplicates an already-shared import alias
-       at emit time) — root cause is somewhere in `internal/emit`'s
-       import-merging pass, not yet traced. Cheap, confirmed,
-       reproducible; close it before it bites another `create` call.
+       — root cause was NOT `internal/emit`'s import-merging pass, it
+       was `handleCreate`'s single-decl path never stripping a leading
+       `import (...)` block from the body (unlike the multi-decl path's
+       `sliceDecls`, which already discards them). Reused `sliceDecls`
+       for the strip, and made the existing `#367` aliased-import-patch
+       mechanism run unconditionally (idempotent) since this path's
+       build check is parse-only and never had a reliable failure
+       signal to gate on. Confirmed via live repro against internal/mcp's
+       own `sdkmcp` alias (reproduced the exact `redeclared` error
+       pre-fix, clean single occurrence post-fix). Regression test:
+       `TestHandleCreate_SingleDeclLeadingImportBlockNotDuplicatedInEmittedFile`.
+       Along the way, found and worked around a separate operational
+       issue: a build-breaking file left by the live repro made
+       `internal/mcp`'s defs briefly invisible to `overview`/`read-file`
+       queries (package failed to `go/packages.Load`) until a scoped
+       `code(op:"sync", file:"internal/mcp/server.go")` — not a data-loss
+       bug (source files were untouched, confirmed via `git status`),
+       but worth knowing: a broken package can make defn's OWN read
+       ops blind to it until synced.
 5. [ ] Bytes-by-op histogram across every `arm_defn/*.json` on disk;
        budget or opt-in any op whose median exceeds ~470 B (files-mode
        baseline). Audit `read` Related footer, provenance tags, starter
