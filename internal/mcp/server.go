@@ -6989,6 +6989,28 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 		}
 	}
 	target := s.testScopeTarget(hint)
+	runPattern := pattern
+	if looksLikePackagePath(pattern) {
+		// Model passed a `go test`-style package path/target (e.g.
+		// "./rest/...") into this parameter, which everywhere else here
+		// treats it as a -run name/regex. Using it as a regex is
+		// nonsensical (it falls through every branch above with
+		// hint=="" ) and used to fall back to the unscoped "./..."
+		// default for BOTH the go test target and the pre-test emit
+		// below -- a fully unscoped emit.Emit() call rewrites every file
+		// in the whole project. Confirmed live: a real
+		// go-zero-refactor-header-vars-move bench trajectory passed
+		// test:"./rest/..." and got a whole-repo emit that silently
+		// stripped the executable bit off 10 unrelated ANTLR-generated
+		// files and reformatted an unrelated doc comment, nowhere near
+		// ./rest. Use the path as the actual test target directly, with
+		// an empty -run (matches every test) instead of as a regex --
+		// this also makes the scopeDirs computation below key off the
+		// real target instead of "./...", keeping the pre-test emit
+		// properly scoped.
+		target = pattern
+		runPattern = ""
+	}
 
 	// Ensure files reflect any pending DB edits so the test sees them.
 	// Every write op already emits its own touched file(s) immediately
@@ -7095,7 +7117,7 @@ func (s *server) handleTestByName(_ context.Context, _ *sdkmcp.CallToolRequest, 
 	timeout := testTimeoutFor(0, target)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "test", "-run", pattern, "-count=1", "-v", target)
+	cmd := exec.CommandContext(ctx, "go", "test", "-run", runPattern, "-count=1", "-v", target)
 	cmd.Dir = s.projectDir
 	out, err := cmd.CombinedOutput()
 
@@ -13551,4 +13573,16 @@ func matchingLineSnippet(body, query string) string {
 		}
 	}
 	return ""
+}
+
+// looksLikePackagePath reports whether pattern is shaped like a `go test`
+// package target (e.g. "./rest/...", "./...", ".") rather than a -run
+// name/regex. -run patterns can contain "/" too (t.Run subtest paths like
+// "TestFoo/subtest"), so this only matches the unambiguous package-path
+// shapes: a leading "./" or "/", the bare ".", or a trailing "/...".
+func looksLikePackagePath(pattern string) bool {
+	return pattern == "." ||
+		strings.HasPrefix(pattern, "./") ||
+		strings.HasPrefix(pattern, "/") ||
+		strings.HasSuffix(pattern, "/...")
 }

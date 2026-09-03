@@ -17248,3 +17248,74 @@ func UseStubby(t *testing.T) string {
 		t.Fatalf("expected exactly 1 occurrence of the aliased import, got %d:\n%s", n, src)
 	}
 }
+
+// TestHandleTestByName_PackagePathPatternDoesNotRewriteUnrelatedFiles is a
+// regression for a real go-zero-refactor-header-vars-move bench
+// trajectory (2026-09-02): a model passed a `go test`-style package path
+// ("./sub/...") into the `test:` parameter, which handleTestByName
+// otherwise treats purely as a -run name/regex. That shape never
+// resolves via topLevelTestName, so hint/target both fell back to the
+// unscoped "./..." default -- which also drove the pre-test emit down
+// the fully-unscoped emit.Emit() path, rewriting every file in the
+// whole project. Confirmed live: this silently stripped the executable
+// bit off unrelated generated files and reformatted an unrelated doc
+// comment, nowhere near the package actually being tested. This
+// fixture's "other" package has non-canonical import grouping
+// (deliberately, to detect any full-project goimports pass) --
+// targeting "./sub/..." must leave it untouched, byte for byte.
+func TestHandleTestByName_PackagePathPatternDoesNotRewriteUnrelatedFiles(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "testproj")
+	os.MkdirAll(filepath.Join(projDir, "sub"), 0755)
+	os.MkdirAll(filepath.Join(projDir, "other"), 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n\nfunc RootFunc() string { return \"root\" }\n\nfunc main() {}\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "sub", "sub.go"), []byte("package sub\n\nfunc SubFunc() string { return \"sub\" }\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "sub", "sub_test.go"), []byte("package sub\n\nimport \"testing\"\n\nfunc TestSubFunc(t *testing.T) {\n\tif SubFunc() == \"\" {\n\t\tt.Fatal(\"sub-package-marker\")\n\t}\n}\n"), 0644)
+	// Non-canonical import grouping -- any full-project goimports pass
+	// would rewrite this file's import block.
+	otherSrc := "package other\n\nimport (\n\t\"strings\"\n\t\"fmt\"\n)\n\nfunc OtherFunc() string { return fmt.Sprintf(\"%s\", strings.ToUpper(\"x\")) }\n"
+	otherPath := filepath.Join(projDir, "other", "other.go")
+	os.WriteFile(otherPath, []byte(otherSrc), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	before, err := os.ReadFile(otherPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, _, err := s.handleTestByName(context.Background(), nil, "./sub/...", "", "")
+	if err != nil {
+		t.Fatalf("handleTestByName: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "across ./sub/...:") {
+		t.Errorf("expected the package-path pattern to be used as the test target verbatim, got:\n%s", text)
+	}
+	if !strings.Contains(text, "ALL TESTS PASSED") {
+		t.Errorf("expected TestSubFunc to run and pass, got:\n%s", text)
+	}
+
+	after, err := os.ReadFile(otherPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Errorf("handleTestByName with a package-path pattern rewrote an unrelated file it never needed to touch:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
