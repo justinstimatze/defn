@@ -355,6 +355,35 @@ move to the new numbers.
     re-litigated: apply-batching/nudges/hard-gating, per §3's own
     "not worth more investment" verdict — confirmed still true, no new
     evidence found to reopen it.
+7c. **DONE 2026-09-03, same day.** Literature scan for external levers
+    (user request: "look online for current avant garde ideas") came up
+    mostly inapplicable to defn's actual constraints: Agent-Omit
+    (arXiv:2602.04284) needs RL-training a custom model, not usable
+    against a hosted Claude model; dynamic tool gating (arXiv:2604.21816)
+    needs mid-session tool re-negotiation Claude Code's session model
+    doesn't support; LOOP Skill Engine (arXiv:2605.14237) needs task
+    *repetition*, which this one-off 10-task corpus doesn't have. Also
+    checked and ruled out splitting the single 47-op `code` tool into
+    several smaller tools: since every registered tool's full schema
+    rides on every call regardless of which is invoked, splitting would
+    duplicate the ~12 fields shared across most ops N times instead of
+    once — the current consolidated-tool design is schema-cost-optimal,
+    not naive.
+    One idea *was* defn-native and shipped: `coupledChangeHint` (fired
+    on a rolled-back signature-changing edit) only ever named up to 3
+    callers, forcing a separate `read()` of each just to see its current
+    call shape before writing a coupled fix — the literal mechanism
+    behind cli-refactor-getcomment-signature's 8-hit churn. Added
+    `findCallSitesInBody` (lightweight body-text AST scan, same
+    established tradeoff as `extractSignature`/`prioritizeByBodyReference`
+    — no type resolution, name-only match) so the hint now shows the
+    actual call-site text inline per caller, cap raised 3→8 (matching
+    `handleDelete`'s existing cap). New regression test
+    `TestCoupledChangeHint_IncludesCallSiteText`; existing coupled-hint
+    tests + 200+ affected tests across several partial full-suite runs
+    show zero failures. Not yet re-measured on a live bench rerun of
+    the affected task — that would be the natural next step if this is
+    worth confirming quantitatively.
 8. **On hold, 2026-09-02 — user call**: "probably no 8 that seems way
    too expensive still. can't possibly be worth it." ≥3 repeats/task/arm
    on the 15 prom tasks + the 10 refactor tasks, Opus, EC2 (~$300) — not

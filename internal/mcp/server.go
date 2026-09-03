@@ -11460,11 +11460,25 @@ func (s *server) coupledChangeHint(defIDs ...int64) string {
 				testNames = append(testNames, c.Name)
 				continue
 			}
-			if seen[c.Name] || len(names) >= 3 {
+			// #369 (refactor-corpus pilot, cli-refactor-getcomment-signature):
+			// a bare caller NAME still forced a separate read() of that
+			// caller just to see its current call shape before writing a
+			// coupled fix -- exactly the extra round-trip this hint exists
+			// to avoid. Show the actual call-site text (best-effort,
+			// name-only match -- see findCallSitesInBody) inline instead.
+			// Cap raised 3->8 (matching handleDelete's existing caller-list
+			// cap) since the whole point is showing enough callers up
+			// front to avoid discovering the rest one build-failure at a
+			// time.
+			if seen[c.Name] || len(names) >= 8 {
 				continue
 			}
 			seen[c.Name] = true
-			names = append(names, c.Name)
+			entry := c.Name
+			if sites := findCallSitesInBody(c.Body, impact.Definition.Name, 1); len(sites) > 0 {
+				entry = fmt.Sprintf("%s (%s)", c.Name, sites[0])
+			}
+			names = append(names, entry)
 		}
 	}
 	if len(names) == 0 && len(testNames) == 0 {
@@ -13585,4 +13599,58 @@ func looksLikePackagePath(pattern string) bool {
 		strings.HasPrefix(pattern, "./") ||
 		strings.HasPrefix(pattern, "/") ||
 		strings.HasSuffix(pattern, "/...")
+}
+
+// findCallSitesInBody does a best-effort, name-only scan (no type
+// resolution -- same tradeoff extractSignature and
+// prioritizeByBodyReference already accept for isolated body text) of
+// callerBody for call expressions invoking targetName, either bare
+// (targetName(...)) or selector-qualified ((x.)targetName(...)) for a
+// method call. Returns the exact source text of each matching call
+// expression, in source order, capped at maxSites.
+//
+// #369 (refactor-corpus pilot, cli-refactor-getcomment-signature):
+// coupledChangeHint previously only named a caller, forcing the model
+// to separately read() the caller just to see its current argument
+// shape before writing a coupled fix -- exactly the extra round-trip
+// this hint exists to avoid. Since a bare identifier match can
+// false-positive on an unrelated same-named receiver (prioritizeByBody
+// Reference's own doc comment documents this same risk for common
+// short names), callers of this function should treat the result as a
+// starting point to verify, not a guaranteed-correct location.
+func findCallSitesInBody(callerBody string, targetName string, maxSites int) []string {
+	src := "package x\n" + callerBody
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, 0)
+	if err != nil {
+		return nil
+	}
+	var sites []string
+	ast.Inspect(f, func(n ast.Node) bool {
+		if maxSites > 0 && len(sites) >= maxSites {
+			return false
+		}
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		matched := false
+		switch fn := call.Fun.(type) {
+		case *ast.Ident:
+			matched = fn.Name == targetName
+		case *ast.SelectorExpr:
+			matched = fn.Sel.Name == targetName
+		}
+		if !matched {
+			return true
+		}
+		start := fset.Position(call.Pos()).Offset
+		end := fset.Position(call.End()).Offset
+		if start < 0 || end > len(src) || start >= end {
+			return true
+		}
+		sites = append(sites, strings.TrimSpace(src[start:end]))
+		return true
+	})
+	return sites
 }

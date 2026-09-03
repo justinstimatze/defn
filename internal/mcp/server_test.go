@@ -17319,3 +17319,53 @@ func TestHandleTestByName_PackagePathPatternDoesNotRewriteUnrelatedFiles(t *test
 		t.Errorf("handleTestByName with a package-path pattern rewrote an unrelated file it never needed to touch:\nbefore:\n%s\nafter:\n%s", before, after)
 	}
 }
+
+// TestCoupledChangeHint_IncludesCallSiteText is #369: a bare caller
+// NAME in the hint still forced a separate read() of that caller just
+// to see its current argument shape before writing a coupled fix --
+// exactly the extra round-trip this hint exists to avoid (confirmed
+// live in the cli-refactor-getcomment-signature refactor-corpus pilot
+// trajectory, 2026-09-03). The hint must now show the actual call-site
+// text (via findCallSitesInBody) inline for each named caller.
+func TestCoupledChangeHint_IncludesCallSiteText(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "coupledproj2")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module coupledproj2\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package coupledproj2
+
+func Fetch(url string) string { return url }
+
+func Use() string {
+	result := Fetch("http://example.com")
+	return result
+}
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db}
+	d, err := db.GetDefinitionByName("Fetch", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hint := s.coupledChangeHint(d.ID)
+
+	if !strings.Contains(hint, "Use") {
+		t.Fatalf("expected caller Use named, got: %q", hint)
+	}
+	if !strings.Contains(hint, `Fetch("http://example.com")`) {
+		t.Errorf("expected the actual call-site text inline in the hint, got: %q", hint)
+	}
+}
