@@ -228,23 +228,56 @@ move to the new numbers.
    bench trajectories span 2026-07-22 to 2026-08-24 and real fixes have
    landed throughout, so a flagged event may be an already-fixed bug,
    not a live one — check `git log -S` on the trigger and look for a
-   newer rerun before trusting a hit. **Remaining queue, not yet
-   root-caused (next up)**: (a) `grpc__grpc-go-3476`'s `replace-hunk:
-   hunk not found in body`, 5× across 3 targets, 2 unresolved, up to 9
-   calls each, dated 2026-07-22, no rerun to cross-check — highest-
-   confidence still-open lead; (b) `zeromicro__go-zero-1907`'s
-   `sync`-triggered "redeclared"/"undefined:" (20+8 calls) — same
-   duplicate-declaration family as `7d66258` but via `sync`, unclear if
-   already covered; (c) the model hallucinating a nonexistent op
-   `"ingest"` across 4 go-zero tasks (13-20 calls each) — a naming-
+   newer rerun before trusting a hit.
+   **(a)+(b) followed up, same session**: `grpc-go-3476`'s full
+   transcript shows `code(op:"sync")` hitting "dialoptions.go:34:2:
+   backoff redeclared in this block" for grpc-go's ROOT package — same
+   "X redeclared in this block" signature, same date (2026-07-22), as
+   `go-zero-1907`'s. `dialoptions.go` sits in the package nearly every
+   other grpc-go package imports, so once it holds a duplicate decl (the
+   pre-`source_file` collision `7d66258` fixed), any whole-module
+   `go/packages.Load` inherits a poisoned graph — which explains the
+   rest of that trajectory too: the 5× `replace-hunk: hunk not found`
+   hits were the model dry-run-probing for `cmp`/`len(a)` text that a
+   fresh grpc-go clone confirms was never actually in those functions
+   (model guessing wrong, not a matcher bug), and a `dry_run:true` edit
+   call — which `handleEdit` returns from immediately, no build/emit —
+   hanging 1801s until the client aborted is best explained by
+   dependency resolution getting stuck on that same poisoned graph.
+   High confidence, not directly confirmed (no post-fix rerun exists for
+   either task, unlike prometheus above).
+   **(c) still open**: model hallucinates a nonexistent op `"ingest"`
+   across 4 go-zero tasks (13-20 calls each, all recovered) — a naming-
    confusion issue, not a code bug, possibly already helped by today's
-   item 2 lean-tool-description + `opHelp`.
-6. **Payload diet from existing data** (~2 h, $0). Bytes-by-op histogram
-   across all `arm_defn` trajectories on disk (prom-opus, etcd-v2,
-   head-to-head-go, small-slice). For every op whose median result
-   exceeds files-mode's ~470 B: make the enrichment opt-in or budgeted.
-   Specifically audit: `read`'s Related footer, provenance tags, starter
-   bundle size, ranked `search` JSON verbosity, `outline` caller lists.
+   item 2 lean-tool-description + `opHelp`; lowest severity of the
+   three (self-recovering), leave for whenever a fresh corpus exists.
+6. **DONE 2026-09-02, same day, later session.** Built
+   `bench/payload_histogram.py`: bytes-by-op histogram (reusing
+   `tail_event_detector.py`'s call/result pairing) plus a mandatory
+   token cross-check per `bench/tokens.py`'s own rule. Filters
+   `unknown op "..."` noise and the Dolt-era `REMOVED_OPS` before
+   computing stats. 1928 real calls / 29 ops; 8 exceed the 470 B median
+   baseline by bytes, but 4 of those (`context`, `expand`, `pragmas`,
+   `file-defs`) are low-volume, explicit consolidation/listing ops —
+   big by design, not bloat. The real question is `test` (n=235),
+   `impact` (n=22), `overview` (n=118), `read` (n=477, ~25% of all
+   calls). **Token cross-check flips the read on `read`**: 833 B median
+   but only 90 token median — the exact byte-vs-token trap
+   `bench/tokens.py` warns about (Go's indentation is byte-heavy,
+   token-cheap) — its "over baseline" byte flag is mostly a false
+   alarm. **Directed measurement**: `read`'s Related footer is 17.4% of
+   bytes / 19.7% of tokens (median, n=281), ~56-59 tokens/call; whether
+   it earns that back by avoiding a follow-up `impact`/`outline` call
+   is unmeasured (same adoption-tracking gap as the starter bundle's
+   open question). **Real, current (not stale) tail**: `impact`'s max
+   (45,410 B / 12,663 tokens) is from `etcd-multifile-v2` (2026-08-20,
+   post the Aug-10 200-item cap fix) — a genuinely high-blast-radius
+   type hitting the cap, not an uncapped runaway; whether 200 items is
+   the right budget is a design question, not a bug. Did NOT gate item
+   7 on this — nothing here rose to "confirmed bug, fix before EC2
+   spend" the way item 4 did; the three leads found (footer adoption,
+   impact's per-item budget, overview's tail) need a fresh corpus or a
+   product call, not a quick fix.
    Gates item 7 — fix free bloat before paying for a pilot to measure it.
 7. **Refactor-shaped corpus** (§4) — build the 10 tasks, gold = the
    actual upstream commit's diff. Run both arms once as a pilot on EC2

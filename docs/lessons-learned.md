@@ -1138,31 +1138,88 @@ their gate references shift to the new numbers.
        describe an already-fixed bug, not a live one — always check
        `git log -S` on the trigger snippet and look for a newer rerun
        of the same instance_id before trusting a hit.
-       **Remaining bug-hunt queue (post-filter, not yet individually
-       root-caused this session — next up)**:
-       (a) `grpc__grpc-go-3476`: `replace-hunk: hunk not found in body`
-       recurs 5× across 3 different targets (builderEqual, matcherEqual,
-       BuilderMapEqual), 2 unresolved, up to 9 calls burned each; dated
-       2026-07-22, no known fix on file, no rerun available to
-       cross-check — highest-confidence still-open lead.
-       (b) `zeromicro__go-zero-1907`: `code(op:"sync")` triggers
-       "X redeclared in this block" / "undefined: internal.X" (20 + 8
-       calls burned) — same duplicate-declaration family as `7d66258`,
-       but via `sync` rather than `test`; also dated 2026-07-22
-       (predates the fix), no rerun available — unclear if the same
-       fix already covers it or if this is a distinct path into the
-       same symptom.
-       (c) Model hallucinates a nonexistent op `"ingest"` across 4
-       separate go-zero tasks (13-20 calls burned each, all recovered)
-       — not a code bug, a naming-confusion issue (CLAUDE.md's CLI
-       `defn ingest` verb likely primes this guess for the MCP tool);
-       possibly already mitigated by today's item 2 lean-tool-description
-       + `opHelp`, untested against fresh data.
-6. [ ] Bytes-by-op histogram across every `arm_defn/*.json` on disk;
-       budget or opt-in any op whose median exceeds ~470 B (files-mode
-       baseline). Audit `read` Related footer, provenance tags, starter
-       bundle, ranked-search JSON, outline caller lists. Gates item 7
-       (below) — fix free bloat before paying for a pilot to measure it.
+       **(a)+(b) followed up 2026-09-02, same day, still later**:
+       `grpc__grpc-go-3476`'s full transcript (not just the flagged
+       lines) shows `code(op:"sync", module:"...rls/internal/keys")`
+       returning "ingest: package errors: ... dialoptions.go:34:2:
+       backoff redeclared in this block" for the ROOT
+       `google.golang.org/grpc` package -- the exact same "X redeclared
+       in this block" signature, on the exact same date (2026-07-22), as
+       `zeromicro/go-zero-1907`'s. `dialoptions.go` sits in grpc-go's
+       root package, imported by nearly every other package in the
+       module, so once it holds a duplicate declaration (the pre-`source_file`
+       dedup collision `7d66258` fixed), `go/packages.Load` for ANY
+       scope touching the module inherits a poisoned whole-module graph.
+       That fully explains the REST of this trajectory's chaos too: the
+       5× `replace-hunk: hunk not found` hits (re-checked against a
+       fresh grpc-go clone -- `builderEqual`/`matcherEqual`/
+       `BuilderMapEqual` don't use `cmp` or contain `len(a)` anywhere in
+       their real bodies, so the model's own dry-run probe guesses were
+       simply wrong, not a defn matcher bug) and, most strikingly, a
+       `code(op:"edit", ..., dry_run:true)` call that hung 1801s until
+       the MCP client aborted it -- `handleEdit`'s own dry-run branch
+       returns immediately after a cheap parse+lookup with no build/emit
+       in the way, so the only place that stall could come from is
+       `resolveWriteTarget`/dependency resolution getting stuck
+       traversing the same poisoned whole-module graph. High confidence,
+       not directly confirmed (no post-fix rerun exists for either task,
+       unlike prometheus-19184/17395 above) — same root cause
+       (`7d66258`), same date, same "X redeclared in this block" string.
+       **(c) still open, not investigated further**: model hallucinates
+       a nonexistent op `"ingest"` across 4 separate go-zero tasks
+       (13-20 calls burned each, all recovered) — not a code bug, a
+       naming-confusion issue (CLAUDE.md's CLI `defn ingest` verb likely
+       primes this guess for the MCP tool); possibly already mitigated
+       by today's item 2 lean-tool-description + `opHelp`, untested
+       against fresh data. Lowest severity of the three (self-recovering,
+       never corrupts anything) — leave for whenever a fresh corpus
+       exists to check against.
+6. [x] **Done 2026-09-02, same day, later session.** Built
+       `bench/payload_histogram.py`: bytes-by-op histogram across every
+       `arm_defn*/*.json` on disk (reuses `tail_event_detector.py`'s
+       `paired_events`), plus a mandatory token cross-check per
+       `bench/tokens.py`'s own rule (bytes alone can mislead). Filters
+       out two kinds of noise before computing stats: `unknown op "..."`
+       results (the model guessing a nonexistent op — not a real op's
+       payload) and the Dolt-era `REMOVED_OPS` set (dead since v0.27).
+       1928 real defn calls across 29 distinct ops, 8 exceed the 470 B
+       median baseline by bytes: `context`, `expand`, `pragmas`,
+       `file-defs` (all low-volume, explicit consolidation/listing ops —
+       big-by-design, not bloat), plus `test` (n=235), `impact` (n=22),
+       `overview` (n=118), `read` (n=477, by far the highest-volume op
+       in the corpus at ~25% of all calls).
+       **The token cross-check changes the read of `read` specifically**:
+       833 B median but only 90 TOKEN median — a live example of exactly
+       the byte-vs-token trap `bench/tokens.py` warns about (Go's
+       whitespace-heavy indentation is byte-heavy but token-cheap), so
+       `read`'s "over baseline" byte flag is largely a false alarm.
+       **Directed measurement of the one sub-question that's cheap to
+       answer precisely**: `read`'s "Related" footer (CLAUDE.md's
+       always-appended summary+callers+callees+neighbors block) is
+       17.4% of a read result's bytes and 19.7% of its tokens (median,
+       n=281 measurable), ~56-59 tokens/call. Whether that's worth its
+       keep depends on how often it actually substitutes for a
+       follow-up `impact`/`outline` call — unmeasured here, same
+       adoption-tracking gap as the starter bundle's open question
+       (lessons-learned's "v8-v10 bench findings" section) — flagging
+       it rather than guessing.
+       **Real remaining tail concern, not stale data**: `impact`'s
+       max (45,410 B / 12,663 tokens) is from `etcd-multifile-v2`
+       (2026-08-20, POST the Aug-10 `impactJSON` 200-item cap fix) — a
+       genuinely high-blast-radius type (`RangeOptions`) hitting the cap
+       at 200 callers, not an uncapped runaway. The cap works as
+       designed; whether 200 items (and the per-item format) is the
+       right budget for a "high blast radius" def is a real, separate
+       design question, not a bug — left open, not fixed this session.
+       `overview`'s tail (max 33,930 B / 10,425 tokens, n=118) looks
+       similar in shape (large packages, "showing N of M" listings) but
+       wasn't traced to a specific def the way impact's was.
+       Did NOT gate item 7 on this the way originally planned — nothing
+       found here rose to "confirmed bug, fix before spending EC2
+       money" the way item 4's create-duplicate-import bug did; the
+       three real leads (footer adoption, impact's per-item budget,
+       overview's tail) are measurement/design questions that need a
+       fresh corpus or a product call, not a quick fix.
 7. [ ] Refactor-shaped corpus (10 tasks, gold = upstream commit diff);
        Sonnet pilot on EC2 (~$10) to validate before any powered run.
        Only run this after item 6 lands.
