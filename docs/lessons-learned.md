@@ -1097,21 +1097,82 @@ dependency — lowest priority, do whenever.
        bug (source files were untouched, confirmed via `git status`),
        but worth knowing: a broken package can make defn's OWN read
        ops blind to it until synced.
-5. [ ] Bytes-by-op histogram across every `arm_defn/*.json` on disk;
+**Reranked again 2026-09-02, same day, after items 3-4 also landed** —
+with both $0 analysis items done, the only two left before any EC2
+spend are the histogram and the tail-event detector, and item 3/4's own
+pattern (a mechanical bug-hunt item — old item 9 — jumped ahead of two
+untouched $0 analysis items because it was cheap, confirmed, and risked
+compounding) applies again one level down: the tail-event detector
+*is* the automated version of the same bug-hunt that produced item 4's
+fix, so running it before the histogram gives it one more cycle to
+surface another cheap, confirmable fix before the histogram's findings
+and the EC2-funded items below lock in. Swapped former 5/6 → new 5/6;
+no other reordering — 7, 8, 9 keep the same relative position, only
+their gate references shift to the new numbers.
+
+5. [x] **Done 2026-09-02, same day, later session.** Built
+       `bench/tail_event_detector.py`: flags any defn error/no-op
+       followed by ≥5 calls before the next successful write op, ranked
+       by calls burned. Reuses `mine_trajectory.py`'s `FRICTION_PATTERNS`
+       (imported, not copied) so the two scripts never drift on what
+       counts as friction. Run against all 62 trajectories on disk: 48
+       flagged events (24 after excluding the stale pre-fix
+       `bench/prometheus-repo/arm_defn` corpus — see caveat below).
+       **Key finding, not the one expected**: the #1 hit (38, then
+       25/24/22/19/9/6 calls burned across two prometheus tasks) was
+       "Config named msk/lightsail is already registered" — a test
+       binary panic. Traced it (cloned prometheus fresh, confirmed a
+       clean `go test -run TestMSKDiscoveryRefresh ./discovery/aws/...`
+       passes with zero defn involvement, so it's not a repo-inherent
+       flake) and it turned out to be **already fixed**: commit
+       `7d66258` (2026-08-10) added `source_file` to `definitions`'
+       UNIQUE constraint for exactly this symptom ("Config named X is
+       already registered" is the literal phrase in that commit's own
+       message). The flagged trajectory predates the fix by one day
+       (2026-08-09). Cross-checked: the same 2 task IDs re-run as part
+       of the newer `prometheus-repo-opus` corpus (2026-08-20,
+       post-fix) show **zero** flagged events. **Calibration lesson for
+       the detector itself, now written into its own docstring**: bench
+       trajectories on disk span 2026-07-22 to 2026-08-24, real fixes
+       have landed throughout that window, so a flagged event may
+       describe an already-fixed bug, not a live one — always check
+       `git log -S` on the trigger snippet and look for a newer rerun
+       of the same instance_id before trusting a hit.
+       **Remaining bug-hunt queue (post-filter, not yet individually
+       root-caused this session — next up)**:
+       (a) `grpc__grpc-go-3476`: `replace-hunk: hunk not found in body`
+       recurs 5× across 3 different targets (builderEqual, matcherEqual,
+       BuilderMapEqual), 2 unresolved, up to 9 calls burned each; dated
+       2026-07-22, no known fix on file, no rerun available to
+       cross-check — highest-confidence still-open lead.
+       (b) `zeromicro__go-zero-1907`: `code(op:"sync")` triggers
+       "X redeclared in this block" / "undefined: internal.X" (20 + 8
+       calls burned) — same duplicate-declaration family as `7d66258`,
+       but via `sync` rather than `test`; also dated 2026-07-22
+       (predates the fix), no rerun available — unclear if the same
+       fix already covers it or if this is a distinct path into the
+       same symptom.
+       (c) Model hallucinates a nonexistent op `"ingest"` across 4
+       separate go-zero tasks (13-20 calls burned each, all recovered)
+       — not a code bug, a naming-confusion issue (CLAUDE.md's CLI
+       `defn ingest` verb likely primes this guess for the MCP tool);
+       possibly already mitigated by today's item 2 lean-tool-description
+       + `opHelp`, untested against fresh data.
+6. [ ] Bytes-by-op histogram across every `arm_defn/*.json` on disk;
        budget or opt-in any op whose median exceeds ~470 B (files-mode
        baseline). Audit `read` Related footer, provenance tags, starter
        bundle, ranked-search JSON, outline caller lists. Gates item 7
-       (below) same as before.
-6. [ ] Tail-event detector script: flag any defn error/no-op followed by
-       ≥5 calls before the next successful write; rank by calls burned.
-       This becomes the bug-hunt queue (the same kind of queue item 4
-       came out of, just automated instead of found by hand).
+       (below) — fix free bloat before paying for a pilot to measure it.
 7. [ ] Refactor-shaped corpus (10 tasks, gold = upstream commit diff);
        Sonnet pilot on EC2 (~$10) to validate before any powered run.
-       Only run this after item 5 lands.
-8. [ ] ONE powered A/B after 5+7 land (and item 3 is fixed): ≥3
-       repeats/task/arm, prom-15 + refactor-10, Opus, EC2 (~$300). Not
-       before — this is the one run that has to count.
+       Only run this after item 6 lands.
+8. [ ] **On hold, 2026-09-02 — user call.** ≥3 repeats/task/arm, prom-15
+       + refactor-10, Opus, EC2 (~$300): "probably no 8 that seems way
+       too expensive still. can't possibly be worth it." Not deleted —
+       if 6+7 later surface a strong enough directional signal cheaply
+       (e.g. a smaller single-repeat EC2 check), revisit whether a full
+       powered run is justified then; don't spend $300 to confirm
+       something items 5/6's free fixes may have already mostly closed.
 9. [ ] Auto-append `opHelp[op]` to the FIRST error result for that op
        per session (item 2's cut scope) — needs a per-session
        "already shown" set threaded through `handleCode`'s existing

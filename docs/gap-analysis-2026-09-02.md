@@ -198,25 +198,65 @@ silently corrupting something item 3's own tooling touches.
    Confirmed via live repro against internal/mcp's own `sdkmcp` alias.
    Regression test:
    `TestHandleCreate_SingleDeclLeadingImportBlockNotDuplicatedInEmittedFile`.
-5. **Payload diet from existing data** (~2 h, $0). Bytes-by-op histogram
+**Reranked again 2026-09-02, same day, after items 3-4 also landed**:
+swapped 5/6 below. With both $0 analysis items still untouched, the
+same logic that jumped item 4 (a cheap, confirmed, mechanical bug fix)
+ahead of the two analysis items applies one level down — the tail-event
+detector is the automated version of the exact bug-hunt that produced
+item 4, so running it first gives it one more cycle to surface another
+cheap fix before the histogram's findings and the EC2 spend below lock
+in. 7, 8, 9 keep their relative position; only their gate references
+move to the new numbers.
+
+5. **DONE 2026-09-02, same day, later session.** Built
+   `bench/tail_event_detector.py`: flags any defn error/no-op result
+   followed by ≥5 calls before the next successful write, ranked by
+   calls burned — the bug-hunt queue, automated, reusing
+   `mine_trajectory.py`'s `FRICTION_PATTERNS` (imported, not copied).
+   Run against all 62 trajectories on disk: 48 flagged events (24 after
+   excluding the stale pre-fix `bench/prometheus-repo/arm_defn` corpus).
+   **Key finding**: the #1 hit (up to 38 calls burned) was "Config named
+   msk/lightsail is already registered" — a test binary panic. Traced
+   it (fresh prometheus clone, confirmed `go test -run
+   TestMSKDiscoveryRefresh ./discovery/aws/...` passes cleanly with no
+   defn involvement) and found it's **already fixed**: commit `7d66258`
+   (2026-08-10) added `source_file` to `definitions`' UNIQUE constraint
+   for this exact symptom. The flagged trajectory predates the fix by a
+   day; the same 2 task IDs re-run in the newer `prometheus-repo-opus`
+   corpus (2026-08-20, post-fix) show zero flagged events — confirms the
+   fix holds. **Calibration lesson, now in the script's own docstring**:
+   bench trajectories span 2026-07-22 to 2026-08-24 and real fixes have
+   landed throughout, so a flagged event may be an already-fixed bug,
+   not a live one — check `git log -S` on the trigger and look for a
+   newer rerun before trusting a hit. **Remaining queue, not yet
+   root-caused (next up)**: (a) `grpc__grpc-go-3476`'s `replace-hunk:
+   hunk not found in body`, 5× across 3 targets, 2 unresolved, up to 9
+   calls each, dated 2026-07-22, no rerun to cross-check — highest-
+   confidence still-open lead; (b) `zeromicro__go-zero-1907`'s
+   `sync`-triggered "redeclared"/"undefined:" (20+8 calls) — same
+   duplicate-declaration family as `7d66258` but via `sync`, unclear if
+   already covered; (c) the model hallucinating a nonexistent op
+   `"ingest"` across 4 go-zero tasks (13-20 calls each) — a naming-
+   confusion issue, not a code bug, possibly already helped by today's
+   item 2 lean-tool-description + `opHelp`.
+6. **Payload diet from existing data** (~2 h, $0). Bytes-by-op histogram
    across all `arm_defn` trajectories on disk (prom-opus, etcd-v2,
    head-to-head-go, small-slice). For every op whose median result
    exceeds files-mode's ~470 B: make the enrichment opt-in or budgeted.
    Specifically audit: `read`'s Related footer, provenance tags, starter
    bundle size, ranked `search` JSON verbosity, `outline` caller lists.
-6. **Tail-event detector, mechanical** (~1 h). Script over trajectories:
-   flag any defn error/no-op result followed by ≥5 calls before the next
-   successful write. Rank by calls burned. That is the bug-hunt queue —
-   replaces reading trajectories by hand (the same kind of queue item 4
-   above came out of, just automated).
+   Gates item 7 — fix free bloat before paying for a pilot to measure it.
 7. **Refactor-shaped corpus** (§4) — build the 10 tasks, gold = the
    actual upstream commit's diff. Run both arms once as a pilot on EC2
    (Sonnet, ~$10) purely to check the corpus is sane before any powered
-   run. Only run after item 5 lands.
-8. **One powered A/B, once, after 3+5+7 land**: ≥3 repeats/task/arm on
-   the 15 prom tasks + the 10 refactor tasks, Opus, EC2 (~$300). This is
-   the only run that can move the "parity is the floor" verdict. No more
-   single-run reruns — they have failed to replicate twice.
+   run. Only run after item 6 lands.
+8. **On hold, 2026-09-02 — user call**: "probably no 8 that seems way
+   too expensive still. can't possibly be worth it." ≥3 repeats/task/arm
+   on the 15 prom tasks + the 10 refactor tasks, Opus, EC2 (~$300) — not
+   deleted, just not scheduled. If items 5/6/7 turn up a strong enough
+   directional signal cheaply, revisit whether a full powered run is
+   still worth it then, rather than spending $300 up front to confirm
+   something the free fixes may have already mostly closed.
 9. **Auto-append `opHelp[op]` to the first error per op** (item 2's cut
    scope) — polish on an already-shipped feature, no downstream
    dependency. Lowest priority, do whenever there's spare time.
