@@ -1220,9 +1220,46 @@ their gate references shift to the new numbers.
        three real leads (footer adoption, impact's per-item budget,
        overview's tail) are measurement/design questions that need a
        fresh corpus or a product call, not a quick fix.
-7. [ ] Refactor-shaped corpus (10 tasks, gold = upstream commit diff);
-       Sonnet pilot on EC2 (~$10) to validate before any powered run.
-       Only run this after item 6 lands.
+7. [x] DONE 2026-09-02/03. Built `bench/refactor-corpus/` (10 tasks,
+       gold = real upstream commit diff, spanning prometheus/etcd/
+       go-zero/cli/grpc-go) and ran the Sonnet pilot on EC2 (both arms,
+       $8.93 defn / $4.97 files, 44min/21min wall). First-pass scoring
+       looked bad for defn (mean F1 0.78 vs files' 0.86, defn never
+       strictly winning a single task) — but root-causing every
+       over/under-touch instead of accepting the raw numbers found:
+       (a) TWO real defn bugs, both fixed and bench-confirmed same
+       session: `safeWriteGoFile` hardcoded file mode to 0644 on every
+       write, stripping the executable bit off unrelated files it
+       re-touched (`internal/emit/emit.go`, commit `emit: preserve
+       existing file mode...`); `handleTestByName` fell back to a fully
+       unscoped `emit.Emit()` whenever `test:` got a go-test package
+       path like "./rest/..." instead of a -run name/regex (never
+       resolves via topLevelTestName → hint/target both default to
+       "./..."), rewriting every file in the whole project — root
+       cause of 10 phantom ANTLR-parser-file touches + a reformatted
+       doc comment in the go-zero move task (`internal/mcp/server.go`,
+       `looksLikePackagePath`, commit `mcp: treat a go-test
+       package-path pattern...`). Rerunning that exact task against the
+       fixed binary: precision 0.41→0.90, matching files-mode exactly,
+       recall unchanged (0.64, a real model-behavior gap in both arms,
+       not a defn bug). (b) The single worst-scoring task (prometheus
+       min/max→least/greatest rename, defn recall 0.18) is a HARNESS
+       CONFOUND, not a defn weak spot: the gold diff requires
+       regenerating `generated_parser.y.go` via `goyacc`, a shell step;
+       `agent_driver.py`'s `FILES_ALLOWED_TOOLS` includes Bash, the
+       defn arm's `DISALLOWED_TOOLS` blocks it entirely (by design, to
+       keep the defn-arm measurement free of off-tool wire). Confirmed
+       directly from the files-arm trajectory: it ran `go install
+       golang.org/x/tools/cmd/goyacc@latest` then invoked `goyacc`.
+       The defn arm has literally no path to do this, regardless of
+       tool quality. Excluding that task, defn's mean F1 across the
+       other 9 (0.86) is within noise of files-mode's (0.87) —
+       correctness parity on THIS pilot, once measurement artifacts are
+       stripped out. Cost/wall-clock gap (defn ~80% more $, ~2x slower)
+       is UNCHANGED by these fixes and remains open — a separate
+       investigation, not addressed this round. See
+       `bench/refactor-corpus/README.md`'s "Known risk deliberately
+       kept in" section for the full writeup.
 8. [ ] **On hold, 2026-09-02 — user call.** ≥3 repeats/task/arm, prom-15
        + refactor-10, Opus, EC2 (~$300): "probably no 8 that seems way
        too expensive still. can't possibly be worth it." Not deleted —

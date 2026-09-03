@@ -35,7 +35,7 @@ precision/recall — same scoring mechanism as every other corpus here.
   `recode` (return `*HistogramAppender` directly, 1 file/2 callers —
   smallest example in the set).
 
-## Known risk deliberately kept in
+## Known risk deliberately kept in -- and a confound found running it
 
 The prometheus rename task touches
 `promql/parser/generated_parser.y.go` — the exact generated-parser file
@@ -43,8 +43,27 @@ that caused a "cannot safety-check ... generated content doesn't parse"
 emit failure in a real prom-19184 trajectory (see
 `docs/lessons-learned.md`'s tail-event-detector write-up). Left in
 rather than swapped for an easier example: it's a genuine, realistic
-case of defn's actual weak spot, and the pilot's whole point is to find
-out whether the corpus (and defn) can handle it, not to dodge it.
+case defn needs to handle, and the pilot's whole point is to find out
+whether the corpus (and defn) can handle it, not to dodge it.
+
+**Correction (2026-09-03, first pilot run):** this task's poor defn-arm
+score (file-level recall 0.18 vs files-mode's 0.64) is NOT a signal
+about `code` tool quality -- it's a harness confound. The gold diff
+requires regenerating `generated_parser.y.go` from `generated_parser.y`
+via `goyacc`, a shell step. `agent_driver.py`'s `FILES_ALLOWED_TOOLS`
+includes `Bash`; the defn arm's `DISALLOWED_TOOLS` blocks it entirely
+(by design, to keep the defn-arm measurement free of off-tool wire --
+see that file's own comment, `n=10` 2026-07-20 measurement). Confirmed
+directly from the files-arm trajectory: it ran `go install
+golang.org/x/tools/cmd/goyacc@latest` then `goyacc -l -o
+generated_parser.y.go generated_parser.y`. The defn arm has no path to
+do this regardless of tool quality -- Bash is unavailable to it,
+full stop. Excluding this task, defn's mean file-level F1 across the
+other 9 tasks (0.86) is within noise of files-mode's (0.87) on the
+first pilot run. Treat this task's score as N/A for defn-vs-files
+correctness comparison until the harness gives the defn arm SOME way to
+invoke a project's own codegen step -- scoring it as a defn loss
+otherwise measures Bash-availability, not the tool.
 
 ## Running
 

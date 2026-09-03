@@ -279,10 +279,27 @@ move to the new numbers.
    impact's per-item budget, overview's tail) need a fresh corpus or a
    product call, not a quick fix.
    Gates item 7 — fix free bloat before paying for a pilot to measure it.
-7. **Refactor-shaped corpus** (§4) — build the 10 tasks, gold = the
-   actual upstream commit's diff. Run both arms once as a pilot on EC2
-   (Sonnet, ~$10) purely to check the corpus is sane before any powered
-   run. Only run after item 6 lands.
+7. **DONE 2026-09-02/03.** Built the 10-task refactor corpus and ran
+   the Sonnet pilot on both arms. Raw numbers looked bad for defn (mean
+   F1 0.78 vs files' 0.86) but root-causing every gap instead of taking
+   the numbers at face value found: two real, now-fixed-and-confirmed
+   defn bugs (`safeWriteGoFile` stripping file mode to 0644 on every
+   write; `handleTestByName` falling back to a fully unscoped
+   `emit.Emit()` on a go-test package-path pattern like "./rest/..." in
+   `test:`) that together explained a 14-phantom-file blowup on the
+   go-zero move task — rerun against the fixed binary confirmed
+   precision 0.41→0.90, matching files-mode exactly. And the single
+   worst task (prometheus min/max rename, defn recall 0.18) turned out
+   to be a harness confound, not a defn weak spot: its gold diff
+   requires `goyacc` regeneration, a shell step files-mode's arm can
+   run (`Bash` is in `FILES_ALLOWED_TOOLS`) and the defn arm structurally
+   cannot (`Bash` is in defn's own `DISALLOWED_TOOLS`, by design).
+   Excluding that task, defn's mean F1 across the other 9 (0.86) is
+   within noise of files-mode's (0.87) — correctness parity, once
+   measurement artifacts are stripped out. The cost/wall-clock gap
+   (defn ~80% more $, ~2x slower) is separate and UNCHANGED by these
+   fixes — still open. Full writeup: `bench/refactor-corpus/README.md`
+   and `docs/lessons-learned.md`'s item 7.
 8. **On hold, 2026-09-02 — user call**: "probably no 8 that seems way
    too expensive still. can't possibly be worth it." ≥3 repeats/task/arm
    on the 15 prom tasks + the 10 refactor tasks, Opus, EC2 (~$300) — not
