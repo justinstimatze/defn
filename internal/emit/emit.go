@@ -1159,7 +1159,17 @@ func safeWriteGoFile(path string, content []byte, allowedRemovals []string) (wro
 	if len(lost) > 0 {
 		return false, lost, nil
 	}
-	return true, nil, atomicWriteFile(path, content, 0644)
+	// Preserve the existing file's mode instead of hardcoding 0644 --
+	// confirmed live via the refactor-corpus bench (2026-09-02): re-emitting
+	// an unrelated file in the same package silently stripped the
+	// executable bit off several ANTLR-generated .go files in go-zero,
+	// inflating the diff with mode-only "changes" that have nothing to do
+	// with what the caller actually asked to edit.
+	perm := os.FileMode(0644)
+	if fi, statErr := os.Stat(path); statErr == nil {
+		perm = fi.Mode().Perm()
+	}
+	return true, nil, atomicWriteFile(path, content, perm)
 }
 
 // topLevelDeclNames returns the qualified names of every top-level

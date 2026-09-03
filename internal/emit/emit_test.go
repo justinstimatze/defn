@@ -2663,3 +2663,37 @@ var (
 		t.Fatalf("var block member offsets not in source order (all collapsed to the same GenDecl offset?): %v", order)
 	}
 }
+
+// TestSafeWriteGoFile_PreservesExistingFileMode is a direct repro for a
+// real refactor-corpus bench finding (2026-09-02): re-emitting a file
+// whose declarations didn't need to change (a sibling in the same
+// package as an actually-edited file) silently stripped the executable
+// bit off several ANTLR-generated .go files in a go-zero bench task --
+// atomicWriteFile was always called with a hardcoded 0644, discarding
+// whatever mode the file had on disk before the rewrite.
+func TestSafeWriteGoFile_PreservesExistingFileMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gen.go")
+
+	orig := []byte("package gen\n\nfunc F() int { return 0 }\n")
+	if err := os.WriteFile(path, orig, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	updated := []byte("package gen\n\nfunc F() int { return 1 }\n")
+	wrote, lost, err := safeWriteGoFile(path, updated, nil)
+	if err != nil {
+		t.Fatalf("safeWriteGoFile error: %v", err)
+	}
+	if !wrote || len(lost) > 0 {
+		t.Fatalf("expected a clean write, got wrote=%v lost=%v", wrote, lost)
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0755 {
+		t.Fatalf("safeWriteGoFile reset file mode to %v, want preserved 0755", got)
+	}
+}
