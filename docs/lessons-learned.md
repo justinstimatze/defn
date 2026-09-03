@@ -1008,8 +1008,12 @@ measurement reason:**
        `resummarize` — and correctly dropping the 5 dead Dolt-era ops
        the old description still advertised) served via
        `op:"help", topic:"<op>"`. Gated behind
-       `stripped("verbose-tool-desc")` (existing `DEFN_STRIP` plumbing)
-       — default unchanged until item 6's A/B confirms it end to end.
+       `stripped("lean-tool-desc")` (existing `DEFN_STRIP` plumbing) —
+       initially left default-off pending item 6's A/B; **flipped to
+       default 2026-09-03** (gap-analysis item 7b) once the
+       refactor-corpus pilot validated it as a real, zero-functional-
+       downside win on a second corpus. `DEFN_STRIP=lean-tool-desc`
+       reverts to the old legacy description if ever needed.
        Measured (in-process probe, not estimated): total wire JSON
        14,037 B → 6,121 B (56.4% smaller); description 8,950 B → 1,144 B
        (87.2% smaller); ~3,171 → ~1,454 tokens/call. Projected saving

@@ -139,7 +139,11 @@ var readShapedOps = map[string]bool{
 // single-variable A/B, or conflating several response-enrichment
 // features shipped this session when trying to explain a bench delta.
 // Known names: starter-bundle (#203), related-footer (#202),
-// circuit-breaker (#209), dedup (#77/#209). Deliberately NOT cached --
+// circuit-breaker (#209), dedup (#77/#209), lean-tool-desc (gap-analysis
+// 2026-09-02 item 7b -- note the inverted sense: lean-tool-desc has
+// been the DEFAULT since 2026-09-03, so stripping it reverts to the old
+// legacyToolDescription, the opposite of every other name here
+// stripping an on-by-default feature away). Deliberately NOT cached --
 // os.Getenv is cheap and a memoized read would be wrong the moment a
 // test (or a future runtime-reconfig path) changes the env mid-process.
 func stripped(feature string) bool {

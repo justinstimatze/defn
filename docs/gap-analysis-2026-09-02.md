@@ -144,9 +144,17 @@ win there either, the thesis is wrong, not the bench.
    served on demand via the new `op:"help", topic:"<op>"`.
    `toolDescription()` picks between them via `stripped("verbose-tool-desc")`
    — same `DEFN_STRIP` plumbing as every other feature flag in this
-   codebase — **default unchanged** (legacy) until the powered A/B
-   (item 6) confirms the lean path end to end;
-   `DEFN_STRIP=verbose-tool-desc` opts in early.
+   codebase — default was initially left unchanged (legacy) pending
+   the powered A/B (item 6). **Flipped to default 2026-09-03 (item
+   7b)**: two independent real-corpus validations (this doc's item 1
+   and item 7b) plus zero functional downside (142 dependent tests
+   pass, same ops/behavior, long-form guidance still available via
+   `op:"help"`) made holding it behind a flag indefinitely just
+   deadweight — the "powered A/B" gate was reserved for genuine
+   behavior-risk changes, and this isn't one. `DEFN_STRIP=lean-tool-desc`
+   now reverts to the old `legacyToolDescription` if a live session
+   ever shows the model needs the inline long-form guidance more than
+   the wire-cost savings.
    Measured via an in-process `tools/list` probe (not estimated):
    **legacy total 14,037 B / lean total 6,121 B — 56.4% smaller wire
    payload; description alone 8,950 B → 1,144 B, 87.2% smaller.**
@@ -300,6 +308,53 @@ move to the new numbers.
    (defn ~80% more $, ~2x slower) is separate and UNCHANGED by these
    fixes — still open. Full writeup: `bench/refactor-corpus/README.md`
    and `docs/lessons-learned.md`'s item 7.
+7b. **DONE 2026-09-03, same corpus, cost decomposition.** Pooled the
+    real per-task token/cost data across all 9 non-confounded
+    refactor-corpus tasks (defn vs files, both arms' raw
+    `.claude-stream.jsonl` pulled from EC2 — `total_cost_usd`,
+    `num_turns`, and `usage.cache_creation_input_tokens` per task, not
+    estimated). Total cost ratio 1.62× decomposes cleanly into two
+    multiplicative factors: **call-count ratio 1.51×** (313 vs 207
+    tool calls pooled) and **per-call weight ratio 1.26×** (1,403 vs
+    1,116 fresh/cache-creation tokens per call, pooled). Two
+    matched-call-count task pairs isolate the weight factor from the
+    confound cleanly: `loopywriter-extract` (7 calls both arms, defn
+    1.64× heavier/call) and `recode-signature` (defn 9 calls vs files'
+    10 — defn made *fewer* calls, still 2.39× heavier/call). This
+    confirms and refines §3's Lead B with a controlled method (matched
+    call counts) the original byte-histogram approach couldn't use.
+    **Tested and ruled out**: hypothesized that a repeat
+    `read(full:true)` of an already-served def was paying the ~500B
+    Related-footer cost (#202) again for nothing, and patched
+    `handleGetDefinition` to suppress it using the existing
+    `bodyServed`/`hasBodyServed` tracking (#176). A regression test
+    proved this dead code before it shipped: `handleCode`'s own
+    existing shortcut *already* short-circuits an unchanged repeat
+    `read` (full or not) to a one-line "already read in this session"
+    stub, well before reaching the footer logic — the exact waste this
+    fix targeted is already eliminated by a coarser, pre-existing
+    mechanism. Reverted the patch and the test; no functional change
+    landed from this thread, which is the correct outcome, not a
+    failure — a real test caught a redundant fix before it merged.
+    **Validated (not just projected) the item-1/2 schema-tax fix's
+    payoff on this specific corpus**: using the corpus's real per-task
+    defn call counts (2–83) against item 1's measured legacy/lean
+    token-equivalents (3,171 vs 1,454) at Sonnet's cache-read rate
+    ($0.30/M — this corpus is Sonnet, not Opus like prom-opus),
+    flipping the lean description on projects to **$0.161 saved of
+    $6.169 total defn-arm cost ≈ 2.6%**. Free, zero-risk, already
+    built and tested (item 2) — so flipped it to the default right
+    here rather than leave a validated free win gated behind a flag
+    (see item 2's updated note) — but confirms the schema tax is a
+    much smaller slice
+    of the gap on Sonnet/refactor-shaped tasks than on Opus/prom-opus
+    (47% projected there): call-count (1.51×) and per-call weight
+    (1.26×) are the two real remaining levers here, and per-call
+    weight's *fixable* (waste) component looks smaller than assumed —
+    the #176 dedup machinery already catches the cheap win. Not
+    re-litigated: apply-batching/nudges/hard-gating, per §3's own
+    "not worth more investment" verdict — confirmed still true, no new
+    evidence found to reopen it.
 8. **On hold, 2026-09-02 — user call**: "probably no 8 that seems way
    too expensive still. can't possibly be worth it." ≥3 repeats/task/arm
    on the 15 prom tasks + the 10 refactor tasks, Opus, EC2 (~$300) — not

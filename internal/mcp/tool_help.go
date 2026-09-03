@@ -9,12 +9,16 @@ import (
 )
 
 // toolDescription picks the "code" tool's wire description. Default is
-// legacyToolDescription (unchanged behavior) until the powered A/B (gap
-// analysis 2026-09-02, docs/gap-analysis-2026-09-02.md work-order item
-// 6) confirms leanToolDescription end to end -- DEFN_STRIP=verbose-tool-desc
-// opts a session into the lean version early for that A/B, same
-// mechanism as every other DEFN_STRIP feature flag (see stripped's doc
-// comment). Read once at server startup (like the other env-gated
+// leanToolDescription as of 2026-09-03: validated on two independent
+// real corpora (docs/gap-analysis-2026-09-02.md work-order items 1/2/7b)
+// with zero functional downside -- same ops, same behavior, all 142
+// dependent tests pass, long-form per-op guidance still fully available
+// via op:"help" -- so there is no reason to keep a strictly-smaller,
+// mechanically-equivalent description gated behind an opt-in flag.
+// DEFN_STRIP=lean-tool-desc reverts to legacyToolDescription (e.g. to
+// re-run the original A/B, or if a live session shows the model
+// actually needs the inline long-form guidance more than the wire-cost
+// savings). Read once at server startup (like the other env-gated
 // choices in newMCPServer), not per-call -- this isn't a live runtime
 // toggle.
 //
@@ -25,15 +29,17 @@ import (
 // real per-task call counts from bench/prometheus-repo-opus/arm_defn
 // (mean 50.2 calls/task) and bench/etcd-multifile-v2/arm_defn (27.3
 // calls/task), that description tax alone accounts for ~87% and ~36%
-// respectively of defn's measured per-task cost gap vs files-mode. The
+// respectively of defn's measured per-task cost gap vs files-mode; item
+// 7b's refactor-corpus pilot (Sonnet, real call counts 2-83/task)
+// projects a smaller but still real ~2.6% of total defn-arm cost. The
 // long-form per-op guidance below didn't disappear -- it moved to
 // opHelp, served on demand via op:"help", topic:"<op>", and
 // auto-discoverable from the tool description's own pointer to it.
 func toolDescription() string {
-	if stripped("verbose-tool-desc") {
-		return leanToolDescription
+	if stripped("lean-tool-desc") {
+		return legacyToolDescription
 	}
-	return legacyToolDescription
+	return leanToolDescription
 }
 
 // handleHelp returns the full usage text for one op (topic:"<op>"), or,
