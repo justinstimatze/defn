@@ -94,6 +94,14 @@ type server struct {
 	summaryWorker      *summary.Worker        // #160: async model-summary generation for def_summaries
 	explainClient      *summary.ExplainClient // #186: Sonnet co-processor for op:"explain" with question
 	freshnessMu        sync.Mutex             // serializes ensureFresh's probe-and-heal against concurrent handleCode calls
+
+	// pendingResolveMu/pendingResolveFiles: files whose outgoing refs
+	// were deferred by handleEdit's #150 sig-stable fast path (skips the
+	// ~200ms ResolveFile call, refreshing on the next full sync or
+	// explicit code(op:"sync") instead). A caller-safety decision can't
+	// tolerate that deferral silently -- see drainPendingResolves.
+	pendingResolveMu    sync.Mutex
+	pendingResolveFiles map[string]bool
 }
 
 // Run starts the MCP server over stdio. projDir is the project root where
@@ -3324,6 +3332,7 @@ func (s *server) handleEdit(_ context.Context, _ *sdkmcp.CallToolRequest, args e
 			if os.Getenv("DEFN_MEASURE_TIMING") == "1" {
 				fmt.Fprintf(os.Stderr, "  [edit] resolve deferred (sig-stable; run code(op:\"sync\") to refresh D's outgoing refs)\n")
 			}
+			s.markPendingResolve(d.SourceFile)
 		} else {
 			s.autoResolveFile(d.SourceFile, s.modulePath(d.ModuleID))
 		}
@@ -3427,6 +3436,7 @@ func (s *server) autoResolve(modulePath string) {
 		resolve.ResolveModule(s.backend, s.projectDir, modulePath)
 	} else {
 		resolve.Resolve(s.backend, s.projectDir)
+		s.clearAllPendingResolves()
 	}
 	// Best effort — log to stderr if commit fails so the operator notices
 	// without breaking the edit they just made.
@@ -3462,6 +3472,7 @@ func (s *server) autoResolveFile(sourceFile, modulePath string) {
 	}
 	absFile := filepath.Join(s.projectDir, sourceFile)
 	_ = resolve.ResolveFile(s.backend, s.projectDir, absFile) // best-effort
+	s.clearPendingResolve(sourceFile)
 	if err := s.autoCommit(); err != nil {
 		fmt.Fprintf(os.Stderr, "defn: auto-commit failed (post-resolve): %v\n", err)
 	}
@@ -3538,6 +3549,7 @@ func (s *server) ingestAndResolve() error {
 		return fmt.Errorf("commit: %w", err)
 	}
 	s.lastResolved.Store(time.Now().UnixNano())
+	s.clearAllPendingResolves()
 	if s.idf != nil {
 		s.idf.Invalidate()
 	}
@@ -6449,6 +6461,11 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// still name this def — a KB where deletes leave dangling
 	// references is worse than one where you have to fix references
 	// first. force:true preserves the pre-existing unsafe behavior.
+	// Drain any #150-deferred resolves first -- GetCallers below must
+	// see the current world, not whatever the last resolve saw. See
+	// drainPendingResolves.
+	s.drainPendingResolves()
+
 	if !args.Force {
 		callers, cerr := s.backend.GetCallers(d.ID)
 		if cerr == nil && len(callers) > 0 {
@@ -6618,6 +6635,10 @@ func (s *server) handleRename(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	// receiver/module/file params on renameParam at all -- rename couldn't
 	// be disambiguated even if the caller wanted to, the worst case of the
 	// same silent-wrong-target bug fixed elsewhere via resolveWriteTarget.
+	// Drain any #150-deferred resolves first -- the caller-body rewrite
+	// below relies on GetCallers; see drainPendingResolves.
+	s.drainPendingResolves()
+
 	d, err := s.resolveWriteTarget(args.OldName, args.Receiver, args.Module, args.File)
 	if err != nil {
 		return s.notFoundOrErr(args.OldName, err)
@@ -7471,9 +7492,30 @@ func (s *server) handleSync(_ context.Context, _ *sdkmcp.CallToolRequest, args c
 		if !filepath.IsAbs(filePath) {
 			filePath = filepath.Join(s.projectDir, filePath)
 		}
+		existedBefore := true
+		if _, statErr := os.Stat(filePath); statErr != nil && os.IsNotExist(statErr) {
+			existedBefore = false
+		}
 		n, err := ingest.IngestFile(s.backend, s.projectDir, filePath)
 		if err != nil {
 			return errResult(fmt.Errorf("ingest file: %w", err))
+		}
+		if !existedBefore {
+			// IngestFile's own missing-file branch already retired this
+			// file's definitions -- there's no file left on disk to
+			// re-resolve outgoing refs for, so skip ResolveFile (it
+			// would just fail trying to load a package.Load-ed path
+			// that no longer exists).
+			if err := s.autoCommit(); err != nil {
+				return errResult(fmt.Errorf("commit after sync: %w", err))
+			}
+			if s.idf != nil {
+				s.idf.Invalidate()
+			}
+			if n == 0 {
+				return textResult(fmt.Sprintf("%s no longer exists on disk, and the index had no definitions for it -- nothing to do.", args.File)), nil, nil
+			}
+			return textResult(fmt.Sprintf("%s no longer exists on disk -- removed %d definition(s) from the index.", args.File, n)), nil, nil
 		}
 		// Re-resolve refs for the affected package so structural changes
 		// (added/removed embeds, signature changes, new defs) keep the
@@ -7517,8 +7559,18 @@ func (s *server) handleSync(_ context.Context, _ *sdkmcp.CallToolRequest, args c
 			if err != nil {
 				return errResult(fmt.Errorf("ingest file %s: %w", sourceFile, err))
 			}
-			if err := resolve.ResolveFile(s.backend, s.projectDir, filePath); err != nil {
-				return errResult(fmt.Errorf("resolve file %s: %w", sourceFile, err))
+			// A file removed since the last sync has nothing left on
+			// disk to resolve -- IngestFile's own missing-file branch
+			// already retired its definitions. Without this guard, one
+			// externally-deleted file used to fail the WHOLE module
+			// sync at ResolveFile (packages.Load can't load a path that
+			// no longer exists), the same class of all-or-nothing
+			// failure #109's file: fast path was written to avoid for
+			// an unrelated unbuildable-package case.
+			if _, statErr := os.Stat(filePath); statErr == nil {
+				if err := resolve.ResolveFile(s.backend, s.projectDir, filePath); err != nil {
+					return errResult(fmt.Errorf("resolve file %s: %w", sourceFile, err))
+				}
 			}
 			n += defs
 		}
@@ -12527,6 +12579,9 @@ func (s *server) handleDeleteFile(_ context.Context, _ *sdkmcp.CallToolRequest, 
 		inFile[d.ID] = true
 	}
 
+	// Drain any #150-deferred resolves first -- see drainPendingResolves.
+	s.drainPendingResolves()
+
 	if !args.Force {
 		var blockers []string
 		for _, d := range defs {
@@ -13653,4 +13708,75 @@ func findCallSitesInBody(callerBody string, targetName string, maxSites int) []s
 		return true
 	})
 	return sites
+}
+
+// clearAllPendingResolves drops every entry -- called after a resolve
+// that covers the whole project, so no per-file bookkeeping can be
+// stale afterward.
+func (s *server) clearAllPendingResolves() {
+	s.pendingResolveMu.Lock()
+	s.pendingResolveFiles = nil
+	s.pendingResolveMu.Unlock()
+}
+
+// clearPendingResolve drops sourceFile from the deferred-resolve set --
+// called once autoResolveFile has actually re-resolved it for real.
+func (s *server) clearPendingResolve(sourceFile string) {
+	if sourceFile == "" {
+		return
+	}
+	s.pendingResolveMu.Lock()
+	delete(s.pendingResolveFiles, sourceFile)
+	s.pendingResolveMu.Unlock()
+}
+
+// drainPendingResolves forces a real resolve for every file whose
+// outgoing refs were deferred by handleEdit's #150 fast path. A
+// caller-safety decision can't tolerate that deferral silently:
+// GetCallers would answer from whatever the LAST resolve saw, which
+// can include a call site an edit earlier in the SAME session already
+// removed. Confirmed live (winze dispatch report, 2026-09-07): edit
+// two callers to drop their only call to a def, then delete that def
+// in the same session with no explicit sync in between -- refused,
+// citing both callers, even though neither still referenced the def
+// anymore. Called before handleDelete/handleDeleteFile's #105
+// refuse-if-referenced check and handleRename's caller-body rewrite.
+// Cheap when nothing is pending (the common case); each pending file
+// pays ResolveFile's ~200ms once, since resolving clears the entry.
+func (s *server) drainPendingResolves() {
+	s.pendingResolveMu.Lock()
+	if len(s.pendingResolveFiles) == 0 {
+		s.pendingResolveMu.Unlock()
+		return
+	}
+	files := make([]string, 0, len(s.pendingResolveFiles))
+	for f := range s.pendingResolveFiles {
+		files = append(files, f)
+	}
+	s.pendingResolveMu.Unlock()
+	for _, f := range files {
+		s.autoResolveFile(f, "")
+	}
+}
+
+// markPendingResolve records that sourceFile has a #150-deferred
+// sig-stable edit whose outgoing refs haven't been re-resolved yet.
+// Drained by drainPendingResolves before any op that makes a
+// caller-safety decision off GetCallers (delete's #105
+// refuse-if-referenced check, rename's caller-body rewrite) -- without
+// this, a def whose only remaining call site was removed by an earlier
+// sig-stable edit in the SAME session still looks "referenced" to a
+// safety check reading the (correctly deferred, but now stale for this
+// purpose) refs table. handleEdit's #150 branch is the only site that
+// ever defers a resolve.
+func (s *server) markPendingResolve(sourceFile string) {
+	if sourceFile == "" {
+		return
+	}
+	s.pendingResolveMu.Lock()
+	if s.pendingResolveFiles == nil {
+		s.pendingResolveFiles = make(map[string]bool)
+	}
+	s.pendingResolveFiles[sourceFile] = true
+	s.pendingResolveMu.Unlock()
 }

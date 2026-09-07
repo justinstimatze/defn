@@ -384,6 +384,60 @@ move to the new numbers.
     show zero failures. Not yet re-measured on a live bench rerun of
     the affected task — that would be the natural next step if this is
     worth confirming quantitatively.
+7d. **DONE 2026-09-07.** External bug report via MCP Dispatch from a
+    winze session (real refactor, `rm`-ing 7 `.go` files), filed with
+    authority against defn. Two real, unrelated correctness bugs, both
+    fixed with regression tests:
+    - **Root cause, not the reported symptom**: `resolve()`'s per-def
+      ref collection only registers a def_id as a key in the `defRefs`
+      map handed to `SetManyReferences` when at least one ref was found
+      that pass (every case's append is gated on `len(refs) > 0`).
+      `SetManyReferences`/`SetReferences` only clear a def's OLD refs
+      for def_ids present as map keys — so a def edited down to ZERO
+      outgoing refs (its last call removed) never got a key, and its
+      stale ref survived every future resolve forever, not just until
+      the next one. This is NOT the "#150 deferred resolve" bug the
+      symptom first suggested — it reproduces even on a full,
+      immediate, non-deferred `resolve.Resolve`. Confirmed via a
+      debug probe: an explicit `ResolveFile` call after the edit still
+      reported the stale caller. Fixed by registering `defRefs[fromID]
+      = nil` immediately once `fromID` resolves, before any ref is
+      collected, for all three cases (FuncDecl/ValueSpec/TypeSpec).
+      New test `TestResolveFileClearsStaleCallRefWhenCallSiteRemoved`
+      (internal/resolve) locks in the root cause directly; full
+      `internal/resolve` suite (19/19) and 4 targeted `internal/mcp`
+      sweeps (delete/rename/sync/apply, 600+ test invocations with
+      overlap) show zero regressions.
+    - **Separately real, `#150`-adjacent**: even with refs correctly
+      clearable, `handleEdit`'s sig-stable fast path *defers* the
+      resolve that would clear them until the next full sync or
+      explicit `code(op:"sync")` — so `handleDelete`/`handleDeleteFile`'s
+      #105 safe-delete caller-check, and `handleRename`'s caller-body
+      rewrite, could still act on stale data within the same session.
+      Added `markPendingResolve`/`drainPendingResolves` (server-scoped,
+      mutex-guarded file set) — `handleEdit`'s deferred branch marks the
+      file; `handleDelete`/`handleDeleteFile`/`handleRename` drain
+      before trusting `GetCallers`. Cleared wherever a real resolve of
+      that scope happens (`autoResolveFile`, `autoResolve`,
+      `ingestAndResolve`). Zero-cost when nothing's pending (the common
+      case). New test `TestHandleDelete_SeesSameSessionEditThatRemovedLastCallSite`.
+    - **Also reported, narrower than described**: "no whole-file delete"
+      was stale (`code(op:"delete", file:...)` shipped 2026-08-19,
+      `a58ef77`/`86a3823`) — winze was likely on an older binary. But
+      `code(op:"sync", file:<already-rm'd-file>)` genuinely still
+      errored (`ingest file: parse ...: no such file or directory`)
+      instead of pruning, since `ensureFresh`'s deleted-file healing is
+      explicitly skipped for `op:"sync"` itself and `IngestFile`'s fast
+      path had no missing-file branch of its own. Fixed in `IngestFile`
+      (treat a missing file as zero live defs, reuse the existing
+      `DeleteFile` cleanup) plus `handleSync`'s file/module paths
+      (accurate messaging, skip the now-pointless `ResolveFile` call).
+      New tests `TestIngestFile_MissingFilePrunesDefinitions`,
+      `TestHandleSync_MissingFilePrunesInsteadOfErroring`.
+    Replied to winze on dispatch with the (b) root-cause finding before
+    fixing, per this project's "verify before reacting" habit — but
+    this time verification itself (a debug probe) surfaced a DEEPER bug
+    than either of us assumed going in.
 8. **On hold, 2026-09-02 — user call**: "probably no 8 that seems way
    too expensive still. can't possibly be worth it." ≥3 repeats/task/arm
    on the 15 prom tasks + the 10 refactor tasks, Opus, EC2 (~$300) — not

@@ -134,3 +134,60 @@ var (
 		t.Errorf("expected flagC to survive re-sync: %v", err)
 	}
 }
+
+// TestIngestFile_MissingFilePrunesDefinitions is the whole-file
+// counterpart to TestIngestFile_PrunesDefRemovedFromGroupedVarBlock:
+// when the file itself is gone (rm'd, checked out to a different
+// branch state, etc.), not just one def within it, IngestFile used to
+// fail outright at the parser.ParseFile step ("parse ...: no such file
+// or directory") instead of treating a vanished file as "this file now
+// has zero definitions" and pruning through the same liveDefIDs
+// mechanism a def dropped from inside an existing file already uses.
+// Real winze dispatch bug report (2026-09-07): code(op:"sync",
+// file:...) on an already-rm'd file errored, with no path to tell
+// defn's index the file was gone.
+func TestIngestFile_MissingFilePrunesDefinitions(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/proj\n\ngo 1.22\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(dir, "gone.go")
+	if err := os.WriteFile(filePath, []byte(`package proj
+
+func Gone() string { return "x" }
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	db := testDB(t)
+	if _, err := IngestFile(db, dir, filePath); err != nil {
+		t.Fatal(err)
+	}
+	const modPath = "example.com/proj"
+	if _, err := db.GetDefinitionByName("Gone", modPath); err != nil {
+		t.Fatalf("expected Gone to be ingested initially: %v", err)
+	}
+
+	if err := os.Remove(filePath); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := IngestFile(db, dir, filePath)
+	if err != nil {
+		t.Fatalf("IngestFile on a removed file should prune, not error: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 definition pruned, got %d", n)
+	}
+	if def, err := db.GetDefinitionByName("Gone", modPath); err == nil {
+		t.Errorf("expected Gone to be pruned after its file was removed, but it still exists (id=%d)", def.ID)
+	}
+
+	// Idempotent: syncing the still-missing file again prunes nothing
+	// new and still doesn't error.
+	if n2, err := IngestFile(db, dir, filePath); err != nil {
+		t.Fatalf("second IngestFile on the same missing file should still not error: %v", err)
+	} else if n2 != 0 {
+		t.Errorf("expected 0 definitions pruned on the second pass, got %d", n2)
+	}
+}

@@ -27,6 +27,36 @@ func IngestFile(db store.Backend, modulePath string, filePath string) (int, erro
 		return 0, fmt.Errorf("rel path: %w", err)
 	}
 
+	if _, statErr := os.Stat(absFile); statErr != nil {
+		if !os.IsNotExist(statErr) {
+			return 0, fmt.Errorf("stat %s: %w", relFile, statErr)
+		}
+		// The file no longer exists on disk (removed by `rm`, a git
+		// checkout, or any other out-of-band process) -- there's
+		// nothing left to parse, but every definition this file used
+		// to have is genuinely gone too. DeleteFile retires its
+		// definitions, comments, and cached file_sources row in one
+		// step -- the same cleanup ensureFresh's own deleted-file
+		// healing already relies on (internal/mcp/freshness.go). This
+		// fast single-file path (what code(op:"sync", file:...) and
+		// sync's module:... loop actually run per file) never had that
+		// wired in, so syncing a file that had already been rm'd failed
+		// outright with a parse error instead of updating the index to
+		// match. Confirmed live (winze dispatch report, 2026-09-07).
+		dir := ""
+		if idx := strings.LastIndex(relFile, "/"); idx >= 0 {
+			dir = relFile[:idx]
+		}
+		before, findErr := db.FindDefinitionsByFile(dir, relFile, 0)
+		if findErr != nil {
+			return 0, fmt.Errorf("find definitions in %s: %w", relFile, findErr)
+		}
+		if err := db.DeleteFile(relFile); err != nil {
+			return 0, fmt.Errorf("delete file %s: %w", relFile, err)
+		}
+		return len(before), nil
+	}
+
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, absFile, nil, parser.ParseComments)
 	if err != nil {

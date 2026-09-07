@@ -516,6 +516,22 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 					if fromID <= 0 {
 						continue
 					}
+					// #NEW: register fromID in defRefs even before any ref
+					// is found. SetManyReferences (and SetReferences) only
+					// clear a def's OLD refs for def_ids present as keys in
+					// the map it's given -- a def edited down to zero
+					// outgoing refs (e.g. a call removed, nothing left to
+					// call) never gets a key here otherwise, since the
+					// appends below are gated on len(refs) > 0. Its stale
+					// pre-edit refs then survive every future resolve
+					// forever, not just until the next one. Confirmed live
+					// (winze dispatch report, 2026-09-07): editing a
+					// caller to drop its only call to a def left
+					// GetCallers still reporting that caller, even after
+					// an explicit, unscoped, non-deferred resolve.
+					if _, ok := defRefs[fromID]; !ok {
+						defRefs[fromID] = nil
+					}
 					// Collect refs from the signature (parameter/return
 					// types) AND the body. Both contribute to the same
 					// fromID; accumulate and flush once so the second
@@ -559,6 +575,12 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 								if fromID <= 0 {
 									continue
 								}
+								// See the matching #NEW comment on the
+								// FuncDecl case above -- same zero-refs
+								// staleness risk applies here.
+								if _, ok := defRefs[fromID]; !ok {
+									defRefs[fromID] = nil
+								}
 								// Collect refs from the value expression
 								// AND the type expression. Both contribute
 								// to the same fromID; accumulate and flush
@@ -587,6 +609,12 @@ func resolve(db store.Backend, preloaded []*packages.Package, projectDir, onlyMo
 							fromID := lookupTypeDefID(db, pkgPath, s.Name.Name, cache)
 							if fromID <= 0 {
 								continue
+							}
+							// See the matching #NEW comment on the FuncDecl
+							// case above -- same zero-refs staleness risk
+							// applies here.
+							if _, ok := defRefs[fromID]; !ok {
+								defRefs[fromID] = nil
 							}
 							refs, litFields := collectRefs(s.Type, pkg.TypesInfo, pkg.Fset, objToDef, ifaceMethodToImpls, db, cache)
 							if len(refs) > 0 {

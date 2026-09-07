@@ -1136,3 +1136,76 @@ func use() io.ReaderAt { return &File{} }
 		t.Fatalf("expected (*File).ReadAt to be recorded as satisfying io.ReaderAt, got: %v", extIfaces)
 	}
 }
+
+// TestResolveFileClearsStaleCallRefWhenCallSiteRemoved is the root-
+// cause regression for a winze dispatch bug report (2026-09-07):
+// resolve()'s per-def ref collection only registers a def_id in the
+// defRefs map passed to SetManyReferences when at least one ref was
+// actually found this pass (each case's append is gated on len(refs) >
+// 0). SetManyReferences only clears a def_id's OLD refs for def_ids
+// present as keys in the map it's given -- so a def edited down to
+// ZERO outgoing refs (its last call site removed, nothing left to
+// call) never got a key at all, and its stale pre-edit ref survived
+// every future resolve forever, not just until the next one. This is
+// distinct from TestResolveFileRefreshesEmbedAfterEdit, which only
+// covers a ref CHANGING target (still non-zero); zero is the case that
+// silently escaped SetManyReferences's from_def-IN(...) delete clause.
+func TestResolveFileClearsStaleCallRefWhenCallSiteRemoved(t *testing.T) {
+	v1 := `package callsbug
+
+func Helper() string { return "x" }
+
+func Caller() string {
+	return Helper()
+}
+`
+	dir := writeModule(t, map[string]string{"main.go": v1})
+
+	db := testDB(t)
+	if err := ingest.Ingest(db, dir); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if err := Resolve(db, dir); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	rs, _ := db.QueryRefs("Caller", "Helper", "call", 0)
+	if len(rs) == 0 {
+		t.Fatalf("setup: expected initial Caller -> Helper call ref")
+	}
+
+	// Edit: Caller no longer calls anything -- zero outgoing refs.
+	v2 := `package callsbug
+
+func Helper() string { return "x" }
+
+func Caller() string {
+	return "y"
+}
+`
+	writeFile(t, dir, "main.go", v2)
+
+	if _, err := ingest.IngestFile(db, dir, filepath.Join(dir, "main.go")); err != nil {
+		t.Fatalf("ingest file: %v", err)
+	}
+	if err := ResolveFile(db, dir, filepath.Join(dir, "main.go")); err != nil {
+		t.Fatalf("resolve file: %v", err)
+	}
+
+	rs, _ = db.QueryRefs("Caller", "Helper", "call", 0)
+	if len(rs) != 0 {
+		t.Errorf("expected stale Caller -> Helper call ref to be cleared once Caller calls nothing, got %+v", rs)
+	}
+
+	helperDef, err := db.GetDefinitionByName("Helper", "")
+	if err != nil {
+		t.Fatalf("get Helper: %v", err)
+	}
+	callers, err := db.GetCallers(helperDef.ID)
+	if err != nil {
+		t.Fatalf("get callers: %v", err)
+	}
+	if len(callers) != 0 {
+		t.Errorf("expected Helper to have zero callers after Caller's edit, got %+v", callers)
+	}
+}

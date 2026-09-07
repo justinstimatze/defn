@@ -17369,3 +17369,145 @@ func Use() string {
 		t.Errorf("expected the actual call-site text inline in the hint, got: %q", hint)
 	}
 }
+
+// TestHandleDelete_SeesSameSessionEditThatRemovedLastCallSite is the
+// regression for a winze dispatch bug report (2026-09-07): handleEdit's
+// #150 fast path defers re-resolving a sig-stable edit's outgoing refs
+// until the next full sync or explicit code(op:"sync"). A caller
+// edited to drop its only call to a def, then a delete of that def in
+// the SAME session with no sync in between, used to be refused --
+// citing the caller as still referencing it, even though the edit
+// removing that call had already landed. drainPendingResolves (called
+// by handleDelete before its #105 safe-delete check) must close this
+// window without giving up #150's perf win for ordinary edits.
+func TestHandleDelete_SeesSameSessionEditThatRemovedLastCallSite(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "deferredproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module deferredproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package deferredproj
+
+func Helper() string { return "x" }
+
+func Caller() string {
+	return Helper()
+}
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	// Sig-stable edit (Caller's own signature is unchanged) that drops
+	// its only call to Helper -- per #150 this defers the ResolveFile
+	// that would otherwise notice Caller no longer calls Helper.
+	editResult, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op:   "edit",
+		Name: "Caller",
+		NewBody: `func Caller() string {
+	return "y"
+}`,
+	})
+	if err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	if editResult.IsError {
+		t.Fatalf("edit failed: %s", resultText(t, editResult))
+	}
+
+	// Delete Helper in the SAME session, no explicit sync in between.
+	// Helper has zero real callers now -- this must succeed, not be
+	// refused citing Caller's stale (pre-edit) reference.
+	delResult, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op:   "delete",
+		Name: "Helper",
+	})
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	text := resultText(t, delResult)
+	if delResult.IsError {
+		t.Fatalf("delete refused citing a stale caller graph -- Caller's edit removing its call to Helper wasn't reflected before the safe-delete check ran: %s", text)
+	}
+	if _, err := db.GetDefinitionByName("Helper", ""); err == nil {
+		t.Error("expected Helper to be deleted")
+	}
+}
+
+// TestHandleSync_MissingFilePrunesInsteadOfErroring is the other half
+// of the winze dispatch bug report (2026-09-07): code(op:"sync",
+// file:...) on a file already removed from disk (e.g. via `rm`)
+// errored outright ("ingest file: parse ...: no such file or
+// directory") instead of retiring that file's definitions -- the exact
+// remedy the error itself has no path to reach, since re-running sync
+// on a gone file just repeats the same parse error forever. sync must
+// prune instead, mirroring what ensureFresh's own deleted-file healing
+// already does for every op except sync itself.
+func TestHandleSync_MissingFilePrunesInsteadOfErroring(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "goneproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module goneproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "gone.go"), []byte(`package goneproj
+
+func Gone() string { return "x" }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+	if _, err := db.GetDefinitionByName("Gone", ""); err != nil {
+		t.Fatalf("Gone should be indexed before the rm: %v", err)
+	}
+
+	if err := os.Remove(filepath.Join(projDir, "gone.go")); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{Op: "sync", File: "gone.go"})
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	text := resultText(t, result)
+	if result.IsError {
+		t.Fatalf("sync on a removed file should prune, not error: %s", text)
+	}
+	if _, err := db.GetDefinitionByName("Gone", ""); err == nil {
+		t.Error("expected Gone to be pruned from the index after syncing its now-deleted file")
+	}
+
+	// Overview on the same (still-gone) file must not resurrect ghost
+	// defs either.
+	overview, _, err := s.handleCode(context.Background(), nil, codeParam{Op: "overview", File: "gone.go"})
+	if err != nil {
+		t.Fatalf("overview: %v", err)
+	}
+	overviewText := resultText(t, overview)
+	if strings.Contains(overviewText, "Gone") {
+		t.Errorf("expected no trace of the pruned def in overview, got: %s", overviewText)
+	}
+}
