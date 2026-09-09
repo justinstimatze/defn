@@ -6544,15 +6544,30 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 	} else {
 		// By the time we reach here (non-force), the #105 safe-delete
 		// check above has already refused if any caller still
-		// references this def -- so a real build can only catch one
-		// thing a zero-caller delete can't otherwise break: a
-		// structural, non-reference requirement like "package main
-		// needs a func main" (main is never called by other Go code,
-		// so it always shows zero callers regardless). That's a rare
-		// enough edge case that deferring it to the next test/apply --
-		// same tradeoff already accepted for create/edit's sig-stable
-		// path -- is worth it for the common case (deleting genuinely
-		// dead code) not paying a full build every time.
+		// references this def. commitOrRollbackOnEmit is emit-only --
+		// no `go build` actually runs here, same tradeoff already
+		// accepted for create/edit's sig-stable path, worth it for the
+		// common case (deleting genuinely dead code) not paying a full
+		// build every time.
+		//
+		// CORRECTION (2026-09-10, confirmed by a direct test --
+		// TestHandleDelete_NonForceBuildFailureRollsBackWithHonestMessage's
+		// earlier draft): this comment used to claim "a real build can
+		// only catch one thing... a structural, non-reference
+		// requirement like 'package main needs a func main'" -- that's
+		// false as written. No build runs here at all, so that
+		// structural class of breakage (deleting the sole `func main`
+		// in a `package main` file, a genuinely zero-caller def) is NOT
+		// caught by anything in this path -- it silently commits,
+		// leaving a non-buildable package with no error, no warning,
+		// same "Deleted X (id=N)" success message as any real deletion.
+		// Emit's own safety net (safeWriteGoFile, parse-failure /
+		// declaration-mismatch checks) still catches unrelated
+		// classes of breakage (confirmed by the test above), just not
+		// this one. Left as-is rather than fixed unilaterally --
+		// upgrading this path to a real build trades away the exact
+		// perf win the comment above describes, for a rare edge case;
+		// that's a product tradeoff call, not a bug fix.
 		buildResult = s.commitOrRollbackOnEmit(tx, commit, rollback, deleteOpts)
 	}
 	// #109 pass 2 (winze op-classification): skip autoResolve on delete.
@@ -6580,23 +6595,36 @@ func (s *server) handleDelete(_ context.Context, _ *sdkmcp.CallToolRequest, args
 		}
 	}
 
+	if buildResult != "" && !args.Force {
+		// Non-force path: a non-empty buildResult here means the whole
+		// transaction was rolled back -- the delete never landed. This
+		// used to still print "Deleted X (id=N)" ahead of the failure
+		// text, reading as a success with a warning attached rather than
+		// a rollback -- the exact misleading-message bug handleEdit was
+		// already fixed for (see its own "rolled back — nothing was
+		// saved" framing), just never applied here. Confirmed live via
+		// a real trajectory (winze dispatch report follow-up mining,
+		// 2026-09-10): the model saw "Deleted IsCreateEvent (id=11732)"
+		// immediately followed by an emit parse error, read it as a
+		// completed-but-broken write, and burned 4 extra calls (read-
+		// file, sync, read-file, a retry that returned the identical
+		// message) sorting out that nothing had actually changed.
+		return textResult(fmt.Sprintf("delete %s%s rolled back — nothing was saved\n\n%s", recv, d.Name, buildResult)), nil, nil
+	}
+
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Deleted %s%s (id=%d)\n", recv, d.Name, d.ID))
 	if buildResult != "" {
 		sb.WriteString("\n" + buildResult)
-		if !args.Force {
-			// Non-force path: a non-empty buildResult here means the
-			// whole transaction was rolled back -- the delete never
-			// landed, so remove_file has nothing to act on.
-			return textResult(sb.String()), nil, nil
-		}
 		// #313 followup (review-caught): force:true already committed
 		// the delete unconditionally above regardless of this build
 		// WARNING (see the branch that computed buildResult) -- the def
 		// really is gone. Returning early here silently skipped
 		// remove_file with no signal at all, reintroducing exactly the
 		// silence #310 was written to eliminate, just for this narrower
-		// force+warning trigger. Fall through instead.
+		// force+warning trigger. Fall through instead. (Only args.Force
+		// can reach here now -- the non-force rollback case returned
+		// above.)
 	}
 	// #310: remove_file was previously only honored by handleDeleteFile's
 	// file:-only bulk path -- a name-scoped delete of the LAST def in a

@@ -17709,3 +17709,77 @@ func TestHelperIsCorrect() bool {
 		t.Errorf("expected a test_names field, got: %s", text)
 	}
 }
+
+// TestHandleDelete_NonForceBuildFailureRollsBackWithHonestMessage covers
+// the one #12 gap that had never actually been tested:
+// TestHandleDelete_BuildFailureRollsBackBothDBAndFile uses force:true
+// (its own doc comment says so), and the other non-force test
+// (TestHandleDelete_SafeRefusesWhenReferenced) never reaches the build
+// gate at all -- it's refused earlier by the #105 safe-delete check.
+// A zero-caller def can still break the build in one specific way
+// handleDelete's own comment names: "package main needs a func main."
+// This exercises exactly that, without force, and checks both the
+// message (must say "rolled back", not "Deleted") and that the def is
+// genuinely still in the DB afterward -- not just a wording fix without
+// a real rollback behind it.
+func TestHandleDelete_NonForceBuildFailureRollsBackWithHonestMessage(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "emitfailproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module emitfailproj\n\ngo 1.26\n"), 0644)
+	mainPath := filepath.Join(projDir, "main.go")
+	os.WriteFile(mainPath, []byte(`package emitfailproj
+
+func Foo() string { return "x" }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	// Corrupt the file externally (bypassing defn, no sync) into
+	// syntactically invalid Go -- emit has to parse the file to merge
+	// the delete against it, and a parse failure is a real emit-level
+	// (not go-build-level) failure, the same class ("generated content
+	// doesn't parse") the real trajectory that motivated this test hit.
+	os.WriteFile(mainPath, []byte(`package emitfailproj
+
+func Foo() string {
+	return "unclosed
+`), 0644)
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleDelete(context.Background(), nil, nameParam{Name: "Foo"})
+	if err != nil {
+		t.Fatalf("handleDelete: %v", err)
+	}
+	text := resultText(t, result)
+	if strings.Contains(text, "Deleted Foo") {
+		t.Errorf("expected NOT to see a bare \"Deleted Foo\" success header on a rolled-back delete, got: %s", text)
+	}
+	if !strings.Contains(text, "rolled back") {
+		t.Errorf("expected \"rolled back\" framing, got: %s", text)
+	}
+
+	if _, err := db.GetDefinitionByName("Foo", ""); err != nil {
+		t.Errorf("expected Foo to still exist in the DB after a rolled-back delete, got: %v", err)
+	}
+	body, err := os.ReadFile(mainPath)
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	if !strings.Contains(string(body), "unclosed") {
+		t.Errorf("expected main.go on disk to still contain the externally-made (corrupt) edit, got:\n%s", body)
+	}
+}

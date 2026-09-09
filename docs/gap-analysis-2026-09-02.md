@@ -690,8 +690,70 @@ move to the new numbers.
     one 10-turn task further risks overfitting; the next real test
     belongs on a corpus where the gap is bigger (refactor-corpus).
 
-Explicitly do not: add nudges, gate ops, build new discovery ops, rerun
-prom-opus a third time as-is, or trust any n=1 win.
+7i. **DONE 2026-09-10.** User asked "run it" on the refactor-corpus
+    (defn-arm only, files-arm reused unchanged from the Sept 3 pilot —
+    files-mode doesn't depend on defn's code). Real result, not a win:
+    correctness held at rough parity (F1 0.723 vs files' 0.711,
+    excluding the established goyacc confound) but pooled cost got
+    **worse**, not better — 2.18x vs the original pilot's 1.62x. Same
+    dynamic as 7f/7g's chi finding, at larger scale: 6 of 9 tasks got
+    MORE expensive after tonight's fixes (up to +214% on one task),
+    consistent with the model reinvesting cheaper-per-call defn ops
+    into more thorough work rather than fewer total calls. One
+    self-correction along the way: initially misdiagnosed
+    `cli-token-type-constants-consolidate`'s F1=0.00 as a corpus/base-
+    commit bug from an incomplete grep; the actual diff showed
+    files-mode's fix was legitimate (consolidating a duplicated
+    prefix-matching table, not just the named constants) and defn's
+    model reasoned too narrowly about task scope — a real, if
+    pre-existing (also failed pre-fix, differently), model gap.
+    Forked a sub-agent to read all 9 non-confounded trajectories in
+    full (not just cost outliers, per this project's own "read every
+    trajectory" methodology) since the aggregate numbers alone didn't
+    explain the regression. Found:
+    - **Confirmed independently on a different corpus**: the read-file
+      bodyServed fix (7f) works correctly here too —
+      `cli-token-type-consolidate` calls `read-file` on the same file
+      3x; the 2nd (no sync between) correctly suppresses all 18 defs,
+      the 3rd (after an explicit sync) correctly re-shows them.
+    - **NEW, real correctness bug, found and fixed**: `handleDelete`'s
+      non-force path printed "Deleted X (id=N)" even when the write was
+      actually rolled back by an emit-level failure — the exact
+      misleading-message bug already fixed for `handleEdit` months ago,
+      never applied here. A real trajectory
+      (`etcd-refactor-event-helpers-move`) hit this directly: saw
+      "Deleted IsCreateEvent (id=11732)" immediately followed by an
+      emit parse error, read it as success-with-a-warning, burned 4
+      extra calls sorting out that nothing had changed. Also found (and
+      confirmed by writing the regression test) that the ONLY existing
+      "rollback" test for delete actually uses `force:true` — the
+      non-force build-failure-rollback path had never been tested at
+      all. Fixed the message; added
+      `TestHandleDelete_NonForceBuildFailureRollsBackWithHonestMessage`.
+      **Separately discovered while building that test**: the code
+      comment claiming "a real build can only catch [structural non-
+      reference breaks like 'package main needs a func main']" is
+      false — no build runs in this path at all (`commitOrRollbackOnEmit`
+      is emit-only), confirmed by deleting the sole `func main` in a
+      test fixture: it commits silently, zero warning, leaving a
+      non-buildable package. Corrected the comment to stop claiming
+      protection that doesn't exist; did NOT change the behavior
+      (upgrading to a real build trades away the exact perf win the
+      comment describes, for a rare case — a product tradeoff, not a
+      bug fix, needs an explicit call not a unilateral change).
+    - **Not yet built** (fork's other two findings, both cheap and
+      well-evidenced, same shape as tonight's shipped fixes): (a)
+      fragment-edit (`replace-hunk`) misses against large/repetitive
+      files get zero diagnostic help — a bare "old_fragment not found"
+      with no near-match hint, driving 5+ blind retries on
+      `cli-refactor-getcomment-signature`'s 814-line test function
+      (~28% of that task's calls). (b) the read auto-downgrade-then-
+      refetch pattern, deprioritized on the chi corpus for lack of
+      evidence, reproduces cleanly here: 4-for-4 wasted round trips on
+      `prometheus-refactor-recode-signature`'s large method bodies —
+      task shape matters, refactor-corpus's real methods are bigger
+      than chi's small middleware functions.
+8. **On hold, 2026-09-02 — user call**: "probably no 8 that seems way
 
 ## 6. Open questions for Opus to settle, not assume
 
