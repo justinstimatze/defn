@@ -17511,3 +17511,144 @@ func Gone() string { return "x" }
 		t.Errorf("expected no trace of the pruned def in overview, got: %s", overviewText)
 	}
 }
+
+// TestHandleExpand_MarksBodyServedSoLaterOverlappingExpandSkipsIt is the
+// #369 follow-up regression: a real chi-ratelimit trajectory called
+// expand twice with an overlapping-but-not-identical name list (so the
+// existing same-call dedup, keyed on exact args, never caught it), and
+// every overlapping name's full body got re-served verbatim both times.
+// expand consulted bodyServedEpochsAgo before this fix but never wrote
+// to it -- only read(full:true) did -- so an earlier expand's own body
+// serves were invisible to a later expand. Now expand marks bodyServed
+// for every name whose body it actually renders.
+func TestHandleExpand_MarksBodyServedSoLaterOverlappingExpandSkipsIt(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "expandbodyproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module expandbodyproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package expandbodyproj
+
+func A() string { return "a" }
+
+func B() string { return "b" }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
+
+	first, _, err := s.handleCode(context.Background(), req, codeParam{
+		Op: "expand", Names: []string{"A"}, Include: []string{"body"},
+	})
+	if err != nil {
+		t.Fatalf("first expand: %v", err)
+	}
+	firstText := resultText(t, first)
+	if !strings.Contains(firstText, `return "a"`) {
+		t.Fatalf("expected A's body in first expand, got: %s", firstText)
+	}
+
+	second, _, err := s.handleCode(context.Background(), req, codeParam{
+		Op: "expand", Names: []string{"A", "B"}, Include: []string{"body"},
+	})
+	if err != nil {
+		t.Fatalf("second expand: %v", err)
+	}
+	secondText := resultText(t, second)
+	if strings.Contains(secondText, `return "a"`) {
+		t.Errorf("expected A's body to be omitted (already served) in second expand, got: %s", secondText)
+	}
+	if !strings.Contains(secondText, `return "b"`) {
+		t.Errorf("expected B's body (never served before) in second expand, got: %s", secondText)
+	}
+}
+
+// TestHandleReadFile_MarksBodyServedSoRepeatCallAndLaterReadSkipIt is
+// the #369 follow-up regression for read-file: a real chi-ratelimit
+// trajectory called read-file on the SAME file twice in one session,
+// re-serving every def's full body both times. read-file never
+// recorded or consulted bodyServed before this fix. Also confirms the
+// cross-op benefit: a later plain read(name) of a def already shown via
+// read-file now short-circuits too, since handleCode's own read
+// dispatch already consulted bodyServedEpochsAgo -- it just never had
+// anything to find before read-file started writing to it.
+func TestHandleReadFile_MarksBodyServedSoRepeatCallAndLaterReadSkipIt(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "readfilebodyproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module readfilebodyproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package readfilebodyproj
+
+func A() string { return "a" }
+
+func B() string { return "b" }
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s.ready.Store(true)
+	req := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
+
+	first, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read-file", File: "main.go"})
+	if err != nil {
+		t.Fatalf("first read-file: %v", err)
+	}
+	firstText := resultText(t, first)
+	if !strings.Contains(firstText, `return "a"`) || !strings.Contains(firstText, `return "b"`) {
+		t.Fatalf("expected both bodies in first read-file, got: %s", firstText)
+	}
+
+	second, _, err := s.handleCode(context.Background(), req, codeParam{Op: "read-file", File: "main.go"})
+	if err != nil {
+		t.Fatalf("second read-file: %v", err)
+	}
+	secondText := resultText(t, second)
+	if strings.Contains(secondText, `return "a"`) || strings.Contains(secondText, `return "b"`) {
+		t.Errorf("expected both bodies omitted (already served) in repeat read-file, got: %s", secondText)
+	}
+	if !strings.Contains(secondText, "already read in this session") {
+		t.Errorf("expected an already-served note, got: %s", secondText)
+	}
+
+	// Cross-op: a fresh session's plain read(name:A) after read-file
+	// should also short-circuit now that read-file writes to bodyServed.
+	s2 := &server{backend: db, projectDir: projDir, respCache: newRespCache()}
+	s2.ready.Store(true)
+	req2 := &sdkmcp.CallToolRequest{Session: &sdkmcp.ServerSession{}}
+	if _, _, err := s2.handleCode(context.Background(), req2, codeParam{Op: "read-file", File: "main.go"}); err != nil {
+		t.Fatalf("seed read-file: %v", err)
+	}
+	readResult, _, err := s2.handleCode(context.Background(), req2, codeParam{Op: "read", Name: "A", Full: true})
+	if err != nil {
+		t.Fatalf("read after read-file: %v", err)
+	}
+	readText := resultText(t, readResult)
+	if strings.Contains(readText, `return "a"`) {
+		t.Errorf("expected read(A) to skip re-serving a body read-file already showed, got: %s", readText)
+	}
+}

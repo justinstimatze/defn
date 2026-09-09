@@ -8402,7 +8402,7 @@ func (s *server) handleFind(_ context.Context, _ *sdkmcp.CallToolRequest, args f
 	return textResult(sb.String()), nil, nil
 }
 
-func (s *server) handleReadFile(_ context.Context, _ *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
+func (s *server) handleReadFile(_ context.Context, req *sdkmcp.CallToolRequest, args codeParam) (*sdkmcp.CallToolResult, any, error) {
 	file := args.File
 	if file == "" {
 		file = args.Name
@@ -8520,6 +8520,25 @@ func (s *server) handleReadFile(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 	}
 	for _, d := range defs {
 		recv := formatReceiver(d.Receiver)
+		// #369 follow-up (fable-agent + real trajectory finding,
+		// 2026-09-09): read-file never recorded OR consulted
+		// bodyServed, so a def already shown in full via an earlier
+		// read(full:true)/expand/read-file got re-dumped verbatim on
+		// the next read-file covering its file -- confirmed live: the
+		// same file's read-file called twice in one chi-ratelimit
+		// trajectory, re-serving every def in it both times. Only
+		// applies to the unscoped (non-line_range) full-file serve --
+		// a narrowed range is a different, smaller excerpt each time,
+		// not a repeat. Whole-file "nothing changed" bookkeeping is
+		// handled by ensureFresh separately; this is session-local,
+		// per-def, and cleared by any write like every other bodyServed
+		// use.
+		if !hasRange && req != nil && s.respCache != nil {
+			if epochsAgo, ok := s.respCache.bodyServedEpochsAgo(req.Session, d.Name); ok && epochsAgo <= staleEpochThreshold {
+				sb.WriteString(fmt.Sprintf("## %s%s (%s) L%d-%d\n_(full body already read in this session -- omitted here, nothing new. If it may have changed since, call code(op:\"sync\") first.)_\n\n", recv, d.Name, d.Kind, d.StartLine, d.EndLine))
+				continue
+			}
+		}
 		sb.WriteString(fmt.Sprintf("## %s%s (%s) L%d-%d\n", recv, d.Name, d.Kind, d.StartLine, d.EndLine))
 		if d.Doc != "" {
 			sb.WriteString(d.Doc)
@@ -8535,6 +8554,9 @@ func (s *server) handleReadFile(_ context.Context, _ *sdkmcp.CallToolRequest, ar
 		}
 		sb.WriteString(body)
 		sb.WriteString("\n```\n\n")
+		if !hasRange && req != nil && s.respCache != nil {
+			s.respCache.markBodyServed(req.Session, d.Name)
+		}
 	}
 	out := sb.String()
 	if !args.Full && !hasRange && len(out) > readFileCapBytes {
@@ -8691,6 +8713,22 @@ func (s *server) handleExpand(_ context.Context, req *sdkmcp.CallToolRequest, ar
 		}
 		if err := s.renderExpandSection(&sb, d, modulePathByID[d.ModuleID], sectionWant); err != nil {
 			return errResult(fmt.Errorf("expand: gather callers for %s: %w", name, err))
+		}
+		// #369 follow-up (fable-agent + real trajectory finding,
+		// 2026-09-09): bodyServedEpochsAgo is consulted above to skip
+		// re-serving a body read(full:true) already showed, but expand
+		// never recorded its OWN body serves here -- so a name whose
+		// full body was shown via expand (not read) got no protection at
+		// all against a LATER expand call re-including it, even with an
+		// overlapping-but-not-identical name list that the existing
+		// same-call dedup can't catch (dedup keys on exact args, not
+		// per-name overlap). Confirmed live: a real chi-ratelimit
+		// trajectory called expand twice with 4 overlapping names,
+		// re-serving all 4 in full both times. Mark on every body this
+		// call actually rendered, matching the same session-scoped,
+		// write-invalidated contract read(full:true) already uses.
+		if sectionWant["body"] && req != nil && s.respCache != nil {
+			s.respCache.markBodyServed(req.Session, name)
 		}
 		resolved++
 		_ = i

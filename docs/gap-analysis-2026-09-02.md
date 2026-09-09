@@ -515,6 +515,81 @@ move to the new numbers.
       testing where crg's bare-name/no-build-gate rename should break
       on Go (duplicate method names) — a falsifiable correctness claim,
       not another cost-only comparison.
+7f. **DONE 2026-09-09.** Live re-run of the exact 2026-08-07
+    chi-ratelimit session-cumulative bench (Opus, same task, fresh
+    isolated clones) to confirm whether the fixes since then actually
+    moved real numbers, not just projections. Gap on this task: **+114%
+    → +24%** (files $2.51→$2.44 fresh/cross-checked; defn-natural
+    $5.36→mean $3.03 across n=3, $2.43–$3.45). All correct throughout.
+    Also ran `code-review-graph` **naturally** (not forced, unlike the
+    only prior data point) for the first time: its own graph tool was
+    called ONCE in the whole 10-turn session — the model did the task
+    almost entirely via native Bash/Read/Edit/Write, matching its own
+    installed instructions ("the graph is a hint, read the source,
+    source wins"). Its natural-mode cost ($2.76/40 calls) is close to
+    files-mode's, not because of a better architecture but because it's
+    barely used — the earlier "crg beats defn" data point was
+    forced-substitution only, an artificial setup. n=1, not proven, but
+    mechanistically clear (1 graph call out of 40 is not noise).
+    **Root-caused the remaining +24% by reading the actual op sequence
+    of all 3 defn runs against the 1 files run**: Bash counts are
+    near-identical across every arm (task-mandated `go build`/`go
+    test`, not a lever). Native `Read` in the defn arm is down to 0-2
+    uses (real substitution now happening, a big change from July's
+    "9 Read + 8 Bash even with the tool available"). The actual driver
+    is **inconsistency in which defn op the model reaches for**, not a
+    structural ceiling: one run (`defn-r2`) hit an EXACT match to
+    files-mode's non-Bash call count (14 vs 14) using a clean, single
+    consolidated path (`read-file` mostly); the other two used 2.5x/1.6x
+    more calls by sampling several overlapping read-shaped ops for the
+    same task (`read` AND `expand` AND `read-file` AND `outline` AND
+    `overview` AND `context` AND `impact` AND `search` AND `help` in one
+    run) instead of settling on one. Quantified the churn directly:
+    r1/r2/r3 re-touch an already-covered target in 21-30% of their
+    non-Bash calls, vs files-mode's own natural redundancy of ~8% (1
+    legitimate re-read out of 12). **Found and fixed the actual gap**:
+    `bodyServed` (the ledger that lets `read`/`outline`/`expand` skip
+    re-serving a body already shown this session) was only ever WRITTEN
+    by `read(full:true)` — `read-file` and `expand` both CONSULTED it
+    but never recorded their OWN body serves, so two `expand` calls with
+    overlapping-but-not-identical name lists (invisible to the existing
+    same-args dedup) re-served the same bodies in full both times, and
+    two `read-file` calls on the same file did too. Fixed: both ops now
+    call `markBodyServed` for every body they actually render (not
+    line-range-narrowed), and `read-file` now also consults
+    `bodyServedEpochsAgo` per-def before rendering, matching the pattern
+    `read`/`outline`/`expand` already had. New tests
+    `TestHandleExpand_MarksBodyServedSoLaterOverlappingExpandSkipsIt`,
+    `TestHandleReadFile_MarksBodyServedSoRepeatCallAndLaterReadSkipIt`
+    (the latter also confirms the cross-op case: a plain `read` after a
+    `read-file` now short-circuits too). Full `handleExpand`/
+    `handleReadFile`-affected suites (241/241 tests each) pass.
+    **Ruled out by checking real response bytes, not assumed**: the
+    read auto-downgrade-to-outline threshold (1500B) is NOT a meaningful
+    driver on this corpus — only 1 of 11 bare `read()` calls across all
+    3 runs was actually downgraded, and it happened in the *most*
+    efficient run with zero downgrade-then-refetch pattern anywhere. Not
+    building a fix against unconfirmed evidence; may still matter on
+    bigger real-world functions (refactor-corpus), unconfirmed.
+    **On hard-gating, asked explicitly this session**: verdict is no,
+    not now. The precondition from `#209`'s postmortem (cheapen/harden
+    the consolidated tool before ever gating) is now mostly satisfied,
+    but tonight's data shows gating is aimed at the wrong problem —
+    native `Read` is already down to 0-2 uses per run; the churn is
+    happening *inside* defn's own op menu (r1/r3 sampling 8 different
+    read-shaped verbs), which a gate can't reduce and would only remove
+    the escape valve for. Revisit only if a read-heavy (chi-explore-
+    shaped, defn called 0x) workload shows native-peek escape becoming
+    the dominant pattern after the op-menu fix below lands.
+    **Not yet built** (next, per a fresh fable-agent plan given tonight's
+    data): collapse the read-menu to one advertised ladder
+    (`read-file`/`read`/`expand`/`impact`/`context`) in both the lean
+    description and `defn init`'s CLAUDE.md template — `read-file`, the
+    op that actually won parity in `defn-r2`, isn't even mentioned in
+    the init template today. Then a small paid re-run (~$15-20, n≥5,
+    defn-only) pre-registered on *variance* (non-Bash calls ≤14 in
+    ≥4/5 runs), not just mean — consistency is the claim to test next,
+    not another mean-cost number.
 8. **On hold, 2026-09-02 — user call**: "probably no 8 that seems way
    too expensive still. can't possibly be worth it." ≥3 repeats/task/arm
    on the 15 prom tasks + the 10 refactor tasks, Opus, EC2 (~$300) — not
