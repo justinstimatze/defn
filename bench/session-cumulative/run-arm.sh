@@ -17,6 +17,21 @@ set -euo pipefail
 
 ARM=${1:?arm name}
 WORKDIR=${2:?workdir}
+
+# Hard guard, not a memory note: files-mode doesn't depend on defn's own
+# code at all, so re-running it almost never adds signal -- it only
+# costs real money/wall-clock and has repeatedly gotten re-run out of
+# habit anyway (flagged 2026-09-01, then again 2026-09-09 in the same
+# session it was flagged). A memory is recalled probabilistically; this
+# check runs every time. Check for existing files-mode reference data
+# (this dir's own *.csv/*.md receipts) before overriding.
+if [[ "$ARM" == *files* && "${FILES_RERUN_OK:-0}" != "1" ]]; then
+    echo "[$ARM] refusing to run a files-mode arm without FILES_RERUN_OK=1." >&2
+    echo "  files-mode doesn't touch defn's code -- it almost never needs a fresh run." >&2
+    echo "  Check for existing reference data first: $(dirname "${BASH_SOURCE[0]}")/*.csv, *.md" >&2
+    echo "  If you've confirmed a fresh run is actually needed, re-run with FILES_RERUN_OK=1." >&2
+    exit 1
+fi
 shift 2
 EXTRA_ARGS=("$@")
 
