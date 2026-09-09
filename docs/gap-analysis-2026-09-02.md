@@ -664,6 +664,32 @@ move to the new numbers.
     needs the same small paid re-run (n≥5, variance-focused) 7f already
     flagged as the next step, not done yet.
 
+7h. **DONE 2026-09-09, same day.** Re-measured turn 6's answer quality
+    (the real "which functions call X, which would be affected"
+    question) across all 10 local trajectories instead of just cost —
+    operationalizing 7g's "correctness-per-dollar, not just call-count
+    parity" reframe. Checked whether each answer flagged the one
+    genuinely subtle risk in the gold shape (`tree.go`'s `walk()` mixing
+    a typed `Middlewares` return with an untyped `[]func(...)` variadic
+    — the actual highest-risk site per a full manual read). Result:
+    `files-3` and `crg-1` both caught it; 6 of 8 defn runs did too;
+    `defn-r3` and `defn-v5` (2/8) missed it. Initially looked like a
+    "defn's compact counts substitute for reading" pattern (worth
+    flagging loudly), but checking the miss rate against BOTH reference
+    arms found it's not systematic — most defn runs caught the same
+    risk the reference arms did. Every arm reads `tree.go` once in turn
+    1 for the (unrelated) routing-tree explanation task; whether that
+    stays salient enough to cross-reference 5 turns later when
+    answering a separate question looks like ordinary model-attention
+    variance on a hard cross-file question, not a defn-specific gap.
+    Logged as an observed-but-inconclusive correctness data point, not
+    acted on — no clean lever here the way the other three fixes had
+    one. Conclusion: defn is at rough correctness parity with files-mode
+    on this hard question (both hit and both occasionally miss the same
+    real risk) — the open gap is cost, not quality, and squeezing this
+    one 10-turn task further risks overfitting; the next real test
+    belongs on a corpus where the gap is bigger (refactor-corpus).
+
 Explicitly do not: add nudges, gate ops, build new discovery ops, rerun
 prom-opus a third time as-is, or trust any n=1 win.
 
