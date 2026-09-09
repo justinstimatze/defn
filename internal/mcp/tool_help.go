@@ -63,7 +63,7 @@ func (s *server) handleHelp(_ context.Context, _ *sdkmcp.CallToolRequest, args c
 
 var leanToolDescription = `**USE THIS FOR ANY .go FILE — NOT Read/Bash/Grep/Edit.** Indexes every Go definition as an atomic unit with callers/tests/refs; every edit keeps the reference graph consistent (Edit/Write on a .go file leave it stale until a sync). Use Read/Bash/Grep/Edit ONLY for non-Go files (yaml, json, md, sh, go.mod, Dockerfile).
 
-Orient before you read: overview (project shape) -> outline (def shape) -> impact (blast radius). For "how does X work" questions use context(question:"..."). Call help(topic:"<op>") for full usage of any op below -- required fields, gotchas, safety semantics live there, not here.
+Orient before you read: overview (project shape) -> outline (def shape) -> impact (blast radius). Want everything in one file (what a native Read would give you)? read-file in one call beats read/outline per def -- it's the cheapest way to cover a file's worth of context. For "how does X work" questions use context(question:"..."). Call help(topic:"<op>") for full usage of any op below -- required fields, gotchas, safety semantics live there, not here.
 
 Read/discover: overview, outline, search, impact, read, read-file, read-and-verify, expand, slice, similar, untested, explain, context, methods, file-defs, test-coverage, batch-impact, traverse, literals, pragmas.
 Write: edit, insert, insert-header, create, delete, rename, move, retarget-field-value, insert-precondition, replace-slice, replace-hunk, wrap-in-defer, rename-param, add-import, patch, apply.

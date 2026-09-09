@@ -260,3 +260,19 @@ func TestWriteGitignore_IgnoresClaudeSettingsLocal(t *testing.T) {
 		t.Errorf("expected .gitignore to ignore .claude/settings.local.json, got:\n%s", data)
 	}
 }
+
+// TestDefnClaudeMDSection_AdvertisesReadFile locks in the #369 fix:
+// read-file (the op that matched native Read's call count exactly in
+// real trajectory data, 2026-09-09) was entirely absent from the
+// init-generated CLAUDE.md's "By intent" list -- a real user following
+// this doc had no way to learn it exists as the whole-file alternative
+// to read/outline/expand.
+func TestDefnClaudeMDSection_AdvertisesReadFile(t *testing.T) {
+	section := defnClaudeMDSection()
+	if !strings.Contains(section, "read-file") {
+		t.Fatal("expected the CLAUDE.md section to mention read-file")
+	}
+	if !strings.Contains(section, "Read a whole file") {
+		t.Errorf("expected an explicit read-file bullet in the CLAUDE.md section, got:\n%s", section)
+	}
+}

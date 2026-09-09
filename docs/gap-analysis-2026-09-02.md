@@ -600,6 +600,26 @@ move to the new numbers.
 9. **Auto-append `opHelp[op]` to the first error per op** (item 2's cut
    scope) — polish on an already-shipped feature, no downstream
    dependency. Lowest priority, do whenever there's spare time.
+9b. **DONE 2026-09-09.** Item 7f's other planned fix: `read-file` (the
+    op that won parity in `defn-r2`) was never advertised anywhere a
+    real user would see it — absent from both the lean tool
+    description's "Orient before you read" guidance (present only as
+    the 6th entry in a flat 18-op list, no disambiguation) and entirely
+    absent from `defn init`'s generated CLAUDE.md "By intent" list.
+    Added one short, cheap clause to the lean description pointing at
+    `read-file` for whole-file coverage (kept minimal — this string
+    rides on every call, can't afford to re-bloat it), and a full bullet
+    + explicit read/read-file/expand disambiguation to the CLAUDE.md
+    template, citing the real measured numbers (parity vs 1.6-2.5x more
+    calls). New tests
+    `TestLeanToolDescription_AdvertisesReadFileForWholeFileCoverage`,
+    `TestDefnClaudeMDSection_AdvertisesReadFile`. Did NOT do fable's
+    more aggressive "demote ~15 read-shaped ops to help-only" — that's
+    a bigger, riskier redesign this session didn't validate; this is
+    the conservative, cheap, evidence-backed piece of it. **Not yet
+    measured**: whether this actually shifts real op-choice behavior —
+    needs the same small paid re-run (n≥5, variance-focused) 7f already
+    flagged as the next step, not done yet.
 
 Explicitly do not: add nudges, gate ops, build new discovery ops, rerun
 prom-opus a third time as-is, or trust any n=1 win.
