@@ -1145,7 +1145,17 @@ func (s *server) handleCode(ctx context.Context, req *sdkmcp.CallToolRequest, ar
 		// happened to already wire up.
 		if q, ok := starterQuestionForOp(args); ok {
 			question := q
-			if real := s.lastUserQuestion(); real != "" {
+			// #369 (fable-agent competitive-analysis finding,
+			// 2026-09-09): the raw captured prompt unconditionally won
+			// over the op's own default, even when it was pure filler
+			// ("good call do it") or a bench harness's fixed task
+			// preamble -- both matched broadly against thousands of
+			// unrelated defs on common words, wasting the bundle's one
+			// shot. Only prefer it when it actually names something
+			// identifier-shaped; otherwise the op-specific default (the
+			// def name actually being read, the search pattern actually
+			// used) is more informative anyway.
+			if real := s.lastUserQuestion(); real != "" && hasIdentifierShapedToken(real) {
 				question = real
 			}
 			if starter := s.maybeAppendStarterBundle(req, question); starter != "" {

@@ -978,8 +978,9 @@ correctness-neutral and ~24% more expensive pooled; the gap is three
 deterministic costs, not model behaviour — (A) the `code` tool's real
 wire schema (13,915 B / 3,171 tokens, measured via an in-process
 `tools/list` probe, not the description string alone) cache-read on
-every call, **measured at ~87% of the pooled prom-opus gap and ~36% of
-the etcd-multifile-v2 gap** (2026-09-02, see item 1 below — done), (B)
+every call, **measured at ~29% of the pooled prom-opus gap and ~36% of
+the etcd-multifile-v2 gap** (2026-09-02, prom-opus figure corrected
+2026-09-09 — see item 1 below — done), (B)
 per-call enrichment the model doesn't consume, (C) tail events from
 failed writes. Also: no current corpus exercises defn's actual
 asymmetries (cross-package rename/move, def-scoped test) — a
@@ -993,8 +994,14 @@ measurement reason:**
        `newMCPServer`, not the description string in isolation) is
        13,915 B / 3,171 tokens. × real mean assistant-message count
        from `bench/prometheus-repo-opus/arm_defn/*.json` (50.2/task)
-       × Opus cache-read ($1.50/M) = $0.239/task ≈ **87%** of the
-       pooled $0.274/task gap. Cross-checked against
+       × Opus cache-read ($1.50/M **— corrected 2026-09-09 to the real
+       $0.50/M; a least-squares fit against actual billing data in
+       `bench/session-cumulative/2026-08-07-session-usage.csv` [40
+       rows, max residual $0.0005], independently spot-checked by hand
+       against 2 of those rows, found `claude-opus-5`'s real cache-read
+       price is 3x cheaper than the generic "10% of input price"
+       heuristic this doc originally assumed**) = $0.080/task ≈
+       **29%** of the pooled $0.274/task gap. Cross-checked against
        `bench/etcd-multifile-v2/arm_defn/*.json` (27.3 calls/task,
        Sonnet cache-read $0.30/M) = $0.026/task ≈ **36%** of that
        corpus's $0.072/task gap. Two independent corpora agree: this
@@ -1017,9 +1024,12 @@ measurement reason:**
        Measured (in-process probe, not estimated): total wire JSON
        14,037 B → 6,121 B (56.4% smaller); description 8,950 B → 1,144 B
        (87.2% smaller); ~3,171 → ~1,454 tokens/call. Projected saving
-       using item 1's real call counts: ≈$0.129/task on prom-opus
-       (≈47% of the pooled gap), ≈$0.014/task on etcd-multifile-v2
-       (≈20% of that gap) — projection, not yet a fresh bench
+       using item 1's real call counts: ≈$0.043/task on prom-opus
+       (≈16% of the pooled gap — corrected 2026-09-09, was ≈$0.129/47%
+       under the wrong $1.50/M Opus cache-read price; see item 1's own
+       correction), ≈$0.014/task on etcd-multifile-v2
+       (≈20% of that gap, Sonnet rate not re-verified) — projection,
+       not yet a fresh bench
        confirmation; that's item 6. All 142 tests statically affected
        by `handleCode` pass. Cut from scope: did NOT add
        "auto-append help to the first error per op" — `handleCode`'s

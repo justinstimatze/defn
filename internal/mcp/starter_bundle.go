@@ -2,7 +2,9 @@ package mcp
 
 import (
 	"context"
+	"regexp"
 	"strings"
+	"unicode"
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -50,3 +52,39 @@ func (s *server) maybeAppendStarterBundle(req *sdkmcp.CallToolRequest, question 
 	}
 	return "\n\n---\n_[#203 starter bundle -- first orient op of this session; won't repeat.]_\n\n" + body
 }
+
+// hasIdentifierShapedToken reports whether s contains at least one token
+// that looks like a real Go identifier reference (an internal case
+// transition, e.g. ParseVector/handleEdit, or a snake_case underscore)
+// rather than plain conversational English. Gates the starter bundle's
+// use of the raw captured user prompt (hooks/defn-capture-question.sh)
+// against firing on pure filler ("good call do it") or a bench harness's
+// task-preamble boilerplate ("You are working in a Go repository. Please
+// solve the following issue.") -- both measured (2026-09-09, real
+// prom-opus trajectories + this very session) to match broadly against
+// thousands of unrelated defs on common words like "go"/"issue"/"call",
+// burning the session's one starter-bundle shot on an irrelevant dump
+// instead of falling back to the op's own more specific default (the
+// def name actually being read, the search pattern actually used).
+func hasIdentifierShapedToken(s string) bool {
+	for _, tok := range identifierShapedTokenRe.FindAllString(s, -1) {
+		if strings.Contains(tok, "_") && len(tok) > 2 {
+			return true
+		}
+		hasLower, hasUpperNotFirst := false, false
+		for i, r := range tok {
+			switch {
+			case unicode.IsLower(r):
+				hasLower = true
+			case unicode.IsUpper(r) && i > 0:
+				hasUpperNotFirst = true
+			}
+		}
+		if hasLower && hasUpperNotFirst {
+			return true
+		}
+	}
+	return false
+}
+
+var identifierShapedTokenRe = regexp.MustCompile(`\b[A-Za-z_][A-Za-z0-9_]*\b`)

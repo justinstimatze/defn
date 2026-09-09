@@ -20,10 +20,13 @@ effect: see `docs/lessons-learned.md`.
 
 Current state of the gap and the ranked work order to close it:
 `docs/gap-analysis-2026-09-02.md` (pooled verdict: correctness tied,
-cost +24%). The schema tax is measured (~87% of the gap on prom-opus,
-~36% on etcd-multifile-v2) AND the fix has shipped: `DEFN_STRIP=verbose-tool-desc`
-opts into a lean `code` tool description (1,144 B vs the legacy
-8,950 B), default unchanged pending the powered A/B in the work order.
+cost +24%). The schema tax is measured (~29% of the gap on prom-opus,
+~36% on etcd-multifile-v2 — the prom-opus figure corrected 2026-09-09;
+the doc previously said ~87%, using a wrong assumed Opus cache-read
+price later found to be 3x too high against real billing data) AND the
+fix has shipped and is now the default: the lean `code` tool
+description (1,144 B vs the legacy 8,950 B) is used unless
+`DEFN_STRIP=lean-tool-desc` reverts to the legacy one.
 The "Handoff" section at the end of `docs/lessons-learned.md` carries
 the checkbox TODO list — pick up there.
 

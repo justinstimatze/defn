@@ -56,8 +56,11 @@ The `code` tool description alone is **8,987 bytes** (server.go:573–582,
 one string) before the input schema. Estimate ~2.2k tokens for the
 description, likely 4–6k tokens total with schema. That prefix is
 cache-read on *every* API call in the session. At Opus cache-read
-($1.50/M): 5k tokens × 40 msgs/task ≈ 200k tokens ≈ **$0.30/task** —
-which is roughly the entire pooled gap ($0.27/task). Even if the true
+(**$1.50/M assumed here — later corrected to the real $0.50/M, see
+item 1**): 5k tokens × 40 msgs/task ≈ 200k tokens ≈ **$0.30/task** —
+which is roughly the entire pooled gap ($0.27/task) on this first-pass,
+uncorrected estimate; the real-data item-1 measurement below supersedes
+it. Even if the true
 figure is half that, it's the single largest deterministic contributor
 and applies identically to every task, including tasks where defn is
 never called (chi-explore: +12.6% with zero defn calls — that *was* the
@@ -119,8 +122,14 @@ win there either, the thesis is wrong, not the bench.
    count in `fncall_messages`, i.e. actual LLM round-trips, not a
    guessed "40 msgs/task"):
    - **prom-opus arm_defn** (15 tasks, local run): mean 50.2 calls/task
-     (range 14–97). Tax = 3,171 × 50.2 × $1.50/M (Opus cache-read) =
-     **$0.239/task ≈ 87% of the pooled $0.274/task gap.**
+     (range 14–97). Tax = 3,171 × 50.2 × $0.50/M (Opus cache-read —
+     **corrected 2026-09-09**: a least-squares fit against real billing
+     data in `bench/session-cumulative/2026-08-07-session-usage.csv`
+     [40 rows, max residual $0.0005] found actual `claude-opus-5`
+     cache-read at $0.50/M, not the $1.50/M this doc originally assumed
+     from the generic "10% of input price" heuristic; independently
+     re-verified against 2 of those rows by hand before editing this) =
+     **$0.080/task ≈ 29% of the pooled $0.274/task gap.**
    - **etcd-multifile-v2 arm_defn** (3 tasks, Sonnet): mean 27.3
      calls/task. Tax = 3,171 × 27.3 × $0.30/M (Sonnet cache-read) =
      **$0.026/task ≈ 36% of that corpus's $0.072/task gap.**
@@ -160,10 +169,13 @@ win there either, the thesis is wrong, not the bench.
    payload; description alone 8,950 B → 1,144 B, 87.2% smaller.**
    Token-equivalent: ~3,171 → ~1,454 tokens per call (tiktoken
    cl100k_base proxy). Projected task-cost effect using the SAME real
-   call counts as item 1: prom-opus (50.2 calls/task, Opus cache-read)
-   saves ≈$0.129/task ≈ 47% of the pooled $0.274/task gap;
-   etcd-multifile-v2 (27.3 calls/task, Sonnet cache-read) saves
-   ≈$0.014/task ≈ 20% of that corpus's $0.072/task gap. **Not yet
+   call counts as item 1: prom-opus (50.2 calls/task, Opus cache-read
+   **corrected 2026-09-09 to the real $0.50/M rate, see item 1's own
+   correction — was $1.50/M**) saves ≈$0.043/task ≈ 16% of the pooled
+   $0.274/task gap; etcd-multifile-v2 (27.3 calls/task, Sonnet
+   cache-read) saves ≈$0.014/task ≈ 20% of that corpus's $0.072/task
+   gap (Sonnet's $0.30/M rate not re-verified against real billing data
+   the way Opus's was — flagged, not corrected). **Not yet
    re-measured on a live bench run — this is the same real-token-count
    math as item 1, not a fresh trajectory replay; item 6 is where that
    gets confirmed.** All 142 tests statically affected by `handleCode`
@@ -348,7 +360,8 @@ move to the new numbers.
     (see item 2's updated note) — but confirms the schema tax is a
     much smaller slice
     of the gap on Sonnet/refactor-shaped tasks than on Opus/prom-opus
-    (47% projected there): call-count (1.51×) and per-call weight
+    (16% projected there — corrected 2026-09-09, was 47%, see item 2's
+    own correction): call-count (1.51×) and per-call weight
     (1.26×) are the two real remaining levers here, and per-call
     weight's *fixable* (waste) component looks smaller than assumed —
     the #176 dedup machinery already catches the cheap win. Not
@@ -438,6 +451,70 @@ move to the new numbers.
     fixing, per this project's "verify before reacting" habit — but
     this time verification itself (a debug probe) surfaced a DEEPER bug
     than either of us assumed going in.
+7e. **DONE 2026-09-09.** User instruction: "figure out how to beat
+    `code-review-graph`" (a real, direct competitor — Tree-sitter-based,
+    read-only, went GitHub-trending on a "49x fewer tokens" headline;
+    beat both defn arms on cost/call-count in a 2026-08-07 forced-
+    substitution bench, n=1, never revisited). Delegated to a fresh
+    agent with a full technical brief (standing rules, prior failed
+    levers, real numbers) rather than continuing to theorize. Findings:
+    - **crg's real mechanism** (read from its source, not its blog
+      post): cross-file caller/rename resolution is bare-name matching
+      with no type information (`callers_of("Close")` returns every
+      same-named method in the repo); its rename is unguarded string
+      replacement with no build gate; 30 MCP tools / 22.8 KB of
+      docstrings (~5.5x defn's current lean schema); its own installed
+      instructions tell its model "the graph is a hint, read the
+      source, source wins," budgeted at ≤5 calls/task. It wins on cost
+      by doing structurally less, not by a better architecture.
+    - **Re-decomposed the 2026-08-07 loss at the correct price** (see
+      the correction below) — the loss was NOT primarily schema/input
+      tax, it was defn emitting 33-38% more OUTPUT tokens that run,
+      because multi-decl `create` (shipped 2026-08-08, one day later)
+      and `insert-header` (shipped 2026-09-02) didn't exist yet, so
+      defn had to `create` two new files one def at a time instead of
+      one shot. That specific gap may already be closed and has never
+      been re-measured.
+    - **Price correction (verified independently, not taken on faith):**
+      this doc's Opus cache-read price ($1.50/M, the generic "10% of
+      input" heuristic) was wrong. A least-squares fit against real
+      billing data (`bench/session-cumulative/2026-08-07-session-usage.csv`,
+      40 rows, max residual $0.0005) found `claude-opus-5`'s actual
+      cache-read price is **$0.50/M** — confirmed by hand against 2 of
+      those rows before touching anything. This changes items 1/2/7b's
+      schema-tax percentages (see their own inline corrections): ~29%
+      of the pooled prom-opus gap, not ~87%; the lean-desc saving is
+      ~16%, not ~47%. Schema tax is real but was overstated 3x; result-
+      byte volume and extra-message count are now the larger remaining
+      share.
+    - **A live bug found by mining real data, not by inspection**: the
+      one-shot starter bundle (`#203`) unconditionally preferred the
+      raw captured user prompt over the calling op's own default
+      question, even when that prompt was pure conversational filler
+      or a bench harness's fixed task-preamble sentence — both matched
+      broadly against thousands of unrelated defs on common words
+      ("go", "issue", "call"), burning the session's one bundle shot on
+      an irrelevant dump. Measured on real `bench/prometheus-repo-opus`
+      trajectories: fired on all 15/15 tasks keyed on the harness's
+      literal first sentence, injecting a mean 8,588 B/task (~12.4% of
+      all defn result bytes that corpus) for zero information — this
+      session's own first bundle-eligible call reproduced it live,
+      keyed on filler words from a venting message. Fixed: added
+      `hasIdentifierShapedToken` (`internal/mcp/starter_bundle.go`) —
+      the raw prompt is only preferred over the op's own default when
+      it contains an actual identifier-shaped token (camelCase/
+      snake_case), not just plain English. Test:
+      `TestHasIdentifierShapedToken`; 234 tests statically affected by
+      the change pass.
+    - **Not yet done** (needs the user's go-ahead on spend, not
+      proposed unilaterally): a small (~$45-75, Opus) re-run of the
+      exact 2026-08-07 chi bench now that the write-side gaps are
+      fixed, pre-registered against defn-natural ≤ crg-natural on total
+      cost with ≥ equal correctness; then, only if that holds, a larger
+      pre-registered head-to-head on the refactor-corpus specifically
+      testing where crg's bare-name/no-build-gate rename should break
+      on Go (duplicate method names) — a falsifiable correctness claim,
+      not another cost-only comparison.
 8. **On hold, 2026-09-02 — user call**: "probably no 8 that seems way
    too expensive still. can't possibly be worth it." ≥3 repeats/task/arm
    on the 15 prom tasks + the 10 refactor tasks, Opus, EC2 (~$300) — not
