@@ -590,6 +590,49 @@ move to the new numbers.
     defn-only) pre-registered on *variance* (non-Bash calls ≤14 in
     ≥4/5 runs), not just mean — consistency is the claim to test next,
     not another mean-cost number.
+7g. **DONE 2026-09-09.** Full analysis of all 8 real defn chi-ratelimit
+    trajectories (pre-fix r1-r3 + post-fix v1-v5) plus files/crg
+    reference runs, requested directly: "analyze all the runs and make
+    a detailed plan." Confirmed the two same-day fixes (7f) work exactly
+    as designed — the "already read in this session" suppression marker
+    fires 2-8 times in 4/5 post-fix runs (grepped directly from raw
+    response text, not inferred), and mean `read-file` use roughly
+    doubled (3.7→6.0/run). But the pre-registered variance bar (≤14
+    non-Bash calls in ≥4/5 runs) still failed 0/5 — mean cost this batch
+    ($3.53) was actually higher than the pre-fix batch ($3.03). Root
+    cause of the non-improvement: NOT a regression from tonight's fixes
+    — `impact` usage rose from ~1.0 to ~2.0 calls/run and `search` from
+    ~1.3 to ~2.4/run, i.e. the model reinvested the saved capacity into
+    doing MORE graph-based investigation, much of it genuinely
+    task-driven (turn 6 explicitly asks a blast-radius question files-
+    mode can only answer via manual grep+reasoning; defn answers it via
+    `impact`, more rigorously but not for free).
+    **New, separate, well-evidenced finding, same class as 7f's two
+    fixes**: `batch-impact` already computes each call's real caller/
+    test NAMES in memory (`allCallers`/`allTests`) but discarded them,
+    returning only counts (`combined_callers: 136`). A real trajectory
+    (`defn-v1`) called `batch-impact` for 6 names, got counts only, and
+    immediately fell back to 2 individual `impact()` calls on names
+    already in that batch — re-querying data already fetched, purely
+    because the response shape couldn't answer "which functions,"
+    only "how many." Fixed: response now includes `caller_names`/
+    `test_names` (sorted, capped at `impactCallerCap`, zero new
+    queries — the data was already collected). New test
+    `TestHandleBatchImpact_IncludesCallerAndTestNames`; full
+    `handleBatchImpact`-affected suite (237/237) passes.
+    **Also checked, no fix needed**: `context`'s response never dumps
+    full bodies (signature/doc + a byte/line count only; full bodies go
+    to an internal buffer for the Sonnet-synthesis path, never the
+    model-visible text) — the bodyServed gap `read-file`/`expand` had
+    doesn't apply there.
+    **Comparative note, not chased further**: `code-review-graph`'s ONE
+    graph-tool call this session was used to explicitly split a real
+    type-vs-method name ambiguity in prose FIRST, then targeted the one
+    genuinely hard part (an interface-dispatched caller) — a
+    reasoning-before-calling pattern our own ambiguity-note mechanism
+    partly supports (it did fire: "2 definitions share the name") but
+    didn't fully prevent the model from making several follow-up calls
+    to sort out. Not a fix, a comparison point worth remembering.
 8. **On hold, 2026-09-02 — user call**: "probably no 8 that seems way
    too expensive still. can't possibly be worth it." ≥3 repeats/task/arm
    on the 15 prom tasks + the 10 refactor tasks, Opus, EC2 (~$300) — not

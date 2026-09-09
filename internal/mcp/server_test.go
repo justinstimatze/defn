@@ -17652,3 +17652,60 @@ func B() string { return "b" }
 		t.Errorf("expected read(A) to skip re-serving a body read-file already showed, got: %s", readText)
 	}
 }
+
+// TestHandleBatchImpact_IncludesCallerAndTestNames is the #369
+// follow-up regression: a real chi-ratelimit trajectory called
+// batch-impact for 6 names, got back only counts ("combined_callers":
+// 136), and immediately fell back to individual impact() calls per
+// name to learn WHO those callers actually were -- data
+// batch-impact had already computed in memory (allCallers/allTests)
+// and then discarded before responding. The names must be in the
+// response, not just the counts.
+func TestHandleBatchImpact_IncludesCallerAndTestNames(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, "batchimpactnamesproj")
+	os.MkdirAll(projDir, 0755)
+	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module batchimpactnamesproj\n\ngo 1.26\n"), 0644)
+	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(`package batchimpactnamesproj
+
+func Helper() string { return "x" }
+
+func Caller() string {
+	return Helper()
+}
+
+func TestHelperIsCorrect() bool {
+	return Helper() == "x"
+}
+`), 0644)
+
+	dbPath := filepath.Join(dir, ".defn")
+	db, err := store.OpenBackend(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ingest.Ingest(db, projDir); err != nil {
+		t.Fatal("ingest:", err)
+	}
+	if err := resolve.Resolve(db, projDir); err != nil {
+		t.Fatal("resolve:", err)
+	}
+
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op: "batch-impact", Names: []string{"Helper"},
+	})
+	if err != nil {
+		t.Fatalf("batch-impact: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "caller_names") || !strings.Contains(text, "Caller") {
+		t.Errorf("expected caller_names to include \"Caller\", got: %s", text)
+	}
+	if !strings.Contains(text, "test_names") {
+		t.Errorf("expected a test_names field, got: %s", text)
+	}
+}

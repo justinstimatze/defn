@@ -9413,10 +9413,42 @@ func (s *server) handleBatchImpact(ctx context.Context, _ *sdkmcp.CallToolReques
 		})
 	}
 
+	// #369 follow-up (real trajectory finding, 2026-09-09): allCallers/
+	// allTests were already fully computed here and then discarded --
+	// the response gave only counts, never the names. A real chi-
+	// ratelimit trajectory answering "which functions call X, which
+	// would be affected" needed the actual names (not just "5 callers"),
+	// so it fell back to individual impact() calls per name right after
+	// the batch that already had this data in memory -- the exact
+	// re-query-what-you-already-fetched pattern the bodyServed fix
+	// targeted elsewhere, just for batch-impact's own response shape
+	// instead of a body. Capped at impactCallerCap (same cap a single
+	// impact call already uses) so a huge batch doesn't blow up the
+	// payload; combined_callers/combined_tests already carry the true
+	// count regardless of how many names are shown.
+	callerNames := make([]string, 0, len(allCallers))
+	for name := range allCallers {
+		callerNames = append(callerNames, name)
+	}
+	sort.Strings(callerNames)
+	if len(callerNames) > impactCallerCap {
+		callerNames = callerNames[:impactCallerCap]
+	}
+	testNames := make([]string, 0, len(allTests))
+	for name := range allTests {
+		testNames = append(testNames, name)
+	}
+	sort.Strings(testNames)
+	if len(testNames) > impactCallerCap {
+		testNames = testNames[:impactCallerCap]
+	}
+
 	result := map[string]any{
 		"definitions":      perDef,
 		"combined_callers": len(allCallers),
 		"combined_tests":   len(allTests),
+		"caller_names":     callerNames,
+		"test_names":       testNames,
 	}
 	text, err := toJSON(result)
 	if err != nil {
