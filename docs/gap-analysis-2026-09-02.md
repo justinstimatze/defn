@@ -753,6 +753,49 @@ move to the new numbers.
       `prometheus-refactor-recode-signature`'s large method bodies —
       task shape matters, refactor-corpus's real methods are bigger
       than chi's small middleware functions.
+7j. **DONE 2026-09-10.** Built 7i's two remaining fork findings, user's
+    call: "both in whatever order seems efficient."
+    - **Fragment-edit hint** (shipped first, self-contained): wired the
+      existing `suggestClosestFragmentHint` helper (built for
+      `replace-hunk`'s miss path) into `handleFragmentEdit`'s
+      `old_fragment` miss too — previously a bare "not found" error
+      with zero help, now a whitespace-insensitive near-match hint on
+      the same miss path that drove 5+ blind retries in 7i.
+    - **Read auto-downgrade threshold**: raised `readAutoOutlineThreshold`
+      1500→6000, evidenced by both corpora — chi showed near-zero
+      downgrades firing at all under 1500 (small middleware functions,
+      nothing to lose), refactor-corpus showed a clean 4-for-4 waste
+      rate (large method bodies downgraded then immediately re-read
+      with `full:true`, since a signature-change task always needs the
+      body regardless of size). 6000 sits above all four observed
+      cases, well under the 30000 hard cap for explicit `full:true`
+      reads.
+    - **Process note, worth remembering**: the local machine's own
+      memory pressure killed three separate background test/push
+      attempts mid-run tonight (harness-level kill on low free memory,
+      not a true kernel OOM — swap had headroom). Worked around it by
+      detaching the actual work from the harness's background-task
+      tracking (`nohup ... & disown` + polling the output file with
+      short foreground SSH/ps calls) rather than retrying the same
+      tracked-background shape repeatedly. Also: a full regression
+      sweep (forced onto the EC2 box by this) caught a 5th test
+      fixture with the same undersized-body problem the initial fix
+      missed (`TestHandleGetDefinition_OutlineDowngradeMentionsFreshSummaryAsOption`)
+      plus two stale doc-strings still advertising "1500 bytes" to the
+      model (`legacyToolDescription`, and the always-live
+      `help(topic:"read")` text in `opHelp`) — both fixed. Separately,
+      a manual PATH override while testing on EC2 (`/usr/local/go/bin`
+      without `~/go/bin`) produced two rounds of false-looking
+      failures (`goimports not found` breaking `TestWriteSafetyConformance`,
+      and — retroactively clear once the PATH was fixed — the
+      `FuzzMutationSequence` seed#1/seed#2 failures originally read as
+      a pre-existing, unrelated interface-embedding bug were actually
+      the same missing-`goimports` issue, not a real defn bug; the
+      "confirmed against clean origin/main" check that seemed to rule
+      this out was itself run under the same broken PATH, so it didn't
+      actually rule out anything). Full suite is clean (`ok`, zero
+      failures) under a correct environment. Shipped as `7838cdb`
+      (fragment-hint) and `b7fa03b` (threshold + fixture/doc fixes).
 8. **On hold, 2026-09-02 — user call**: "probably no 8 that seems way
 
 ## 6. Open questions for Opus to settle, not assume
