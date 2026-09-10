@@ -10866,11 +10866,22 @@ func emitUsageLog(u usageStats) {
 // mode:"body" both bypass; query-adaptive reads also bypass so
 // their filtered-body path is preserved.
 //
-// 1500 is deliberately larger than outlineBodyThreshold (300) —
-// outline crosses over below 300, but 300-1500 is still comfortable
-// to read directly and downgrading there produces model confusion
-// without meaningful savings.
-const readAutoOutlineThreshold = 1500
+// Raised 1500 -> 6000 (2026-09-10), evidence from two independent
+// corpora: the chi-ratelimit bench showed near-zero downgrades firing
+// at all under 1500 (small middleware functions), so raising it cost
+// nothing there; the refactor-corpus rerun showed a clean 4-for-4
+// waste rate -- four real signature-change-task method bodies,
+// 2196-4696 bytes, each auto-downgraded and then IMMEDIATELY re-read
+// with full:true, paying a full extra round-trip every time for zero
+// benefit, because a signature-change task always needs the body
+// regardless of size. 6000 sits comfortably above all four observed
+// cases and well under readFullBodyHardCap (30000, the "genuinely too
+// big even for an explicit ask" tier) -- the original 300-1500 "still
+// comfortable to read directly" band this constant's siblings
+// (outlineBodyThreshold=300) were tuned against is unaffected; only
+// the specific 1500-6000 range, which real signature-change work now
+// shows is NOT a case where downgrading pays for itself, changes.
+const readAutoOutlineThreshold = 6000
 
 // fileNarrativeMinDefs is the smallest def count a file needs before
 // #212 bothers generating an architectural narrative for it -- small

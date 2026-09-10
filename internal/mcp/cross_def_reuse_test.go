@@ -454,8 +454,8 @@ func TestHandleCode_ReadDowngradeTrackingInvalidatedByEdit(t *testing.T) {
 	bigBody := func(marker string) string {
 		var body strings.Builder
 		body.WriteString(fmt.Sprintf("package main\n\nfunc BigFunc(name string) string {\n\tresult := \"%s\"\n", marker))
-		for i := 0; i < 60; i++ {
-			body.WriteString(fmt.Sprintf("\tresult += \"line %d: padding to push body past 1500 bytes\\n\"\n", i))
+		for i := 0; i < 100; i++ {
+			body.WriteString(fmt.Sprintf("\tresult += \"line %d: padding to push body past 6000 bytes\\n\"\n", i))
 		}
 		body.WriteString("\treturn result + name\n}\n")
 		return body.String()
@@ -480,7 +480,7 @@ func TestHandleCode_ReadDowngradeTrackingInvalidatedByEdit(t *testing.T) {
 		t.Fatalf("expected first bare read to auto-downgrade to outline, got: %s", resultText(t, first))
 	}
 
-	// Edit to a DIFFERENT body that is STILL large (>1500 bytes) --
+	// Edit to a DIFFERENT body that is STILL large (>6000 bytes) --
 	// this isolates the #313 tracking-invalidation question from the
 	// unrelated "body just got small" case: if invalidation did NOT
 	// clear readDowngraded, this next read would wrongly skip straight
@@ -540,8 +540,8 @@ func TestHandleCode_RepeatBareReadAfterOutlineDowngradeServesFullBody(t *testing
 	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0o644)
 	var body strings.Builder
 	body.WriteString("package main\n\nfunc BigFunc(name string) string {\n\tresult := \"\"\n")
-	for i := 0; i < 60; i++ {
-		body.WriteString(fmt.Sprintf("\tresult += \"line %d: padding to push body past 1500 bytes\\n\"\n", i))
+	for i := 0; i < 100; i++ {
+		body.WriteString(fmt.Sprintf("\tresult += \"line %d: padding to push body past 6000 bytes\\n\"\n", i))
 	}
 	body.WriteString("\treturn result + name\n}\n")
 	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(body.String()), 0o644)

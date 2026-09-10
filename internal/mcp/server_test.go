@@ -12541,8 +12541,8 @@ func TestHandleGetDefinition_OutlineDowngradeMentionsFreshSummaryAsOption(t *tes
 	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0o644)
 	var body strings.Builder
 	body.WriteString("package main\n\nfunc BigFunc(name string) string {\n\tresult := \"\"\n")
-	for i := 0; i < 60; i++ {
-		body.WriteString(fmt.Sprintf("\tresult += \"line %d: padding to push body past 1500 bytes\\n\"\n", i))
+	for i := 0; i < 100; i++ {
+		body.WriteString(fmt.Sprintf("\tresult += \"line %d: padding to push body past 6000 bytes\\n\"\n", i))
 	}
 	body.WriteString("\treturn result + name\n}\n")
 	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(body.String()), 0o644)
@@ -12979,8 +12979,8 @@ func TestHandleExpand_AutoBatchBodyOverrideRespectsSizeThreshold(t *testing.T) {
 	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0o644)
 	var body strings.Builder
 	body.WriteString("package main\n\n// BigFunc has a body larger than the auto-outline threshold.\nfunc BigFunc(name string) string {\n\tresult := \"\"\n")
-	for i := 0; i < 60; i++ {
-		body.WriteString(fmt.Sprintf("\tresult += \"line %d: this is padding to push body past 1500 bytes\\n\"\n", i))
+	for i := 0; i < 100; i++ {
+		body.WriteString(fmt.Sprintf("\tresult += \"line %d: this is padding to push body past 6000 bytes\\n\"\n", i))
 	}
 	body.WriteString("\treturn result + name\n}\n")
 	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(body.String()), 0o644)

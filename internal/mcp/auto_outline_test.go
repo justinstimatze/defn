@@ -28,11 +28,11 @@ func TestHandleGetDefinition_AutoDowngradesLargeBody(t *testing.T) {
 	projDir := filepath.Join(dir, "testproj")
 	os.MkdirAll(projDir, 0o755)
 	os.WriteFile(filepath.Join(projDir, "go.mod"), []byte("module testproj\n\ngo 1.26\n"), 0o644)
-	// Fabricate a body > readAutoOutlineThreshold (1500 bytes).
+	// Fabricate a body > readAutoOutlineThreshold (6000 bytes).
 	var body strings.Builder
 	body.WriteString("package main\n\n// BigFunc has a body larger than the auto-outline threshold.\nfunc BigFunc(name string) string {\n\tresult := \"\"\n")
-	for i := 0; i < 60; i++ {
-		body.WriteString(fmt.Sprintf("\tresult += \"line %d: this is padding to push body past 1500 bytes\\n\"\n", i))
+	for i := 0; i < 100; i++ {
+		body.WriteString(fmt.Sprintf("\tresult += \"line %d: this is padding to push body past 6000 bytes\\n\"\n", i))
 	}
 	body.WriteString("\treturn result + name\n}\n")
 	os.WriteFile(filepath.Join(projDir, "main.go"), []byte(body.String()), 0o644)
