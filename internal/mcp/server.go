@@ -3895,7 +3895,18 @@ func (s *server) handleFragmentEdit(_ context.Context, _ *sdkmcp.CallToolRequest
 	// Check old_fragment exists in body.
 	count := strings.Count(d.Body, args.OldFragment)
 	if count == 0 {
-		return errResult(fmt.Errorf("old_fragment not found in %s body", args.Name))
+		// #369 follow-up (fork trajectory finding, 2026-09-10):
+		// suggestClosestFragmentHint already exists and is proven for
+		// this exact failure mode -- it's wired into handleReplaceHunk
+		// (the sibling old/new "hunk" op) but was never wired in here,
+		// even though this handler's own old_fragment/new_fragment
+		// shape hits the identical bare "not found" miss. A real
+		// trajectory (cli-refactor-getcomment-signature) burned 5+
+		// blind retries against an 814-line test function with many
+		// near-identical blocks, each miss giving zero hint about what
+		// was actually there.
+		hint := suggestClosestFragmentHint(d.Body, args.OldFragment)
+		return errResult(fmt.Errorf("old_fragment not found in %s body%s", args.Name, hint))
 	}
 	if count > 1 && !args.ReplaceAll {
 		return errResult(fmt.Errorf("old_fragment matches %d times in %s — use replace_all:true to replace all, or provide a more specific fragment", count, args.Name))

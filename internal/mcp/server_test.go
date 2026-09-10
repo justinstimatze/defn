@@ -17783,3 +17783,38 @@ func Foo() string {
 		t.Errorf("expected main.go on disk to still contain the externally-made (corrupt) edit, got:\n%s", body)
 	}
 }
+
+// TestHandleFragmentEdit_NotFoundSuggestsWhitespaceNormalizedMatch is
+// the sibling regression to
+// TestHandleReplaceHunk_NotFoundSuggestsWhitespaceNormalizedMatch:
+// suggestClosestFragmentHint already existed and was proven for
+// replace-hunk's identical "not found" miss, but was never wired into
+// handleFragmentEdit's own old_fragment/new_fragment path, which hits
+// the exact same failure mode. A real trajectory
+// (cli-refactor-getcomment-signature) burned 5+ blind old_fragment
+// retries against a large test function with zero diagnostic help.
+func TestHandleFragmentEdit_NotFoundSuggestsWhitespaceNormalizedMatch(t *testing.T) {
+	db, projDir := setupTestDB(t)
+	defer db.Close()
+	s := &server{backend: db, projectDir: projDir}
+	s.ready.Store(true)
+
+	// Greet's real body line is exactly `\treturn "Hello, " + name` --
+	// pass a whitespace-mangled version that will never byte-exact match.
+	result, _, err := s.handleCode(context.Background(), nil, codeParam{
+		Op:          "edit",
+		Name:        "Greet",
+		OldFragment: `return  "Hello, " + name`,
+		NewFragment: `return "Hi, " + name`,
+	})
+	if err != nil {
+		t.Fatalf("handleCode: %v", err)
+	}
+	text := resultText(t, result)
+	if !strings.Contains(text, "old_fragment not found") {
+		t.Fatalf("expected the base 'not found' error to still be present, got: %s", text)
+	}
+	if !strings.Contains(text, `return "Hello, " + name`) {
+		t.Errorf("expected the hint to show the real body text to copy verbatim, got: %s", text)
+	}
+}
